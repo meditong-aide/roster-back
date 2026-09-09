@@ -1665,7 +1665,9 @@ def recommend_replacement_candidates(
             if join_date and slot.date < join_date:
                 excluded["before_joining_date"] += 1
                 continue
-            if resign_date and slot.date > resign_date:
+            # ★ resignation_date 는 퇴사일 그 자체 — 그날부터 소속이 아니므로
+            #   마지막 근무일은 resign_date - 1 일이다(_active_range_in_month 와 동일 규약).
+            if resign_date and slot.date >= resign_date:
                 excluded["after_resignation_date"] += 1
                 continue
 
@@ -1939,7 +1941,8 @@ def _evaluate_single_slot(
         resign_date = _to_date(getattr(nurse, "resignation_date", None))
         if join_date and slot.date < join_date:
             continue
-        if resign_date and slot.date > resign_date:
+        # ★ 퇴사일 당일은 근무 불가 (_active_range_in_month 와 동일 규약)
+        if resign_date and slot.date >= resign_date:
             continue
         if slot.date in _asgn_blocked.get(candidate_id, set()):
             continue

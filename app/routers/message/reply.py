@@ -59,5 +59,7 @@ def set_message(current_user: UserSchema = Depends(get_current_user_from_cookie)
             return {"result": "fail", "message": "오류가 발생하였습니다."}
         else:
             return {"result": "success", "message": "답변 메세지가 전송되었습니다."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing email request: {e}")

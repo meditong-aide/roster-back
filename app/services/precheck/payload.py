@@ -375,6 +375,16 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
             _resolution_options = _lever + _resolution_options
     except Exception:
         pass
+    # 야간 월용량 부족의 병목이 **개인 한도**면 config 축만 제안해서는 안 풀린다
+    #   (상한 = min(working, config, 개인한도, 회복) — 개인이 더 작으면 config 상향이 무효).
+    #   precheck evidence 의 capped_by='personal' 로 대상을 지목해 맨 앞에 둔다.
+    try:
+        from services.cp_sat.undiagnosed_probe import personal_night_cap_options_from_issues
+        _pn = personal_night_cap_options_from_issues(issues)
+        if _pn:
+            _resolution_options = _pn + _resolution_options
+    except Exception:
+        pass
 
     return {
         "infeasibility": {
@@ -565,6 +575,16 @@ def build_unrecoverable_payload(
                 if str(_c.get("reason_code") or "").upper() == "CAPACITY_TOTAL_SHORTAGE":
                     _c.pop("fix", None)
             _resolution_options = _lever + _resolution_options
+    except Exception:
+        pass
+    # 야간 월용량 부족의 병목이 **개인 한도**면 config 축만 제안해서는 안 풀린다
+    #   (상한 = min(working, config, 개인한도, 회복) — 개인이 더 작으면 config 상향이 무효).
+    #   precheck evidence 의 capped_by='personal' 로 대상을 지목해 맨 앞에 둔다.
+    try:
+        from services.cp_sat.undiagnosed_probe import personal_night_cap_options_from_issues
+        _pn = personal_night_cap_options_from_issues(issues)
+        if _pn:
+            _resolution_options = _pn + _resolution_options
     except Exception:
         pass
 

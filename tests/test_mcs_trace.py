@@ -29,6 +29,47 @@ def test_mcs_none_when_relax_all_still_infeasible():
     assert minimal_correction_set(resolve, ["A", "B"]) is None
 
 
+def test_card_night_only_monthly_limit_raises_cap_not_lower():
+    """야간전담 monthly_limit target → 내리지 않고 월 야간상한을 요구치까지 올리는 카드."""
+    from services.ontology_graph.mcs_trace import cause_to_resolution_options
+
+    targets = [{"nurse_id": "N1", "name": "전담", "family": "monthly_limit",
+                "current": 15, "cap": 6, "is_night_only": True, "off_after_cap": 24}]
+    cards = cause_to_resolution_options("personal_infeasible", "monthly_limit", targets)
+    assert cards
+    # 야간전담은 '내리지' 않는다(monthly_limit_release 비어야).
+    assert cards[0].get("monthly_limit_release") == []
+    # 대신 config max_nig 를 요구치(15)까지 올린다(apply → config_override).
+    assert cards[0].get("apply", {}).get("max_nig_per_month") == 15
+    assert "야간전담" in cards[0]["trade_off_ko"]
+
+
+def test_card_mixed_night_only_and_regular_monthly_limit():
+    """야간전담(상향) + 일반(하향) 혼재 → 상향은 apply, 하향은 monthly_limit_release 로 분리."""
+    from services.ontology_graph.mcs_trace import cause_to_resolution_options
+
+    targets = [
+        {"nurse_id": "NO", "name": "전담", "family": "monthly_limit",
+         "current": 15, "cap": 2, "is_night_only": True, "off_after_cap": 28},
+        {"nurse_id": "RG", "name": "일반", "family": "monthly_limit",
+         "current": 13, "cap": 7},
+    ]
+    cards = cause_to_resolution_options("personal_infeasible", "monthly_limit", targets)
+    assert cards
+    assert cards[0]["apply"]["max_nig_per_month"] == 15                         # 야간전담 상향
+    assert cards[0]["monthly_limit_release"] == [                               # 일반만 하향
+        {"nurse_id": "RG", "field": "n_max", "value": 7}]
+
+
+def test_card_weekend_aggregate_releases_only_needed():
+    """주말 집계 원인(family=weekend_off targets) → weekend_off_release 카드로 매핑."""
+    from services.ontology_graph.mcs_trace import cause_to_resolution_options
+
+    targets = [{"nurse_id": f"w{i}", "name": f"주말{i}", "family": "weekend_off"} for i in range(4)]
+    cards = cause_to_resolution_options("coverage_shortage", "weekend_off", targets)
+    assert cards and cards[0]["weekend_off_release"] == ["w0", "w1", "w2", "w3"]
+
+
 def test_trace_conflict_family_then_instance_drilldown():
     """family MCS(weekend_off, monthly_limit) → 각 family 안 culprit 간호사까지 추적."""
     families = ["coverage", "weekend_off", "monthly_limit", "transition", "off_budget"]

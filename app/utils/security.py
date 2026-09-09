@@ -55,6 +55,8 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
             new_id = msdb_manager.execute(Token.Set_Token(), params=(clientId, clientSecret, encoded_jwt, current_date))
             if new_id is None:
                 raise HTTPException(status_code=500, detail=f"DB Error")
+        except HTTPException:
+            raise
         except Exception:
             raise HTTPException(status_code=500, detail=f"DB Error")
     else :

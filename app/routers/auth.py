@@ -20,7 +20,7 @@ from db.models import Nurse, Group
 from schemas.auth_schema import User as UserSchema, TokenData
 from utils.email import email_sender, EmailSchema
 from utils.security import create_login_token
-from utils.utils import set_sms
+from utils.utils import set_sms, groupware_write_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -105,26 +105,36 @@ def mworks_get_user (account_id: str, password: str, client_ip: str) :
     if not IsPWCorrect :
         raise HTTPException(status_code=500, detail=f"Login failed")
 
-    new_id = msdb_manager.execute(Member.login_log(), params=params)
+    # [gw-write-gate] 로그인 이력은 **운영 roster DB 로 붙었을 때만** 그룹웨어에 남긴다.
+    # dev/localhost 는 인증(읽기)만 운영 gw 로 하고 쓰기는 건너뛴다. 이유 2가지:
+    #   ① 운영 그룹웨어 데이터 오염 방지 — dev 로그인이 운영 Member_LoginLog 에 쌓였다.
+    #   ② eun_gw 는 21개 DB 공용이라 락 경합이 잦다. 여기서 대기가 걸리면
+    #      async 핸들러 + uvicorn 워커 1개 구조상 **dev 서버 전체가 멈춘다**(2026-09-07 장애).
+    # ★ 쓰기와 그 None 검사를 **함께** 게이트 안에 둔다 — 쓰기만 건너뛰면 new_id/rows 가
+    #   None 이 되어 아래 검사에 걸려 dev 로그인이 500 으로 죽는다.
+    if groupware_write_enabled():
+        new_id = msdb_manager.execute(Member.login_log(), params=params)
 
-    if new_id is None:
-        raise HTTPException(status_code=500, detail=f"Login failed")
+        if new_id is None:
+            raise HTTPException(status_code=500, detail=f"Login failed")
 
-    rows = msdb_manager.execute(Member.login_update(), params=str(EmpSeqNo))
+        rows = msdb_manager.execute(Member.login_update(), params=str(EmpSeqNo))
 
-    if rows is None:
-        raise HTTPException(status_code=500, detail=f"Login failed")
+        if rows is None:
+            raise HTTPException(status_code=500, detail=f"Login failed")
 
     try :
         user_info = msdb_manager.fetch_all(Member.member_view(), params=(account_id))
 
         return user_info
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 @router.post("/login", response_model=UserSchema)
-async def login_for_access_token(
+def login_for_access_token(
     request: Request,
     response: Response, 
     form_data: OAuth2PasswordRequestForm = Depends(), 
@@ -168,9 +178,11 @@ async def login_for_access_token(
                     Nurse.account_id == account_id
                 ).first()
                 if nurse_record is None:
+                    # ★ SSO(/token/login)와 같은 판정·같은 문구를 쓴다. 사유가 동일한데
+                    #   경로마다 문구가 다르면 사용자가 다른 문제로 오해한다.
                     raise HTTPException(
                         status_code=501,
-                        detail="등록되지 않은 사용자입니다.",
+                        detail="AI근무표 이용 대상이 아닙니다. 병동 수간호사에게 등록을 요청하세요.",
                     )
             except HTTPException:
                 raise
@@ -253,7 +265,7 @@ async def login_for_access_token(
 
 
 @router.post("/logout")
-async def logout(response: Response, redirectUrl: str | None = None):
+def logout(response: Response, redirectUrl: str | None = None):
     """
         redirectUrl이 있는 경우 처리하고 값이 없는 경우 결과값 반환
     """
@@ -322,8 +334,34 @@ async def get_current_user_from_cookie(token: Optional[str] = Cookie(None, alias
         original_group_id=original_group_id,
     )
 
+
+async def require_current_user(
+    current_user: Optional[UserSchema] = Depends(get_current_user_from_cookie),
+) -> UserSchema:
+    """로그인이 반드시 필요한 엔드포인트용 — 미인증이면 401.
+
+    ★ `get_current_user_from_cookie` 는 토큰이 없거나 만료·무효일 때 **401 을 던지지 않고
+      `None` 을 돌려준다**(익명 허용 경로가 있어서다). 그 None 을 가드 없이
+      `current_user.account_id` 처럼 역참조하면 AttributeError → **500** 이 나간다.
+
+      클라이언트는 401 을 못 받으니 재로그인으로 넘어가지 못하고, 모바일에선 그대로
+      화면이 하얗게 뜬다. 게다가 이 500 은 로그에도 안 남는다 —
+      액션 로거가 `call_next` 를 try 밖에서 부르고(main.py), `_LOG_METHODS` 에 GET 이 없다.
+
+      그래서 "미인증이면 401" 이 필요한 핸들러는 이 의존성을 쓴다.
+      익명 접근을 실제로 허용하는 핸들러만 `get_current_user_from_cookie` 를 직접 쓴다.
+    """
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return current_user
+
+
 @router.get("/me", response_model=UserSchema)
-async def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cookie)):
     if current_user is None:
         print('[/me]: 유저 없음')
         raise HTTPException(
@@ -545,6 +583,8 @@ async def handle_find_pw_request(
                 html_body=html_body,
                 subtype=MessageType.html
             )
+        except HTTPException:
+            raise
         except Exception as e:
             # SMTP 연결 오류 등이 발생하면 500 에러를 반환
             raise HTTPException(status_code=500, detail=f"Error processing email request: {e}")

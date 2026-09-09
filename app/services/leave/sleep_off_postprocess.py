@@ -179,6 +179,8 @@ def postprocess_sleep_off(db: Session, schedule, generated: dict,
     #     정상값인데도 폴백을 타 다른 근무표 기준 값이 섞인다.
     fallback = ({} if has_anchor(db, gid, py, pm)
                 else prev_month_fallback(db, gid, py, pm))
+    # 월 경계도 하드락 대상이다 — 1일 N 을 빼면 전월 말 N 이 단독이 될 수 있다.
+    prev_tails = _load_prev_month_tail(db, gid, py, pm)
 
     for nid, codes in generated.items():
         if not is_sleep_off_eligible(flags.get(str(nid))):
@@ -196,7 +198,8 @@ def postprocess_sleep_off(db: Session, schedule, generated: dict,
         new_trigger += len(blocks)
         spans = blocks or [(0, 0)]          # 이월만 있으면 월초부터 탐색
         for block in spans[:need]:
-            day = _pick_day(generated, codes, block, req, target.shift_id)
+            day = _pick_day(generated, codes, block, req, target.shift_id,
+                            prev_tails.get(str(nid), ""))
             if day is None:
                 skipped += 1
                 continue
@@ -220,25 +223,112 @@ def postprocess_sleep_off(db: Session, schedule, generated: dict,
     return generated
 
 
+def _load_prev_month_tail(db: Session, group_id: str, year: int,
+                          month: int) -> dict[str, str]:
+    """전월 **마지막 날** 근무코드 {nurse_id: code}. 없으면 빈 dict.
+
+    하드락은 월 경계를 넘어 적용된다. 이 값이 없으면 1일 N 을 수면OFF 로 바꿔
+    전월 말 N 을 단독 1N 으로 만드는 경우를 못 잡는다.
+    ★ 마감분 우선 — draft 는 폐기될 수 있어 확정본이 있으면 그것을 본다.
+    """
+    import calendar as _cal
+    from sqlalchemy import case
+    from db.models import Schedule, ScheduleEntry
+
+    last_day = _cal.monthrange(int(year), int(month))[1]
+    sch = (
+        db.query(Schedule)
+        .filter(Schedule.group_id == str(group_id),
+                Schedule.year == int(year), Schedule.month == int(month),
+                Schedule.dropped == False)  # noqa: E712
+        .order_by(case((Schedule.status == "issued", 0), else_=1),
+                  Schedule.created_at.desc())
+        .first()
+    )
+    if sch is None:
+        return {}
+    try:
+        rows = (
+            db.query(ScheduleEntry.nurse_id, ScheduleEntry.work_date,
+                     ScheduleEntry.shift_id)
+            .filter(ScheduleEntry.schedule_id == sch.schedule_id)
+            .all()
+        )
+    except Exception as exc:
+        logger.warning("[SleepOff] 전월 꼬리 조회 실패(무시): %s", exc)
+        return {}
+    out: dict[str, str] = {}
+    for nid, wdate, code in rows:
+        if wdate is None or int(wdate.day) != last_day:
+            continue
+        out[str(nid)] = str(code or "").strip()
+    return out
+
+
+def _count_solo_nights(codes: list[str]) -> int:
+    """단독 1N 블록의 개수."""
+    n, i, solo = len(codes), 0, 0
+    while i < n:
+        if str(codes[i] or "").strip() == "N":
+            j = i
+            while j + 1 < n and str(codes[j + 1] or "").strip() == "N":
+                j += 1
+            if j - i + 1 == 1:
+                solo += 1
+            i = j + 1
+        else:
+            i += 1
+    return solo
+
+
+def _breaks_one_night(codes: list[str], day: int, sleep_code: str,
+                      prev_tail: str = "") -> bool:
+    """`day` 를 수면OFF 로 치환하면 **단독 1N 이 늘어나는가**.
+
+    ★★ 하드락 #7(1N 금지) 방어. `N N N` 의 가운데를 빼면 `N 수면 N` = 1N 두 개다.
+      이월분 처리 경로(block=(0,0))는 후보를 "월 전체 근무일"로 잡는데
+      `_WORK_MAIN` 에 N 이 들어 있어 아무 N 이나 뽑을 수 있었다 — 실측으로 확인된
+      위반 경로다(호스피스 2026-12, 3회 중 1회 재발).
+    ★ 원래부터 1N 이던 것은 우리 탓이 아니므로 **증가분**만 본다.
+    ★ 블록 끝 N 치환(②)은 `N N 수면` 이라 증가가 없어 그대로 통과한다.
+    ★★ `prev_tail` 은 전월 마지막날 코드다. **월 경계도 하드락 대상**이라 이걸 앞에
+      붙여 세지 않으면, 1일 N 을 빼서 전월 말 N 을 단독으로 만드는 경우를 놓친다
+      (전월 31일 N + 1일 N = 연속 2N 인데, 1일을 빼면 전월이 1N 이 된다).
+    """
+    if str(codes[day - 1] or "").strip() != "N":
+        return False                      # N 이 아닌 근무일 치환은 N 구조를 안 바꾼다
+    head = [str(prev_tail or "").strip()] if prev_tail else []
+    before = head + list(codes)
+    after = head + list(codes)
+    after[len(head) + day - 1] = sleep_code
+    return _count_solo_nights(after) > _count_solo_nights(before)
+
+
 def _scan(generated: dict, codes: list[str], days: list[int],
-          req: dict[int, dict[str, int]]) -> Optional[int]:
-    """후보일 중 빼도 커버리지가 유지되는 첫 날.
+          req: dict[int, dict[str, int]], sleep_code: str = "",
+          prev_tail: str = "") -> Optional[int]:
+    """후보일 중 빼도 커버리지가 유지되고 1N 을 만들지 않는 첫 날.
 
     ★ 근무를 빼면 그날 인원이 1 줄어든다. `daily_shift` 필요 인원을 넘겨야만 뺀다.
       요구 행이 없으면(설정 미비) 안전하게 건너뛴다 — 커버리지를 깨는 것보다 낫다.
+    ★ N 을 빼는 경우엔 하드락 #7 을 깨지 않는지도 본다.
     """
     for day in days:
         main = str(codes[day - 1] or "").strip()
         need = (req.get(day) or {}).get(main)
         if not need:
             continue
-        if _assigned_count(generated, day, main) - 1 >= need:
-            return day
+        if _assigned_count(generated, day, main) - 1 < need:
+            continue
+        if sleep_code and _breaks_one_night(codes, day, sleep_code, prev_tail):
+            continue
+        return day
     return None
 
 
 def _pick_day(generated: dict, codes: list[str], block: tuple[int, int],
-              req: dict[int, dict[str, int]], sleep_code: str) -> Optional[int]:
+              req: dict[int, dict[str, int]], sleep_code: str,
+              prev_tail: str = "") -> Optional[int]:
     """치환할 근무일 하나. 없으면 None.
 
     ① 실측 규칙 우선 — N 블록 종료 후 다음 N 블록 전의 근무일(준수 96.6%).
@@ -261,10 +351,10 @@ def _pick_day(generated: dict, codes: list[str], block: tuple[int, int],
     days = candidate_days(list(codes), block) if block[1] else [
         i + 1 for i, c in enumerate(codes) if str(c or "").strip() in _WORK_MAIN
     ]
-    picked = _scan(generated, codes, days, req)
+    picked = _scan(generated, codes, days, req, sleep_code, prev_tail)
     if picked is not None:
         return picked
     # ② 블록의 마지막 N — n_count 여유 검사는 _scan 이 동일하게 수행한다.
     if block[1] and (block[1] - block[0] + 1) >= _MIN_BLOCK_FOR_TAIL_CUT:
-        return _scan(generated, codes, [block[1]], req)
+        return _scan(generated, codes, [block[1]], req, sleep_code, prev_tail)
     return None

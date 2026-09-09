@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from db.client2 import get_db
 from db.models import RosterConfig
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest, RosterConfigCreate
 from services.roster_create_service import (
@@ -144,6 +144,8 @@ async def _send_sqs_job(job_body: Dict[str, Any]) -> Dict[str, Any]:
                 MessageBody=message_body,
             )
         )
+    except HTTPException:
+        raise
     except Exception as exc:  # boto3 예외 타입 다양
         # print('response', response)
         print('exc', exc)
@@ -156,7 +158,7 @@ async def _send_sqs_job(job_body: Dict[str, Any]) -> Dict[str, Any]:
 async def roster_create_async(
     req: RosterRequest,
     request: Request,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     _db: Session = Depends(get_db),
     wait_for_result: bool = False,
 ):
@@ -224,6 +226,8 @@ async def roster_create_async(
                 ),
                 "materialized_config": materialized,
             }
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(
                 status_code=500, detail=f"근무표 생성 실패: {exc}"
@@ -264,6 +268,8 @@ async def roster_create_async(
             group_id=target_group_id,
             nurse_id=current_user.nurse_id,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Job 생성 실패: {exc}") from exc
 
@@ -281,7 +287,7 @@ async def roster_create_async(
 @router.post("/roster_create/generate")
 async def generate_roster_endpoint(
     req: RosterRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 
 ):
@@ -345,7 +351,7 @@ class ApplyResolutionRequest(BaseModel):
 @router.post("/roster_create/apply-resolution")
 async def apply_resolution_endpoint(
     req: ApplyResolutionRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """선택한 해결 옵션(설정 delta)을 **이번 생성에만 transient 적용**해 재생성한다.
@@ -414,9 +420,16 @@ async def apply_resolution_endpoint(
             for k, v in col_delta.items():
                 setattr(rc, k, v)
             db.commit()
-        # 비-컬럼 키는 DB 미변경 → config_override 로 이번 생성에만 주입
+        # 비-컬럼 키는 DB 미변경 → config_override 로 이번 생성에만 주입.
+        # ★ 컬럼 델타는 위에서 **임시 commit** 했고 실패하거나 persist 가 아니면
+        #   finally 에서 되돌린다. 그 사실을 생성 쪽에 알려야 원복될 값의 성패가
+        #   프리셋에 낙인되지 않는다(persist 는 성공 시 유지되므로 성공만 낙인).
+        _cd_mode = None
+        if col_delta:
+            _cd_mode = "persist" if bool(getattr(req, "persist", False)) else "temporary"
         result = generate_roster_service(
-            gen_req, current_user, db, config_override=(override_delta or None)
+            gen_req, current_user, db, config_override=(override_delta or None),
+            column_delta_mode=_cd_mode
         )
         if bool(getattr(req, "persist", False)):
             _keep = True  # 성공 후에만 도달 → 컬럼 변경 영구 유지
@@ -455,7 +468,7 @@ async def apply_resolution_endpoint(
 @router.post("/roster/request")
 async def request_schedule(
     req: RosterRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -474,6 +487,8 @@ async def request_schedule(
     """
     try:
         return request_schedule_service(req, current_user, db)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"스케줄 생성 실패: {str(e)}")
 
@@ -502,6 +517,8 @@ async def hold_generate_roster_endpoint(
     try:
         # 고정된 셀 정보를 포함하여 근무표 생성 서비스 호출
         return generate_roster_service_with_fixed_cells(req, current_user, db)
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"고정 후 근무표 생성 실패: {str(e)}")

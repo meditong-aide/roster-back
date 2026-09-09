@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from sqlalchemy import case
 from sqlalchemy.orm import Session
 
 from db.models import NurseNightCycle, Schedule, ScheduleEntry, RosterConfig, Shift
@@ -151,7 +152,8 @@ def prev_month_fallback(db: Session, group_id: str, year: int,
         .filter(Schedule.group_id == str(group_id),
                 Schedule.year == int(year), Schedule.month == int(month),
                 Schedule.dropped == False)  # noqa: E712
-        .order_by((Schedule.status == "issued").desc(), Schedule.created_at.desc())
+        .order_by(case((Schedule.status == "issued", 0), else_=1),
+                  Schedule.created_at.desc())
         .first()
     )
     if sch is None:

@@ -109,7 +109,16 @@ class NurseRosterConfig:
     use_mid: bool = False                               # True 시 DENO → DENMO 커버리지 전환
 
     # --- 신규 Hard Constraint 제어 파라미터 ---
-    ban_night_before_fixed_off: bool = True  # fixed_wanted 비근무(휴무/휴가/공가 등) 직전일 N 배치 금지
+    ban_night_before_fixed_off: bool = True  # 확정 원티드 **휴가·공가** 직전일 N 배치 금지
+    # 확정 원티드로 굳힌 **O(휴무)** 직전일 N 금지. 위 설정과 축이 다르다 —
+    # 저쪽은 shift **type**(휴가·공가)으로, 이쪽은 **출처**(fixed_wanted)로 대상을 고른다.
+    #   왜 필요한가: 신청해서 받은 휴일이 직전 N 의 **회복 OFF 시작점**으로 소비되면
+    #   실질적으로 쉰 것이 아니다 — 휴가·공가와 같은 취급을 받아야 한다는 요구.
+    # ★ 기본값이 **False** 다. 위 `ban_night_before_fixed_off` 는 NULL→True 규약인데
+    #   이쪽은 **반대**이므로 컬럼이 없거나 NULL 인 병동은 꺼진 채로 둔다.
+    # ★★ 하드락 4·5(2N/3N 후 OFF 2회)와 부딪친다. 실측상 대상의 93% 가 N 블록 직후의
+    #   회복 OFF 라, 켜면 솔버는 N 블록을 확정 OFF 에서 2~3일 떨어뜨려야 한다.
+    ban_night_before_fixed_wanted_off: bool = False
     
     # 근무 요구사항 우선순위 (0~1) - 1에 가까울수록 더 강하게 근무 요구사항 강제
     shift_requirement_priority: float = 0.8  # 근무 요구사항 우선순위

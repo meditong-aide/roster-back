@@ -26,6 +26,13 @@ holidays>=0.76
 langchain-anthropic>=0.3.17
 langchain-google-genai>=2.1.5
 langchain-mcp-adapters>=0.1.7
+# ★ mcp 는 langchain-mcp-adapters 의 전이 의존이라 여기 없었고, 상한도 없어서
+#   2026-08-10 빌드가 mcp 2.0.0 을 끌어왔다. 2.0 에서 `mcp.shared.context.RequestContext`
+#   가 사라졌는데 adapters 가 그걸 import 해 **app.main import 자체가 실패**,
+#   dev 컨테이너가 2619 회 크래시 루프 → ALB 타깃 0 → 502.
+#   prod 는 7/20 빌드(mcp 1.28.1)라 살아 있었을 뿐, 재빌드했으면 같이 죽었다.
+#   전이 의존이라도 **깨지는 것은 직접 핀한다.**
+mcp<2.0
 langchain-openai>=0.3.27
 matplotlib>=3.10.3
 numpy[standard]>=2.2.5

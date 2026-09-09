@@ -60,7 +60,7 @@ load_dotenv()
 
 # [Shifts] - 모든 시프트 정보 조회
 @router.get("/shifts")
-async def get_shifts(
+def get_shifts(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)   
@@ -361,6 +361,8 @@ async def get_shift_manage(
         if not current_user:
             print('[/shift-manage/{class_name}]: 유저 없음')
             raise HTTPException(status_code=401, detail="Not authenticated")
+    except HTTPException:
+        raise
     except Exception as e:
         print('[/shift-manage/{class_name}]:', e)
         raise HTTPException(status_code=401, detail="Not authenticated")

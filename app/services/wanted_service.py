@@ -51,7 +51,13 @@ from schemas.roster_schema import (
     BannedWantedEntryCreate,
     BannedWantedEntryResponse,
 )
-from services.graph_service import graph_service
+# ★ `graph_service` 는 최상위에서 import 하지 않는다 — 그 모듈이
+#   `agents.main_graph` → `langgraph` 를 끌어오는데, **Lambda 솔버 이미지에는
+#   langgraph 가 없다**(`requirements.lambda.txt` 가 LLM 스택을 의도적으로 배제).
+#   근무표 생성이 `_build_banned_wanted_constraints` 에서 이 모듈을 지연 import 하므로,
+#   여기서 최상위 import 를 하면 **생성 전체가 ModuleNotFoundError 로 죽는다**
+#   (실측 2026-08-20 운영: 42병동-RN 10월 생성 실패).
+#   실제 사용처는 LLM 호출 2곳뿐이라 그 안에서만 import 한다.
 from services.weekly_off_service import (
     calc_weekly_off_weekday_by_month,
     calc_weekly_off_weekday_by_week,
@@ -896,6 +902,8 @@ async def analyze_wanted_text(
     ward_mains = _ward_main_codes(db, group_id)
 
     try:
+        from services.graph_service import graph_service  # 지연 import (모듈 상단 주석 참조)
+
         raw = await graph_service.invoke(
             request=text, schema=schema, case=None, year=year, month=month,
             allowed_shifts=", ".join(allowed_shift_map.keys()),
@@ -1203,6 +1211,91 @@ def cleanup_previous_requests(db: Session, nurse_id: str, month_str: str, curren
     print(f"정리 완료: shift {deleted_shift}건, pair {deleted_pair}건 삭제")
 
 
+def _clear_nurse_avoid_on_wanted(
+    db: Session, nurse_id: str, group_id: str, year: int, month: int,
+    request_id: int, *, commit: bool = True,
+) -> Dict[str, Any]:
+    """새로 저장된 선호와 겹치는 **기존 기피**를 지운다.
+
+    ★ 왜 필요한가 — 선호와 기피는 저장소가 다르다(nurse_shift_requests /
+      banned_wanted_entries). "N 금지" 뒤에 "N 달라" 라고 하면 선호만 새로 쌓이고
+      **기피는 그대로 남는다.** 기피는 하드(X==0)이고 선호는 소프트(score)라
+      하드가 이겨서 N 이 끝내 안 들어간다. 사용자에겐 "말이 안 먹는" 것으로 보인다.
+      `_parse_avoid_results` 가 **같은 요청 안에서** 하는 정리(wanted_days 제외)를,
+      **이미 DB 에 있는 기피**까지 넓힌 것이다.
+
+    ★★ **날짜 단위로 지운다** — 근무코드가 겹칠 때만 지우면 안 된다.
+      `_normalize_wanted_entries` 가 **날짜만으로** 중복을 판정하기 때문이다
+      (intent 를 안 본다). 같은 날 선호 D 와 기피 N 을 남겨 두면 다음 저장이
+      `duplicate_date` 422 로 **요청 전체가 실패**한다.
+      논리로도 맞다 — 그 날 D 를 배정하면 N 은 어차피 불가능하므로 기피는 잉여다.
+      `_parse_avoid_results` 가 `wanted_days` 를 날짜 단위로 제외하는 것과 같은 규칙.
+
+    ★ **지우는 것은 `banned_wanted_entries` 뿐이다.** `nurse_shift_requests` 는
+      `wanted_requests`(request_id) 에 딸린 **간호사 제출 기록**이라 행을 지우면
+      간호사가 낸 요청 자체가 증발한다. 성격이 다른 테이블이다 —
+      기피는 월 단위 상태, 선호는 제출 스냅샷.
+
+    ★ source='nurse' 만 지운다. hn 승격분은 수간호사가 확정한 것이라 간호사 발화로
+      뒤집지 않는다. 그 날짜는 `blocked_by_hn` 으로 돌려 호출 측이 알린다 —
+      선호는 저장되지만 하드 금지에 막혀 배정되지 않으므로, 조용히 두면
+      "왜 안 먹지" 가 반복된다.
+
+    반환: {"cleared": [{date}], "blocked_by_hn": [{date, shift}]}
+    """
+    from db.models import BannedWantedEntry
+
+    out: Dict[str, Any] = {"cleared": [], "blocked_by_hn": []}
+    days_in_month = calendar.monthrange(year, month)[1]
+    start, end = date(year, month, 1), date(year, month, days_in_month)
+
+    # ★★ `SessionLocal` 은 **autoflush=False** 다. 저장 경로가 `db.add()` 로 쌓아만 둔
+    #   선호 행은 flush 전까지 SELECT 에 안 잡힌다. 이걸 빠뜨리면 아래 조회가 빈
+    #   결과를 내고, 정리가 **조용히 no-op** 이 된다(실측으로 그렇게 통과했다).
+    db.flush()
+
+    wanted_dates = {
+        sd for (sd,) in db.query(NurseShiftRequest.shift_date).filter(
+            NurseShiftRequest.nurse_id == nurse_id,
+            NurseShiftRequest.request_id == request_id,
+            NurseShiftRequest.shift_date >= start,
+            NurseShiftRequest.shift_date <= end,
+        ).all()
+    }
+    if not wanted_dates:
+        return out
+
+    rows = db.query(BannedWantedEntry).filter(
+        BannedWantedEntry.group_id == group_id,
+        BannedWantedEntry.year == year,
+        BannedWantedEntry.month == month,
+        BannedWantedEntry.nurse_id == nurse_id,
+        BannedWantedEntry.shift_date.in_(list(wanted_dates)),
+    ).all()
+
+    for r in rows:
+        if str(r.source or BANNED_SOURCE_HN) == BANNED_SOURCE_HN:
+            # 수간호사 확정분 — 지우지 않고 알리기만 한다.
+            out["blocked_by_hn"].append({
+                "date": r.shift_date.isoformat(),
+                "shift": [str(c).strip().upper() for c in (r.banned_shift_ids or [])],
+            })
+            continue
+        out["cleared"].append({"date": r.shift_date.isoformat()})
+        db.delete(r)
+
+    if out["cleared"] or out["blocked_by_hn"]:
+        # ★ commit=False 는 호출자가 더 큰 트랜잭션 안에서 부를 때다(예: 저장 중
+        #   제출 플래그를 아직 안 세운 상태). 여기서 커밋하면 부분 상태가 확정된다.
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        print(f"[선호/기피 정합] 기피해제={len(out['cleared'])}일, "
+              f"수간호사 확정이라 미해제={len(out['blocked_by_hn'])}일")
+    return out
+
+
 async def invoke_and_persist_wanted_service(
     req: WantedInvokeRequest,
     current_user: UserSchema,
@@ -1374,6 +1467,8 @@ async def invoke_and_persist_wanted_service(
         aide_status = {"code": "skipped_dummy", "ok": True}
     else:
         try:
+            from services.graph_service import graph_service  # 지연 import (모듈 상단 주석 참조)
+
             raw_response = await graph_service.invoke(
                 request=req.request,
                 schema=req.schema,
@@ -1647,12 +1742,28 @@ async def invoke_and_persist_wanted_service(
                 if not shift_parsed[exc_shift]:
                     del shift_parsed[exc_shift]
 
+    # ★ 선호가 새로 잡힌 (날짜, 근무)의 **기존 기피**를 지운다.
+    #   "N 금지" → "N 달라" 전환에서, 기피가 남아 하드로 선호를 이기는 것을 막는다.
+    #   프론트가 /preferences 로 무엇을 보내든 이 시점의 DB 는 모순이 없게 만든다.
+    try:
+        avoid_cleanup = _clear_nurse_avoid_on_wanted(
+            db, nurse_id, group_id, req.year, req.month, new_request_id
+        )
+    except Exception as e:
+        db.rollback()
+        print(f"[AIDE] 기피 정리 실패(무시): {e}")
+        avoid_cleanup = {"cleared": [], "blocked_by_hn": []}
+
     result = {
         "shift": shift_parsed,
         "preference": pref_parsed,
         # 기피 근무. 저장하지 않고 분석 결과만 실어보낸다 — 프론트가 wanted_entries 의
         # intent="avoid" 로 옮겨 /preferences 로 보내면 거기서 단독 저장된다.
         "avoid_entries": avoid_parsed,
+        # 이번 요청으로 **해제된** 기존 기피와, 수간호사 확정이라 해제하지 못한 것.
+        # 프론트가 캘린더 상태를 갱신하고 사용자에게 알릴 수 있도록 함께 내린다.
+        "avoid_cleared": avoid_cleanup["cleared"],
+        "avoid_blocked_by_hn": avoid_cleanup["blocked_by_hn"],
         "warning": None,
         "aide_status": aide_status,
     }
@@ -3154,6 +3265,45 @@ def banned_source_filter(source: str):
     return BannedWantedEntry.source == source
 
 
+def _submitted_nurse_ids(
+    db: Session, group_id: str, month_str: str, nurse_ids: Set[str]
+) -> Set[str]:
+    """그 달 원티드를 **제출한** 간호사 id 집합. 대상 id 로 좁혀서 조회한다.
+
+    ★ 판정은 **최신 request_id 기준**이다. `wanted_requests` 의 PK 가
+      (nurse_id, request_id, month) 라 한 달에 여러 요청이 쌓인다. "하나라도
+      제출됐으면 제출자" 로 보면, 제출 후 새 draft 를 만들어 기피를 고친 간호사가
+      **미제출 상태인데 승격**된다. `_build_original_shift_map` 도 같은 기준
+      (최신 request_id → is_submitted)을 쓴다.
+    ★ group_id 로도 좁힌다. 병동이동·파견으로 같은 달에 타 병동 제출본이 있으면
+      그것만으로 제출자로 판정돼 버린다.
+
+    조회 실패 시 빈 집합을 돌려준다 — 기피 승격(확정)은 미루는 쪽이 안전하다.
+    과반영은 되돌리기 어렵지만 미승격은 다음 저장에서 바로 복구된다.
+    """
+    if not nurse_ids:
+        return set()
+    try:
+        rows = db.query(
+            WantedRequest.nurse_id, WantedRequest.request_id, WantedRequest.is_submitted
+        ).filter(
+            WantedRequest.group_id == group_id,
+            WantedRequest.month == month_str,
+            WantedRequest.nurse_id.in_(nurse_ids),
+        ).all()
+    except Exception as exc:
+        print(f"[BannedWanted] 제출여부 조회 실패 — 승격 보류: {exc}")
+        return set()
+
+    latest: Dict[str, Tuple[int, bool]] = {}
+    for nid, rid, submitted in rows:
+        key = str(nid)
+        rid_int = int(rid or 0)
+        if key not in latest or rid_int > latest[key][0]:
+            latest[key] = (rid_int, bool(submitted))
+    return {nid for nid, (_rid, submitted) in latest.items() if submitted}
+
+
 def _decode_banned_response(e: BannedWantedEntry, year: int, month: int) -> BannedWantedEntryResponse:
     """BannedWantedEntry ORM → 응답 스키마 (JSON 컬럼 안전 디코드)."""
     codes = e.banned_shift_ids
@@ -3241,9 +3391,13 @@ def precheck_adjustment_save(db: Session, group_id: str, req: FixedWantedCreate)
         and (str(e.nurse_id), e.shift_date) not in cross_skipped
     }
 
-    # 간호사 본인 기피는 조정판이 **코드를 못 바꾸고 적용 여부만** 바꾼다
-    # (`save_banned_wanted_service` 의 제자리 갱신). precheck 도 똑같이 봐야
-    # 수간호사가 해제로 위반을 푸는 길이 막히지 않는다.
+    # 간호사 본인 기피는 조정판 저장 시 **hn 으로 승격**되며, 그때 근무코드도
+    # 페이로드 값으로 갱신된다(`save_banned_wanted_service`). 확정 선택자가
+    # 수간호사이기 때문이다.
+    # ★ 그래서 precheck 도 **페이로드 코드로** 봐야 한다. 예전처럼 DB 값(ocodes)만
+    #   보면, 수간호사가 간호사 기피의 코드를 넓히는 경우(예: ["N"] → ["D","E","N"])
+    #   강제휴무 연속 검사를 통째로 우회해 infeasible 한 하드 제약이 저장된다.
+    #   (승격 도입 전에는 코드가 읽기전용이라 DB 값만 봐도 맞았다.)
     nurse_owned: Dict[Tuple[str, date], Tuple[List[str], bool]] = {
         (str(r.nurse_id), r.shift_date): (
             [str(c).strip().upper() for c in (r.banned_shift_ids or [])],
@@ -3256,17 +3410,32 @@ def precheck_adjustment_save(db: Session, group_id: str, req: FixedWantedCreate)
             banned_source_filter(BANNED_SOURCE_NURSE),
         ).all()
     }
+    # ★ 미제출 간호사 기피는 저장이 **승격하지 않고 건너뛴다**(nurse_not_submitted).
+    #   즉 솔버에 안 실린다. 그런데 검사에 넣으면, 반영되지도 않을 draft 기피 때문에
+    #   422 가 나서 **조정판 저장 전체가 막힌다.** 저장이 보는 것만 검사한다.
+    _submitted_for_precheck = _submitted_nurse_ids(
+        db, group_id, f"{req.year}-{req.month:02d}",
+        {nid for (nid, _d) in nurse_owned},
+    )
+    nurse_owned = {
+        (nid, d): v for (nid, d), v in nurse_owned.items()
+        if nid in _submitted_for_precheck
+    }
+
     payload_by_cell = {
         (str(e.nurse_id), e.shift_date): e for e in (banned_entries or [])
     }
 
     post_state: Dict[str, Dict[date, List[str]]] = {}
     for (onid, od), (ocodes, oapplied) in nurse_owned.items():
+        codes_after = ocodes
         pe = payload_by_cell.get((onid, od))
         if pe is not None and (onid, od) not in cross_skipped:
-            oapplied = bool(pe.is_applied)   # 적용 여부만 페이로드가 바꾼다
+            oapplied = bool(pe.is_applied)
+            # 승격 시 코드도 페이로드로 갱신되므로 저장 후 상태로 검사한다.
+            codes_after = [str(c).strip().upper() for c in (pe.banned_shift_ids or [])]
         if oapplied:
-            post_state.setdefault(onid, {})[od] = ocodes
+            post_state.setdefault(onid, {})[od] = codes_after
 
     if banned_entries is None:
         # 금지 미변경 요청 — 기존 HN 저장분도 그대로 남는다.
@@ -3476,6 +3645,21 @@ def save_banned_wanted_service(
     # (공존을 허용하면 조회가 셀당 최신 1건만 내려주는 탓에 **화면에 안 뜨는데
     #  솔버는 거는** 금지가 생긴다 — 컨버터가 같은 셀 여러 행을 코드 합집합으로
     #  처리하기 때문이다.)
+    # ── 원작성자 보존 맵 — 삭제 전에 떠 둔다 ────────────────────────────────
+    # ★ hn 스코프는 delete-then-insert 라서, 승격된 셀(원작성자=간호사)을 다시 저장하면
+    #   created_by 가 수간호사로 덮인다. 그러면 간호사 화면이 `created_by == 본인` 으로
+    #   자기 기피를 되찾는 경로가 끊겨 **두 번째 저장부터 조용히 사라진다.**
+    #   created_by 는 "최초로 낸 사람" 이고 재저장으로 바뀔 값이 아니다.
+    origin_by_cell: Dict[Tuple[str, date], Optional[str]] = {
+        (str(r.nurse_id), r.shift_date): r.created_by
+        for r in db.query(BannedWantedEntry).filter(
+            BannedWantedEntry.group_id == group_id,
+            BannedWantedEntry.year == req.year,
+            BannedWantedEntry.month == req.month,
+            banned_source_filter(BANNED_SOURCE_HN),
+        ).all()
+    }
+
     deleted = db.query(BannedWantedEntry).filter(
         BannedWantedEntry.group_id == group_id,
         BannedWantedEntry.year == req.year,
@@ -3483,27 +3667,47 @@ def save_banned_wanted_service(
         banned_source_filter(BANNED_SOURCE_HN),
     ).delete()
 
+    # ── 승격 대상 판정 — 제출한 사람 것만 ─────────────────────────────────────
+    # 조정판은 미제출 draft 기피까지 보여준다(출처 구분 없이 전량 노출). 그대로
+    # 승격하면 간호사가 **아직 제출하지도 않은** 기피가 확정된다. 선호와 같은 기준
+    # (WantedRequest.is_submitted)으로 거른다.
+    submitted_ids = _submitted_nurse_ids(
+        db, group_id, f"{req.year}-{req.month:02d}",
+        {nid for (nid, _d) in nurse_owned_rows},
+    )
+
     new_entries: List[BannedWantedEntry] = []
-    skipped_nurse_owned = 0
+    promoted_nurse_owned = 0
     for e in kept:
         codes = [str(c).strip().upper() for c in e.banned_shift_ids]
         owned = nurse_owned_rows.get((e.nurse_id, e.shift_date))
         if owned is not None:
-            # 소유권은 간호사에게 남기고 **적용 여부만** 제자리 갱신한다.
-            # 프론트 조정판은 by-id 토글 엔드포인트를 쓰지 않고 스냅샷 하나로
-            # 저장하므로, 여기서 안 받아주면 수간호사가 누른 적용/미적용이
-            # 에러도 없이 사라진다(새로고침하면 되돌아간다).
-            skipped_nurse_owned += 1
-            owned.is_applied = bool(e.is_applied)
-            if sorted(str(c).strip().upper() for c in (owned.banned_shift_ids or [])) != sorted(codes):
-                # 근무코드는 간호사 소유라 못 바꾼다. 조용히 무시하면 바뀐 줄 안다.
+            # ★★ 승격 — **조정판 저장이 곧 확정 행위다.**
+            #   source='nurse' 인 동안에는 생성이 이 셀을 읽지 않는다(hn 스코프 게이트).
+            #   여기서 hn 으로 올려야 비로소 근무표에 걸린다. 확정 선택자가 수간호사
+            #   이므로 근무코드도 페이로드 값으로 갱신한다(예전엔 읽기전용이었다).
+            #   ★ 제자리 UPDATE 다 — 위의 hn 스코프 delete 는 이미 끝났고 이 행은
+            #     그때 nurse 라 살아남았다. 새로 insert 하면 id 가 바뀌어 조정판의
+            #     셀당-최신-id 선택이 흔들린다.
+            if str(e.nurse_id) not in submitted_ids:
                 warnings.append({
                     "nurse_id": e.nurse_id,
                     "shift_date": e.shift_date.isoformat(),
                     "dropped_shift_ids": codes,
-                    "reason": "nurse_owned_codes_readonly",
-                    "message": "간호사가 낸 기피근무라 근무코드는 바꿀 수 없습니다. 적용 여부만 반영했습니다.",
+                    "reason": "nurse_not_submitted",
+                    "message": "간호사가 아직 원티드를 제출하지 않아 확정하지 않았습니다. 제출 후 다시 저장하세요.",
                 })
+                continue
+            promoted_nurse_owned += 1
+            owned.source = BANNED_SOURCE_HN
+            owned.banned_shift_ids = codes
+            owned.is_applied = bool(e.is_applied)
+            if e.reason is not None:
+                owned.reason = e.reason
+            # ★ 응답에도 싣는다. 승격은 제자리 UPDATE 라 insert 가 없는데, 여기서
+            #   빠뜨리면 "승격만 일어난 저장" 의 응답에 확정된 기피가 통째로 누락돼
+            #   호출 측 캐시가 DB 와 어긋난다.
+            new_entries.append(owned)
             continue
         if (e.nurse_id, e.shift_date) in fixed_cells:
             # 확정 근무가 있는 셀은 근무가 1개로 확정 → 금지는 의미가 없다.
@@ -3526,7 +3730,8 @@ def save_banned_wanted_service(
             is_applied=bool(e.is_applied),
             source=BANNED_SOURCE_HN,
             reason=e.reason,
-            created_by=nurse_id,
+            # 최초로 낸 사람을 유지한다(승격된 셀이면 간호사). 없으면 이번 저장자.
+            created_by=origin_by_cell.get((str(e.nurse_id), e.shift_date)) or nurse_id,
         )
         db.add(row)
         new_entries.append(row)
@@ -3535,9 +3740,9 @@ def save_banned_wanted_service(
     #   need>공급이면 warnings 에 {"reason": "coverage_risk", ...} 비차단 통지 추가.
     #   cap 로직은 cp_sat/fallback_lex.py:645-714 참고. (config daily_shift_requirements 필요)
 
-    if skipped_nurse_owned:
-        print(f"[BannedWanted] 간호사 소유 셀 {skipped_nurse_owned}건 — 승격 차단, "
-              f"적용 여부만 제자리 갱신")
+    if promoted_nurse_owned:
+        print(f"[BannedWanted] 간호사 기피 {promoted_nurse_owned}건 hn 승격(확정) — "
+              f"이 시점부터 생성에 반영")
 
     db.commit()
     for r in new_entries:
@@ -3657,6 +3862,118 @@ def reset_fixed_wanted_service(
     )
 
     return get_wanted_adjustment_service(db, group_id, year, month)
+
+
+def set_adjustment_applied_service(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+    applied: bool,
+) -> AdjustmentResponse:
+    """조정판 '원티드 전체 반영/미반영' — 두 채널의 is_applied 를 서버에서 일괄 설정.
+
+    ★ 왜 서버인가 — 솔버 주입 경로가 **둘**이다.
+        확정 원티드  FixedWantedEntry.is_applied  → fixed_cells (하드 고정)
+        기피        BannedWantedEntry.is_applied → initial_forbidden → X==0
+      프론트가 채널별 상태 맵을 따로 들고 있어 한쪽을 빠뜨리면, 수간호사는 "전체
+      미반영" 토스트를 보는데 기피는 하드로 살아 있다(2026-08-12 실측 결함).
+      불변식(둘은 항상 같이 켜지고 같이 꺼진다)을 한 곳에 둔다.
+
+    ★★ 기피는 **출처를 가리지 않고** 전부 건드린다(source='nurse' 포함).
+      `reset_fixed_wanted_service` 가 hn 만 지우는 것과 다른데, 이유가 있다 —
+      reset 은 **삭제**라 간호사 입력을 없앨 권한이 없지만, 여기는 표시/적용
+      플래그만 바꾸므로 파괴적이지 않다.
+      nurse 행을 남겨두면 "전체 미반영" 이 **조용히 되돌려진다**:
+        전체 미반영 → nurse 행은 is_applied=True 로 남음
+        → 조정판 저장(스냅샷에 그 값이 그대로 실림)
+        → `save_banned_wanted_service` 가 is_applied=True 로 승격
+        → 방금 끈 기피가 다시 하드 제약으로 주입
+      이 EP 의 존재 이유가 "주입 0" 이므로 그 구멍을 남기면 안 된다.
+      단, `source` 는 건드리지 않는다 — 승격은 조정판 저장의 권한이다.
+
+    ★ 켜는 방향만 사전 점검한다 — **경고이지 차단이 아니다.**
+      끄는 방향은 제약이 줄어 새 위반을 만들 수 없다. 켜는 방향은 만들 수 있는데,
+      여기서 422 로 막으면 "되돌리기"가 불가능해진다(수간호사가 복구 수단을 잃는다).
+      대신 위반을 `warnings` 로 즉시 알린다 — 안 알리면 나중에 생성이 INFEASIBLE
+      로 실패한 뒤에야 원인을 되짚게 된다.
+    """
+    fixed_updated = db.query(FixedWantedEntry).filter(
+        FixedWantedEntry.group_id == group_id,
+        FixedWantedEntry.year == year,
+        FixedWantedEntry.month == month,
+    ).update({FixedWantedEntry.is_applied: applied}, synchronize_session=False)
+
+    banned_updated = db.query(BannedWantedEntry).filter(
+        BannedWantedEntry.group_id == group_id,
+        BannedWantedEntry.year == year,
+        BannedWantedEntry.month == month,
+    ).update({BannedWantedEntry.is_applied: applied}, synchronize_session=False)
+
+    db.commit()
+    print(
+        f"[Adjustment] 전체 {'반영' if applied else '미반영'}: group={group_id}, "
+        f"{year}-{month:02d}, 확정={fixed_updated}건 / 기피={banned_updated}건"
+    )
+
+    resp = get_wanted_adjustment_service(db, group_id, year, month)
+    if applied:
+        resp.warnings = _forced_off_warnings(db, group_id, year, month)
+        if resp.warnings:
+            print(f"[Adjustment] 전체 반영 후 강제휴무 경고 {len(resp.warnings)}건")
+    return resp
+
+
+def _forced_off_warnings(
+    db: Session, group_id: str, year: int, month: int
+) -> List[Dict[str, Any]]:
+    """현재 저장 상태(커밋 후)로 강제휴무 연속 위반을 본다. 비차단 통지용.
+
+    ★ 생성에 실제로 실리는 것만 센다 — `source='hn'` + `is_applied`.
+      미승격(source='nurse')까지 세면 솔버 주입 상태보다 과하게 경고한다.
+    """
+    post_state: Dict[str, Dict[date, List[str]]] = {}
+    for r in db.query(BannedWantedEntry).filter(
+        BannedWantedEntry.group_id == group_id,
+        BannedWantedEntry.year == year,
+        BannedWantedEntry.month == month,
+        BannedWantedEntry.is_applied == True,  # noqa: E712
+        banned_source_filter(BANNED_SOURCE_HN),
+    ).all():
+        codes = [str(c).strip().upper() for c in (r.banned_shift_ids or [])]
+        if codes:
+            post_state.setdefault(str(r.nurse_id), {})[r.shift_date] = codes
+    if not post_state:
+        return []
+
+    # 확정 근무가 있는 셀은 금지가 무효라 휴무로 세면 안 된다(저장 경로와 동일 규칙).
+    fixed_cells = {
+        (str(nid), sd)
+        for nid, sd in db.query(
+            FixedWantedEntry.nurse_id, FixedWantedEntry.shift_date
+        ).filter(
+            FixedWantedEntry.group_id == group_id,
+            FixedWantedEntry.year == year,
+            FixedWantedEntry.month == month,
+            FixedWantedEntry.is_applied == True,  # noqa: E712
+        ).all()
+    }
+    try:
+        violations = precheck_forced_off_runs(
+            db, group_id, year, month, post_state, fixed_cells=fixed_cells
+        )
+    except Exception as exc:
+        print(f"[Adjustment] 강제휴무 점검 실패(무시): {exc}")
+        return []
+    return [
+        {
+            "reason": "forced_off_run",
+            "nurse_id": v.get("nurse_id"),
+            "days": v.get("days"),
+            "message": v.get("message"),
+        }
+        for v in violations
+    ]
 
 
 def _filter_entries_by_caller_ownership(
@@ -4004,3 +4321,117 @@ def get_shift_requests_service(
         })
 
     return results
+
+
+def get_my_wanted_dashboard_service(current_user: UserSchema, db: Session) -> dict:
+    """모바일 대시보드용 — 내가 작성할 원티드와 각각의 작성 상태를 한 번에.
+
+    프론트가 `/wanted/all` 로 목록을 받고 월마다 `/preferences/latest` 를 따로 부르던
+    것을 하나로 합친다. 월 수만큼 왕복하던 것이 2쿼리로 끝난다.
+
+    노출 대상 — 닫히지 않았고(`status != 'closed'`) **지금 작성할 의미가 있는 것**.
+      · 현재 월 이후는 전부 노출한다(마감일 유무와 무관).
+      · **과거 월은 마감일이 아직 남아 있을 때만** 노출한다.
+      · 재오픈은 자동으로 처리된다 — 닫힌 월을 다시 열 때 새 마감일을 주면
+        그 시점에 다시 뜬다. 별도 플래그가 필요 없다.
+
+      ★ 처음에는 '닫히지 않았으면 전부'로 뒀다가 실데이터에서 뒤집었다. 개발 DB 한
+        계정에서 16건이 나왔는데 그중 15건이 **2025년 1~12월** 이었다. 마감일 없이
+        `requested` 로 남은 과거 원티드는 `/wanted/close-expired` 가 닫지 못한다 —
+        그쪽 판정 기준이 마감일이라, 마감일이 없으면 영영 열린 채로 남는다.
+        그 상태를 그대로 내보내면 모바일 대시보드가 몇 년치 빈 카드로 덮인다.
+      ★ 그래서 '닫는 책임은 close-expired 에 있으니 여기서 거르지 않는다' 는 원칙을
+        버렸다. 그 원칙은 close-expired 가 모든 행을 닫을 수 있을 때만 성립한다.
+
+    정렬 — `exp_date` 오름차순, **없는 것은 뒤로**. 급한 것부터 위에 온다.
+      마감일이 같거나 없으면 (year, month) 오름차순으로 안정 정렬한다.
+
+    제출 상태 — `shift_preferences` 는 PK 에 `created_at` 이 있는 **이력 테이블**이라
+      한 사람·월에 행이 여러 개다. **월별 최신 행 하나**가 현재 상태다.
+        행 없음            → not_started
+        최신 is_submitted  → submitted
+        그 외              → draft
+    """
+    nurse_id = getattr(current_user, "nurse_id", None)
+    if not nurse_id:
+        raise HTTPException(status_code=400, detail="nurse_id 를 확인할 수 없습니다.")
+
+    group_id = resolve_home_group_id(db, current_user)
+    if not group_id:
+        return {"items": []}
+
+    # ★ `status != 'closed'` 만 쓰면 **NULL 행이 통째로 사라진다.** SQL 의 3값 논리에서
+    #   `NULL != 'closed'` 는 참이 아니라 UNKNOWN 이고, WHERE 는 UNKNOWN 을 버린다.
+    #   `Wanted.status` 는 nullable 이라(기본값이 있을 뿐 NOT NULL 이 아니다) 실제로
+    #   비어 있는 행이 있으면 '닫히지 않은 원티드는 전부 보인다' 는 이 함수의 계약이 깨진다.
+    #   부정 조건에는 `IS NULL OR` 를 항상 함께 건다.
+    rows = (
+        db.query(Wanted)
+        .filter(
+            Wanted.group_id == group_id,
+            or_(Wanted.status.is_(None), Wanted.status != "closed"),
+        )
+        .all()
+    )
+    # 과거 월은 마감일이 아직 남아 있는 것만 남긴다(재오픈 케이스).
+    _now = datetime.now()
+    _cur_ym = _now.year * 100 + _now.month
+    rows = [
+        w for w in rows
+        if (w.year * 100 + w.month) >= _cur_ym
+        or (w.exp_date is not None and w.exp_date >= _now)
+    ]
+    if not rows:
+        return {"items": []}
+
+    # 대상 월의 내 작성 이력만 읽는다. 한 사람분이라 가볍고, 월별 최신 선택은
+    # 파이썬에서 한다(window 함수를 쓰면 dialect 를 타고 읽기도 어렵다).
+    targets = {(w.year, w.month) for w in rows}
+    prefs = (
+        db.query(
+            ShiftPreference.year,
+            ShiftPreference.month,
+            ShiftPreference.created_at,
+            ShiftPreference.is_submitted,
+        )
+        .filter(
+            ShiftPreference.nurse_id == nurse_id,
+            ShiftPreference.year.in_({y for y, _ in targets}),
+        )
+        .all()
+    )
+    latest: dict[tuple[int, int], tuple] = {}
+    for p in prefs:
+        key = (p.year, p.month)
+        if key not in targets:
+            continue                      # year 로만 좁혔으니 month 는 여기서 건다
+        cur = latest.get(key)
+        if cur is None or (p.created_at and cur[0] and p.created_at > cur[0]):
+            latest[key] = (p.created_at, p.is_submitted)
+
+    items = []
+    for w in rows:
+        hit = latest.get((w.year, w.month))
+        if hit is None:
+            state = "not_started"
+        elif bool(hit[1]):
+            state = "submitted"
+        else:
+            state = "draft"
+        items.append({
+            "year": w.year,
+            "month": w.month,
+            "exp_date": w.exp_date.isoformat() if w.exp_date else None,
+            "submission_status": state,
+        })
+
+    # 마감일 없는 항목을 뒤로 보내려면 정렬 키를 (없음 여부, 마감일) 로 잡는다.
+    items.sort(
+        key=lambda it: (
+            it["exp_date"] is None,
+            it["exp_date"] or "",
+            it["year"],
+            it["month"],
+        )
+    )
+    return {"items": items}

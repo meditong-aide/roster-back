@@ -41,7 +41,7 @@ from schemas.roster_schema import (
     NurseMonthlyLimitListResponse,
     NightBulkApplyRequest,
 )
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 from services.assignment_service import (
     create_assignment,
@@ -344,7 +344,7 @@ async def get_nurses_in_group(
     nurse_id: Optional[str] = None,  # 신규 파라미터
     year: Optional[int] = None,   # 근무자관리에서만 전달: 주면 nurse_monthly_limits.n_exact 조인
     month: Optional[int] = None,  # year 와 함께 주어질 때만 n_exact 주입
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     _ensure_office_exists(
@@ -398,6 +398,8 @@ async def get_nurses_in_group(
         if year is not None and month is not None:
             attach_n_exact_to_nurses(db, response, year, month, view_group_id=_group)
         return response
+    except HTTPException:
+        raise
     except Exception as e:
         print("[DEBUG] [nurses.py - get_nurses_in_group] office_id", office_id)
         print("[DEBUG] [nurses.py - get_nurses_in_group] group_id", group_id)
@@ -507,6 +509,8 @@ async def download_template(
             filename="간호사_정보_템플릿.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"템플릿 생성 실패: {str(e)}")
 
@@ -525,6 +529,8 @@ async def download_template2(
             filename="간호사_업로드2_템플릿.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         print("error", e)
         raise HTTPException(status_code=500, detail=f"템플릿2 생성 실패: {str(e)}")
@@ -582,6 +588,8 @@ async def upload2_validate_endpoint(
             return result
         finally:
             os.unlink(tmp_file_path)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
 
@@ -609,7 +617,7 @@ async def upload2_confirm_endpoint(
     group_id: str = Query(
         ..., description="대상 병동 group_id (필수)"
     ),  # ← 반드시 URL에 ?group_id=... 포함
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """업로드2 - 검증 통과 후 저장. 오류가 있는 행은 건너뜀."""
@@ -642,6 +650,8 @@ async def upload2_confirm_endpoint(
         result = upload2_confirm(payload.rows, current_user, db, target_group_id)
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[ERROR] upload2-confirm 엔드포인트 실패: {str(e)}")
         raise HTTPException(status_code=500, detail=f"저장 실패: {str(e)}")
@@ -655,7 +665,7 @@ async def get_available_members(
     search_by: str = Query("name", description="Search target: name or affiliation"),
     cursor: Optional[str] = Query(None, description="Pagination cursor"),
     limit: int = Query(20, ge=1, le=100, description="Page size"),
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -798,6 +808,8 @@ async def validate_excel_data_endpoint(
             raise HTTPException(status_code=403, detail="수간호사만 접근 가능합니다.")
         result = validate_excel_data(request.data, current_user, db)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"데이터 검증 실패: {str(e)}")
 
@@ -824,6 +836,8 @@ async def confirm_upload(
         else:
             result = save_excel_data(filtered_data, current_user, db)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"데이터 저장 실패: {str(e)}")
 
@@ -848,6 +862,8 @@ async def integrated_register(
             payload.group_id,  # 프론트에서 반드시 보내야 함
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"통합 등록 실패: {str(e)}")
 
@@ -860,8 +876,8 @@ verification_cache: Dict[
 
 
 @router.get("/personnel-basic-info")
-async def get_personnel_basic_info(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+def get_personnel_basic_info(
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -914,7 +930,9 @@ async def get_personnel_basic_info(
                     "age": _age,
                     "gender": _gw.get("gender"),
                     "joining_date": str(_join)[:10] if _join else None,
-                    "experience": int(_gw.get("career") or 0) if _gw.get("career") else None,
+                    # ★ 같은 폼이 받는 값이라 None 대신 0 — 그룹웨어에 경력이
+                    #   없는 관리자도 마이페이지 저장이 막히지 않게 한다.
+                    "experience": int(_gw.get("career") or 0),
                     "tenure": _tenure,
                     "tenure_display": _tenure,
                     "work_place": _gw.get("office_name", ""),
@@ -969,16 +987,23 @@ async def get_personnel_basic_info(
             "joining_date": nurse.joining_date.isoformat()
             if nurse.joining_date
             else None,
-            "experience": nurse.experience,
+            # ★ 마이페이지 폼이 `z.number().min(0)` 로 검증한다 — null 이면
+            #   "Invalid input: expected number, received null" 로 저장이 막힌다
+            #   (roster_front/src/pages/myPage/components/UserForm.tsx
+            #    basicInfoFormSchema). DB 는 그대로 두고 응답에서만 채운다.
+            "experience": nurse.experience or 0,
             "phone_number": nurse.phone_number,
             "email": nurse.email or "",
             "role": nurse.role,
-            "level_": nurse.level_,
-            "is_head_nurse": nurse.is_head_nurse,
+            "level_": nurse.level_ or "",
+            # boolean 은 `or` 금지 — False 가 뒤집힌다
+            "is_head_nurse": bool(nurse.is_head_nurse),
             "tenure": tenure_display,
             "work_place": work_place,
             "profile_image_url": get_profile_image_url(nurse.profile_image_key),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"간호사 기본 정보 조회 실패: {str(e)}"
@@ -988,7 +1013,7 @@ async def get_personnel_basic_info(
 @router.patch("/personnel-basic-info")
 async def partial_update_personnel_basic_info(
     update_data: PersonnelUpdate,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     nurse = (
@@ -1075,7 +1100,7 @@ async def delete_profile_image(
 @router.put("/change-password")
 async def change_password(
     payload: PasswordChangeRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     nurse_id = current_user.nurse_id
@@ -1124,7 +1149,7 @@ async def change_password(
 @router.post("/change-phone/send-code")
 async def send_phone_verification_code(
     payload: PhoneChangeRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     nurse_id = current_user.nurse_id
@@ -1168,7 +1193,7 @@ async def send_phone_verification_code(
 @router.put("/change-phone/verify")
 async def verify_and_update_phone(
     payload: PhoneChangeRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     nurse_id = current_user.nurse_id
@@ -1337,7 +1362,7 @@ async def get_nurse_by_id(
     group_id: Optional[str] = None,
     year: Optional[int] = None,
     month: Optional[int] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """단일 간호사 프로필 조회.
@@ -1427,7 +1452,7 @@ async def update_nurse_profile(
     group_id: Optional[str] = None,
     year: Optional[int] = None,
     month: Optional[int] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """간호사 프로필 수정.
@@ -1460,5 +1485,7 @@ async def delete_nurse(
     try:
         result = delete_nurse_service(nurse_id, current_user, db)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"간호사 삭제 실패: {str(e)}")

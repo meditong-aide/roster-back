@@ -96,7 +96,7 @@ def _fetch_latest_job(office_id: Optional[str], group_id: Optional[str], nurse_i
         session.close()
 
 
-@router.get("/jobs/status/latest", response_model=JobStatusResponse)
+@router.get("/jobs/status/latest", response_model=Optional[JobStatusResponse])
 async def get_latest_job_status(
     response: Response,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -135,12 +135,13 @@ async def get_latest_job_status(
             current_user.group_id,
             current_user.nurse_id,
         )
+        # ★ "Job 이 없음"에 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 의 404 를
+        #   `index.html` 200(text/html) 으로 바꿔 보내기 때문이다. 그러면 PC 의
+        #   404→null 분기(useCreateRosterJob.ts)가 죽고, axios 가 HTML 문자열을
+        #   그대로 넘겨서 폴링이 "job 없음"을 영영 감지하지 못한다.
+        #   없음은 정상 상태이므로 200 + null 이 의미상으로도 맞다.
         if not job:
-            raise HTTPException(
-                status_code=404,
-                detail="해당 사용자/그룹의 Job이 없습니다.",
-                headers={"Cache-Control": "no-store"},
-            )
+            return None
 
         current = (job.job_id, job.status)
 

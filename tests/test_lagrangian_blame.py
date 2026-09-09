@@ -139,7 +139,11 @@ def test_explain_from_config_extracts_weekend_off():
     cfg = {"daily_shift_requirements": {"D": 2, "E": 1, "N": 1}, "off_days": 2}
     e = explain_infeasibility_from_config(nurses, cfg, 8, year=2026, month=8)
     assert e.top_family == "weekend_off"
-    assert e.classification == "personal_overconstraint"
+    # 주말휴무자 과다(3/4) → 주말 하루 가용(1) < 요구(4) 산술 확정 → 집계 커버리지 부족.
+    #   기존 λ-추론(personal_overconstraint) 대신 arithmetic-증명(coverage_shortage, probe 스킵)로 승격.
+    assert e.classification == "coverage_shortage"
+    assert e.arithmetic.get("release_needed") == 3
+    assert e.targets and all(t["family"] == "weekend_off" for t in e.targets)
 
 
 def test_explain_per_nurse_night_floor_over_cap():
@@ -157,6 +161,25 @@ def test_explain_per_nurse_night_floor_over_cap():
     e = explain_infeasibility_from_config(nurses, cfg, 31, year=2026, month=8)
     assert e.classification == "personal_infeasible"
     assert "김수선" in e.certificate and "13" in e.certificate and "7" in e.certificate
+
+
+def test_explain_night_only_floor_over_cap_flags_off_coupling():
+    """야간전담(allowed=[N]) n_exact>max_nig: 상한 낮추면 off=일수−상한 강제 → target 에 표식."""
+    from services.ontology_graph.lagrangian import explain_infeasibility_from_config
+
+    class _Nu:
+        def __init__(self, name, allowed, n_exact=None):
+            self.name = name; self.nurse_id = name
+            self.allowed_shifts = allowed; self.n_exact = n_exact
+
+    nurses = [_Nu("전담", ["N"], n_exact=15)] + [_Nu(f"d{i}", ["D", "E"]) for i in range(9)]
+    cfg = {"daily_shift_requirements": {"D": 2, "E": 2, "N": 2}, "max_nig_per_month": 6}
+    e = explain_infeasibility_from_config(nurses, cfg, 30, year=2026, month=8)
+    assert e.classification == "personal_infeasible"
+    tgt = next(t for t in e.targets if t["nurse_id"] == "전담")
+    assert tgt.get("is_night_only") is True
+    assert tgt.get("off_after_cap") == 30 - 6            # 상한 6 → 24일 강제 OFF
+    assert "야간전담" in e.certificate
 
 
 def test_explain_per_nurse_floor_over_workdays():

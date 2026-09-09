@@ -92,11 +92,10 @@ jobs:
           tags: ${{ env.IMAGE_URI }}
           cache-from: type=gha,scope=backend-${{ env.ENV }}
           cache-to: type=gha,mode=max,scope=backend-${{ env.ENV }}
+          # ★ API 키는 build-arg 로 넘기지 않는다 — Dockerfile 이 ENV 로 굽던 것을
+          #   제거했고(레이어 평문 노출), 런타임 .env 로만 주입한다.
           build-args: |
             ENV=${{ env.ENVIRONMENT }}
-            GOOGLE_API_KEY=${{ env.GOOGLE_API_KEY }}
-            ANTHROPIC_API_KEY=${{ env.ANTHROPIC_API_KEY }}
-            OPENAI_API_KEY=${{ env.OPENAI_API_KEY }}
 
       - name: Apply ECR lifecycle policy (idempotent)
         if: github.ref_name == 'main'
@@ -268,6 +267,9 @@ jobs:
             SHARE_META_IMAGE_URL=${{ secrets.PROD_SHARE_META_IMAGE_URL }}
             CALL_HISTORY_FIREHOSE_STREAM=roster-call-history
             UI_EVENTS_FIREHOSE_STREAM=roster-ui-events
+            GOOGLE_API_KEY=${{ secrets.PROD_ENV_GOOGLE }}
+            ANTHROPIC_API_KEY=${{ secrets.PROD_ENV_ANTHROPIC }}
+            OPENAI_API_KEY=${{ secrets.PROD_ENV_OPENAI }}
             EOF
               fi
 
@@ -303,6 +305,9 @@ jobs:
             SHARE_META_IMAGE_URL=${{ secrets.DEV_SHARE_META_IMAGE_URL }}
             CALL_HISTORY_FIREHOSE_STREAM=roster-call-history-dev
             UI_EVENTS_FIREHOSE_STREAM=roster-ui-events-dev
+            GOOGLE_API_KEY=${{ secrets.DEV_ENV_GOOGLE }}
+            ANTHROPIC_API_KEY=${{ secrets.DEV_ENV_ANTHROPIC }}
+            OPENAI_API_KEY=${{ secrets.DEV_ENV_OPENAI }}
             EOF
             echo "/home/ubuntu/app/.env created for ${{ env.ENV }}"
 
@@ -323,13 +328,30 @@ jobs:
               --env-file /home/ubuntu/app/.env \
               --network host \
               --restart unless-stopped \
+              --log-driver awslogs \
               --log-opt awslogs-create-group=true \
               --log-opt awslogs-region=ap-northeast-2 \
               --log-opt awslogs-group=/ecs/aide-server-prod \
               --log-opt awslogs-stream=aide-server-prod \
               -p 8000:8000 \
               "${IMAGE_URI}"
-            echo "Started: http://$HOSTNAME:8000/health"
+
+            # ── 배포 게이트: ALB 와 같은 경로로 직접 확인한다 ──
+            #   ★ --log-driver 가 빠져 있어 데몬 기본값(none)이 적용됐고, 로그가
+            #     통째로 버려져 dev 가 2619회 크래시하는 동안 아무도 몰랐다.
+            #     드라이버를 명시하고, 기동 실패는 여기서 잡아 job 을 빨간불로 만든다.
+            for i in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://localhost:8000/health/basic || true)
+              if [ "$code" = "200" ]; then
+                echo "[deploy-gate] health OK (${i}회차)"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "[deploy-gate] FAILED — 60초 안에 /health/basic 이 200 을 주지 않았습니다."
+            sudo docker ps -a --filter name=aide-server-prod --format '{{.Status}}'
+            echo "로그: CloudWatch /ecs/aide-server-prod (stream: aide-server-prod)"
+            exit 1
 
       - name: Run container (dev)
         if: github.ref_name == 'dev'
@@ -348,13 +370,27 @@ jobs:
               --env-file /home/ubuntu/app/.env \
               --network host \
               --restart unless-stopped \
+              --log-driver awslogs \
               --log-opt awslogs-create-group=true \
               --log-opt awslogs-region=ap-northeast-2 \
               --log-opt awslogs-group=/ecs/aide-server-dev \
               --log-opt awslogs-stream=aide-server-dev \
               -p 8000:8000 \
               "${IMAGE_URI}"
-            echo "Started: http://$HOSTNAME:8000/health (dev)"
+
+            # ── 배포 게이트 (prod 스텝과 동일) ──
+            for i in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -m 3 http://localhost:8000/health/basic || true)
+              if [ "$code" = "200" ]; then
+                echo "[deploy-gate] health OK (${i}회차)"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "[deploy-gate] FAILED — 60초 안에 /health/basic 이 200 을 주지 않았습니다."
+            sudo docker ps -a --filter name=aide-server-dev --format '{{.Status}}'
+            echo "로그: CloudWatch /ecs/aide-server-dev (stream: aide-server-dev)"
+            exit 1
       # PROD 전용: EC2에서 직접 FastAPI 실행
       # - name: Deploy to PROD EC2 (non-Docker)
       #   if: github.ref_name == 'main'

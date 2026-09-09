@@ -23,7 +23,7 @@ from db.models import (
 )
 from db.nurse_config import Nurse as NurseEngine
 from db.roster_config import NurseRosterConfig, DEFAULT_CONFIG
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from routers.utils import get_days_in_month
 from schemas.auth_schema import User
 from schemas.auth_schema import User as UserSchema
@@ -82,7 +82,7 @@ from db.models import (
     DailyShift,
     NurseAssignment,
 )
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, or_
 from routers.utils import get_days_in_month
 from db.nurse_config import Nurse as NurseEngine
 from services.roster_system import RosterSystem
@@ -95,6 +95,8 @@ from services.roster_service import (
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
     get_my_issued_roster_service,
+    get_my_issued_week_service,
+    get_my_today_service,
     get_prev_month_tail_service,
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
@@ -151,6 +153,10 @@ def _roster_config_to_dict(config) -> dict:
         "off_first": bool(getattr(config, "off_first", False)),
         "off_swap_enabled": bool(getattr(config, "off_swap_enabled", False)),
         # 보건휴가 자동 부여 — NULL(미설정)은 False 로 떨어져야 한다.
+        # NULL(미설정) = 꺼짐. 기존 ban_night_before_fixed_off 와 규약이 반대다.
+        "ban_night_before_fixed_wanted_off": bool(
+            getattr(config, "ban_night_before_fixed_wanted_off", False)
+        ),
         "health_leave_enabled": bool(getattr(config, "health_leave_enabled", False)),
         "health_leave_weekend": bool(getattr(config, "health_leave_weekend", False)),
         # 수면OFF 자동 부여 — NULL(미설정)은 False / cycle 은 값 그대로(미설정 None).
@@ -201,6 +207,8 @@ async def save_roster_config(
             config_data, user, db, override_group_id=override_gid,
             sync_use_mid_live=True,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Configuration save failed: {str(e)}"
@@ -253,7 +261,7 @@ async def unsave_roster_config(
 
 
 @router.get("/config/versions")
-async def get_config_versions(
+def get_config_versions(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -262,6 +270,11 @@ async def get_config_versions(
 
     version 이 부여된 row(=프리셋)만 반환. legacy/ad-hoc(version NULL) 은 제외.
     각 프리셋의 요약(D/E/N·OFF), 메모, 마지막 저장, 최근 적용 근무표를 포함.
+
+    생성에 실패한 프리셋은 목록에서 뺀다 — 다시 선택돼 같은 실패를 반복하기 때문.
+    월 구분 없이 숨기고, 편집해 저장해도 되살리지 않는다 — 저장은 검증이 아니다.
+    그 설정으로 다시 생성해 **성공하면** success 로 덮여 복귀한다(검증된 것이므로).
+    새로 쓰려면 config_id 없이 저장하면 된다(신규 행 → NULL 에서 시작).
     """
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -272,12 +285,33 @@ async def get_config_versions(
     target_office_id = current_user.office_id
 
     try:
+        # ★ 생성에 실패한 설정은 목록에서 뺀다 — 프리셋으로 남으면 다시 선택돼
+        #   같은 실패를 반복한다(2026-09-04 남촌 중환자실1: max_nig_per_month=1 과
+        #   not_one_night=True 가 양립 불가인 설정이 프리셋으로 계속 노출).
+        #   **편집 저장으로는 되살리지 않는다** — 저장은 검증이 아니기 때문이다.
+        #   다시 생성해서 성공하면 그때 success 로 덮여 복귀한다(검증된 것이므로).
+        #   새로 쓰려면 config_id 없이 저장하면 신규 행이라 NULL 에서 시작한다.
+        #   당시 입력은 roster_config_attempt.snapshot 으로 분석한다.
+        #   NULL 은 "아직 안 써본 설정" 이라 반드시 살려둔다.
+        #   ★ MSSQL 은 NULL 비교가 dialect 를 타므로 `== None` 이 아니라 `.is_(None)`.
         presets = (
             db.query(RosterConfigModel)
             .filter(
                 RosterConfigModel.office_id == target_office_id,
                 RosterConfigModel.group_id == target_group_id,
                 RosterConfigModel.version.isnot(None),
+                #   ★ 'error' 는 여기서 안 뺀다. 낙인 3지점을 안 거치고 빠져나간
+                #     예외를 담는 값인데, 설정 탓이 아닌 것(일시적 DB 오류·구현 버그)도
+                #     섞인다. 그걸로 프리셋을 영구히 지우면 운영 사고 한 번에 멀쩡한
+                #     설정이 사라진다 — 숨기는 것보다 나쁜 실패다. attempt 에는 남는다.
+                #     설정이 원인임이 증명된 blocked/infeasible 만 목록에서 뺀다.
+                #   ★★ MSSQL 의 NOT IN 은 NULL 을 제외한다 — `.is_(None)` 을 반드시
+                #     OR 로 함께 걸어야 "아직 안 써본 프리셋"이 통째로 사라지지 않는다.
+                or_(
+                    RosterConfigModel.last_generate_status.is_(None),
+                    RosterConfigModel.last_generate_status.notin_(
+                        ("blocked", "infeasible")),
+                ),
             )
             .order_by(RosterConfigModel.version.desc())
             .all()
@@ -324,6 +358,8 @@ async def get_config_versions(
                 "last_applied": last_applied.get(p.config_id),
             })
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Failed to get config versions: {str(e)}"
@@ -480,7 +516,7 @@ async def get_config_by_version(
 
 # [Schedules] - 최신 월과 버전의 스케줄 정보 조회 (수간호사용)
 @router.get("/latest")
-async def get_latest_schedule(
+def get_latest_schedule(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -574,8 +610,14 @@ async def get_issued_roster_snapshot(
             db=db,
             target_group_id=target_group_id,
         )
+        # ★ 발행본이 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 의 404 를
+        #   `index.html` **200(text/html)** 으로 바꿔 보내고, 그 HTML 을 **URL 단위로
+        #   캐시**해 재사용한다(2026-08-13 실측: 이 EP 응답이 `age: 7245`·`server: AmazonS3`).
+        #   모바일 useSnapShot 은 `!response.ok` 로만 거르고 바로 `response.json()` 을 불러서
+        #   "Unexpected token '<'" 로 죽고, ErrorBoundary 가 없어 화면이 하얗게 뜬다.
+        #   200 + null 이면 PC(axios·404→null)·모바일 모두 기존 "발행본 없음" 경로와 동일하다.
         if not snapshot:
-            raise HTTPException(status_code=404, detail="Issued snapshot not found")
+            return None
 
         # 파견/병동이동 assignment 메타데이터 추가 + schedule 치환
         from services.assignment_service import get_roster_assignments
@@ -794,25 +836,155 @@ async def get_issued_roster_snapshot(
 
 # [Roster] - 본인 발행 근무표 조회
 @router.get("/issued_roster/me")
-async def get_my_issued_roster(
+def get_my_issued_roster(
     year: int,
     month: int,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     try:
         result = get_my_issued_roster_service(
             year=year, month=month, current_user=current_user, db=db
         )
-        if not result:
-            raise HTTPException(status_code=404, detail="발행된 근무표가 없습니다.")
-        return result
+        # ★ 발행본이 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 의 404 를
+        #   `index.html` **200** 으로 바꿔 보내기 때문이다(CustomErrorResponses 는 배포
+        #   전체 적용이라 /api behavior 만 뺄 수 없다). 그러면 클라이언트의 404 분기가
+        #   통째로 죽고, HTML 을 JSON 으로 파싱하다 모바일 화면이 하얗게 뜬다.
+        #   200 + null 로 내리면 PC(axios·404→null)·모바일(fetch·404→null) 양쪽 모두
+        #   기존 "근무표 없음" 경로와 **똑같이** 동작한다(2026-08-13 실측).
+        #   ※ "없음"은 정상 상태지 오류가 아니라서 의미상으로도 200 이 맞다.
+        return result or None
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"개인 근무표 조회 실패: {str(e)}"
         )
+
+
+# [Roster] - 본인 발행 근무표 · 기준일이 속한 주(일~토)
+@router.get("/issued_roster/me/week")
+def get_my_issued_week(
+    date: Optional[str] = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """모바일 대시보드 최상단용 — 본인의 **발행(마감)** 근무표에서 이번 주 7일.
+
+    ★ `async def` 가 아니라 **동기 `def`** 다. 안에서 도는 SQLAlchemy 는 동기라
+      `async` 핸들러에 두면 DB I/O 동안 이벤트 루프가 통째로 막힌다. 이 엔드포인트는
+      대시보드 최상단이라 **폴링**되므로 그 영향이 다른 요청까지 번진다.
+      동기 `def` 로 두면 FastAPI 가 threadpool 에서 실행해 루프를 붙잡지 않는다.
+      (의존성 `require_current_user` 가 async 인 것은 무관 — FastAPI 가 알아서 처리한다.)
+
+    ★ 주는 달을 넘는다(8/30 일 ~ 9/5 토). 서비스가 걸친 달을 각각 읽어 이어붙인다.
+    ★ 발행 안 된 달은 그 날들이 `code=null, issued=false` 로 내려간다. 빼지 않는 이유는
+      프론트가 요일 7칸 격자를 그리기 때문이다.
+    ★ 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 404 를 `index.html` **200** 으로
+      바꿔 보내 모바일이 HTML 을 JSON 으로 파싱하다 하얗게 뜬다(`/issued_roster/me` 주석 참조).
+      여기서는 한 발 더 나아가 **null 도 반환하지 않는다** — 주 단위는 '일부 달만 발행' 이
+      정상 상태라, 형태를 항상 유지하는 편이 프론트 분기를 단순하게 만든다.
+
+    Args:
+        date: 기준일(선택, 기본=오늘). 프론트가 주를 앞뒤로 넘길 때 쓴다.
+            `YYYY-MM-DD` 이며 월·일의 0 패딩은 없어도 된다(`2026-2-3` 허용).
+            ★ 빈 문자열(`?date=`)은 **거부**한다. 값을 주지 않을 거면 파라미터 자체를
+              빼야 한다 — 빈 값을 오늘로 눕히면 잘못 만든 요청이 성공으로 보인다.
+    """
+    base_date = None
+    if date is not None:
+        _raw = date.strip()
+        if not _raw:
+            raise HTTPException(
+                status_code=400,
+                detail="date 가 비어 있습니다. 생략하거나 YYYY-MM-DD 로 주세요.",
+            )
+        try:
+            base_date = datetime.strptime(_raw, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="date 는 YYYY-MM-DD 형식이어야 합니다."
+            )
+    try:
+        return get_my_issued_week_service(
+            current_user=current_user, db=db, base_date=base_date
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # 서비스가 기준일 범위를 거른다(date.min/max 코앞은 주 계산이 표현 범위를 넘는다).
+        # 입력 오류이므로 아래 500 으로 새지 않게 여기서 400 으로 낸다.
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"주간 근무표 조회 실패: {str(e)}"
+        )
+
+
+# [Roster] - 본인 당일 근무 + 같은 시간대 동료 + 다음 OFF (모바일)
+@router.get("/me/today")
+def get_my_today(
+    date: Optional[str] = None,
+    include: Optional[str] = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """모바일 '오늘 근무' 화면용 — 본인 근무 + 같은 상태 동료 + 다음 OFF.
+
+    `coworkers` 는 본인이 **근무면 같은 시간대 근무자**, **비근무(OFF·주휴·휴가)면
+    그 날 쉬는 사람 전부**다. 본인 근무를 모르는 날(`shift_unknown`)은 빈 목록이다 —
+    "동료 없음"(빈 배열 + `shift_unknown:false`)과 구분해서 읽으면 된다.
+
+    셋을 한 응답에 담는 이유는 **같은 발행 스냅샷 하나로 전부 계산되기 때문**이다.
+    나누면 같은 스냅샷을 2~3번 로드한다.
+
+    Args:
+        date: 기준일(선택, 기본=오늘). `YYYY-MM-DD`. 빈 문자열(`?date=`)은 거부한다 —
+            값을 안 줄 거면 파라미터 자체를 빼야 한다(`/issued_roster/me/week` 와 동일 규칙).
+        include: 쉼표 구분(`coworkers`,`next_off`). 생략하면 둘 다 포함.
+
+    ★ `async def` 가 아니라 **동기 `def`** 다. SQLAlchemy 가 동기라 `async` 핸들러에
+      두면 DB I/O 동안 이벤트 루프가 막힌다. 대시보드 상단이라 폴링된다.
+    ★ 미발행은 오류가 아니다 — `issued: false` + `my_shift: null` 로 200 을 낸다.
+      404 는 CloudFront 가 `index.html` 200 으로 바꿔 보내 모바일이 하얗게 뜬다.
+    """
+    base_date = None
+    if date is not None:
+        raw = date.strip()
+        if not raw:
+            raise HTTPException(
+                status_code=400,
+                detail="date 가 비어 있습니다. 생략하거나 YYYY-MM-DD 로 주세요.",
+            )
+        try:
+            base_date = datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="date 는 YYYY-MM-DD 형식이어야 합니다."
+            )
+
+    parts = None
+    if include is not None:
+        parts = {p.strip() for p in include.split(",") if p.strip()}
+        unknown = parts - {"coworkers", "next_off"}
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"include 에 알 수 없는 값: {', '.join(sorted(unknown))}",
+            )
+
+    try:
+        return get_my_today_service(
+            current_user=current_user,
+            db=db,
+            base_date=base_date,
+            include_coworkers=parts is None or "coworkers" in parts,
+            include_next_off=parts is None or "next_off" in parts,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"당일 근무 조회 실패: {str(e)}")
 
 
 # [Schedules] - 현재 그룹의 특정 월에 대한 스케줄 상태 확인
@@ -930,8 +1102,12 @@ async def get_roster_by_schedule_id(
     target_group_id = schedule.group_id
 
     # Get all nurses in the group
+    # ★ active / resignation_date 를 함께 읽는다 — 아래에서 그 달 명단 규칙으로 거른다.
     nurses_in_group = list(
-        db.query(Nurse.nurse_id, Nurse.name, Nurse.experience)
+        db.query(
+            Nurse.nurse_id, Nurse.name, Nurse.experience,
+            Nurse.active, Nurse.resignation_date,
+        )
         .filter(Nurse.group_id == target_group_id)
         .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
         .all()
@@ -963,11 +1139,50 @@ async def get_roster_by_schedule_id(
     _inbound_ids = _inbound_ids | _assign_inbound_ids
     if _inbound_ids:
         _inbound_nurses = (
-            db.query(Nurse.nurse_id, Nurse.name, Nurse.experience)
+            db.query(
+                Nurse.nurse_id, Nurse.name, Nurse.experience,
+                Nurse.active, Nurse.resignation_date,
+            )
             .filter(Nurse.nurse_id.in_(_inbound_ids))
             .all()
         )
         nurses_in_group.extend(_inbound_nurses)
+
+    # ★ 그 달에 속하지 않는 인원(퇴사·비활성)을 명단에서 제외한다.
+    #   증상: 화면에 유령 행이 뜨고, 다른 사람 셀을 고치면 그 행이 드러났다.
+    #   실측(9병동-9A 2026-09): 응답 16명 = entries 11명 + 5명(전 칸 '-'),
+    #     그중 이윤지·이애진은 2026-07 퇴사자였다.
+    #   원인: 위 쿼리가 group_id 만 보고 active·resignation_date 를 보지 않았다.
+    #   판정은 group_members_in_month(assignment_service) 와 **같은 규칙**으로 맞춘다:
+    #     · resign < 월초                 → 제외 (퇴사 다음 달부터 안 보인다)
+    #     · 월초 <= resign <= 월말        → 퇴사月이라 표시
+    #     · active != 1 이고 그 달 퇴사자도 아님 → 제외
+    #   ★ 단 ScheduleEntry 에 기록이 있으면 무조건 남긴다 — 이미 배정된 근무를
+    #     명단 규칙으로 숨기면 근무표가 사실과 달라진다.
+    _sch_year = int(getattr(schedule, "year", 0) or 0)
+    _sch_month = int(getattr(schedule, "month", 0) or 0)
+    if _sch_year and _sch_month:
+        from calendar import monthrange as _mr_member   # 이 파일의 기존 관례(로컬 import)
+        _m_start = date(_sch_year, _sch_month, 1)
+        _m_end = date(_sch_year, _sch_month, _mr_member(_sch_year, _sch_month)[1])
+
+        def _visible_in_month(n) -> bool:
+            if n.nurse_id in _all_entry_nurse_ids:
+                return True                      # 근무 기록이 있으면 항상 표시
+            _rd = getattr(n, "resignation_date", None)
+            _rd = _rd.date() if hasattr(_rd, "date") else _rd
+            if _rd is not None and _rd < _m_start:
+                return False
+            _resigned_this_month = _rd is not None and _rd <= _m_end
+            if getattr(n, "active", None) != 1 and not _resigned_this_month:
+                return False
+            return True
+
+        _before = len(nurses_in_group)
+        nurses_in_group = [n for n in nurses_in_group if _visible_in_month(n)]
+        if _before != len(nurses_in_group):
+            print(f"[Roster][MemberFilter] schedule={schedule_id} "
+                  f"{_sch_year}-{_sch_month:02d} 명단 {_before} → {len(nurses_in_group)}")
 
     # Get shift manage data
     # Get shift colors
@@ -1016,7 +1231,7 @@ async def get_roster_by_schedule_id(
         nurse_entry = {
             "id": nurse.nurse_id,
             "name": nurse.name,
-            "experience": nurse.experience,
+            "experience": nurse.experience or 0,
             "schedule": nurse_schedule,
             "schedule_ids": schedule_ids,
             "counts": counts,
@@ -1166,7 +1381,7 @@ async def get_roster_by_schedule_id(
 
 # [Schedules] - 특정 월의 모든 버전 목록 조회 (수간호사용)
 @router.get("/{year:int}/{month:int}/versions")
-async def get_schedule_versions(
+def get_schedule_versions(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -1292,7 +1507,7 @@ async def get_roster_for_month(
             {
                 "id": nurse.nurse_id,
                 "name": nurse.name,
-                "experience": nurse.experience,
+                "experience": nurse.experience or 0,
                 "schedule": nurse_schedule,
                 "counts": counts,
             }
@@ -1370,12 +1585,13 @@ async def publish_roster(
     office_id = current_user.office_id
 
     # Check if this is the first publication
+    #   ★ office_id 는 걸지 않는다 (2026-09-01 제거). group_id 가 office 를 확정하는데
+    #     호출자 office 를 겹쳐 걸면 타 병원 그룹일 때 0건이 되어 **발행 이력이 없는 것처럼
+    #     보인다.** 아래 is_first_issue·max_seq·is_republish 가 전부 그 결과에 의존한다.
+    #     그룹 접근 권한은 _load_schedule_for_caller 가 이미 검증했다.
     existing_issued = (
         db.query(IssuedRoster)
-        .filter(
-            IssuedRoster.group_id == target_group_id,
-            IssuedRoster.office_id == office_id,
-        )
+        .filter(IssuedRoster.group_id == target_group_id)
         .first()
     )
 
@@ -1383,12 +1599,11 @@ async def publish_roster(
 
     # Get next sequence number
 
+    #   ★★ office_id 제거 — 여기서 0건이 나면 max_seq=0 이 되어 **이미 쓰인 seq_no 를
+    #     다시 부여한다**(중복). 위 existing_issued 와 같은 이유.
     max_seq = (
         db.query(func.max(IssuedRoster.seq_no))
-        .filter(
-            IssuedRoster.group_id == target_group_id,
-            IssuedRoster.office_id == office_id,
-        )
+        .filter(IssuedRoster.group_id == target_group_id)
         .scalar()
         or 0
     )
@@ -1431,8 +1646,8 @@ async def publish_roster(
         db.query(IssuedRoster)
         .join(Schedule, IssuedRoster.schedule_id == Schedule.schedule_id)
         .filter(
+            #   ★ office_id 제거 — 0건이면 is_republish 가 False 로 잘못 잡힌다.
             IssuedRoster.group_id == target_group_id,
-            IssuedRoster.office_id == office_id,
             Schedule.year == schedule.year,
             Schedule.month == schedule.month,
         )
@@ -1687,7 +1902,7 @@ async def get_roster_for_month(
             {
                 "id": nurse.nurse_id,
                 "name": nurse.name,
-                "experience": nurse.experience,
+                "experience": nurse.experience or 0,
                 "schedule": nurse_schedule,
                 "counts": counts,
             }
@@ -1699,6 +1914,17 @@ async def get_roster_for_month(
 
 # [Roster] - 근무표 저장
 @router.post("/save")
+#   ★ 동기 def 로 바꾸지 말 것 (2026-09-01 되돌림).
+#     이 핸들러는 안이 전부 동기 SQLAlchemy 라 def 로 두면 threadpool 에서 도는데,
+#     그러면 **이벤트 루프에서 도는 다른 핸들러와 진짜 병렬로 실행된다.** 아래 N 연번
+#     재계산(`rebuild_night_cycle_from`)은 **그룹 전체** 범위라, 같은 그룹의 다른 근무표를
+#     고치는 publish/unpublish/drop 과 겹치면 서로의 낡은 상태를 읽어 공유 앵커
+#     (`NurseNightCycle`)를 덮어쓴다. 이 엔드포인트가 ScheduleEntry 를 전량 삭제 후
+#     재삽입하는 탓에, 그 중간을 읽은 쪽은 "근무표가 텅 빈" 스냅샷(0행)을 만든다.
+#     예외는 아래에서 삼켜지므로 **조용히 어긋난 채 커밋된다.**
+#     운영은 uvicorn 워커 1개(EC2 단일 프로세스, ECS 는 미사용)라 호출자 5곳이 전부
+#     async 인 동안에는 루프 하나에서 직렬화돼 이 결함에 도달하지 않는다.
+#     성능 때문에 def 로 돌리려면 **먼저** 5곳 전부에 그룹 단위 잠금을 넣어야 한다.
 async def save_roster(
     roster_data: dict,
     group_id: Optional[str] = None,
@@ -1731,22 +1957,72 @@ async def save_roster(
     )
     target_group_id = schedule.group_id
     schedule.memo = memo
+    # ★★ 같은 근무표에 대한 저장을 **직렬화**한다.
+    #   이 엔드포인트는 근무표를 전량 교체하므로, 두 사람이 동시에 저장하면 뒤늦은 쪽이
+    #   앞선 저장을 통째로 덮어쓴다(lost update). 이력도 덩달아 "무엇에서 무엇으로" 를
+    #   잘못 기록한다 — 둘 다 같은 옛 상태를 스냅샷으로 잡기 때문이다.
+    #   여기서 schedule 행을 갱신하고 flush 하면 그 행에 배타 잠금이 걸려, 두 번째 저장은
+    #   첫 번째가 커밋한 뒤에야 진행하고 **최신 상태를 스냅샷으로 본다**(실측: 대기 1.8초).
+    #   ★ updated_at 을 함께 건드리는 이유 — memo 가 그대로면 SQLAlchemy 가 UPDATE 를
+    #     생략해 잠금이 안 걸린다. 저장 시각 갱신은 의미상으로도 맞다.
+    schedule.updated_at = datetime.now()
+    db.flush()
+
+    # ── 수정 이력용 스냅샷 ──
+    #   ★ 이 엔드포인트는 근무표 **전체**를 받아 전량 교체한다. 즉 서버는 무엇이 바뀌었는지
+    #     모른다. 그래서 지우기 **직전에** 현재 상태를 찍어 두고, 재삽입 후 비교해 바뀐 칸만
+    #     로그로 남긴다. 실패해도 저장 자체는 막지 않는다(이력은 부가 기능).
+    #   ★★ 스냅샷은 **저장 트랜잭션 안**에서 도는 읽기다. 여기서 DB 예외가 나면 세션이
+    #     깨진 채로 남아 이후 delete/insert/commit 이 통째로 실패한다 — "부가 기능이라
+    #     감쌌다" 는 방어가 오히려 저장을 죽인다. 그래서 예외를 삼키기 전에 반드시
+    #     rollback 해서 세션을 되살린다(뒤 작업이 깨끗한 트랜잭션에서 시작하도록).
+    try:
+        from services.schedule_history_service import (
+            snapshot_entries, log_manual_changes,
+        )
+        _hist_before = snapshot_entries(db, schedule.schedule_id)
+    except Exception as _hist_exc:
+        print(f"[ScheduleHistory] 스냅샷 실패(이력 생략): {_hist_exc}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _hist_before = None
+        # rollback 으로 위에서 읽은 schedule 객체가 만료되므로 다시 붙인다.
+        schedule = _load_schedule_for_caller(
+            db, current_user, schedule_id,
+            not_found_detail="No schedule found for this month",
+        )
+        schedule.memo = memo
+        # ★ rollback 이 **직렬화 잠금까지 풀어 버린다.** 다시 잡지 않으면 이 저장만
+        #   잠금 없이 진행해 동시 저장 시 lost update 가 그대로 난다(이력이 없는 것과
+        #   근무표를 잃는 것은 다른 문제다). 위와 같은 방식으로 재획득한다.
+        schedule.updated_at = datetime.now()
+        db.flush()
+    _hist_after: dict = {}
+
     # Clear existing roster entries
     db.query(ScheduleEntry).filter(
         ScheduleEntry.schedule_id == schedule.schedule_id
     ).delete()
 
     # Save new roster entries (케이스 보존을 위해 유효 shift_id 기반 정규화)
+    #   ★ office_id 는 걸지 않는다 (2026-09-01 제거). group_id 가 이미 office 를 확정하므로
+    #     중복 조건인데, **호출자의** office 를 겹쳐 걸면 대상 그룹이 다른 병원일 때
+    #     조회가 0건이 된다. 그러면 아래 valid_* 가 전부 비어 클라이언트가 보낸 정상
+    #     `schedule_ids` 가 무효 판정을 받고 **셀의 id 가 전량 NULL 로 저장된다** —
+    #     에러 없이 200 이라 조용히 망가진다(실측: 589칸 소실).
+    #     ADM 은 assert_caller_can_access_group 에서 office 무관하게 통과하므로 실제로
+    #     도달 가능한 경로다. 그룹 접근 권한은 위 `_load_schedule_for_caller` 가 이미 본다.
     shifts_for_group = (
         db.query(Shift)
-        .filter(
-            Shift.group_id == target_group_id,
-            Shift.office_id == getattr(current_user, "office_id", None),
-        )
+        .filter(Shift.group_id == target_group_id)
         .all()
     )
     valid_shift_ids = {s.shift_id for s in shifts_for_group}
     shift_id_to_int_id = {s.shift_id: s.id for s in shifts_for_group}
+    # 클라이언트가 보낸 schedule_ids 검증용 — 그 그룹에 실재하는 shifts.id 만 허용한다.
+    valid_int_ids = {s.id for s in shifts_for_group if s.id is not None}
 
     def _normalize_shift_id_for_save_router(raw_shift: str) -> str:
         if raw_shift in valid_shift_ids:
@@ -1772,6 +2048,11 @@ async def save_roster(
                 norm_shift = _normalize_shift_id_for_save_router(str(shift_id))
                 # 기존 schedule_ids 값 우선 사용, 없으면(수동 수정 셀) shift_id로 lookup
                 int_id = schedule_ids[day_index] if day_index < len(schedule_ids) else None
+                # ★ 클라이언트가 보낸 값이므로 **그 그룹의 유효한 shifts.id 인지** 확인한다.
+                #   낡거나 조작된 값을 그대로 쓰면 근무표에 남을 뿐 아니라 이력에도
+                #   그대로 박혀 나중에 "그때 무슨 근무였나" 를 영원히 잘못 가리킨다.
+                if int_id is not None and int_id not in valid_int_ids:
+                    int_id = None
                 if int_id is None:
                     int_id = shift_id_to_int_id.get(norm_shift)
                 entry = ScheduleEntry(
@@ -1783,6 +2064,36 @@ async def save_roster(
                     id=int_id,
                 )
                 db.add(entry)
+                if _hist_before is not None:
+                    _hist_after[(str(nurse_id), work_date)] = (norm_shift, int_id)
+
+    # ── 수정 이력 적재 ──
+    #   ★ 같은 트랜잭션에 넣는다. 따로 커밋하면 근무표는 바뀌었는데 이력이 없거나
+    #     그 반대인 상태가 생긴다.
+    #   ★★ **savepoint 안에서** 적재한다. `db.add()` 는 예외를 내지 않고 실제 오류는
+    #     flush/commit 에서 터지므로, 단순 try 로 감싸면 방어가 통째로 헛돈다 —
+    #     로그가 실패했는데 근무표 저장까지 같이 죽는다. 중첩 트랜잭션으로 묶어
+    #     여기서 flush 까지 끝내고, 실패하면 **로그만** 되돌린 뒤 저장을 이어간다.
+    if _hist_before is not None:
+        # ★★ savepoint 를 잡기 **전에** 근무표 변경을 먼저 확정한다.
+        #   `begin_nested()` 는 savepoint 를 만들기 앞서 pending 을 flush 하는데, 그 flush 가
+        #   실패하면 세션이 깨진 채로 아래 except 에 들어간다 — 이력 실패로 오인해 삼키고
+        #   나중 commit 에서 PendingRollbackError 로 터진다. 여기서 먼저 flush 해 두면
+        #   근무표 자체의 오류는 이력 방어에 걸리지 않고 정상적으로 위로 전파된다.
+        db.flush()
+        try:
+            with db.begin_nested():
+                _n = log_manual_changes(
+                    db, schedule_id=schedule.schedule_id, group_id=target_group_id,
+                    before=_hist_before, after=_hist_after,
+                    changed_by=getattr(current_user, "nurse_id", None),
+                )
+                db.flush()      # 오류를 savepoint 안에서 확정시킨다
+            if _n:
+                print(f"[ScheduleHistory] {schedule.schedule_id} 변경 {_n}칸 기록")
+        except Exception as _hist_exc:
+            # savepoint 만 롤백됐고 바깥 트랜잭션(근무표 저장)은 살아 있다.
+            print(f"[ScheduleHistory] 적재 실패(저장은 계속): {_hist_exc}")
 
     # ── N 연번 앵커 재계산 (마감본이 수정된 경우만) ──
     #   ★ 이 엔드포인트는 ScheduleEntry 를 전량 삭제 후 재삽입한다. 마감(issued) 근무표를
@@ -1803,6 +2114,49 @@ async def save_roster(
             print(f"[NightCycle] 마감본 수정 후 재계산 실패(무시): {_nc_exc}")
     db.commit()
     return {"message": "Roster saved successfully"}
+
+
+# [Roster] - 근무표 수정 이력
+@router.get("/schedule/{schedule_id}/history")
+def get_schedule_history(
+    schedule_id: str,
+    limit: int = 500,
+    latest_only: bool = False,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """선택한 근무표의 셀 수정 이력 — 최신순.
+
+    Args:
+        latest_only: True 면 칸마다 마지막 변경 한 건씩만. 같은 칸을 여러 번 고쳤을 때
+            중간 단계를 빼고 "손댄 칸들의 최종 모습" 을 본다.
+
+    ★ 사람이 화면에서 고친 것만 남는다. 생성·재생성은 기록하지 않는다.
+    ★ `current` 는 로그의 `after` 가 아니라 **근무표의 현재값**이다. 로그에는 바뀐 칸만
+      있어 마지막 after 를 현재값으로 쓰면 어긋날 수 있다(재생성 등).
+    ★ 동기 `def` 다 — 안의 SQLAlchemy 가 동기라 async 로 두면 이벤트 루프를 붙잡는다.
+    ★ 관리자 전용이다. `_load_schedule_for_caller` 만으로는 같은 그룹의 **일반 간호사도**
+      통과해 동료의 수정 이력과 수정자(changed_by)까지 보게 된다. 수정을 할 수 있는
+      사람과 같은 기준(`/roster/save`)으로 막는다.
+    """
+    if not (
+        caller_is_head_nurse(db, current_user)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    _load_schedule_for_caller(
+        db, current_user, schedule_id,
+        not_found_detail="근무표를 찾을 수 없습니다.",
+    )
+    try:
+        from services.schedule_history_service import list_schedule_history
+        return list_schedule_history(
+            db, schedule_id=schedule_id, limit=limit, latest_only=latest_only,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"수정 이력 조회 실패: {str(e)}")
 
 
 # [Schedules] - 특정 스케줄의 모든 간호사 원티드 제출 현황 확인
@@ -2471,6 +2825,8 @@ async def copy_schedule_to_new_version(
         print(
             f"[COPY SUCCESS] 새 schedule_id: {new_schedule_id}, version: {new_version}"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f"[COPY ERROR] 커밋 실패: {str(e)}")
@@ -2551,6 +2907,8 @@ async def create_empty_roster(
     try:
         db.commit()
         db.refresh(new_schedule)
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"빈 근무표 생성 실패: {str(e)}")
@@ -2727,6 +3085,8 @@ async def create_roster_with_weekly_off(
         db.commit()
         db.refresh(new_schedule)
         print(f"[DEBUG] 전체 주휴 엔트리 생성 완료: {created_entries}개")
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f"[ERROR] commit 실패: {str(e)}")
@@ -2819,6 +3179,8 @@ async def create_schedule_share_link(
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"공유 링크 생성 실패: {str(e)}")
 
@@ -2863,6 +3225,8 @@ async def create_schedule_share_link_with_upload(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"이미지 업로드/공유 링크 생성 실패: {str(e)}"
@@ -2909,6 +3273,8 @@ async def create_schedule_share_link_auto(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"자동 이미지 생성/공유 링크 생성 실패: {str(e)}"
@@ -2957,6 +3323,8 @@ async def create_schedule_share_link_capture(
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"캡처 이미지 공유 링크 생성 실패: {str(e)}"
@@ -2982,6 +3350,8 @@ async def revoke_schedule_share_link(
         raise HTTPException(status_code=403, detail=str(e))
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"공유 링크 해제 실패: {str(e)}")
 
@@ -3096,6 +3466,8 @@ async def render_schedule_share_image(token: str, db: Session = Depends(get_db))
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Share image load failed: {str(e)}"

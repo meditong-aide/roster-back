@@ -455,13 +455,16 @@ def _compute_join_leave(rs):
     for nu in rs.nurses:
         j = (nu.joining_date - first_day).days if getattr(nu, "joining_date", None) else 0
         if getattr(nu, "resignation_date", None):
-            if nu.resignation_date < first_day:
+            # ★ resignation_date 는 퇴사일 그 자체 — 그날부터 소속이 아니므로
+            #   마지막 근무일은 resignation_date - 1 일이다(cp_sat_basic 과 동일 규약).
+            _last_work = nu.resignation_date - timedelta(days=1)
+            if _last_work < first_day:
                 # 이번 달 이전에 퇴사한 경우: 변수 생성을 막기 위해 범위를 비워둔다.
                 join.append(1)
                 leave.append(0)
                 continue
-            l = (nu.resignation_date - first_day).days
-            if nu.resignation_date > last_day:
+            l = (_last_work - first_day).days
+            if _last_work > last_day:
                 l = D - 1
         else:
             l = D - 1

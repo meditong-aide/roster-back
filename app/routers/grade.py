@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from db.client2 import get_db
 from db.models import Group
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from services.group_access import resolve_effective_group
 from schemas.auth_schema import User as UserSchema
 from schemas.grade_schema import GradeConfigResponse, GradeConfigUpsert
@@ -47,7 +47,7 @@ def get_grade_config(
 def upsert_grade_config(
     req: GradeConfigUpsert,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """그룹의 Grade 설정을 저장하거나 갱신합니다."""

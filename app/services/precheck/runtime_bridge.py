@@ -309,6 +309,8 @@ def build_precheck_input(
                 sync_window_start=sync_start,
                 sync_window_end=sync_end,
                 night_cap=night_cap,
+                # 진단 카드가 사번 대신 이름으로 사람을 지목하도록 실어 보낸다.
+                name=(str(nd.get("name")).strip() or None) if nd.get("name") else None,
             )
         )
 

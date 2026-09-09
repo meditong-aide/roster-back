@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field, field_validator, ValidationInfo, EmailStr
+from pydantic import (
+    BaseModel, Field, field_validator, model_validator, ValidationInfo, EmailStr,
+)
 from typing import List, Dict, Any, Optional, Literal
 from datetime import date, datetime
 from enum import StrEnum
@@ -334,6 +336,10 @@ class RosterConfigBase(BaseModel):
     health_leave_weekend: Optional[bool] = Field(
         default=None,
         description="보건휴가 주말 배치 허용 — False 시 평일에만 배치. health_leave_enabled=True 일 때만 의미가 있다. 미전송(None) 시 기존 값 유지",
+    )
+    ban_night_before_fixed_wanted_off: Optional[bool] = Field(
+        default=None,
+        description="확정 원티드로 굳힌 OFF 직전일에 N 배치 금지 — 신청해서 받은 휴일이 직전 N 의 회복 OFF 시작점으로 소비되면 실질적으로 쉰 것이 아니므로 휴가·공가와 같은 취급을 한다. 대상은 확정 원티드로 굳힌 **O** 셀이다(주휴 코드로 신청한 셀도 대표코드가 O 로 접혀 포함). 자동으로 배정된 OFF 는 대상이 아니고, 휴가·공가 계열은 기존 설정이 담당한다. 당월 1일이 확정 OFF 인 경우는 전월 N 마감의 회복분이라 면제. 미전송(None) 시 기존 값 유지",
     )
     sleep_off_enabled: Optional[bool] = Field(
         default=None,
@@ -883,10 +889,26 @@ class NightBulkApplyRequest(BaseModel):
     group_id: str
     year: int = Field(ge=2000, le=2100)
     month: int = Field(ge=1, le=12)
-    kind: Literal["fixed", "max"] = Field(
-        description="fixed=고정(n_exact), max=최대(n_max)"
+    kind: Literal["fixed", "max", "clear"] = Field(
+        description="fixed=고정(n_exact), max=최대(n_max), clear=나이트 설정 초기화"
     )
-    value: int = Field(ge=0, description="전 야간가능 근무자에 적용할 나이트 개수")
+    # ★ clear 는 값이 없다(null). `value: int` 로 두면 프론트의 {kind:'clear', value:null}
+    #   이 **422 로 막혀 초기화가 아예 동작하지 않는다**(실측 2026-08-21 운영).
+    value: Optional[int] = Field(
+        default=None, ge=0, description="적용할 나이트 개수. clear 면 null"
+    )
+
+    @model_validator(mode="after")
+    def _value_required_unless_clear(self):
+        """★ Optional 로 푼 대가를 여기서 막는다.
+
+        `{kind:'fixed', value:null}` 을 그대로 통과시키면 서비스가 선택 필드에 None 을
+        넣고, upsert 가 **12개 한도 필드를 통째로 덮어쓰므로** 대상 병동 전원의 월 한도가
+        조용히 지워진다. 값이 필요한 모드에서는 None 을 거절한다.
+        """
+        if self.kind != "clear" and self.value is None:
+            raise ValueError("fixed/max 는 value 가 필요합니다.")
+        return self
 
 
 class NurseMonthlyLimitWarning(BaseModel):
@@ -985,6 +1007,21 @@ class FixedWantedCreate(BaseModel):
     banned_entries: Optional[List[BannedWantedEntryCreate]] = None
 
 
+class AdjustmentApplyAllRequest(BaseModel):
+    """조정판 '원티드 전체 반영/미반영' 요청.
+
+    ★ 채널을 나누지 않는다 — 확정 원티드와 기피는 **항상 같이** 켜지고 꺼진다.
+      한쪽만 끄면 "전체 미반영" 인데 기피는 하드 제약으로 살아 있는 상태가 된다.
+    """
+
+    applied: bool = Field(
+        description=(
+            "True=전체 반영, False=전체 미반영. "
+            "확정 원티드(fixed_cells)와 기피(initial_forbidden)에 동시에 적용된다."
+        ),
+    )
+
+
 class FixedWantedEntryResponse(BaseModel):
     """확정 원티드 항목"""
 
@@ -1079,6 +1116,9 @@ class AdjustmentResponse(BaseModel):
     nurses: List[AdjustmentNurse]
     has_fixed_wanted: bool = False  # 저장된 확정 원티드 존재 여부
     has_banned_wanted: bool = False  # 저장된 금지 원티드 존재 여부
+    # 비차단 통지. 조회에서는 비어 있고, '전체 반영'(apply-all) 에서 채워진다 —
+    # 일괄로 켠 결과가 강제휴무 연속 상한을 넘으면 여기로 알린다(막지는 않는다).
+    warnings: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class FixedWantedListResponse(BaseModel):

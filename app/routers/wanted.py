@@ -14,6 +14,7 @@ from schemas.roster_schema import (
     WantedConfigCreate,
     WantedConfig as WantedConfigSchema,
     FixedWantedCreate,
+    AdjustmentApplyAllRequest,
     AdjustmentResponse,
     FixedWantedListResponse,
     FixedWantedEntryResponse,
@@ -21,7 +22,7 @@ from schemas.roster_schema import (
 )
 from services.graph_service import graph_service
 from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from utils.utils import send_wanted_close_push, send_wanted_deadline_update_push
 from db.client2 import get_db
 from db.models import (
@@ -35,6 +36,7 @@ from db.models import (
 )
 from schemas.auth_schema import User as UserSchema
 from services.wanted_service import (
+    get_my_wanted_dashboard_service,
     request_wanted_shifts_service,
     invoke_and_persist_wanted_service,
     get_wanted_config,
@@ -54,8 +56,10 @@ from services.wanted_service import (
     get_fixed_wanted_for_roster_service,
     get_fixed_wanted_entries_service,
     reset_fixed_wanted_service,
+    set_adjustment_applied_service,
     get_shift_requests_service,
 )
+from services.roster_service import get_my_wanted_reflection_service
 
 router = APIRouter(
     prefix="/wanted",
@@ -85,6 +89,8 @@ async def request_wanted_shifts(
     try:
         result = request_wanted_shifts_service(payload, current_user, db, override_group_id=override_gid)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Wanted 작성 요청 실패: {str(e)}")
 
@@ -122,6 +128,78 @@ async def get_wanted_status(
         "exp_date": wanted.exp_date,
         "message": "작성 가능" if wanted.status == 'requested' else "wanted 작성 요청이 마감되었습니다"
     }
+
+
+# [Wanted] - 본인이 제출한 원티드의 반영률 (모바일)
+@router.get("/me/dashboard")
+def get_my_wanted_dashboard(
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """모바일 대시보드 — 내가 작성할 원티드 + 각각의 작성 상태를 한 번에.
+
+    * 호출방식 : /wanted/me/dashboard  (파라미터 없음 — 대상 선정은 서버가 한다)
+    * 리턴값 : `{"items": [{year, month, exp_date, submission_status}]}`
+      - submission_status : `not_started` | `draft` | `submitted`
+      - exp_date : 마감일 없으면 null. 대상이 없으면 items 는 빈 배열이다.
+      - 정렬 : 마감일 오름차순, **없는 것은 뒤로**
+      - 상세 `preference_data` 는 넣지 않는다 — 목록 화면이 쓰지 않는데 응답만 커진다.
+
+    ★ `/wanted/all` + 월별 `/preferences/latest` 를 대체한다. 월 수만큼 왕복하던 것이
+      2쿼리로 끝난다.
+    ★ 노출 기준·정렬·재오픈 처리는 `get_my_wanted_dashboard_service` 도크스트링이 정본이다.
+    ★ 대상이 없어도 404 가 아니라 200 + 빈 배열이다 — CloudFront 가 `/api/*` 404 를
+      `index.html` 200 으로 바꿔 보내 모바일이 하얗게 뜬다.
+    """
+    try:
+        return get_my_wanted_dashboard_service(current_user=current_user, db=db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"원티드 대시보드 조회 실패: {str(e)}")
+
+
+@router.get("/me/reflection")
+def get_my_wanted_reflection(
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """본인이 제출한 원티드가 **발행(마감) 근무표**에 얼마나 반영됐는지.
+
+    - `year`/`month` 생략 → **지난달**(모바일 홈 카드용)
+    - `year`/`month` 지정 → 그 달(근무표 화면에서 보고 있는 달)
+
+    ★ `async def` 가 아니라 **동기 `def`** 다. 안에서 도는 SQLAlchemy 는 동기라
+      `async` 핸들러에 두면 DB I/O 동안 이벤트 루프가 통째로 막힌다. 홈 카드라
+      폴링되므로 그 영향이 다른 요청까지 번진다(`/roster/issued_roster/me/week` 와 동일).
+    ★ 미발행·미제출에 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 404 를
+      `index.html` **200** 으로 바꿔 보내 모바일이 하얗게 뜬다. `issued`/`submitted`
+      플래그로 구분한다.
+    """
+    if (year is None) != (month is None):
+        raise HTTPException(
+            status_code=400,
+            detail="year 와 month 는 함께 주거나 함께 생략해야 합니다.",
+        )
+    if month is not None and not (1 <= month <= 12):
+        raise HTTPException(status_code=400, detail="month 는 1~12 여야 합니다.")
+    # ★ year 도 함께 막는다. 지금은 `year=0` 이 500 이 아니라 200("미발행")으로 나가는데,
+    #   불가능한 입력에 정상 응답을 주는 셈이라 계약상 틀렸다. 게다가 통과하는 이유가
+    #   설계가 아니라 우연이다 — 스냅샷 meta 매칭이 먼저 실패해 `date(year, ...)` 에
+    #   닿지 않을 뿐이라, 조회 순서가 바뀌면 그대로 ValueError→500 이 된다.
+    #   범위는 `datetime.date` 의 정의역(1~9999)에 맞춘다.
+    if year is not None and not (1 <= year <= 9999):
+        raise HTTPException(status_code=400, detail="year 는 1~9999 여야 합니다.")
+    try:
+        return get_my_wanted_reflection_service(
+            current_user=current_user, db=db, year=year, month=month
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"원티드 반영률 조회 실패: {str(e)}")
 
 
 # [Wanted] - 특정 스케줄의 모든 간호사 제출 현황 확인
@@ -168,7 +246,7 @@ async def get_submission_statuses(
 
 # [Wanted] - 현재 그룹의 모든 wanted 데이터 조회
 @router.get("/all")
-async def get_all_wanted(
+def get_all_wanted(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -293,7 +371,7 @@ async def update_wanted_deadline(
 
 # @router.post("/invoke", response_model=WantedInvokeResponse)
 @router.post("/invoke")
-async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = Depends(get_current_user_from_cookie), db: Session = Depends(get_db)):
+async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = Depends(require_current_user), db: Session = Depends(get_db)):
     """
     그래프를 실행하여 로스터 관련 요청을 처리합니다.
     """
@@ -311,6 +389,8 @@ async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = 
         
         print(f"[INVOKE END] trace_id={trace_id} | 생성된 request_id={result.get('request_id')}")
         return {"response": result}
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         print(f'error', e)
@@ -495,7 +575,7 @@ def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, An
 
 # WantedConfig 관련 엔드포인트
 @router.get("/config")
-async def get_wanted_config_endpoint(
+def get_wanted_config_endpoint(
     year: Optional[int] = None,
     month: Optional[int] = None,
     target_date: Optional[str] = None,
@@ -526,12 +606,14 @@ async def get_wanted_config_endpoint(
     try:
         result = get_wanted_config(db, target_group_id, filters)
         return [WantedConfigSchema.model_validate(r) for r in result]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 조회 실패: {str(e)}")
 
 
 @router.post("/config")
-async def upsert_wanted_config_endpoint(
+def upsert_wanted_config_endpoint(
     config_data: List[WantedConfigCreate],
     group_id: Optional[str] = None,
     year: Optional[int] = None,
@@ -559,12 +641,14 @@ async def upsert_wanted_config_endpoint(
         return [WantedConfigSchema.model_validate(r) for r in results]
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 저장 실패: {str(e)}")
 
 
 @router.delete("/config")
-async def delete_wanted_config_endpoint(
+def delete_wanted_config_endpoint(
     target_date: Optional[str] = None,
     shift_type: Optional[str] = None,
     group_id: Optional[str] = None,
@@ -598,6 +682,8 @@ async def delete_wanted_config_endpoint(
             "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
             "deleted_count": deleted_count
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
 
@@ -631,6 +717,8 @@ async def delete_wanted_config_by_month_endpoint(
             "message": f"{deleted_count}건의 설정이 삭제되었습니다.",
             "deleted_count": deleted_count,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"설정 삭제 실패: {str(e)}")
 
@@ -667,6 +755,8 @@ async def validate_wanted_limits_endpoint(
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"날짜 형식 오류: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
 
@@ -677,7 +767,7 @@ async def get_over_limit_nurses_api(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     # 관리자 권한 체크 (수간호사 여부는 토큰 대신 DB)
@@ -693,7 +783,7 @@ async def delete_excess_off_api(
     nurse_id: str,
     year: int,
     month: int,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     if current_user.is_master_admin:
@@ -739,6 +829,8 @@ async def get_wanted_adjustment(
             content=jsonable_encoder(result),
             media_type="application/json; charset=utf-8"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"원티드 조정판 조회 실패: {str(e)}")
 
@@ -907,9 +999,52 @@ async def reset_fixed_wanted(
     try:
         result = reset_fixed_wanted_service(db, target_group_id, year, month)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"확정 원티드 재설정 실패: {str(e)}")
+
+
+@router.post("/adjustment/{year}/{month}/apply-all", response_model=AdjustmentResponse)
+async def set_adjustment_applied(
+    year: int,
+    month: int,
+    req: AdjustmentApplyAllRequest,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db)
+):
+    """조정판 '원티드 전체 반영/미반영' API
+
+    솔버 주입 채널 **둘 다** 를 한 번에 켜고 끈다.
+    - FixedWantedEntry.is_applied  → fixed_cells (하드 고정)
+    - BannedWantedEntry.is_applied → initial_forbidden → X==0   (source='hn' 스코프)
+
+    ★ 클라이언트가 채널별로 따로 끄던 것을 서버로 옮긴 것이다. 한쪽만 꺼지면
+      "전체 미반영" 인데 기피는 하드로 살아 있는 상태가 된다.
+    ★ 반환은 `/reset` 과 동일한 AdjustmentResponse — 호출 측이 재조회 없이
+      캐시를 그대로 갱신할 수 있다.
+    """
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not (caller_is_head_nurse(db, current_user) or getattr(current_user, 'is_master_admin', False)):
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    target_group_id = resolve_effective_group(db, current_user, group_id)
+
+    try:
+        return set_adjustment_applied_service(
+            db, target_group_id, year, month, req.applied
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"원티드 전체 {'반영' if req.applied else '미반영'} 실패: {str(e)}",
+        )
 
 
 @router.get("/fixed/{year}/{month}")
@@ -953,6 +1088,8 @@ async def get_fixed_wanted(
             "entries": entries,
             "total_count": len(all_entries),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"확정 원티드 조회 실패: {str(e)}")
 

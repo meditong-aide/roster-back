@@ -521,12 +521,21 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
         if n_floor is not None and max_nig is not None:
             try:
                 if int(n_floor) > max_nig:
-                    personal_conflicts.append(
-                        f"{nm} 야간 {int(n_floor)}회 필요, 상한 {max_nig}회")
-                    personal_targets.append({
+                    _al = [str(x).strip().upper() for x in (_nurse_attr(nu, "allowed_shifts") or [])]
+                    _n_only = ((set(_al) & {"D", "E", "N"}) == {"N"}) if _al else False
+                    _msg = f"{nm} 야간 {int(n_floor)}회 필요, 상한 {max_nig}회"
+                    _tgt = {
                         "nurse_id": nid, "name": nm, "family": "monthly_limit",
                         "detail": f"야간 요구 {int(n_floor)} > 월 상한 {max_nig}",
-                        "current": int(n_floor), "cap": max_nig})
+                        "current": int(n_floor), "cap": max_nig}
+                    if _n_only:
+                        # 야간전담은 off=일수−나이트. 상한으로 낮추면 나머지가 강제 OFF 가 되어
+                        # 그만큼 야간 공급이 줄어 되레 커버리지가 악화될 수 있다(카드가 알도록 표식).
+                        _tgt["is_night_only"] = True
+                        _tgt["off_after_cap"] = int(num_days) - int(max_nig)
+                        _msg += f"(야간전담 — 상한으로 낮추면 {int(num_days) - int(max_nig)}일 강제 OFF)"
+                    personal_conflicts.append(_msg)
+                    personal_targets.append(_tgt)
                     continue
             except (TypeError, ValueError):
                 pass
@@ -550,10 +559,36 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
 
     if personal_conflicts:
         _more = f" 외 {len(personal_conflicts) - 3}명" if len(personal_conflicts) > 3 else ""
-        cert = "; ".join(personal_conflicts[:3]) + _more + " — 그 간호사 설정만 바꾸면 돼요."
+        # 야간전담이 끼면 '내리기'가 아니라 '월 야간 상한 올리기'가 정답이라 문구도 그에 맞춘다.
+        _has_no = any(t.get("is_night_only") for t in personal_targets)
+        _suffix = (" — 야간전담이라 월 야간 상한을 올려 그만큼 서게 하면 돼요."
+                   if _has_no else " — 그 간호사 설정만 바꾸면 돼요.")
+        cert = "; ".join(personal_conflicts[:3]) + _more + _suffix
         return InfeasibilityExplanation(
             "personal_infeasible", "monthly_limit", {}, cert,
             {"personal_conflicts": len(personal_conflicts)}, targets=personal_targets)
+
+    # ── 0c) 주말 커버리지 집계 (주말휴무자 과다 → 주말 요일 공급 부족, arithmetic 증명) ──
+    #   주말휴무자는 주말 강제OFF. 주말 하루 가용 = 전체 − 주말휴무자. 이게 주말 요구(daily)보다
+    #   적으면 그 주말은 못 채운다(필요조건, sound). 값싼 산술(전체 인원만 봄)의 사각지대를 메운다.
+    #   presolve max-flow 가 계산하던 신호를 사용자 원인으로 승격. year/month 없으면 주말 미식별로 skip.
+    _daily_req_sum = sum(int(v or 0) for v in req.values())
+    if wk_nurses and wk_day_cnt > 0 and _daily_req_sum > 0:
+        _avail_wk = len(nurses) - len(wk_nurses)
+        if _avail_wk < _daily_req_sum:
+            _need = _daily_req_sum - _avail_wk       # 주말 매일 +1 공급 위해 풀 최소 인원
+            _rel_idxs = sorted(wk_nurses)[:_need]    # 과해제 방지: 필요 인원만 카드에 담는다
+            _wk_tgts = [{
+                "nurse_id": _nurse_attr(nurses[i], "nurse_id"),
+                "name": _nurse_attr(nurses[i], "name") or _nurse_attr(nurses[i], "nurse_id") or f"n{i}",
+                "family": "weekend_off"} for i in _rel_idxs]
+            cert = (f"주말 휴무자가 많아 주말 근무를 못 채워요 "
+                    f"(주말 하루 {_daily_req_sum}명 필요, 가용 {_avail_wk}명) — "
+                    f"주말 휴무를 최소 {_need}명 해제하면 돼요.")
+            return InfeasibilityExplanation(
+                "coverage_shortage", "weekend_off", {}, cert,
+                {"weekend_demand": _daily_req_sum, "weekend_available": _avail_wk,
+                 "release_needed": _need}, targets=_wk_tgts)
 
     # ── 0b) 다인 N-커버리지 결합 (조인트 frontier DP, bounded-treewidth) ──────────
     #   "각자는 되는데 같이는 야간을 못 채움" — 단일 상태DAG 로는 못 보는 결합. N-pool 이

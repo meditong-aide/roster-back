@@ -30,6 +30,8 @@ from db.models import (
     IssuedRosterSnapshot,
     WeeklyOffSetting,
     RosterGradeConfig,
+    WantedRequest,
+    NurseShiftRequest,
 )
 from db.roster_config import NurseRosterConfig
 from db.nurse_config import Nurse as NurseEngine
@@ -164,6 +166,7 @@ def _propagate_use_mid_all_configs(db, office_id, group_id, use_mid) -> None:
 
     use_mid 는 병동 단위 설정이므로 per-config 로 갈리면 안 된다. 어떤 config 를
     조회·포크·생성하더라도 동일 값이 되도록 그룹 전체를 한 번에 맞춘다.
+
     """
     db.query(RosterConfigModel).filter(
         RosterConfigModel.office_id == office_id,
@@ -230,6 +233,16 @@ def materialize_generation_config(
     pdict = {
         k: v for k, v in payload.model_dump().items() if k not in _COMPARE_EXCLUDE
     }
+    # 미전송(None) 보존 필드는 **baseline 값으로 정규화한 뒤** 비교한다.
+    #   이 필드를 모르는 화면은 None 을 보내는데, 그걸 baseline 의 True/False 와 그대로
+    #   견주면 "바뀌었다" 로 읽혀 매 생성마다 프리셋이 포크된다. docstring 이 명시한
+    #   "동일하면 기존 row 재사용" 과 어긋나고, 포크된 row 는 save 경로에서 **직전 최신**
+    #   config 값을 승계하므로 사용자가 고른 baseline 과 다른 값이 실릴 수 있다.
+    #   저장 루프의 _PRESERVE_IF_NONE 가드와 같은 규약을 비교에도 적용하는 것이다.
+    if baseline is not None:
+        for _k in _PRESERVE_IF_NONE:
+            if _k in pdict and pdict[_k] is None:
+                pdict[_k] = getattr(baseline, _k, None)
     differs = True
     if baseline is not None:
         differs = any(getattr(baseline, k, None) != v for k, v in pdict.items())
@@ -238,11 +251,18 @@ def materialize_generation_config(
         resolved = baseline
     else:
         auto_name = _next_auto_config_name(db, office_id, group_id)
+        # ★ 포크에도 **정규화한 값**을 실어야 한다. None 인 채로 넘기면
+        #   save_roster_config_service 의 _PRESERVE_IF_NONE 승계가 **직전 최신** config 에서
+        #   값을 가져오므로, 사용자가 고른 baseline 이 오래된 프리셋일 때 엉뚱한 값이 실린다.
+        #   baseline 이 없으면 pdict 도 정규화되지 않아 None 그대로다(승계할 기준이 없으니 정상).
+        _preserved = {k: pdict[k] for k in _PRESERVE_IF_NONE if k in pdict}
         new_payload = payload.model_copy(
-            update={'config_id': None, 'config_name': auto_name}
+            update={'config_id': None, 'config_name': auto_name, **_preserved}
         )
+        # ★ 승계 기준을 baseline 으로 못박는다. 안 넘기면 save 가 **직전 최신** 프리셋에서
+        #   미전송 필드를 승계해, 오래된 baseline 을 고른 사용자가 최신의 값을 얻는다.
         res = save_roster_config_service(
-            new_payload, user, db, override_group_id=group_id
+            new_payload, user, db, override_group_id=group_id, inherit_from=baseline
         )
         resolved = db.query(RosterConfigModel).filter(
             RosterConfigModel.config_id == res['config_id']
@@ -269,6 +289,9 @@ def materialize_generation_config(
 _PRESERVE_IF_NONE = (
     "health_leave_enabled", "health_leave_weekend",
     "sleep_off_enabled", "sleep_off_cycle",
+    # 확정 원티드 O 직전일 N 금지. 켜 둔 병동이 이 필드를 모르는 화면에서 저장하면
+    # 조용히 꺼지므로 보존 대상이다.
+    "ban_night_before_fixed_wanted_off",
 )
 
 
@@ -278,6 +301,7 @@ def save_roster_config_service(
     db: Session,
     override_group_id: str | None = None,
     sync_use_mid_live: bool = False,
+    inherit_from=None,
 ):
     """근무표 설정 저장 (프리셋 upsert).
 
@@ -343,6 +367,12 @@ def save_roster_config_service(
             ).first()
             if db_config is None:
                 raise Exception("수정할 설정(config_id)을 찾을 수 없습니다.")
+            # ★ 생성 결과 기록(last_generate_status)을 리셋하지 않는다 — 그게 방침이다.
+            #   한 번 실패로 기록된 설정은 **편집해 저장해도 되살리지 않는다** —
+            #   저장은 검증이 아니기 때문이다(재생성해서 성공하면 그때 복귀한다).
+            #   새로 쓰려면 config_id 없이 저장해 신규 행을 만든다
+            #   (신규 행은 NULL 에서 시작하므로 목록에 보인다).
+            #   ※ 여기에 db_config.last_generate_status = None 을 넣지 말 것.
             for _key, _val in config_dict.items():
                 # ★ 미전송(None) 시 기존 값 유지 — 이 필드를 모르는 기존 저장 화면이
                 #   저장할 때마다 설정을 꺼버리는 사고를 막는다(스키마 기본값도 None).
@@ -359,10 +389,14 @@ def save_roster_config_service(
                 db_config.version = _next_config_version(db, target_office_id, target_group_id)
         else:
             # 신규 프리셋 — 그룹(office+group)별 version = MAX+1 (0부터)
-            # ★ 미전송 필드는 직전 최신 config 값을 승계 — 생성은 created_at DESC 로 config 를
+            # ★ 미전송 필드는 기준 config 값을 승계 — 생성은 created_at DESC 로 config 를
             #   고르므로, 승계하지 않으면 새 프리셋을 저장하는 순간 기능이 꺼진 채로 생성된다.
+            # ★★ 기준은 `inherit_from` 이 있으면 그것, 없으면 직전 최신이다.
+            #   생성 시 포크(materialize_generation_config)는 **사용자가 고른 baseline** 을 넘긴다.
+            #   안 넘기면 오래된 프리셋을 골라 다른 설정만 바꿔도 최신 프리셋의 값이 딸려 들어와,
+            #   baseline 이 NULL(꺼짐)인 설정이 조용히 켜진 채로 생성된다.
             if any(config_dict.get(_k) is None for _k in _PRESERVE_IF_NONE):
-                _prev = (
+                _prev = inherit_from or (
                     db.query(RosterConfigModel)
                     .filter(
                         RosterConfigModel.office_id == target_office_id,
@@ -1456,6 +1490,712 @@ def get_my_issued_roster_service(
         "transfers": transfers_out,
         "groups": groups_out,
     }
+
+
+#: 주 시작 요일 = 일요일. `date.weekday()` 는 월=0…일=6 이므로 +1 후 7 로 나눈 나머지가
+#: '그 주 일요일로부터 며칠째' 가 된다(일→0, 월→1, … 토→6).
+_WEEK_START_SUNDAY_OFFSET = 1
+
+
+def get_my_issued_week_service(
+    current_user,
+    db: Session,
+    base_date: date | None = None,
+) -> dict:
+    """본인의 **발행(마감)** 근무표 중 기준일이 속한 주(일~토) 7일을 돌려준다.
+
+    ★ 주는 달을 넘는다. 8/30(일)~9/5(토) 처럼 걸치면 8월·9월 **두 발행본**을 각각 읽어
+      이어붙여야 한다. 한 달만 읽으면 주의 절반이 조용히 빈다.
+    ★ 월별 조회는 `get_my_issued_roster_service` 를 그대로 쓴다. 파견/병동이동 overlay,
+      shift_colors, home group 해석이 전부 그 안에 있어 여기서 다시 구현하면 갈린다.
+    ★ 발행 안 된 달은 `code=None, issued=False` 로 채운다. 빼버리면 프론트가 7칸
+      요일 격자를 못 그린다. "미발행" 은 오류가 아니라 정상 상태다.
+
+    Args:
+        base_date: 기준일(기본=오늘). 프론트가 주를 앞뒤로 넘길 때 쓴다.
+
+    Returns:
+        days 는 **항상 7개**(일→토). 조회 가능한 발행본이 하나도 없어도 형태는 유지된다.
+        ★ `issued` 는 "그 달이 발행됐는가" 가 아니라 **"그 날 내가 조회 가능한 근무표가
+          있는가"** 다. 그 달이 미발행이어도, 발행됐지만 내가 그 달 소속이 아니어도
+          똑같이 False 다. 간호사 화면에서는 두 경우 모두 "내 근무 없음" 으로 같게
+          표시되므로 굳이 가르지 않는다(가르려면 스냅샷 존재 여부를 따로 조회해야 해
+          왕복이 는다).
+
+    Raises:
+        ValueError: 기준일이 `date` 표현 범위의 양 끝 6일 안쪽일 때. 라우터가 400 으로 옮긴다.
+    """
+    today = date.today()
+    anchor = base_date or today
+    # 주 계산은 기준일에서 앞뒤로 최대 6일 움직인다. date.min/max 코앞에서는 그 이동이
+    # 표현 범위를 넘어 OverflowError 가 나고, 라우터의 포괄 except 가 그것을 **500** 으로
+    # 바꾼다 — 클라이언트 입력 오류인데 서버 장애로 보고되는 셈이다.
+    # 실측(2026-08-31): 0001-01-01~06 은 week_start 에서, 9999-12-26~31 은 week_end 에서 터진다.
+    _span = timedelta(days=6)
+    if not (date.min + _span <= anchor <= date.max - _span):
+        raise ValueError(
+            f"기준일이 주 계산 가능 범위를 벗어났습니다: {anchor.isoformat()} "
+            f"(허용 {(date.min + _span).isoformat()} ~ {(date.max - _span).isoformat()})"
+        )
+    week_start = anchor - timedelta(days=(anchor.weekday() + _WEEK_START_SUNDAY_OFFSET) % 7)
+    week_days = [week_start + timedelta(days=i) for i in range(7)]
+
+    # 주가 걸친 달만 조회한다(최대 2개). 같은 달을 두 번 읽지 않는다.
+    months = list(dict.fromkeys((d.year, d.month) for d in week_days))
+    by_month: dict[tuple[int, int], dict | None] = {}
+    for y, m in months:
+        # ★ 예외를 삼키지 않는다. 조회 실패(인가·DB·스냅샷 파싱)를 `None` 으로 눕히면
+        #   "아직 발행 안 됨" 과 구분이 사라져, 장애 중에도 200 으로 **빈 주**가 나간다.
+        #   간호사는 근무표가 안 나온 줄 알지만 실제로는 시스템이 고장난 것이다.
+        #   진짜 미발행은 이 함수가 이미 `None` 을 돌려주므로 따로 감쌀 이유가 없다.
+        by_month[(y, m)] = get_my_issued_roster_service(
+            year=y, month=m, current_user=current_user, db=db
+        )
+
+    _WD = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+    days_out: list[dict] = []
+    for i, d in enumerate(week_days):
+        data = by_month.get((d.year, d.month))
+        # ★ 색 폴백은 **그 날이 속한 달**의 색표로만 본다. 두 달 색표를 하나로 합치면
+        #   같은 코드가 달마다 다른 색일 때 뒤 달이 앞 달을 덮어써 2월 칸이 3월 색으로
+        #   칠해진다(주중 병동이동이면 실제로 갈린다). 그래서 병합하지 않는다.
+        colors_m = (data or {}).get("shift_colors") or {}
+        cell = None
+        if data:
+            cell = next(
+                (c for c in (data.get("schedule") or []) if int(c.get("day") or 0) == d.day),
+                None,
+            )
+        code = str((cell or {}).get("code") or "") or None
+        days_out.append({
+            "date": d.isoformat(),
+            "weekday": _WD[i],
+            "day": d.day,
+            "code": code,
+            # ★ 코드가 없으면 색도 없다. 근무가 없는 칸에 색만 남으면 화면에는 '무언가
+            #   배정된 칸'으로 보인다. 실측(발행본 12건·셀 5,653개)에 그런 셀은 없지만,
+            #   code 와 color 가 따로 놀 수 있는 구조라 여기서 묶어 둔다.
+            "color": ((cell or {}).get("color") or colors_m.get(code) or None) if code else None,
+            "group_id": (cell or {}).get("group_id"),
+            "group_name": (cell or {}).get("group_name"),
+            "is_today": d == today,
+            "issued": data is not None,
+        })
+
+    today_cell = next((c for c in days_out if c["is_today"]), None)
+    me = next((v for v in by_month.values() if v), None) or {}
+    return {
+        "week_start": week_start.isoformat(),
+        "week_end": week_days[-1].isoformat(),
+        "today": today.isoformat(),
+        # 기준일이 이번 주 밖이면(프론트가 다른 주를 조회) today_* 는 비운다.
+        "today_code": (today_cell or {}).get("code"),
+        "today_color": (today_cell or {}).get("color"),
+        "nurse_id": me.get("nurse_id") or getattr(current_user, "nurse_id", None),
+        # ★ 한 달도 발행본이 없으면 `me` 가 비어 이름이 통째로 null 이 된다. 신원 표시는
+        #   근무표 유무와 무관하므로 로그인 사용자에서 채운다(nurse_id 와 같은 규칙).
+        "name": me.get("name") or getattr(current_user, "name", None),
+        # ★ 응답에 통합 `shift_colors` 를 두지 않는다. 주가 두 달에 걸치면 같은 코드가
+        #   서로 다른 색일 수 있어 하나로 합치는 순간 한쪽이 틀린다. 칠할 색은
+        #   `days[].color` 에 칸마다 이미 정확히 들어 있으므로 그것이 정본이다.
+        "days": days_out,
+    }
+
+
+# ─────────────────── 모바일: 본인 발행 근무표 파생 조회 ───────────────────
+#: 다음 OFF 탐색 상한(일). 연속근무 5일이 하드 제약이라 정상 근무표면 6일 안에 나온다.
+#: 그보다 길면 데이터 이상이거나 미발행이므로, 달을 무한정 넘겨 읽지 않고 끊는다.
+_NEXT_OFF_HORIZON_DAYS = 14
+
+
+def _raw_cell_code(cell) -> str:
+    """스냅샷/월조회 셀 → 근무코드 문자열.
+
+    셀은 문자열이거나 `{"code": ...}` dict 두 형태로 들어온다
+    (`get_my_issued_roster_service._cell_code` 와 같은 규칙).
+    """
+    if isinstance(cell, dict):
+        return str(cell.get("code") or "").strip()
+    return str(cell or "").strip()
+
+
+def _cell_of_day(my_month: dict | None, day: int) -> dict:
+    """월 조회 결과(`get_my_issued_roster_service`)에서 해당 일자 셀. 없으면 빈 dict."""
+    days = (my_month or {}).get("schedule") or []
+    for cell in days:
+        if int(cell.get("day") or 0) == day:
+            return cell
+    return {}
+
+
+def _shift_meta_by_code(snapshot: dict | None) -> dict[str, dict]:
+    """발행 스냅샷의 `shifts` → `{코드: {name, color, start/end_time, default_shift, is_work}}`.
+
+    ★ 현재 `shifts` 테이블이 아니라 **스냅샷**을 본다. `shifts` 는 PK 가 없고 코드
+      문자열이 실제로 교체되므로(`N`→`N1`, `O`→`OFF` 실측), 지금 정의로 과거 발행본을
+      해석하면 이름·색·시간대가 그 달 화면과 어긋난다. 스냅샷은 발행 시점 정의라
+      코드가 나중에 바뀌어도 흔들리지 않는다.
+    ★ OFF 판정은 `type != '근무'` — `_get_off_shift_ids` 와 같은 기준이다.
+      휴무·휴가·보건휴가 등이 모두 여기 걸린다.
+    """
+    out: dict[str, dict] = {}
+    for row in (snapshot or {}).get("shifts") or []:
+        code = str(row.get("shift_id") or "").strip()
+        if not code:
+            continue
+        out[code] = {
+            "name": row.get("name") or code,
+            "color": row.get("color") or "",
+            "start_time": row.get("start_time"),
+            "end_time": row.get("end_time"),
+            "default_shift": str(row.get("default_shift") or code).strip() or code,
+            "is_work": str(row.get("type") or "") == "근무",
+        }
+    return out
+
+
+def _cell_is_unknown(code: str, meta: dict[str, dict]) -> bool:
+    """그 셀의 배정을 **알 수 없는가** — 파견지 발행본이 없는 날.
+
+    ★ 이때 셀에는 코드가 남아 있지만 그건 **홈 병동의 잔여값**이다
+      (`get_my_issued_roster_service` 의 미발행 분기가 `group_id` 만 바꾸고 `code` 는
+      안 건드린다). `_meta_for_cell` 이 그 경우 빈 메타를 돌려주므로 여기서 가려낸다.
+    ★★ 이 판정을 **모든 소비처가 함께** 써야 한다. 한 곳만 막으면 나머지가 낡은 코드를
+      진짜 배정처럼 내보낸다(실제로 그렇게 반쪽만 막았다가 지적받았다).
+    """
+    return bool(code) and not meta
+
+
+def _code_view(code: str, meta: dict[str, dict]) -> dict:
+    """근무코드 표시용 최소 형태. 스냅샷에 없는 코드는 코드 자체를 이름으로 쓴다."""
+    m = meta.get(code) or {}
+    return {"code": code, "name": m.get("name") or code, "color": m.get("color") or ""}
+
+
+def _code_detail(code: str, meta: dict[str, dict]) -> dict:
+    """근무코드 상세(시간·시간대 포함).
+
+    ★ `is_work` 는 스냅샷에 없는 코드일 때 `None` 이다. `False` 로 눕히면 화면이
+      OFF 로 읽는데, 실제로는 '이 코드의 정의를 모른다' 는 다른 상태다.
+    """
+    m = meta.get(code)
+    return {
+        "code": code,
+        "name": (m or {}).get("name") or code,
+        "color": (m or {}).get("color") or "",
+        "start_time": (m or {}).get("start_time"),
+        "end_time": (m or {}).get("end_time"),
+        "default_shift": (m or {}).get("default_shift") or code,
+        "is_work": m.get("is_work") if m else None,
+    }
+
+
+def _load_group_snapshot(
+    db: Session, current_user, year: int, month: int, group_id: str | None
+) -> dict | None:
+    """특정 병동의 그 달 활성 발행 스냅샷. 파견지 병동 조회에도 쓴다.
+
+    ★ `_expand_target_rosters=False` 가 중요하다. 기본값(True)은 관련 병동 스냅샷을
+      재귀로 전부 끌어오는데, 여기서 필요한 건 그 병동의 `shifts`·`nurses`·`roster`
+      뿐이라 조회가 몇 배로 늘어날 이유가 없다.
+    """
+    if not group_id:
+        return None
+    return get_issued_roster_snapshot_service(
+        year=year,
+        month=month,
+        current_user=current_user,
+        db=db,
+        target_group_id=group_id,
+        _expand_target_rosters=False,
+    )
+
+
+def _snapshot_cached(
+    db: Session, current_user, cache: dict, year: int, month: int, group_id: str | None
+) -> dict | None:
+    """`_load_group_snapshot` 의 캐시 래퍼. 한 요청 안에서 같은 (연월·병동)을 두 번 읽지 않는다.
+
+    한 호출에서 같은 스냅샷을 코드 메타·동료 목록·다음 OFF 가 각각 필요로 한다.
+    """
+    key = ("snap", year, month, group_id)
+    if key not in cache:
+        cache[key] = _load_group_snapshot(db, current_user, year, month, group_id)
+    return cache[key]
+
+
+def _month_view(
+    db: Session, current_user, cache: dict, year: int, month: int
+) -> tuple[dict | None, dict[str, dict]]:
+    """`(그 달 본인 근무표, 그 달 코드 메타)`. 같은 달을 두 번 읽지 않도록 캐시한다.
+
+    다음 OFF 탐색이 달을 넘길 때 재사용된다.
+    """
+    key = ("month", year, month)
+    if key not in cache:
+        my_month = get_my_issued_roster_service(
+            year=year, month=month, current_user=current_user, db=db
+        )
+        snapshot = None
+        if my_month:
+            snapshot = _snapshot_cached(
+                db, current_user, cache, year, month, _home_gid(db, current_user, cache)
+            )
+        cache[key] = (my_month, _shift_meta_by_code(snapshot))
+    return cache[key]
+
+
+def _meta_for_cell(
+    db: Session,
+    current_user,
+    cache: dict,
+    year: int,
+    month: int,
+    cell: dict,
+    home_meta: dict[str, dict],
+) -> dict[str, dict]:
+    """그 **셀이 속한 병동** 기준 코드 메타. 홈 메타 위에 대상 병동 정의를 덮는다.
+
+    ★★ 파견/병동이동 날은 셀의 코드가 **대상 병동 것**이라 홈 병동 `shifts` 에 없다.
+      홈 메타만 보면 그 코드가 '정의를 모르는 코드' 로 떨어져 근무로도 OFF 로도
+      세지지 않는다 — 다음 OFF 가 실제보다 뒤 날짜로 나오거나 연속근무일이 어긋나고,
+      파견이 길면 `not_found` 가 된다.
+    ★ 홈 병동 날이면 추가 조회 없이 홈 메타를 그대로 쓴다. 병동별로 캐시해
+      같은 파견 병동을 여러 날 스캔해도 스냅샷은 한 번만 읽는다.
+    """
+    gid = cell.get("group_id")
+    if not gid or gid == _home_gid(db, current_user, cache):
+        return home_meta
+    key = ("meta", year, month, gid)
+    if key not in cache:
+        snapshot = _snapshot_cached(db, current_user, cache, year, month, gid)
+        # ★★ 대상 병동이 **미발행**이면 빈 메타를 돌려준다 — 홈 메타로 채우면 안 된다.
+        #   그 경우 `get_my_issued_roster_service` 는 셀의 `group_id` 만 대상 병동으로
+        #   바꾸고 **`code` 는 홈 병동 값을 그대로 남긴다**(미발행 분기가 code 를
+        #   안 건드린다). 홈 메타를 씌우면 그 잔여 코드가 진짜 근무/OFF 로 해석돼
+        #   **모르는 날을 안다고 답하게 된다** — 다음 OFF·연속근무일이 조용히 틀린다.
+        #   빈 메타로 두면 호출부가 이미 '정의 모름' 으로 처리한다
+        #   (`_code_detail` → `is_work: None`, `_next_off_from` → unknown).
+        cache[key] = (
+            {**home_meta, **_shift_meta_by_code(snapshot)} if snapshot else {}
+        )
+    return cache[key]
+
+
+def _home_gid(db: Session, current_user, cache: dict) -> str | None:
+    """본인 home 병동 id. 토큰이 아니라 DB 기준(그룹전환·소속변경 시에도 정합)."""
+    if "home_gid" not in cache:
+        cache["home_gid"] = resolve_home_group_id(db, current_user)
+    return cache["home_gid"]
+
+
+def _require_nurse_id(current_user) -> str:
+    """간호사 계정만 통과. 관리자(ADM)는 nurses 행이 없어 본인 근무표가 성립하지 않는다."""
+    nurse_id = getattr(current_user, "nurse_id", None)
+    if not nurse_id:
+        raise HTTPException(status_code=403, detail="간호사 계정만 조회할 수 있습니다.")
+    return str(nurse_id)
+
+
+def _latest_submitted_wanted(db: Session, nurse_id: str, month_str: str):
+    """그 달 원티드 제출본(최신 1건). 없으면 None.
+
+    판정 기준은 `preferences_service._latest_submitted_request` 와 동일하다
+    (`is_submitted=1` 중 `submitted_at` 최신). 사설 헬퍼를 가져다 쓰지 않고 여기서
+    다시 쓴 이유는 모듈 간 결합을 늘리지 않기 위해서다 — 기준이 바뀌면 양쪽을 함께 고친다.
+    """
+    return (
+        db.query(WantedRequest)
+        .filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month == month_str,
+            WantedRequest.is_submitted == True,  # noqa: E712
+        )
+        .order_by(WantedRequest.submitted_at.desc())
+        .first()
+    )
+
+
+def _submitted_shift_requests(
+    db: Session, nurse_id: str, request_id: int, year: int, month: int
+) -> list:
+    """제출본에 실린 그 달 선호(원티드) 항목. 날짜 오름차순."""
+    start = date(year, month, 1)
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return (
+        db.query(NurseShiftRequest)
+        .filter(
+            NurseShiftRequest.nurse_id == nurse_id,
+            NurseShiftRequest.request_id == request_id,
+            NurseShiftRequest.shift_date >= start,
+            NurseShiftRequest.shift_date < end,
+        )
+        .order_by(NurseShiftRequest.shift_date.asc())
+        .all()
+    )
+
+
+def _is_granted(row, cell: dict, req_code: str, asg_code: str) -> bool:
+    """요청 1건이 발행본에 반영됐는가. **같은 근무코드여야** 반영이다(D 요청에 D1 은 아님).
+
+    ★★ 판정 키는 코드 문자열이 아니라 **`shifts.id`** 다. `shifts` 는 PK 가 없고
+      코드 문자열이 실제로 교체된다(실측 5건: 같은 `shifts.id` 에 `N`→`N1`,
+      `O`→`OFF`, `D`→`Dㅇ`). 제출과 발행 사이에 개명되면 같은 근무인데 문자열이
+      달라 **미반영으로 잡힌다.** 요청은 `shifts_table_id`, 발행본 셀은
+      `schedule_ids`(이름과 달리 담긴 값이 `shifts.id` 다)로 같은 행을 가리킨다.
+    ★★ 단, id 비교는 **같은 병동일 때만** 유효하다. `shifts.id` 는 병동 간 유일하지
+      않다(실측: id 1874 가 동탄시티 'OFF' 와 시화 '반반반' 양쪽에 있다). 파견 나간
+      날은 셀이 다른 병동 id 를 담고 있어, 그대로 비교하면 우연히 같은 번호에
+      **거짓 반영**이 난다. 그런 날은 코드 문자열로 떨어뜨린다.
+    """
+    if not asg_code:
+        return False
+    req_tid = getattr(row, "shifts_table_id", None)
+    cell_tid = cell.get("schedule_id")
+    same_ward = bool(cell.get("group_id")) and cell.get("group_id") == getattr(row, "group_id", None)
+    if same_ward and req_tid is not None and cell_tid is not None:
+        return int(req_tid) == int(cell_tid)
+    return asg_code == req_code
+
+
+def _reflection_entries(
+    db: Session,
+    current_user,
+    cache: dict,
+    requests: list,
+    my_month: dict,
+    home_meta: dict[str, dict],
+    year: int,
+    month: int,
+) -> list[dict]:
+    """요청 행 → 반영 판정 엔트리. 판정 규칙은 `_is_granted` 참조.
+
+    ★ 이름·색은 **그 항목을 소유한 병동** 기준으로 뽑는다 — 요청은 `row.group_id`,
+      배정은 셀의 `group_id`. 홈 메타 하나로 둘 다 그리면 파견/병동이동 날에
+      ① 대상 병동 전용 코드가 색 없는 raw 코드로 뜨고 ② **양쪽에 다 있는 코드는
+      홈 병동의 이름·색으로 잘못 칠해진다**(달력에서 다른 근무처럼 보인다).
+      `granted` 판정 자체는 `_is_granted` 가 병동을 가리므로 이 문제와 무관하다.
+    """
+    out: list[dict] = []
+    for row in requests:
+        req_date = row.shift_date
+        cell = _cell_of_day(my_month, req_date.day)
+        req_code = str(row.shift or "").strip()
+        asg_code = _raw_cell_code(cell)
+        req_meta = _meta_for_cell(
+            db, current_user, cache, year, month,
+            {"group_id": getattr(row, "group_id", None)}, home_meta,
+        )
+        asg_meta = _meta_for_cell(db, current_user, cache, year, month, cell, home_meta)
+        # 파견지 미발행 날은 셀의 코드가 홈 병동 잔여값이다. 그대로 쓰면 문자열 폴백이
+        # **반영으로 오판**하고(요청도 홈 코드라 곧잘 맞는다) 배정까지 표시돼 반영률이
+        # 부풀려진다. 알 수 없는 날은 배정 없음(`assigned: null`)·미반영으로 둔다.
+        unknown = _cell_is_unknown(asg_code, asg_meta)
+        shown_code = "" if unknown else asg_code
+        out.append({
+            "date": req_date.isoformat(),
+            "requested": _code_view(req_code, req_meta),
+            "assigned": _code_view(shown_code, asg_meta) if shown_code else None,
+            "granted": _is_granted(row, cell, req_code, shown_code),
+            "unknown": unknown,
+            "comment": row.comment or None,
+        })
+    return out
+
+
+def _reflection_summary(entries: list[dict]) -> dict:
+    """반영률 집계.
+
+    ★ 요청 0건이면 `rate` 는 `null` 이다. `0.0` 을 내리면 화면이 '0% 반영' 으로
+      읽는데, 애초에 낸 게 없는 것과 전부 거절된 것은 전혀 다른 상태다.
+    ★★ 판정 불가(파견지 미발행)는 **분모에서 뺀다**. `rejected` 로 세면 간호사에게
+      "요청이 반려됐다" 고 잘못 말하는 셈이다 — 실제로는 아직 아무도 판단하지 않았다.
+      대신 `unknown` 으로 따로 세어 화면이 "n건은 판정 대기" 를 말할 수 있게 한다.
+      `total = granted + rejected + unknown` 이 항상 성립한다.
+    """
+    total = len(entries)
+    unknown = sum(1 for e in entries if e.get("unknown"))
+    granted = sum(1 for e in entries if e["granted"])
+    judged = total - unknown
+    return {
+        "total": total,
+        "granted": granted,
+        "rejected": judged - granted,
+        "unknown": unknown,
+        "rate": round(granted * 100 / judged, 1) if judged else None,
+    }
+
+
+def get_my_wanted_reflection_service(
+    current_user,
+    db: Session,
+    year: int | None = None,
+    month: int | None = None,
+) -> dict:
+    """본인이 제출한 원티드가 **발행(마감) 근무표**에 얼마나 반영됐는지.
+
+    ★ 기피(`banned_wanted_entries`)는 분모에 넣지 않는다. 그 테이블은 제출 스냅샷 축이
+      없어(간호사·병동·연월당 1행) '그때 낸 기피' 를 복원할 수 없다 — 넣으면 지난달
+      수치가 **지금** 기피 설정에 따라 흔들린다. 선호(`nurse_shift_requests`)만 센다.
+    ★ 미발행·미제출은 오류가 아니다. 404 를 쓰면 CloudFront 가 `/api/*` 404 를
+      `index.html` **200** 으로 바꿔 보내 모바일이 HTML 을 JSON 으로 파싱하다 하얗게
+      뜬다(`/issued_roster/me` 주석 참조). 200 + 상태 필드로 내린다.
+
+    Args:
+        year, month: 생략하면 **지난달**. 홈 카드는 생략, 근무표 화면은 보고 있는 달을 지정.
+    """
+    if year is None or month is None:
+        prev = date.today().replace(day=1) - timedelta(days=1)
+        year, month = prev.year, prev.month
+
+    nurse_id = _require_nurse_id(current_user)
+    result = {
+        "year": year, "month": month,
+        "issued": False, "submitted": False, "submitted_at": None,
+        "summary": None, "entries": [],
+    }
+
+    # ★ 발행 여부를 **제출 여부보다 먼저** 확정한다. 순서를 뒤집으면 미제출자에게
+    #   `issued: false` 가 나가는데, 근무표는 나왔고 원티드만 안 낸 상태와 근무표가
+    #   아직 안 나온 상태가 같은 값이 된다. 프론트가 "근무표 준비 중" 을 잘못 띄운다
+    #   (실측: 김지영 2026-08 은 발행본이 있는데 미제출이라 false 로 나갔다).
+    #   두 플래그는 서로 독립이므로 각각 정확해야 한다.
+    cache: dict = {}
+    my_month, meta = _month_view(db, current_user, cache, year, month)
+    result["issued"] = my_month is not None
+
+    submitted = _latest_submitted_wanted(db, nurse_id, f"{year}-{month:02d}")
+    if not submitted:
+        return result
+    result["submitted"] = True
+    result["submitted_at"] = submitted.submitted_at
+    if not my_month:
+        return result
+
+    entries = _reflection_entries(
+        db, current_user, cache,
+        _submitted_shift_requests(db, nurse_id, submitted.request_id, year, month),
+        my_month, meta, year, month,
+    )
+    result["entries"] = entries
+    result["summary"] = _reflection_summary(entries)
+    return result
+
+
+def _nurse_profiles(db: Session, snapshot: dict | None) -> dict[str, dict]:
+    """`{nurse_id: 최소 프로필}` — 스냅샷을 바탕으로 **사람 속성은 라이브 값으로 덮는다.**
+
+    ★ 근무 배정은 그 시점 사실이라 스냅샷이 정본이지만, 이름·경력 같은 **사람 속성은
+      현재 값이 맞다**. 화면에서 "이 사람 몇 년차야" 는 지금 기준으로 묻는 질문이다.
+    ★★ 스냅샷 값만 쓰면 실제로 빈다 — 실측(snapshot 300, 2026-08-03 발행): 송혜영은
+      `nurses.experience=30` 인데 `nurses_json.experience` 는 **null** 이다. 발행 당시
+      비어 있었고 나중에 채워졌기 때문이다. 스냅샷만 보면 경력이 영영 안 나온다.
+    ★ 라이브 조회는 한 번의 `IN` 이다. 간호사마다 조회하면 병동 인원만큼 쿼리가 는다.
+    ★ 연락처·생년월일·이메일은 싣지 않는다. 같은 병동이라도 근무 확인 화면이
+      개인정보 조회 창구가 되면 안 된다.
+    ★ `experience` 가 끝내 없으면 `None` 그대로 둔다. 0 으로 눕히면 화면이
+      '0년차' 로 읽는데 실제로는 미입력이다.
+    """
+    out: dict[str, dict] = {}
+    for row in (snapshot or {}).get("nurses") or []:
+        nurse_id = str(row.get("nurse_id") or "")
+        if not nurse_id:
+            continue
+        out[nurse_id] = {
+            "name": row.get("name") or "",
+            "experience": row.get("experience"),
+            "role": row.get("role"),
+            "is_head_nurse": bool(row.get("is_head_nurse")),
+            "sequence": int(row.get("sequence") or 0),
+        }
+    if not out:
+        return out
+
+    live = db.query(
+        Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.role,
+        Nurse.is_head_nurse, Nurse.sequence,
+    ).filter(Nurse.nurse_id.in_(list(out.keys()))).all()
+    for row in live:
+        profile = out.get(str(row.nurse_id))
+        if profile is None:
+            continue
+        # 라이브에 값이 있을 때만 덮는다 — 퇴사 등으로 비워진 값이 스냅샷을 지우지 않게.
+        if row.name:
+            profile["name"] = row.name
+        if row.experience is not None:
+            profile["experience"] = row.experience
+        if row.role:
+            profile["role"] = row.role
+        profile["is_head_nurse"] = bool(row.is_head_nurse)
+        profile["sequence"] = int(row.sequence or 0)
+    return out
+
+
+def _coworkers_of_day(
+    db: Session,
+    snapshot: dict | None,
+    meta: dict[str, dict],
+    my_nurse_id: str,
+    day: int,
+    my_code: str,
+) -> list[dict]:
+    """같은 날 **같은 상태**인 동료. 본인 제외.
+
+    · 본인이 근무면 → 같은 시간대(`default_shift`) 근무자
+    · 본인이 비근무면 → 그 날 **근무하지 않는 사람 전부**(OFF·주휴·휴가·공가)
+
+    ★ 근무 쪽은 정확일치가 아니라 시간대로 묶는다. 병동마다 `D`/`D1`/`반반` 같은
+      파생코드가 있어 코드로 묶으면 실제로 붙어 일하는 사람이 목록에서 빠진다.
+    ★ 비근무 쪽은 코드를 나누지 않는다 — 화면 개념이 '오늘 나처럼 쉬는 사람'이다.
+      OFF 와 주휴를 가르고 싶으면 프론트가 각 항목의 `shift_code` 로 하면 된다.
+    ★★ 메타가 **비어 있으면 어느 쪽에도 넣지 않는다.** `is_work` 는 3상태라
+      (True/False/None) `None` 은 'OFF' 가 아니라 '그 코드의 정의를 모른다' 이다
+      (`_code_detail` 의 같은 주석 참조). 눕혀서 세면 정의 없는 코드가 전부
+      '쉬는 동료' 로 나간다. 본인 셀이 unknown(파견지 미발행 → 메타 없음)일 때도
+      같은 이유로 빈 목록이다 — 본인 근무를 모르는데 동료를 단정할 수 없다.
+    """
+    my_meta = meta.get(my_code) or {}
+    if not my_code or not my_meta:
+        return []
+    my_is_work = bool(my_meta.get("is_work"))
+    my_slot = (my_meta.get("default_shift") or my_code) if my_is_work else None
+
+    profiles = _nurse_profiles(db, snapshot)
+    out: list[dict] = []
+    for row in ((snapshot or {}).get("roster") or {}).get("nurses") or []:
+        nurse_id = str(row.get("nurse_id") or "")
+        if not nurse_id or nurse_id == my_nurse_id:
+            continue
+        cells = row.get("schedule") or []
+        code = _raw_cell_code(cells[day - 1] if 0 < day <= len(cells) else None)
+        cell_meta = meta.get(code) or {}
+        if not code or not cell_meta:
+            continue
+        cw_is_work = bool(cell_meta.get("is_work"))
+        if my_is_work:
+            if not cw_is_work:
+                continue
+            if (cell_meta.get("default_shift") or code) != my_slot:
+                continue
+        elif cw_is_work:
+            continue
+        profile = profiles.get(nurse_id, {})
+        out.append({
+            "nurse_id": nurse_id,
+            "name": profile.get("name") or row.get("name") or "",
+            "experience": profile.get("experience"),
+            "role": profile.get("role"),
+            "is_head_nurse": bool(profile.get("is_head_nurse")),
+            "shift_code": code,
+            "shift_name": cell_meta.get("name") or code,
+            "_seq": profile.get("sequence", 0),
+        })
+    out.sort(key=lambda r: (r["_seq"], r["name"]))
+    for row in out:
+        row.pop("_seq", None)
+    return out
+
+
+def _next_off_result(status: str, day, days_until, work_days: int, code) -> dict:
+    """다음 OFF 응답 한 형태로 고정 — 상태만 달라지고 키는 항상 같다."""
+    return {
+        "status": status,
+        "date": day.isoformat() if day else None,
+        "days_until": days_until,
+        "consecutive_work_days": work_days,
+        "code": code,
+    }
+
+
+def _next_off_from(db: Session, current_user, cache: dict, target: date) -> dict:
+    """기준일부터 앞으로 스캔해 첫 OFF 를 찾는다.
+
+    ★ 달을 넘기면 **다음 달 발행본**을 한 번 더 읽는다(`get_my_issued_week_service`
+      가 주 경계에서 쓰는 것과 같은 패턴). 다음 달이 아직 미발행이면 알 수 없으므로
+      `unknown_not_issued` 로 내린다 — `null`/`0` 으로 눕히면 'OFF 가 없다' 와
+      구분이 사라진다.
+    ★ 코드가 비었거나(미배정) 스냅샷에 정의가 없는 코드는 근무로도 OFF 로도 세지
+      않고 지나간다. 모르는 것을 근무로 세면 연속근무일이 부풀려진다.
+    ★ 코드 정의는 **그 날 셀이 속한 병동** 기준이다(`_meta_for_cell`). 파견 날은
+      홈 병동 `shifts` 에 없는 코드가 오므로 홈 메타만 보면 통째로 건너뛴다.
+    ★ 상한을 `date.max` 로도 자른다. 안 자르면 `date=9999-12-31` 같은 유효 입력에서
+      `timedelta` 덧셈이 OverflowError 를 내고, 라우터의 포괄 except 가 그것을
+      **500** 으로 바꾼다 — 클라이언트 입력이 서버 장애로 보고되는 셈이다.
+    """
+    work_days = 0
+    max_offset = min(_NEXT_OFF_HORIZON_DAYS, (date.max - target).days)
+    for offset in range(max_offset + 1):
+        day = target + timedelta(days=offset)
+        my_month, home_meta = _month_view(db, current_user, cache, day.year, day.month)
+        if my_month is None:
+            return _next_off_result("unknown_not_issued", None, None, work_days, None)
+        cell = _cell_of_day(my_month, day.day)
+        code = _raw_cell_code(cell)
+        meta = _meta_for_cell(db, current_user, cache, day.year, day.month, cell, home_meta)
+        # 파견지 미발행 날 — 배정이 있는데도 근무인지 OFF 인지 알 수 없다. 건너뛰고
+        # 계속 세면 그 뒤 연속근무일이 통째로 틀리므로 여기서 '모름' 으로 끊는다.
+        if _cell_is_unknown(code, meta):
+            return _next_off_result("unknown_not_issued", None, None, work_days, None)
+        cell_meta = meta.get(code)
+        if not code or not cell_meta:
+            continue
+        if not cell_meta.get("is_work"):
+            status = "today_is_off" if offset == 0 else "found"
+            return _next_off_result(status, day, offset, work_days, code)
+        work_days += 1
+    return _next_off_result("not_found", None, None, work_days, None)
+
+
+def get_my_today_service(
+    current_user,
+    db: Session,
+    base_date: date | None = None,
+    include_coworkers: bool = True,
+    include_next_off: bool = True,
+) -> dict:
+    """오늘(또는 지정일) 본인 근무 + 같은 상태 동료 + 다음 OFF 까지 남은 일수.
+
+    `coworkers` 는 본인이 근무면 같은 시간대 근무자, 비근무면 그 날 쉬는 사람 전부다
+    (`_coworkers_of_day` 참조).
+
+    ★ 그 날 소속 병동은 토큰이 아니라 **본인 근무표 셀의 `group_id`** 로 정한다.
+      파견/병동이동 중이면 그 날은 다른 병동이고 동료도 그쪽에서 찾아야 한다.
+      셀은 `get_my_issued_roster_service` 가 overlay 를 이미 적용해 돌려준 값이다.
+    ★ 미발행은 오류가 아니다 — `issued: false` + `my_shift: null` 로 내린다.
+    """
+    target = base_date or date.today()
+    nurse_id = _require_nurse_id(current_user)
+
+    cache: dict = {}
+    my_month, home_meta = _month_view(db, current_user, cache, target.year, target.month)
+    cell = _cell_of_day(my_month, target.day)
+    code = _raw_cell_code(cell)
+    day_gid = cell.get("group_id") or _home_gid(db, current_user, cache)
+
+    # 코드 메타는 그 날 병동 기준(`_meta_for_cell`) — 다음 OFF 스캔과 같은 규칙을 쓴다.
+    meta = _meta_for_cell(db, current_user, cache, target.year, target.month, cell, home_meta)
+    day_snapshot = _snapshot_cached(db, current_user, cache, target.year, target.month, day_gid)
+
+    # 파견지 미발행 날은 셀에 홈 병동 잔여 코드가 남아 있다. 그걸 `my_shift` 로 내보내면
+    # 실제로는 모르는 날에 화면이 D/E/N/O 를 단정해 보여준다. 알 수 없으면 비운다.
+    unknown = _cell_is_unknown(code, meta)
+    result = {
+        "date": target.isoformat(),
+        "issued": my_month is not None,
+        "group_id": day_gid,
+        "group_name": cell.get("group_name") or "",
+        # 파견/병동이동이면 사유. `my_shift` 가 비어도 화면이 이유를 말할 수 있다.
+        "reason": cell.get("reason"),
+        "shift_unknown": unknown,
+        "my_shift": None if unknown else (_code_detail(code, meta) if code else None),
+    }
+    if include_coworkers:
+        result["coworkers"] = _coworkers_of_day(
+            db, day_snapshot, meta, nurse_id, target.day, code
+        )
+    if include_next_off:
+        result["next_off"] = _next_off_from(db, current_user, cache, target)
+    return result
 
 
 def create_issued_roster_snapshot(

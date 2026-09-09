@@ -1,7 +1,9 @@
 # roster 사용자 액션 로깅 카탈로그 (GTM식)
 
-> 자동 생성 문서. 소스 = 사전 수집 인벤토리(BE 변경 엔드포인트 111개 + FE CTA 151개).
-> 갱신 = `scratchpad/build_catalog.py` 재실행. 수기 편집 시 다음 생성에서 덮어써짐.
+> 최초 생성 = 사전 수집 인벤토리(BE 변경 엔드포인트 111개 + FE CTA 151개) 기반 자동 생성.
+> ★ 생성기 `scratchpad/build_catalog.py` 는 **리포에 없다**(scratchpad 는 커밋 대상이 아니었다).
+> 따라서 지금은 **수기 갱신 문서**이며, 덮어쓰기 걱정 없이 편집한다.
+> AWS 실측값은 조회 일자를 함께 적을 것 — 인프라가 문서보다 앞서가 있던 전례가 있다(3절).
 
 ## 1. 개요
 
@@ -48,24 +50,55 @@
 
 목표 파티션 레이아웃은 **3키**(`dt` → `office_id` → `group_id`)로, 날짜 스캔과 테넌트 스코프를 동시에 좁힌다.
 
-### 현재 상태(AWS 실조회)
+### 현재 상태(2026-08-20 AWS 실조회)
 
 - **Firehose 스트림 4개**: `roster-call-history`, `roster-call-history-dev`, `roster-ui-events`, `roster-ui-events-dev`.
-  - 공용 버킷 `roster-call-history-702166530338`, 역할 `arn:aws:iam::702166530338:role/firehose-roster-call-history-role`, 버퍼 5MB/60s.
-  - **동적 파티셔닝(DynamicPartitioning) = 꺼짐(null)**. 현재 prefix 는 `call_history/dt=!{timestamp:yyyy-MM-dd}/` 처럼 **`dt` 단일**.
-- **Glue 테이블 4개**(`roster_analytics` DB): `call_history`, `call_history_dev`, `ui_events`, `ui_events_dev`.
-  - `call_history` 컬럼(15): `ts, method, path, query, status, dur_ms, account_id, nurse_id, name, office_id, group_id, role, ip, ua, req_id`.
-  - 파티션키 = `dt`(string) 만. Serde=JsonSerDe. projection `dt`=date, range `2026-07-01,NOW`, interval 1 DAY.
+  - 공용 버킷 `roster-call-history-702166530338`, 역할 `arn:aws:iam::702166530338:role/firehose-roster-call-history-role`, 버퍼 **64MB/60s**.
+  - **동적 파티셔닝 = 켜짐(4개 전부)**. prefix 는 3키:
+    `call_history/dt=!{timestamp:yyyy-MM-dd}/office_id=!{partitionKeyFromQuery:office_id}/group_id=!{partitionKeyFromQuery:group_id}/`
+  - 테넌트 값은 정상 적재된다(`office_id=102243`·`102560`·`101358` 등). `none` 은 로그인 등 **인증 전** 요청.
+- **Glue 테이블 8개**(`roster_analytics` DB): base 4 (`call_history`, `call_history_dev`, `ui_events`, `ui_events_dev`)
+  + 뷰 4 (`v_` 접두).
+  - `call_history` 컬럼(**21**): `ts, method, path, query, status, dur_ms, account_id, nurse_id, name, role, ip, ua, req_id,
+    page, section, action, summary, office_id, group_id, target, changes`.
+  - 파티션키 = `dt`(string) 만. Serde=OpenX JsonSerDe. projection `dt`=date, range `2026-07-01,NOW`, interval 1 DAY.
+  - `ui_events` 컬럼(12): `event, page, section, session_id, account_id, nurse_id, props, ip, ua, ts, office_id, group_id`.
+  - **뷰는 `SELECT *` 가 아니라 명시적 컬럼 목록**이다 → base 에 컬럼을 더해도 **뷰를 재정의해야** 노출된다.
 
-### 3키로 승격하기 위한 핵심 제약 & 결정
+### `target` / `changes` 추가 (2026-08-20 적용 완료)
 
-- ★ **Firehose 동적 파티셔닝은 스트림 생성 시에만 활성화 가능** → 4개 스트림 **재생성 필요**(수정 불가).
-  - 로거는 **fire-and-forget**(실패해도 로그만·요청 무영향) → 동일 이름 delete+recreate 시 짧은 로그 유실만 발생(무해). 무손실이 필요하면 **신규 이름 + env 플립**.
-- 동적 파티셔닝은 `ProcessingConfiguration` 의 **MetadataExtraction(JQ)** 로 `office_id`/`group_id` 를 추출, null→`"none"`:
-  - JQ: `{office_id:(.office_id // "none"),group_id:(.group_id // "none")}`
-  - prefix: `call_history/dt=!{timestamp:yyyy-MM-dd}/office_id=!{partitionKeyFromQuery:office_id}/group_id=!{partitionKeyFromQuery:group_id}/`
-- **Athena**: `office_id`/`group_id` 를 **파티션키로 승격**(데이터 컬럼에서 제거 — JSON 엔 남지만 serde 가 무시). projection `office_id`/`group_id`=**injected**(쿼리에 `WHERE` 필수 → 테넌트 스코프가 자연히 강제됨). 신규 컬럼 `page/section/action/target/changes/summary` 추가.
-- **신규 테이블 = DROP+CREATE**(7월 신설이라 데이터 극소, 과거 `dt` 단일 데이터는 무시 가능).
+미들웨어는 처음부터 두 필드를 JSON 에 실어 보냈으나 **Glue 에 컬럼이 없어 OpenX JsonSerDe 가 조용히 버렸다**
+— `summary` 문자열만 보이고 필드 단위·대상 식별자로는 조회가 안 되던 원인. base 2 + 뷰 2 를 갱신했다.
+
+```sql
+ALTER TABLE roster_analytics.call_history_dev ADD COLUMNS (target string, changes string);
+ALTER TABLE roster_analytics.call_history     ADD COLUMNS (target string, changes string);
+CREATE OR REPLACE VIEW roster_analytics.v_call_history_dev AS SELECT ..., summary, target, changes, ... ;
+CREATE OR REPLACE VIEW roster_analytics.v_call_history     AS SELECT ..., summary, target, changes, ... ;
+```
+
+- ★ 타입은 **`string`** 이다. `changes[].value` 는 bool·int·string 이 섞이므로(`_short()` 가 스칼라를 원형 유지)
+  `array<struct<...,value:string>>` 로 잡으면 SerDe 가 타입 불일치로 떨군다. 원본 JSON 문자열로 받아
+  `json_parse` + `UNNEST` 로 푼다.
+- S3 원본에 이미 들어 있던 값이라 **과거 데이터도 함께 조회된다**(재적재 불필요).
+
+```sql
+SELECT action,
+       json_extract_scalar(c, '$.label') AS label,
+       json_extract_scalar(c, '$.value') AS value
+FROM roster_analytics.v_call_history
+CROSS JOIN UNNEST(CAST(json_parse(changes) AS array(json))) AS t(c)
+WHERE dt = '2026-08-20' AND changes IS NOT NULL AND changes <> '[]'
+```
+
+### 남은 갭 — Athena 쪽 3키 승격은 아직
+
+Firehose 는 3키로 쓰는데 **Glue 파티션키는 `dt` 단일**이다. `storage.location.template` 이 `dt=${dt}/` 라
+하위 디렉터리를 재귀 스캔해 **조회는 되지만 프루닝이 안 된다** — `WHERE office_id=...` 를 걸어도 그 날짜 전체를 읽는다.
+
+- **Athena**: `office_id`/`group_id` 를 **파티션키로 승격**(데이터 컬럼에서 제거 — JSON 엔 남지만 serde 가 무시).
+  projection `office_id`/`group_id`=**injected**(쿼리에 `WHERE` 필수 → 테넌트 스코프가 자연히 강제됨).
+- 승격은 **DROP+CREATE** 가 필요하다(파티션키는 ALTER 불가). 뷰도 함께 재정의한다.
 - **FE ui_events 는 `office_id`/`group_id` 를 반드시 전송해야 한다**(파티션키). 현재 autotrack 보강 필요.
 
 ## 4. 백엔드 — `call_history`
@@ -78,13 +111,33 @@
 
 ### 라벨 카탈로그 (app/call_action_catalog.py)
 
-- 경로 → (page/section/action) 라벨 + 요청본문 화이트리스트 카탈로그. 배포 시 약 **106개 엔드포인트** 라벨링.
+- 경로 → (page/section/action) 라벨 + 요청본문 화이트리스트 카탈로그. **116개 엔드포인트** 라벨링(2026-08-20 기준).
 - `match(method, path)` → `(entry, path_params)`; `enrich()` → `{page, section, action, target, changes, summary}`.
 - **검증 완료**: 본문 무손상(60KB 도 라우트 전량 수신) · PII 마스킹 · 미등록 경로 무보강.
 
+#### 미등록 잔여 7건 (의도적 제외)
+
+`/openapi.json` 의 변경 라우트 122개와 대조한 결과다. 나머지는 전부 라벨링돼 있다.
+
+- `POST /agent/test/chat` · `POST /agent/test/setup-db` — 테스트 화면 전용.
+- `POST /events` — UI 이벤트 **수신부 자신**(로깅 대상이 아니라 로깅 경로).
+- `POST /member/send-{sms,push,mlink,email-background}-message` — 파라미터가 함수 안에 하드코딩된 테스트 스텁.
+  ★ 네 경로 모두 `current_user` 의존성이 **없다** — 인증 없이 호출하면 실제 발송이 나간다. 정리 대상.
+
+#### PII 판단 기준
+
+`fields`(값까지 기록) vs `masked`(`'***'`) 를 가르는 실제 기준은 **자유 텍스트냐**가 아니라 **누가 읽을 것을 전제로 쓴 글이냐**다.
+
+- `masked` — 사람 간 소통 내용: `/message/write` 의 `message`(쪽지), `/api/agent/chat/send` 의 `message`(에이전트 요청문).
+  에이전트 요청문은 대상 지목이 목적이라 **실명이 필연적으로 들어간다**("김민지 원티드 취소하고 이영희로 대체해줘").
+- `fields` — 업무 메모·사유: `nurse_memo`, `reason`, `note`, `issue_comment`, `monthly_memo`, `title` 등.
+- 건강 관련 플래그는 `masked`: `/nurse-period/leave-flags` 의 `pregnant`(바꿨다는 사실만 남고 값은 가려진다).
+
 ### 엔드포인트 카탈로그 표
 
-> 아래는 인벤토리된 변경 엔드포인트 **111개**(3개 BE 인벤토리 병합, page별 그룹핑). 배포된 `call_action_catalog.py` 는 이 중 약 106개를 라벨링하며, 테스트 스텁/일부 DEPRECATED·크론 경로는 일반 기록만 되고 enrich 되지 않는다.
+> 아래는 최초 인벤토리 시점의 변경 엔드포인트 **111개**(3개 BE 인벤토리 병합, page별 그룹핑)이라 **표 자체는 낡았다**.
+> 현재 `call_action_catalog.py` 는 **116개**를 라벨링하며, 남은 7건은 위 「미등록 잔여」 항목대로 의도적으로 제외돼
+> 일반 기록(method+path)만 남는다. 정본은 코드이고 이 표는 참고용이다.
 > action 뒤 태그: `[DEPRECATED]` 대체됨 · `[테스트]` 테스트 스텁 · `[크론/내부]` FE 미호출/시스템 · `[읽기성]` DB 미변경(부작용 없음).
 
 #### 홈 (1)

@@ -9,7 +9,7 @@ from starlette.responses import FileResponse
 
 from datalayer.setting import Setting
 from db.client2 import msdb_manager
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from services.group_access import assert_master_admin
 from schemas.auth_schema import User as UserSchema
 from utils import utils
@@ -24,7 +24,7 @@ DOWNLOAD_FOLDER = "downloads"
 
 # 메세지 리스트 조회 : mariadb_manager
 @router.get("/position_upload", summary="직위 엑셀 업로드 화면을 출력합니다.")
-def excelupload_form(request: Request, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def excelupload_form(request: Request, current_user: UserSchema = Depends(require_current_user)):
     # ADM 전용 — office 전체 인사 마스터를 갈아끼우고 그룹웨어로 역전파한다.
     assert_master_admin(current_user)
     try:
@@ -51,6 +51,8 @@ def excelupload_form(request: Request, current_user: UserSchema = Depends(get_cu
 
         filename = 'easysetting_position.xls'
         rows = msdb_manager.fetch_all(Setting.list_position(), params=(OfficeCode, EmpSeqNo))
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"직위 엑셀 업로드 화면을 출력할 수 없습니다.")
@@ -58,7 +60,7 @@ def excelupload_form(request: Request, current_user: UserSchema = Depends(get_cu
 
 
 @router.post("/position_upload", summary="직위 엑셀을 DB에 저장합니다.")
-async def create_upload_file(current_user: UserSchema = Depends(get_current_user_from_cookie), file: UploadFile = File(...)):
+async def create_upload_file(current_user: UserSchema = Depends(require_current_user), file: UploadFile = File(...)):
     """
     **회원 엑셀파일을 업로드 하여 DB에 저장합니다.**
     - 양식 엑셀파일 : easysetting_member.xls
@@ -140,6 +142,8 @@ async def create_upload_file(current_user: UserSchema = Depends(get_current_user
                     json_string = '{"result": insert fail}'
             else:
                 json_string = '{"result": delete fail}'
+    except HTTPException:
+        raise
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"직위 엑셀 업로드 실패")

@@ -48,3 +48,7 @@ tools/e2e_*.py
 tools/run_june_*.py
 tools/verify_*.py
 tools/harness/run_*.py
+
+# 근무표 원본에서 뽑은 분석 시드 — 간호사 실명(name)과 사번(nurse_id)이 그대로 들어 있다.
+# (leave_idx 448명 · night_cycle_seed 227명 · _jul 207명) 스크립트는 커밋하되 데이터는 로컬 보관.
+tools/leave_analysis/*.json

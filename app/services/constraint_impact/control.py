@@ -358,8 +358,22 @@ def _apply_weekend_off_only(cfg: dict[str, Any], adj: ConstraintAdjustment) -> N
 
 
 def _apply_ban_night_before_fixed_off(cfg: dict[str, Any], adj: ConstraintAdjustment) -> None:
+    """이 family 는 **설정 두 개**가 같은 이름으로 emit 된다 — 어느 축을 끌지 골라야 한다.
+
+    · axis="type"         → ban_night_before_fixed_off        (휴가·공가 직전 N)
+    · axis="fixed_wanted" → ban_night_before_fixed_wanted_off (확정 원티드 O 직전 N)
+    ★ axis 가 없으면 어느 쪽이 원인인지 모른다. 완화의 목적이 infeasible 해소이므로
+      **둘 다 끈다** — 한쪽만 끄면 재시도가 같은 이유로 또 실패한다.
+    """
     if adj.action == "disable_module":
-        cfg["ban_night_before_fixed_off"] = False
+        axis = (adj.scope_filter or {}).get("axis")
+        if axis == "fixed_wanted":
+            cfg["ban_night_before_fixed_wanted_off"] = False
+        elif axis == "type":
+            cfg["ban_night_before_fixed_off"] = False
+        else:
+            cfg["ban_night_before_fixed_off"] = False
+            cfg["ban_night_before_fixed_wanted_off"] = False
         return
     raise ValueError(f"unsupported BanNightBeforeFixedOff action: {adj.action}")
 
