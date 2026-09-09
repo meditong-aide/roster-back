@@ -246,78 +246,123 @@ def infer(feats):
 # ── 평가 ─────────────────────────────────────────────────
 
 
+def evaluate(db, picked, *, consensus: bool):
+    """한 설정으로 전 병동을 채점. (지표 dict, 흔들림 목록, 상시오답 목록) 반환.
+
+    consensus=True — ★ Fix B: 같은 병동·같은 코드에서 **여러 표의 답이 일치할 때만**
+      확정한다. 하나라도 다르면 전부 보류로 내린다. 표마다 답이 달라지는 판정은
+      근거가 약한 것이고, 그런 건 사람에게 넘기는 게 맞다.
+    """
+    tot = correct = wrong = abst = 0
+    per_label = defaultdict(lambda: [0, 0])
+    unstable, always_wrong = [], []
+
+    for gid, truth, scs in picked:
+        votes = defaultdict(list)
+        for sc in scs:
+            grid = build_grid(db, sc.schedule_id)
+            if len(grid) < 5:
+                continue
+            pred = infer(code_features(grid))
+            for code in truth:
+                if code in pred:
+                    votes[code].append(pred[code][0])
+
+        for code, vs in votes.items():
+            gt = truth[code]
+            decided = {v for v in vs if v is not None}
+            if len(decided) > 1:
+                unstable.append((gid, code, gt, sorted(decided), len(vs)))
+            elif decided and decided != {gt}:
+                always_wrong.append((gid, code, gt, next(iter(decided)), len(vs)))
+
+            # Fix B: 표들의 답이 갈리면 전부 보류로 내린다.
+            eff = [None] * len(vs) if (consensus and len(decided) > 1) else vs
+            for v in eff:
+                tot += 1
+                if v is None:
+                    abst += 1
+                elif v == gt:
+                    correct += 1; per_label[gt][0] += 1
+                else:
+                    wrong += 1; per_label[gt][1] += 1
+
+    dec = correct + wrong
+    return ({
+        "tot": tot, "correct": correct, "wrong": wrong, "abst": abst,
+        "acc": (correct / dec) if dec else 0.0, "dec": dec,
+        "labels": dict(per_label),
+    }, unstable, always_wrong)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wards", type=int, default=12)
-    ap.add_argument("--min-truth", type=int, default=3, help="정답 보유 코드 최소 개수")
+    ap.add_argument("--wards", type=int, default=20)
+    ap.add_argument("--per-ward", type=int, default=5)
+    ap.add_argument("--min-truth", type=int, default=3)
     args = ap.parse_args()
 
     db = SessionLocal()
-    scheds = (
-        db.query(Schedule)
-        .filter(Schedule.dropped == False)  # noqa: E712
-        .order_by(Schedule.year.desc(), Schedule.month.desc())
-        .limit(400)
-        .all()
-    )
+    gids = [g for (g,) in db.query(Schedule.group_id)
+            .filter(Schedule.dropped == False)  # noqa: E712
+            .distinct().all() if g]
 
-    seen_groups, picked = set(), []
-    for sc in scheds:
-        if sc.group_id in seen_groups:
-            continue
+    picked = []
+    for gid in gids:
         truth = {
             s.shift_id: (s.default_shift or "").strip().upper()
-            for s in db.query(Shift).filter(Shift.group_id == sc.group_id).all()
+            for s in db.query(Shift).filter(Shift.group_id == gid).all()
             if (s.default_shift or "").strip()
         }
         if len(truth) < args.min_truth:
             continue
-        seen_groups.add(sc.group_id)
-        picked.append((sc, truth))
+        scs = (db.query(Schedule)
+               .filter(Schedule.group_id == gid, Schedule.dropped == False)  # noqa: E712
+               .order_by(Schedule.year.desc(), Schedule.month.desc(),
+                         Schedule.version.desc())
+               .limit(args.per_ward).all())
+        if scs:
+            picked.append((gid, truth, scs))
         if len(picked) >= args.wards:
             break
 
-    print(f"평가 대상: {len(picked)} 병동(각 최신 근무표 1개)\n")
-    tot = correct = wrong = abst = 0
-    wrong_cases, per_label = [], defaultdict(lambda: [0, 0])
+    n_sched = sum(len(x[2]) for x in picked)
+    print(f"평가: {len(picked)} 병동 × 최대 {args.per_ward}표 = 근무표 {n_sched}개\n")
 
-    for sc, truth in picked:
-        grid = build_grid(db, sc.schedule_id)
-        if len(grid) < 5:
-            continue
-        pred = infer(code_features(grid))
-        n_ok = n_ng = n_ab = 0
-        for code, gt in truth.items():
-            if code not in pred:
-                continue          # 그 달 표에 안 쓰인 코드 — 추론 대상 아님
-            tot += 1
-            p, conf, why = pred[code]
-            if p is None:
-                abst += 1; n_ab += 1
-            elif p == gt:
-                correct += 1; n_ok += 1; per_label[gt][0] += 1
-            else:
-                wrong += 1; n_ng += 1; per_label[gt][1] += 1
-                wrong_cases.append((sc.group_id, code, gt, p, conf, why))
-        print(f"  {sc.group_id} {sc.year}-{sc.month:02d} "
-              f"간호사 {len(grid):2}명 | 정답보유 {len(truth):3} | "
-              f"맞음 {n_ok:2} 틀림 {n_ng:2} 보류 {n_ab:2}")
+    # ★ ablation 기록(2026-09-09, 20병동×5표=309건):
+    #     baseline            맞음 114 / 틀림  5 / 보류 190 / 판정정확도 95.8%
+    #     +휴무집합 앵커       맞음 129 / 틀림 52 / 보류 128 / 판정정확도 71.3%  ← 폐기
+    #     +여러표 합의         맞음 114 / 틀림  2 / 보류 193 / 판정정확도 98.3%  ← 채택
+    #   휴무집합 안(양방향 인접으로 묶기)은 **근무↔휴무도 양방향 인접**이라 D·E 가
+    #   휴무로 빨려 들어갔다(D 20/3 → 8/24). 관측은 맞았고 묶는 기준이 틀렸다.
+    arms = [
+        ("합의 없음 (baseline)", dict(consensus=False)),
+        ("여러표 합의 (채택)",   dict(consensus=True)),
+    ]
+    print(f"{'설정':22} {'맞음':>6} {'틀림':>6} {'보류':>6} {'판정정확도':>10} {'흔들림':>6} {'상시오답':>7}")
+    print("─" * 70)
+    results = {}
+    for name, kw in arms:
+        m, unstable, aw = evaluate(db, picked, **kw)
+        results[name] = (m, unstable, aw)
+        print(f"{name:22} {m['correct']:5}  {m['wrong']:5}  {m['abst']:5}  "
+              f"{m['acc']:9.1%}  {len(unstable):5}  {len(aw):6}")
 
-    print(f"\n{'='*62}\n판정 대상 {tot}건")
-    if tot:
-        dec = correct + wrong
-        print(f"  맞음   {correct:4} ({correct/tot:.1%})")
-        print(f"  틀림   {wrong:4} ({wrong/tot:.1%})   ← 조용히 틀리는 것")
-        print(f"  보류   {abst:4} ({abst/tot:.1%})   ← 사람에게 넘김")
-        if dec:
-            print(f"  판정한 것 중 정확도: {correct/dec:.1%}  (n={dec})")
-    print("\n라벨별 (맞음/틀림):")
-    for lab, (ok, ng) in sorted(per_label.items()):
-        print(f"  {lab:3} {ok:4} / {ng:4}")
-    if wrong_cases:
-        print("\n오답 샘플(최대 10):")
-        for g, c, gt, p, conf, why in wrong_cases[:10]:
-            print(f"  {g} {c:12} 정답={gt} 추론={p} conf={conf} — {why}")
+    print(f"\n(판정 대상 {results['합의 없음 (baseline)'][0]['tot']}건 기준)")
+    print("\n라벨별 (맞음/틀림) — 합의 전 → 합의 후")
+    b = results["합의 없음 (baseline)"][0]["labels"]
+    f = results["여러표 합의 (채택)"][0]["labels"]
+    for lab in sorted(set(b) | set(f)):
+        bo, bn = b.get(lab, [0, 0]); fo, fn = f.get(lab, [0, 0])
+        print(f"  {lab:3} {bo:4}/{bn:<3} → {fo:4}/{fn:<3}")
+
+    for name in ("합의 없음 (baseline)", "여러표 합의 (채택)"):
+        _m, unstable, aw = results[name]
+        print(f"\n[{name}] 흔들림 {len(unstable)} · 상시오답 {len(aw)}")
+        for gid, c, gt, ds, n in unstable[:5]:
+            print(f"   흔들림 {gid} {c:10} 정답={gt} → {ds}")
+        for gid, c, gt, d, n in aw[:5]:
+            print(f"   상시오답 {gid} {c:10} 정답={gt} 추론={d}")
     db.close()
 
 
