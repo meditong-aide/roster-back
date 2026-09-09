@@ -2955,7 +2955,16 @@ def optimize_fallback_lex_hard_first(
             if isinstance(_gc_fb, dict):
                 _allow_soft_fb = bool(_gc_fb.get("allow_soft_fallback", False))
             if isinstance(_gc_fb, dict) and not _allow_soft_fb:
-                add_grade_constraints_fn(
+                # ★★ 반환값(목적항)을 **버리지 않고 모델에 보관**한다.
+                #   stage3 objective 경로가 목적항이 필요해 같은 함수를 다시 부르는데,
+                #   그러면 제약과 side-channel(`_grade_cell_spec`)이 **두 벌** 쌓인다.
+                #   그 spec 은 호출마다 append 만 하고 초기화하지 않기 때문이다.
+                #   실측: stage2 cells=93 · stage3 cells=186(정확히 2배)이고,
+                #   동결식 `sum(stage3 shorts) <= lex_grade_short` 의 우변은 93개 기준이라
+                #   같은 셀을 두 번 세면서 실질 상한이 절반이 된다 → stage3 INFEASIBLE.
+                #   `short <= 0` 인 병동만 멀쩡했다(0 은 두 벌로 세도 0).
+                #   보관해 두면 objective 가 재호출 없이 이 항을 그대로 쓴다.
+                _gt_fb = add_grade_constraints_fn(
                     m=m,
                     rs=roster_system,
                     X=X,
@@ -2964,6 +2973,15 @@ def optimize_fallback_lex_hard_first(
                     grade_strategy=_gs_fb,
                     grade_config=_gc_fb,
                 )
+                try:
+                    m._grade_obj_terms = list(_gt_fb or [])  # type: ignore[attr-defined]
+                    # ★ 목적항이 **비어 있어도** 제약은 이미 걸렸다. 최대 제약만 있는
+                    #   설정이면 반환값이 빈 리스트라, 목적항 유무로 판단하면
+                    #   소비처가 "안 걸렸다" 로 읽고 다시 불러 중복이 되살아난다.
+                    #   그래서 '걸었다' 를 **별도 마커**로 남긴다.
+                    m._grade_constraints_added = True  # type: ignore[attr-defined]
+                except Exception:
+                    pass
         except Exception as _grade_hard_exc:
             print(f"{logger_prefix} [GradeHard] fallback stage 공통 제약 추가 실패: {_grade_hard_exc}")
 
@@ -3034,6 +3052,24 @@ def optimize_fallback_lex_hard_first(
                 m.Add(sum(short_terms) == coverage_eq)
             if over_le is not None:
                 m.Add(sum(over_terms) <= over_le)
+            # ── stage3 INFEASIBLE 원인 추적 (2026-09-08) — 게이트는 걷어냈고 결론만 남긴다
+            #   증상: stage3 가 11곳 중 6곳에서 INFEASIBLE. 그때 stage2 해가 그대로
+            #     커밋되므로 **선호·공정성이 통째로 버려지는데 오류로는 안 보인다.**
+            #     DiagS3 가 6곳 전부에서 "m3 가 stage2 해를 거부한다(m3≠m2 확정)".
+            #   ★ 원인은 **grade 제약의 중복 등록**이었다. `add_grade_constraints` 가
+            #     `_grade_cell_spec` 에 초기화 없이 append 하는데, stage3 만 그 함수를
+            #     두 번 부른다(여기 build_model + stage3 objective 경로).
+            #     그래서 spec 이 stage2 93개 → stage3 186개(정확히 2배)가 되고,
+            #     동결식 `sum(stage3 shorts) <= lex_grade_short` 의 우변은 93개 기준이라
+            #     같은 셀을 두 번 세면서 실질 상한이 절반이 된다.
+            #     `short <= 0` 인 병동만 멀쩡했다(0 은 두 벌로 세도 0). 인과가 닫힌다.
+            #   기각된 가설(다시 의심하지 말 것):
+            #     · `stage2_zero_locks` — 빼도 4곳 전부 INFEASIBLE 그대로였다.
+            #     · 목적항의 `NewIntVar` 상한 — 창 길이와 임계값이 맞아 최대가 1이다.
+            #     · build_model 의 grade 조건부 호출 비대칭 — 대상 전 병동이
+            #       `allow_soft_fallback=0` 이라 모든 stage 에 걸린다.
+            #   ★ MUS 로는 진단할 수 없다 — 켜면 solve 가 4~6배 느려져 INFEASIBLE 이
+            #     UNKNOWN 으로 바뀐다. 관측이 대상을 바꾼다.
             if stage2_zero_locks:
                 for k, arr in stage2_zero_locks.items():
                     for v in arr:
@@ -3999,14 +4035,22 @@ def optimize_fallback_lex_hard_first(
             #   lex 패스이고, 그 패스가 실패했으면 실패한 solve 의 값을 읽는다.
             #   `lex_safety_val` 은 성공한 패스에서만 갱신되므로(3943) 그쪽이 정확하다.
             _s4n3 = 0
+            _s4_frozen, _s4_skipped = [], []
             for k in safety3.keys():
                 _lhs3 = safety3.get(k) or []
                 _vals2 = lex_safety_val.get(k)
                 if not _lhs3 or _vals2 is None:
+                    # ★ 어느 항목이 방어에서 빠지는지 남긴다. 개수만으로는
+                    #   '항목이 없어서 빠진 것'과 '값을 못 구해 포기한 것'이 구분되지 않는다.
+                    _s4_skipped.append(
+                        f"{k}({'항목없음' if not _lhs3 else '값없음'})")
                     continue
                 m3.Add(sum(_lhs3) <= sum(int(_v) for _v in _vals2))
                 _s4n3 += 1
+                _s4_frozen.append(k)
             print(f"{logger_prefix} [S4-2] stage3 safety 동결 {_s4n3}개 (값 기준)")
+            print(f"{logger_prefix} [S4-2] 동결됨: {', '.join(_s4_frozen) or '없음'}")
+            print(f"{logger_prefix} [S4-2] 제외됨: {', '.join(_s4_skipped) or '없음'}")
         else:
             for k in safety3.keys():
                 m3.Add(sum(safety3[k]) == sum(safety2[k]))

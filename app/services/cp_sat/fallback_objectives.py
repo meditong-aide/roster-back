@@ -577,17 +577,36 @@ def build_fallback_stage3_objective_terms(
     except Exception as e2:
         print("team_min_constraints(fallback) 예외 발생", e2)
 
-    # Grade 제약을 soft penalty로 추가 (distribution 전용)
+    # Grade 목적항 (distribution 전용)
+    # ★★ build_model 이 이미 걸었으면 **재호출하지 않는다.** 다시 부르면 제약과
+    #   `_grade_cell_spec`(초기화 없이 append 한다)이 두 벌 쌓여, stage3 의 grade
+    #   동결식이 절반으로 조여진다 — 같은 셀을 두 번 세는데 상한은 한 벌 기준이다.
+    #   실측: stage2 cells=93 / stage3 cells=186 이었고, stage3 가 11곳 중 6곳에서
+    #   INFEASIBLE 이었다(`short <= 0` 인 병동만 멀쩡했다 — 0 은 두 벌로 세도 0).
+    #   보관분은 목적항이므로 그대로 쓰면 된다 — 제약은 이미 모델에 들어가 있다.
+    # ★ `allow_soft_fallback=True` 인 그룹은 build_model 이 grade 를 건너뛰므로
+    #   보관분이 없다. 그때는 여기서 처음 건다(두 경로 모두 살아 있어야 한다).
+    #   판정(2026-09-09): stage3 실패 **6곳 → 0곳**(11곳 1회, FEASIBLE 8 · OPTIMAL 2).
+    #   safety 는 건드리지 않는다 — 중환자실2 16회에서 최종값이 stage2 와 **전부 일치**했다
+    #   (S4-2 동결이 상한을 지킨다). 한때 A/B 5회에서 악화로 보였으나 그 병동의
+    #   stage2 폭이 240만~780만이라 5회가 폭을 못 담은 것이었고, 8회로는 오히려 낮았다.
+    # ★ 판단 기준은 목적항의 **유무가 아니라** '걸었다' 마커다. 최대 제약만 있는
+    #   설정이면 목적항이 빈 리스트로 돌아오는데, 그걸 "안 걸렸다" 로 읽으면
+    #   다시 불러 중복이 되살아난다 — 이 수정이 없애려는 바로 그 결함이다.
+    _grade_done = bool(getattr(m, "_grade_constraints_added", False))
     try:
-        grade_terms = add_grade_constraints_fn(
-            m=m,
-            rs=roster_system,
-            X=X,
-            join=join,
-            leave=leave,
-            grade_strategy="COMBINED",
-            grade_config=getattr(roster_system, "grade_config", None),
-        )
+        if _grade_done:
+            grade_terms = list(getattr(m, "_grade_obj_terms", []) or [])
+        else:
+            grade_terms = add_grade_constraints_fn(
+                m=m,
+                rs=roster_system,
+                X=X,
+                join=join,
+                leave=leave,
+                grade_strategy="COMBINED",
+                grade_config=getattr(roster_system, "grade_config", None),
+            )
         obj.extend(grade_terms or [])
         _gt_lex_terms.extend(grade_terms or [])
     except Exception as e:
