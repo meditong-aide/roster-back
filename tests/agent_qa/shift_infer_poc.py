@@ -47,6 +47,7 @@ def code_features(grid):
     total_cells = 0
     freq = Counter()
     next_of = defaultdict(Counter)   # c → 다음날 코드 분포
+    after_run = defaultdict(Counter)  # c → **연속이 끝난 직후** 코드 분포(회복 오프 지문)
     runs = defaultdict(list)         # c → 연속 등장 길이들
     per_day = defaultdict(Counter)   # c → {day: 인원수}
 
@@ -69,6 +70,8 @@ def code_features(grid):
             else:
                 if cur:
                     runs[cur].append(run)
+                    if c:
+                        after_run[cur][c] += 1
                 cur, run = c, 1
         if cur:
             runs[cur].append(run)
@@ -87,6 +90,8 @@ def code_features(grid):
             "self_next": nx[c] / nx_tot,              # 자기 자신이 다음날 올 확률
             "next_dist": {k: v / nx_tot for k, v in nx.items()},
             "next_raw": dict(nx),   # 원시 횟수 — 비율만 보면 소규모 병동에서 요동친다
+            "after_run": {k: v / max(sum(after_run[c].values()), 1)
+                          for k, v in after_run[c].items()},
             "avg_run": sum(rl) / len(rl),
             "max_run": max(rl),
         }
@@ -151,57 +156,87 @@ def infer(feats):
         if c != off and c not in work:
             out[c] = (ABSTAIN, 0.0, "연속되지 않는 저빈도 코드(휴가·단발 성격)")
 
-    # 2) 전이 비대칭 → 방향성
+    # 2) 전이 비대칭 → **방향 그래프**
+    #   ★ v6 — v5 는 +1/-1 을 **합산**했는데, 그게 신호를 스스로 지웠다.
+    #     E 는 (D→E)에서 -1, (E→N)에서 +1 을 받아 합이 0 → "근거 없음"으로 보류됐다.
+    #     실제로는 D 뒤·N 앞이라는 순서가 완벽히 정해지는데도. 합산은 위치 정보를 버린다.
+    #     그래서 점수 대신 **간선을 세우고 위상 정렬**한다.
     def p(a, b):
         return feats[a]["next_dist"].get(b, 0.0)
 
     def raw(a, b):
         return feats[a]["next_raw"].get(b, 0)
 
-    # ★ 원시 관측 수 게이트 — 비율만 보면 소규모 병동에서 요동친다.
-    #   실측: 간호사 5명 병동에서 E 를 N 으로 오판(유일한 오답)했다. 155셀에서
-    #   특정 쌍의 전이가 한두 번이면 비율은 의미가 없다.
+    # 원시 관측 수 게이트 — 소규모 병동에서 비율이 요동친다.
     MIN_OBS = 8
 
-    order_score = {c: 0.0 for c in work}   # 클수록 앞(이른 시각)
+    edges = set()          # (a, b) = a 가 b 보다 앞선 근무
     for a in work:
         for b in work:
             if a >= b:
                 continue
-            n_obs = raw(a, b) + raw(b, a)
-            if n_obs < MIN_OBS:
-                continue                      # 근거 부족 — 이 쌍은 판단 보류
+            if raw(a, b) + raw(b, a) < MIN_OBS:
+                continue
             fwd, bwd = p(a, b), p(b, a)
             if max(fwd, bwd) < 0.05:
-                continue                      # 둘 다 거의 없음 — 정보 없음
-            if fwd > bwd * 3:                 # a→b 만 허용 = a 가 앞
-                order_score[a] += 1; order_score[b] -= 1
+                continue
+            if fwd > bwd * 3:
+                edges.add((a, b))
             elif bwd > fwd * 3:
-                order_score[b] += 1; order_score[a] -= 1
+                edges.add((b, a))
 
-    ranked = sorted(work, key=lambda c: -order_score[c])
+    # 위상 정렬 — 매 단계에서 **후보가 정확히 1개**일 때만 진행한다.
+    #   2개 이상이면 그 자리 순서가 안 갈린 것이므로 거기서 멈춘다(억지로 세우지 않음).
+    remaining = set(work)
+    chain = []
+    while remaining:
+        heads = [c for c in remaining
+                 if not any((o, c) in edges for o in remaining if o != c)]
+        if len(heads) != 1:
+            break                      # 동시 후보 다수 = 순서 미확정 → 중단
+        h = heads[0]
+        chain.append(h)
+        remaining.discard(h)
 
-    # 3) ★ 점수가 **실제로 갈린 자리만** 라벨을 붙인다.
-    #    v2 는 상위 3개를 무조건 D/E/N 에 배정해 오답 9.8% 가 났다. 오답 전부가
-    #    '점수 +0'(= 순서 근거 없음)이었다 — 동점인데 억지로 세운 것이다.
-    #    이 문제는 정확도보다 **조용히 틀리지 않는 것**이 중요하므로, 동점이거나
-    #    점수가 0 이면 커버리지를 포기하고 보류한다.
-    labels = ["D", "E", "N"]
-    for i, c in enumerate(ranked):
-        if i >= len(labels):
-            out[c] = (ABSTAIN, 0.0,
-                      f"주요 3교대 밖(점수 {order_score[c]:+.0f}) — 고정·특수 근무 가능")
-            continue
-        sc_c = order_score[c]
-        # 앞/뒤 이웃과 점수가 같으면 순서가 안 갈린 것 → 보류.
-        prev_tie = i > 0 and order_score[ranked[i - 1]] == sc_c
-        next_tie = i + 1 < len(ranked) and order_score[ranked[i + 1]] == sc_c
-        if sc_c == 0 or prev_tie or next_tie:
-            why = "동점이라 순서 미확정" if (prev_tie or next_tie) else "전이 비대칭 없음"
-            out[c] = (ABSTAIN, 0.0, f"{why}(점수 {sc_c:+.0f}) — 시간 정보 필요")
-            continue
-        out[c] = (labels[i], 0.85,
-                  f"근무 순서 {i+1}위(전이 비대칭 점수 {sc_c:+.0f}, 이웃과 분리됨)")
+    # 3) ★ v7 — 라벨을 사슬 **앞**이 아니라 **나이트 기준**으로 붙인다.
+    #   v6 는 사슬 1·2·3위를 무조건 D·E·N 으로 찍었는데, 사슬 맨 앞에 3교대가 아닌
+    #   코드(미드·고정근무)가 끼면 **한 칸씩 밀려** 통째로 틀렸다(실측 오답 2건이 그것).
+    #   나이트는 독립적인 지문이 있다 — **연속이 끝나면 반드시 휴무**(회복 오프).
+    #   그걸로 뒤에서 앵커를 잡고 거꾸로 D·E 를 센다.
+    def recovery_off(c):
+        return feats[c]["after_run"].get(off, 0.0) if off else 0.0
+
+    night_idx = None
+    for i, c in enumerate(chain):
+        # 나이트 후보: 연속이 끝나면 휴무로 가는 비율이 압도적 + 실제로 연속으로 선다
+        if recovery_off(c) >= 0.70 and feats[c]["avg_run"] >= 1.5:
+            night_idx = i          # 사슬 뒤쪽일수록 나이트에 가까우므로 마지막 후보 채택
+    linked_any = {c: any((c, o) in edges or (o, c) in edges
+                         for o in chain if o != c) for c in chain}
+
+    if night_idx is None:
+        for c in chain:
+            out[c] = (ABSTAIN, 0.0, "나이트 기준점을 못 찾음(회복 오프 지문 없음)")
+    else:
+        # night_idx 를 N 으로 두고 앞으로 E, D 를 센다.
+        label_at = {night_idx: "N"}
+        if night_idx - 1 >= 0:
+            label_at[night_idx - 1] = "E"
+        if night_idx - 2 >= 0:
+            label_at[night_idx - 2] = "D"
+        for i, c in enumerate(chain):
+            lab = label_at.get(i)
+            if lab is None:
+                out[c] = (ABSTAIN, 0.0, "3교대 사슬 밖 — 고정·특수 근무 가능")
+            elif not linked_any[c]:
+                out[c] = (ABSTAIN, 0.0, "다른 근무와의 선후 근거 없음")
+            else:
+                out[c] = (lab, 0.85,
+                          f"나이트({chain[night_idx]}) 기준 {night_idx - i}칸 앞"
+                          if lab != "N" else
+                          f"연속 종료 후 휴무 {recovery_off(c):.0%} → 나이트")
+    for c in remaining:
+        out[c] = (ABSTAIN, 0.0, "순서 후보가 여럿이라 미확정 — 시간 정보 필요")
 
     for c in feats:
         out.setdefault(c, (ABSTAIN, 0.0, "판별 근거 없음"))
