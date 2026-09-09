@@ -289,6 +289,13 @@ _LOG_EXCLUDE_PREFIX = ("/static", "/health", "/docs", "/openapi", "/favicon", "/
 #   2026-08-27 실측: 미인증 GET 7종이 401 아닌 **500** 으로 나가는데(가드 누락) 전부 기록이
 #   없었다 — GET 미포함 + `call_next` 가 try 밖이라는 두 겹 때문이었다.
 _LOG_FAILURE_FROM = 400
+# ★ 느린 요청은 **method 무관하게** 남긴다(2026-09-09 추가).
+#   위 규칙만으로는 "성공한 GET" 이 통째로 안 남아 성능 진단에 사각지대가 생긴다.
+#   실제로 2026-09-09 11:21 prod 응답이 26초(ALB 실측)였는데 call_history 에는
+#   그 요청이 없었다 — 조회 성공분이라 기록 대상이 아니었기 때문이다.
+#   양은 거의 안 는다: 2개월치에서 3초 초과가 20건 남짓이라 Firehose·S3 비용 영향은 무시 가능.
+#   GET 의 query 는 아래에서 값을 버리고 키만 남기므로 PII 원칙도 그대로 유지된다.
+_LOG_SLOW_MS = 3000
 
 # 경로→(page/section/action) 라벨 + 요청본문 화이트리스트 카탈로그(의미 보강용).
 import call_action_catalog as _catalog
@@ -353,7 +360,24 @@ async def _call_action_logger(request: Request, call_next):
         status = getattr(response, "status_code", None) if response is not None else 500
         # 예외로 빠졌으면 아직 응답이 없다 — 실제로 나갈 값(500)으로 기록한다.
         failed = exc is not None or (status is not None and status >= _LOG_FAILURE_FROM)
-        if ((method in _LOG_METHODS or failed)
+        # ★ 소요시간을 조건 판정 **전에** 한 번만 재고 아래 event 에서 재사용한다.
+        #   판정과 기록이 같은 값을 쓰게 하려는 것이다(기존엔 event 안에서 다시 쟀다).
+        #
+        # ★★ 알려진 한계 — **스트리밍 응답은 헤더까지만 측정된다.**
+        #   `BaseHTTPMiddleware` 의 `call_next()` 는 응답 **헤더가 준비된 시점**에 반환되고,
+        #   본문은 그 뒤에 생성·전송된다. 따라서 `FileResponse`/`StreamingResponse` 를 쓰는
+        #   GET 9곳(`/schedule/{id}/export` · `/*-download` · `/s/{token}/image` 등)은
+        #   실제로 오래 걸려도 여기선 "빠름" 으로 분류돼 slow 기록에서 빠진다.
+        #   → **의도적으로 두는 한계다.** end-to-end 로 재려면 이 미들웨어를 순수 ASGI 로
+        #     바꿔 `send` 를 감싸야 하는데, `_CallBodyTapMiddleware` 와의 순서·
+        #     `CancelledError` 전파·CORS 순서까지 걸려 회귀 범위가 이 기능에 비해 과하다.
+        #   → 다운로드 계열은 **경로가 한정적이고**(9곳) ALB `TargetResponseTime` 지표와
+        #     `roster-{prod,dev}-alb-slow` 알람이 계층을 달리해 이미 감시한다.
+        #     실제로 2026-09-09 11:21 의 26초도 그 지표가 잡았다.
+        #   (2026-09-09 Codex 리뷰 2회차 P2 지적 — 재현으로 사실 확인 후 범위를 이렇게 정함)
+        dur_ms = int((time.perf_counter() - start) * 1000)
+        slow = dur_ms >= _LOG_SLOW_MS
+        if ((method in _LOG_METHODS or failed or slow)
                 and not path.startswith(_LOG_EXCLUDE_PREFIX)):
             xff = request.headers.get("x-forwarded-for", "")
             ip = xff.split(",")[0].strip() if xff else (
@@ -377,7 +401,7 @@ async def _call_action_logger(request: Request, call_next):
                 "path": path[:500],
                 "query": (qs[:1000] if qs else None),
                 "status": status,
-                "dur_ms": int((time.perf_counter() - start) * 1000),
+                "dur_ms": dur_ms,
                 # 예외로 끝난 요청만 채워진다. ★**타입만** 남긴다 —
                 # 예외 메시지에는 쿼리 바인딩 값·요청 데이터가 그대로 실릴 수 있어(pymssql 등)
                 # 이 로그의 "본문 미저장" 원칙과 충돌한다. 길이 제한은 방어가 못 된다.
