@@ -78,6 +78,11 @@ def get_shifts(
             if not g or g.office_id != current_user.office_id:
                 raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
             override_gid = group_id
+        # ★ 이 GET 은 서비스 안에서 기본 근무코드를 시딩한다(조회인데 INSERT 를 한다).
+        #   **여기서 재시도하지 않는다.** 서비스가 경쟁 충돌은 스스로 되돌리고 수렴시키므로,
+        #   그래도 밖으로 나온 IntegrityError 는 FK·NOT NULL 같은 **재시도로 안 풀리는
+        #   실패**다. 그걸 409 '준비 중' 으로 바꾸면 클라이언트가 헛되이 재시도하고
+        #   서버 장애 원인이 가려진다. 아래 catch-all 로 떨어져 500 + 로그가 되게 둔다.
         shifts = get_shifts_service_mssql(current_user, db, override_gid)
         for shift in shifts:
             shift["start_time"] = convert_time(shift["start_time"])
