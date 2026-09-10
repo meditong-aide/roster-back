@@ -152,7 +152,8 @@ def get_message(
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
-    msg = message_service.get_message(db, message_id)
+    # 당사자(발신자·수신자)가 아니면 서비스가 None 을 준다 — 없는 메시지와 같은 404 다.
+    msg = message_service.get_message(db, message_id, current_user.nurse_id)
     if not msg:
         raise HTTPException(status_code=404, detail="메시지를 찾을 수 없습니다.")
 

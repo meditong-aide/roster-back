@@ -926,9 +926,14 @@ async def analyze_wanted_text(
                 d = date(year, month, int(day))
             except (TypeError, ValueError):
                 continue
+            # ★ `comment` 는 AIDE 가 뽑아낸 **사유**다. `request` 는 그 사유를 뽑아낸
+            #   문장(=사용자가 친 프롬프트를 쪼갠 조각) 이라 여기에 실으면 안 된다.
+            #   실측: "10일 N 부담돼서 빼주세요" 로 신청하면 사유 칸에 "10일은 N로 줘" 가
+            #   그대로 박혔다. 저장 경로(`/wanted/invoke`)는 `comment` 를 쓰고 있어
+            #   같은 신청이 어느 경로로 들어오느냐에 따라 사유가 달라졌다.
             out.append({
                 "date": d.isoformat(), "shift_id": code, "intent": "wanted",
-                "comment": (meta or {}).get("request") or None,
+                "comment": (meta or {}).get("comment") or None,
             })
     wanted_days = {int(x["date"][8:10]) for x in out}
     if len(raw) >= 3:

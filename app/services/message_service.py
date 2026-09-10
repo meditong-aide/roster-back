@@ -4,6 +4,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session, aliased
 
 from db.models import Message, Nurse, Group
+from services.nurse_service import get_profile_image_url
 
 
 def get_member_list(db: Session, office_id: str, group_id: str, extra_group_ids: Optional[List[str]] = None) -> List[dict]:
@@ -40,6 +41,8 @@ def get_member_list(db: Session, office_id: str, group_id: str, extra_group_ids:
             "level_": n.level_,
             "group_id": n.group_id,
             "group_name": group_name,
+            # 프로필 사진 미등록이면 null — 프론트가 기본 아바타로 대체한다.
+            "profile_image_url": get_profile_image_url(n.profile_image_key),
         }
         for n, group_name in nurses
     ]
@@ -132,8 +135,15 @@ def get_message_count(db: Session, nurse_id: str, msg_type: str) -> int:
     return q.count()
 
 
-def get_message(db: Session, message_id: int) -> Optional[dict]:
-    """단건 조회."""
+def get_message(db: Session, message_id: int, nurse_id: str) -> Optional[dict]:
+    """단건 조회 — **당사자(발신자·수신자)만**. 아니면 None.
+
+    ★ 당사자 조건이 없으면 `id` 는 IDENTITY 연번이라 로그인만 한 사람이 번호를
+      올려가며 남의 메시지 본문을 그대로 읽는다(실측: 제3자 계정으로 200).
+      `delete_message` 는 처음부터 같은 조건을 걸고 있었고 여기만 빠져 있었다.
+    ★ 없는 메시지와 남의 메시지를 **같은 None** 으로 돌린다 — 404/403 을 갈라
+      주면 존재 여부가 새고, 그 자체가 열람 대상 목록이 된다.
+    """
     SenderNurse = aliased(Nurse)
     ReceiverNurse = aliased(Nurse)
 
@@ -141,7 +151,11 @@ def get_message(db: Session, message_id: int) -> Optional[dict]:
         db.query(Message, SenderNurse, ReceiverNurse)
         .join(SenderNurse, Message.sender_nurse_id == SenderNurse.nurse_id)
         .join(ReceiverNurse, Message.receiver_nurse_id == ReceiverNurse.nurse_id)
-        .filter(Message.id == message_id)
+        .filter(
+            Message.id == message_id,
+            (Message.sender_nurse_id == nurse_id)
+            | (Message.receiver_nurse_id == nurse_id),
+        )
         .first()
     )
     if not row:
@@ -274,6 +288,10 @@ def get_received_page(
                 # 발신자가 nurses 에 없으면 null. 아이디는 메시지 행에 있으므로 항상 준다.
                 "name": s.name if s is not None else None,
                 "role": s.role if s is not None else None,
+                # 프로필 사진 미등록이면 null — 프론트가 기본 아바타로 대체한다.
+                "profile_image_url": (
+                    get_profile_image_url(s.profile_image_key) if s is not None else None
+                ),
             },
             "message": m.message,
             "message_img": m.message_img,
@@ -366,6 +384,10 @@ def get_sent_page(
                     # 수신자가 nurses 에 없으면 null. 행은 살려 인원 수를 맞춘다.
                     "name": r.name if r is not None else None,
                     "role": r.role if r is not None else None,
+                    # 프로필 사진 미등록이면 null — 프론트가 기본 아바타로 대체한다.
+                    "profile_image_url": (
+                        get_profile_image_url(r.profile_image_key) if r is not None else None
+                    ),
                     "is_read": bool(m.is_read),
                     "read_at": m.read_at,
                 }
@@ -396,9 +418,12 @@ def _to_dict(msg: Message, sender: Nurse, receiver: Nurse) -> dict:
         "sender_nurse_id": msg.sender_nurse_id,
         "sender_name": sender.name,
         "sender_role": sender.role,
+        # 프로필 사진 미등록이면 null — 프론트가 기본 아바타로 대체한다.
+        "sender_profile_image_url": get_profile_image_url(sender.profile_image_key),
         "receiver_nurse_id": msg.receiver_nurse_id,
         "receiver_name": receiver.name,
         "receiver_role": receiver.role,
+        "receiver_profile_image_url": get_profile_image_url(receiver.profile_image_key),
         "message": msg.message,
         "message_img": msg.message_img,
         "is_read": msg.is_read,

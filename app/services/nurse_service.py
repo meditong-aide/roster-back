@@ -32,6 +32,7 @@ import secrets
 import time
 import boto3
 from threading import Lock
+from functools import lru_cache
 from urllib.parse import quote
 import base64
 import json
@@ -64,7 +65,18 @@ def get_profile_image_url(image_key: Optional[str]) -> Optional[str]:
     return _build_profile_image_url(image_key)
 
 
+@lru_cache(maxsize=8)
 def _build_s3_client(region: str):
+    """S3 클라이언트. **리전별로 한 번만 만든다.**
+
+    ★ boto3 클라이언트 생성은 실측 **1회 0.77초** 다(로더가 서비스 모델 JSON 을
+      매번 파싱한다). 이 함수는 프로필 이미지 URL 을 만들 때 **간호사 1명당 1회**
+      불리므로, 캐시가 없으면 26명 병동 명단 조회 하나가 여기서만 20초를 쓴다.
+      presign 자체는 로컬 서명이라 네트워크 왕복이 없다 — 비용은 전부 생성 쪽이다.
+    ★ 자격증명은 프로세스 기동 시 환경에서 정해지고 런타임에 바뀌지 않으므로
+      캐시해도 값이 어긋나지 않는다. 클라이언트는 스레드에서 공유해도 안전하다
+      (요청 객체를 공유하지 않고 서명만 한다).
+    """
     access_key = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY")
     secret_key = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_KEY")
     session_token = os.getenv("AWS_SESSION_TOKEN")
