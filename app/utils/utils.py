@@ -19,6 +19,34 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_404_NOT_FOUND
 from datalayer.common import Common
 from db.client2 import msdb_manager
 
+def excel_to_pandas_sync(file: UploadFile) -> pd.DataFrame:
+    """`excel_to_pandas` 의 동기판 — **동기(`def`) 라우터에서 쓴다.**
+
+    ★ 왜 따로 두는가 — 동기 DB 를 여러 번 부르는 업로드 라우터는 `async def` 로 두면
+      그 호출들이 이벤트 루프를 막는다(같은 워커의 무관한 요청까지 선다). `def` 로 두면
+      FastAPI 가 스레드풀에서 돌려 자동으로 격리된다. 그런데 `async def` 인 이 함수 하나
+      때문에 라우터가 async 로 묶여 있었다.
+    ★ `UploadFile.file` 은 동기 파일 객체(SpooledTemporaryFile)라 그대로 읽을 수 있다.
+      비동기 버전은 다른 라우터가 쓰고 있으므로 그대로 둔다.
+    """
+    if file.content_type not in ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                 "application/vnd.ms-excel"]:
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an Excel file (.xlsx, .xls).")
+    try:
+        file.file.seek(0)
+        contents = file.file.read()
+        file_stream = io.BytesIO(contents)
+        if file.filename.endswith('.xlsx'):
+            df = pd.read_excel(file_stream, engine='openpyxl', skiprows=2)
+        else:   # Assumes .xls
+            df = pd.read_excel(file_stream, engine='xlrd', skiprows=2)
+        return df
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while processing the file: {str(e)}")
+
+
 async def excel_to_pandas (file : UploadFile) -> pd.DataFrame:
     if file.content_type not in ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                   "application/vnd.ms-excel"]:

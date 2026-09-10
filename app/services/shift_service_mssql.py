@@ -25,6 +25,60 @@ _MSSQL_SESSION_MAKER: sessionmaker | None = None
 
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ★★★ 이 모듈의 쓰기 함수 4종은 **현재 라우터에 배선돼 있지 않다** (동면 상태)
+#
+#   `add_shift_service` · `update_shift_service` · `remove_shift_service` ·
+#   `move_shift_service` 는 아무데서도 import 되지 않는다. `app/routers/shifts.py` 는
+#   이 넷을 전부 `services.shift_service` 에서 가져가고, 이 모듈에서는
+#   `get_shifts_service` · `get_shifts_paged_service` 만(그리고 roster_service 가
+#   `_to_time_str` 만) 쓴다.
+#
+#   왜 이렇게 됐나 — 2025-10 MySQL→MSSQL 전환 때 "MSSQL 전용 세션" 을 따로 두려고
+#   이 모듈이 생겼다. 전환이 끝나 앱 전체가 MSSQL 이 되면서(`db/client2.py` 의
+#   DATABASE_URL 이 `mssql+pymssql://`) 분리 이유가 사라졌다. 흔적: 이 파일의
+#   `_MSSQL_SESSION_MAKER` 는 선언만 되고 쓰이지 않으며, 함수들은 전부 `session = db` 로
+#   라우터가 넘긴 같은 세션을 쓴다. `client2.py` 에 그 계획이 주석으로 남아 있다.
+#   **보존은 의도된 결정이다**(언제 되살릴지 모른다). 지우지 말 것.
+#
+# ──────────────────────────── 부활 체크리스트 ────────────────────────────
+#   되살릴 때 아래를 **순서대로** 처리하라. 배선된 `services/shift_service.py` 가 정답지다.
+#
+#   1. 시그니처에 `override_group_id: str | None = None` 를 4번째 인자로 추가하라.
+#      라우터는 `add_shift_service(req, current_user, db, group_id)` 로 **4인자**를 넘긴다.
+#      지금 이 모듈은 3인자라 import 만 바꾸면 첫 호출에서 TypeError 로 즉사한다.
+#      ★ 이때 라우터에서 4번째 인자를 빼는 쪽으로 고치지 마라 — 에러는 사라지지만
+#        아래 2번(그룹 스코프)이 조용히 뚫린다.
+#   2. 대상 병동을 `resolve_effective_group(db, current_user, override_group_id or ...)` 로
+#      해석하라. 지금은 `current_user.group_id` 를 그대로 쓴다.
+#   3. 권한을 `caller_is_head_nurse(db, current_user) or is_master_admin` 으로 바꿔라.
+#      지금의 `current_user.is_head_nurse` 는 토큰 클레임이라 승급·강등 후 만료까지 stale 하고,
+#      nurse 행이 없는 ADM 은 False 라 전면 차단된다.
+#   4. add/update 에 `off_swap_target` · `health_leave_target` · `sleep_off_target` 대입과
+#      `_assert_off_swap_target_valid` 등 검증 3종을 **함께** 넣어라. 지금은 둘 다 없어
+#      일관되다. 대입만 넣으면 그룹당 1건 제약이 검증 없이 뚫린다.
+#   5. add/update 에 `shift_code_taken(...)` 중복·개명 충돌 검사를 넣어라. 유일성 키는
+#      (office_id, group_id, shift_id) 다.
+#   6. Shift 쓰기와 `shift_manage` 갱신을 한 트랜잭션으로 묶어라 —
+#      `flush()` → `_append_shift_manage_code(..., commit=False)` → `commit()` 1회 → 실패 시 rollback.
+#      지금은 2단 commit 이라 중간 실패 시 슬롯 등록만 누락되고 재시도로 복구되지 않는다.
+#   7. `try: ... finally: pass` 죽은 블록을 정리하라. 예외를 잡지도 되돌리지도 않는데
+#      "여긴 에러 처리가 있다" 는 오독을 부른다.
+#   8. `_append` 클로저(아래)가 인자 `target_id` 대신 바깥 `shift_id` 를 쓴다. 호출이 한 곳뿐이라
+#      지금은 값이 같지만, 다른 인자로 재사용하는 순간 조용히 틀린다.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ★★ 근무코드 목록의 **표준 정렬**. 여기를 바꾸면 아래 두 곳도 같이 바꿔야 한다.
+#   - roster_create_service._persist_entries (근무표 셀이 가리킬 shifts.id 를 고르는 곳)
+#   - roster_create_service 의 파견/병동이동 전달 매핑
+#   `shifts` 에 (office_id, group_id, shift_id) UNIQUE 가 없어 같은 코드가 여러 행일 수 있고,
+#   그 경우 **먼저 오는 행이 대표**다. `sequence` 만으로는 부족하다 — 같은 병동 안에서
+#   sequence 가 겹치는 행이 실재해서(예: 한 병동의 M 과 검진이 둘 다 5), 동점일 때 SQL 이
+#   돌려주는 순서는 보장되지 않는다. 그러면 화면이 보여 주는 행과 근무표가 가리키는 행이
+#   갈려서 "코드를 고쳤는데 근무표에 반영이 안 된다" 가 다시 난다. `id` 로 동점을 끊는다.
+SHIFT_LIST_ORDER = (Shift.sequence.asc(), Shift.id.asc())
+
+
 def _to_time_str(value: Any) -> str | None:
     """TIME 컬럼값을 HH:MM 문자열로 변환합니다."""
     if value is None:
@@ -143,12 +197,24 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
         shifts = (
             session.query(Shift)
             .filter(Shift.office_id == current_user.office_id, Shift.group_id == group_id)
-            .order_by(Shift.sequence.asc())
+            .order_by(*SHIFT_LIST_ORDER)
             .all()
         )
-        
+
+        # ★★ 이 함수는 조회 엔드포인트(GET /shifts)인데 아래에서 **INSERT + commit 을 한다.**
+        #   그래서 대상 병동이 정해지지 않은 호출(ADM 이 병동 지정 없이 목록을 여는 경우
+        #   `current_user.group_id` 가 빈 문자열이다)에서도 그 빈 값으로 근무코드가 깔렸다.
+        #   실측: 운영에 `group_id=''` 행이 **12개 오피스에 4~6개씩, 합 62행** 쌓여 있다.
+        #   어느 병동에도 속하지 않아 화면에 안 보이고 지울 경로도 없는 유령 행이다.
+        #   병동이 정해지지 않았으면 있는 것만 돌려주고 **만들지 않는다.**
+        if not group_id:
+            return [_shift_row_to_dict(s) for s in shifts]
+
         if shifts:
-            has_mid = any(str(getattr(s, "default_shift", "") or "").upper() == "M" for s in shifts)
+            # ★ 판정은 shift_id 로 한다. 예전엔 `default_shift == 'M'` 로 판정하면서 삽입은
+            #   `shift_id='M'` 으로 해서, shift_id='M' 이 있는데 default_shift 가 M 이 아닌
+            #   병동에서는 **목록을 열 때마다 'M' 이 한 행씩 늘었다.**
+            has_mid = any(str(getattr(s, "shift_id", "") or "").upper() == "M" for s in shifts)
             if not has_mid:
                 mid_shift = Shift(
                     shift_id="M",
@@ -179,36 +245,14 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
                 shifts = (
                     session.query(Shift)
                     .filter(Shift.office_id == current_user.office_id, Shift.group_id == group_id)
-                    .order_by(Shift.sequence.asc())
+                    .order_by(*SHIFT_LIST_ORDER)
                     .all()
                 )
             # print('shifts', [s.__dict__ for s in shifts])
-            
-            return [
-                {
-                    "shift_id": s.shift_id,
-                    "name": s.name,
-                    "color": s.color,
-                    "start_time": _to_time_str(s.start_time),
-                    "end_time": _to_time_str(s.end_time),
-                    "type": s.type,
-                    "allday": s.allday,
-                    "auto_schedule": s.auto_schedule,
-                    "duration": s.duration,
-                    "sequence": s.sequence,
-                    "shift_gb": getattr(s, "shift_gb", None),
-                    "default_shift": getattr(s, "default_shift", s.shift_id),
-                    "id": getattr(s, "id", None),
-                    # 추가
-                    "show_in_preference": s.show_in_preference, # True/False 또는 1/0
-                    "off_swap_target": bool(getattr(s, "off_swap_target", False)),
-                    "health_leave_target": bool(getattr(s, "health_leave_target", False)),
-                    "sleep_off_target": bool(getattr(s, "sleep_off_target", False)),
-                    "description": getattr(s, "description", None),
-                }
-                for s in shifts
-            ]
-        
+
+            return [_shift_row_to_dict(s) for s in shifts]
+
+
         # 2) 기본값 생성 (오피스/그룹은 존재한다고 가정; 없으면 office_id=None로 저장)
         # 기본값 생성
         office_id = None
@@ -267,34 +311,11 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
 
         shifts = (
             session.query(Shift)
-            .filter(Shift.group_id == group_id)
-            .order_by(Shift.sequence.asc())
+            .filter(Shift.office_id == office_id, Shift.group_id == group_id)
+            .order_by(*SHIFT_LIST_ORDER)
             .all()
         )
-        return [
-            {
-                "shift_id": s.shift_id,
-                "name": s.name,
-                "color": s.color,
-                "start_time": _to_time_str(s.start_time),
-                "end_time": _to_time_str(s.end_time),
-                "type": s.type,
-                "allday": s.allday,
-                "auto_schedule": s.auto_schedule,
-                "duration": s.duration,
-                "sequence": s.sequence,
-                "shift_gb": getattr(s, "shift_gb", None),
-                "default_shift": getattr(s, "default_shift", s.shift_id),
-                "id": getattr(s, "id", None),
-                # 추가
-                "show_in_preference": s.show_in_preference,
-                "off_swap_target": bool(getattr(s, "off_swap_target", False)),
-                "health_leave_target": bool(getattr(s, "health_leave_target", False)),
-                "sleep_off_target": bool(getattr(s, "sleep_off_target", False)),
-                "description": getattr(s, "description", None),
-            }
-            for s in shifts
-        ]
+        return [_shift_row_to_dict(s) for s in shifts]
     finally:
         pass
 
@@ -437,6 +458,16 @@ def add_shift_service(req, current_user, db: Session | None = None):
             sequence=max_sequence + 1,
             shift_gb=req.shift_gb,
             description=getattr(req, "description", None),
+            # ★ 이 둘은 정책 검증이 걸리지 않아 단독으로 넣어도 안전하다. 빠져 있으면
+            #   부활 시 화면에서 켠 값이 **오류도 경고도 없이 삼켜진다.**
+            #   `default_shift` 는 주휴 식별 SSOT 라 NULL 이면 주휴 코드를 새로 만들어도
+            #   주휴로 인식되지 않고 MID 판정도 어긋난다.
+            #   ★ off_swap_target · health_leave_target · sleep_off_target 3종은 **일부러
+            #     넣지 않았다.** 이 모듈에는 짝이 되는 `_assert_*_target_valid` 검증이 없어서,
+            #     대입만 추가하면 그룹당 1건 제약이 검증 없이 뚫린다. 부활할 때 대입과 검증을
+            #     **함께** 넣어야 한다(아래 부활 체크리스트 참조).
+            default_shift=getattr(req, "default_shift", None),
+            show_in_preference=getattr(req, "show_in_preference", False),
         )
         session.add(new_shift)
         session.commit()
@@ -464,7 +495,14 @@ def add_shift_service(req, current_user, db: Session | None = None):
 
 
 def update_shift_service(req, current_user, db: Session | None = None):
-    """시프트 수정 서비스(MSSQL)."""
+    """시프트 수정 서비스(MSSQL).
+
+    ★★ **현재 라우터에 배선돼 있지 않다.** `app/routers/shifts.py` 는 add/update/remove/move 를
+      `services.shift_service` 에서 가져오고, 이 모듈에서는 `get_shifts_service` ·
+      `get_shifts_paged_service` · `_to_time_str` 만 쓴다(전수 확인).
+      같은 이름의 쓰기 함수가 두 모듈에 있어 실제로 **엉뚱한 쪽을 고치는 사고가 난 적이 있다.**
+      고칠 일이 생기면 먼저 어느 쪽이 배선돼 있는지 확인할 것. 배선된 쪽은 `shift_service.py` 다.
+    """
     if not current_user or not current_user.is_head_nurse:
         raise Exception("Permission denied")
 
@@ -479,18 +517,27 @@ def update_shift_service(req, current_user, db: Session | None = None):
         old_shift_id = existing_shift.shift_id
         old_shift_gb = getattr(existing_shift, "shift_gb", None)
 
+        # 필수 필드(스키마상 항상 실려 온다).
         existing_shift.shift_id = req.shift_id
         existing_shift.name = req.name
         existing_shift.color = req.color
-        existing_shift.start_time = req.start_time
-        existing_shift.end_time = req.end_time
         existing_shift.type = req.type
-        existing_shift.duration = req.duration
-        existing_shift.allday = req.allday
-        existing_shift.auto_schedule = req.auto_schedule
-        existing_shift.shift_gb = req.shift_gb
-        # 근무코드 설명 업데이트 — 프론트가 빈 값을 null 로 전송하므로 클리어 허용(항상 반영).
-        existing_shift.description = getattr(req, "description", None)
+        # ★ Optional 필드는 `services.shift_service.update_shift_service` 와 **같은 계약**을
+        #   따른다 — 미전송이면 기존 값 유지, 명시적 null 이면 해제. 무조건 대입하면 필수
+        #   필드만 실은 부분 수정 요청이 근무시간·설명을 지우고, `shift_gb` 는 값이 달라지는
+        #   바람에 `shift_manage` 에서 코드까지 사라진다.
+        #   두 구현의 계약이 갈리면 이 쪽이 재배선되는 순간 같은 사고가 되살아난다.
+        _sent = getattr(req, "model_fields_set", ())
+        for _f in ("start_time", "end_time", "duration", "allday",
+                   "auto_schedule", "shift_gb", "description", "default_shift"):
+            if _f in _sent:
+                setattr(existing_shift, _f, getattr(req, _f))
+        # 배선본(shift_service.update_shift_service)과 같은 형태로 맞춘다.
+        if getattr(req, "show_in_preference", None) is not None:
+            existing_shift.show_in_preference = req.show_in_preference
+        # ★ 타깃 3종(off_swap · health_leave · sleep_off)은 add 와 같은 이유로 일부러 뺐다 —
+        #   이 모듈에 검증이 없어 대입만 넣으면 그룹당 1건 제약이 뚫린다.
+        effective_shift_gb = existing_shift.shift_gb
 
         session.commit()
         session.refresh(existing_shift)
@@ -499,7 +546,7 @@ def update_shift_service(req, current_user, db: Session | None = None):
         office_id=existing_shift.office_id,
         group_id=current_user.group_id,
         shift_id=existing_shift.shift_id,
-        shift_gb=req.shift_gb,
+        shift_gb=effective_shift_gb,
         old_shift_id=old_shift_id,
         old_shift_gb=old_shift_gb,
     )
@@ -539,6 +586,21 @@ def remove_shift_service(req, current_user, db: Session | None = None):
             raise Exception("해당 근무코드는 현재 사용 중이므로 삭제할 수 없습니다.")
 
         deleted_sequence = existing_shift.sequence
+        # ★ 삭제 시 `shift_manage.codes` 에서도 빼야 한다. 없으면 지워진 근무코드 문자열이
+        #   배열에 **영구 고아**로 남는다 — FK 가 없어 DB 오류도 안 나고, 남은 고아는 그 슬롯의
+        #   대체코드로 읽혀 커버리지·수요 계산과 솔버 입력에 조용히 섞인다. 지울 경로가 따로
+        #   없어 사후 복구가 어렵다.
+        #   ★ 이 헬퍼를 이 모듈에 **복사하지 말 것.** 복사하면 '슬롯 한정' 옛 버전이 되살아나
+        #     배선본이 이미 되돌린 고아 버그가 다시 생긴다. 배선본 것을 그대로 쓴다.
+        #   커밋하지 않고 dirty 만 만들므로 아래 `session.commit()` 하나에 함께 묶인다.
+        from services.shift_service import _remove_shift_manage_code
+        _remove_shift_manage_code(
+            session,
+            existing_shift.office_id,
+            current_user.group_id,
+            existing_shift.shift_id,
+            getattr(existing_shift, "shift_gb", None),
+        )
         session.delete(existing_shift)
         session.query(Shift).filter(
             Shift.group_id == current_user.group_id,

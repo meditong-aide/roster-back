@@ -83,12 +83,69 @@ class Setting:
         return _queryString
 
     @staticmethod
+    def member_ids_taken(count: int):
+        """업로드 전 아이디 중복 검사 — **여러 건을 한 번에**.
+
+        ★ 예전엔 행마다 `member_id_check` 를 따로 던졌다. 500행이면 왕복 500번이라
+          정상 상황에서도 지연이 쌓이고, 락 경합이 있으면 그만큼 오래 물린다.
+          아이디는 오피스 무관 전역 유일이라 오피스 조건이 필요 없다(`member_id_check` 와 같은 전제).
+        ★ `WITH(NOLOCK)` 을 쓰지 않는 이유는 `member_created_check` 주석 참조.
+        ★ MSSQL 파라미터 상한(2100) 때문에 호출측이 끊어서 넣는다.
+
+        params: MemberID 튜플 (count 개)
+        """
+        placeholders = ",".join(["%s"] * count)
+        return f"""
+        select MemberID from bizwiz20db.Member_Login
+         where MemberID in ({placeholders})
+        """
+
+    @staticmethod
     def member_id_check():
+        """업로드 전 아이디 중복 검사(단건).
+
+        ★ 일괄 검사는 `member_ids_taken` 을 쓴다. 이 단건 버전은 남은 호출부 호환용이다.
+
+        ★ `member_created_check` 와 같은 이유로 `WITH(NOLOCK)` 을 쓰지 않는다.
+          미커밋 행을 읽으면 **아직 확정되지도 않은(그리고 롤백될) 아이디 때문에 멀쩡한
+          신청을 거부**한다. 사용자는 왜 막혔는지 알 수 없고, 다시 올려도 같은 결과가 난다.
+          아이디 1건짜리 인덱스 조회라 커밋된 데이터만 읽어도 부담이 없다.
+        """
         _queryString = """
         select count(*) as cnt
-          from bizwiz20db.Member_Login WITH(NOLOCK) where MemberID = %s ;
+          from bizwiz20db.Member_Login where MemberID = %s ;
         """
         return _queryString
+
+    @staticmethod
+    def member_created_check(count: int):
+        """주어진 MemberID 중 **실제로 계정이 만들어진 것**만 돌려준다.
+
+        ★ 왜 필요한가 — 그룹웨어 처리 페이지(`member_excel_ai_ok.asp`)가 200 을 주는 것과
+          계정이 실제로 생긴 것은 다르다. 실측(2025-11-15 업로드분): 10건 중 6건만
+          생성되고 4건은 **같은 사람이 이미 다른 아이디로 존재**해 거부됐는데, 응답은
+          200 이라 전원 성공으로 보고됐다. 그래서 호출 뒤 이 쿼리로 대조해야 한다.
+        ★★ **내 오피스에 생겼는지**까지 본다. `MemberID` 자체는 오피스 무관 전역 유일이지만
+          (`member_id_check` 와 같은 전제), 아이디가 어딘가 존재한다는 것과 **이번 업로드가
+          내 병원에 계정을 만들었다**는 것은 다르다. OfficeCode 를 빼면 ASP 가 엉뚱한
+          오피스에 만들었거나 남의 오피스에 이미 있던 아이디를 "생성됨" 으로 읽는다.
+        ★ MSSQL 파라미터 상한(2100) 때문에 호출측이 끊어서 넣는다.
+        ★★ **`WITH(NOLOCK)` 을 쓰지 않는다.** 이 조회 하나가 "계정이 실제로 생겼는가" 의
+          유일한 근거이고, 특히 ASP 가 비-200 을 준 경우를 성공으로 뒤집는 판단까지 여기에
+          걸려 있다. NOLOCK 은 커밋 전 행을 읽는다 — ASP 트랜잭션이 아직 커밋 전인 순간을
+          관측한 뒤 그게 롤백되면 **존재하지도 않는 계정을 생성됨으로 확정**하고, 반대로
+          스캔 중 행을 놓치면 정상 생성을 부분 실패로 오판한다. 둘 다 사용자가 재업로드하게
+          만들어 중복·부분 성공을 겹치게 한다.
+          조회 대상이 아이디 목록(최대 500개)뿐이라 커밋된 데이터만 읽어도 부담이 없다.
+
+        params: (OfficeCode,) + MemberID 튜플 (count 개)
+        """
+        placeholders = ",".join(["%s"] * count)
+        return f"""
+        select MemberID from bizwiz20db.Member_Login
+         where OfficeCode = %s
+           and MemberID in ({placeholders})
+        """
 
     @staticmethod
     def delete_member():
@@ -119,8 +176,26 @@ class Setting:
         return _queryString
     @staticmethod
     def insert_mobile_user_setting_list():
+        """엑셀 일괄등록 경로의 모바일 설정 기본행 생성.
+
+        ★★ `WHERE NOT EXISTS` 가 필수다. 이 테이블의 PK 는 `Idx`(identity)이고 `MemberID` 는
+          **non-unique 인덱스**라 그냥 INSERT 하면 같은 아이디로 행이 여러 개 쌓인다.
+          업로드 경로에서 특히 잘 생긴다 — ASP 가 일부 계정을 거부해도 이 행은 이미
+          들어가 있고, 사용자가 실패분을 고쳐 **다시 올리면 그때마다 또 쌓인다.**
+          `get_push_yn()` 은 `row[0]` 만 보므로 그 순간부터 조회값이 어느 행을 집는지에
+          따라 갈린다. 같은 이유로 `insert_push_yn_if_absent()` 도 같은 형태다.
+        ※ UNIQUE 제약으로 막는 방법도 있으나 **그룹웨어 운영 테이블 DDL** 이라 기존 중복이
+          있으면 생성이 실패하고 타 시스템 영향도 알 수 없어 택하지 않았다.
+
+        params: (MemberID, RegDate, MemberID)
+        """
         _queryString = """
-        INSERT INTO bizwiz20db.TB_Mobile_User_Setting_List(MemberID, AutoYN, WifiYN, PushYN, DeviceKey, RegDate) VALUES (%s, 'Y', 'Y', 'Y', '', %s);
+        INSERT INTO bizwiz20db.TB_Mobile_User_Setting_List
+               (MemberID, AutoYN, WifiYN, PushYN, DeviceKey, RegDate)
+        SELECT %s, 'Y', 'Y', 'Y', '', %s
+         WHERE NOT EXISTS (
+               SELECT 1 FROM bizwiz20db.TB_Mobile_User_Setting_List WITH (UPDLOCK, HOLDLOCK)
+                WHERE MemberID = %s)
         """
         return _queryString
 

@@ -3185,6 +3185,55 @@ def _priority_families_from_presolve(presolve_diag) -> list:
     return out
 
 
+def build_team_min_by_team(
+    team_rows,
+    member_team_ids: set[str],
+    use_mid: bool,
+) -> dict[str, dict[str, int]]:
+    """팀별 최소 인원(`team_min_by_team`)을 구성한다.
+
+    ★★ **생성과 precheck 가 같은 함수를 써야 한다.** 예전엔 두 곳이 따로 만들었고, 생성만
+      `teams.min_shift` 를 읽고 precheck 는 디폴트(D:1, E:1)만 넣었다. 그래서 저장값이
+      더 엄격하면(예: N:1) precheck 를 통과하고 솔버에서 실패했고, 반대로 D 를 0 으로 둔
+      팀은 **없는 제약으로 precheck 가 요청을 막았다.** 진단 차이가 아니라 정상 생성이
+      차단되거나 성공을 잘못 예고하는 문제다.
+
+    규칙:
+      - `teams.min_shift` 가 저장돼 있으면 **그 값이 우선**이다.
+      - 미설정 팀만 디폴트(D:1, E:1, N:0[, use_mid 면 M:0])로 채운다.
+      - 0 은 무제약이라 제외한다 — 디폴트의 실효 제약은 팀별 D≥1·E≥1 이다.
+      - **멤버가 배정된 팀에만** 적용한다. 인원 0 팀에 넣으면 precheck 가
+        TEAM_SIZE_INSUFFICIENT 로 오블로킹한다.
+
+    Args:
+        team_rows: 활성 Team ORM 행.
+        member_team_ids: 실제 간호사가 배정된 team_id 문자열 집합.
+        use_mid: MID 근무코드 사용 여부.
+    """
+    default_min: dict[str, int] = {"D": 1, "E": 1, "N": 0}
+    if use_mid:
+        default_min["M"] = 0
+
+    result: dict[str, dict[str, int]] = {}
+    for t in team_rows:
+        tid = str(t.team_id)
+        if tid not in member_team_ids:
+            continue
+        raw = t.min_shift if isinstance(t.min_shift, dict) else None
+        src = raw if raw else default_min
+        cleaned: dict[str, int] = {}
+        for k, v in src.items():
+            try:
+                iv = int(v or 0)
+            except (TypeError, ValueError):
+                continue
+            if iv > 0:
+                cleaned[k] = iv
+        if cleaned:
+            result[tid] = cleaned
+    return result
+
+
 def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None, _assignments=None, _inbound_assignments=None, _outbound_assignments=None, weekend_off_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
     cp_sat_result = None
@@ -3229,33 +3278,33 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                 )
                 .all()
             )
-            team_min_by_team: dict[str, dict[str, int]] = {}
             team_handoff_policy_by_team: dict[str, dict] = {}
-            # teams.min_shift 는 현재 저장 수단/디폴트가 없어 보지 않는다. 존재하는 활성 팀마다
-            # 디폴트 최소인원(D:1, E:1, N:0[, use_mid면 M:0])을 적용한다. 0(=무제약)은 제외하므로
-            # 실효 제약은 팀별 D≥1·E≥1. (N/M 은 최소 0 = 제약 없음.)
-            _use_mid = bool(config_dict.get("use_mid", False))
-            _default_team_min: dict[str, int] = {"D": 1, "E": 1, "N": 0}
-            if _use_mid:
-                _default_team_min["M"] = 0
             # 멤버가 배정된 팀에만 team_min 적용 — 솔버(team_members)·precheck(members_by_team)와
-            # 동일 기준. 인원 0 팀에 디폴트를 넣으면 precheck 가 TEAM_SIZE_INSUFFICIENT 로 오블로킹.
+            # 동일 기준. 구성 규칙은 build_team_min_by_team 에 한 곳으로 모여 있다(precheck 와 공유).
             _member_team_ids = {
                 str(getattr(n, "team_id", None))
                 for n in nurses_in_group
                 if getattr(n, "team_id", None) not in (None, "", 0)
             }
+            # ★★ 런타임에서 이미 들어온 값(치료·config_override)이 있으면 **그것이 이긴다.**
+            #   예전엔 조건 없이 `teams.min_shift` 로 다시 만들어 덮어썼다. precheck 는
+            #   반대로 값이 있으면 그대로 썼기 때문에, 팀 최소인원을 완화한 override 가
+            #   **precheck 는 통과하고 솔버 직전에 버려져** 사전검증과 실제 생성이 또 갈렸다.
+            #   (override 를 넣어도 안 먹는다는 뜻이기도 하다.)
+            #   두 경로 모두 "없을 때만 저장값으로 구성" 으로 맞춘다.
+            if "team_min_by_team" not in config_dict:
+                team_min_by_team = build_team_min_by_team(
+                    team_rows,
+                    _member_team_ids,
+                    bool(config_dict.get("use_mid", False)),
+                )
+                if team_min_by_team:
+                    config_dict["team_min_by_team"] = team_min_by_team
             for t in team_rows:
                 _tid = str(t.team_id)
-                if _tid in _member_team_ids:
-                    cleaned = {k: v for k, v in _default_team_min.items() if v > 0}
-                    if cleaned:
-                        team_min_by_team[_tid] = cleaned
                 hp = t.handoff_policy if isinstance(t.handoff_policy, dict) else None
                 if hp and isinstance(hp.get("restrictions"), list) and hp["restrictions"]:
                     team_handoff_policy_by_team[_tid] = hp
-            if team_min_by_team:
-                config_dict["team_min_by_team"] = team_min_by_team
             if team_handoff_policy_by_team:
                 config_dict["team_handoff_policy_by_team"] = team_handoff_policy_by_team
         except Exception as e:
@@ -3547,9 +3596,18 @@ def _persist_entries(db: Session, schedule, generated, req):
     shifts_db = (
         db.query(Shift)
         .filter(Shift.group_id == schedule.group_id, Shift.office_id == schedule.office_id)
+        # ★ 같은 병동에 같은 `shift_id` 가 여러 행일 수 있다(실측: 운영 9개 병동 75조합).
+        #   `shifts` 에 UNIQUE 제약이 아직 없어 개명·일괄업로드로 중복이 만들어졌다.
+        #   정렬 없이 dict 로 접으면 **DB 가 돌려주는 마지막 행**이 이겨서, 근무코드 화면이
+        #   보여 주는 행(sequence 순 첫 행)과 근무표 셀이 가리키는 행이 갈렸다
+        #   — 사용자에겐 "코드를 고쳤는데 근무표에 반영이 안 된다" 로 보인다.
+        #   화면과 같은 순서로 정렬하고 아래에서 **첫 행이 이기게** 한다.
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
         .all()
     )
-    shift_id_to_int_id = {s.shift_id: s.id for s in shifts_db}
+    shift_id_to_int_id: dict[str, int] = {}
+    for s in shifts_db:
+        shift_id_to_int_id.setdefault(s.shift_id, s.id)
     weekend_off_nurse_ids: set[str] = set()
     try:
         # 주말휴무 SSOT = nurse_weekendoff_period (as-of month). 컬럼 미의존.
@@ -3649,12 +3707,21 @@ def _copy_transferred_entries(
         # source shift → default_shift → target shift_id 매핑
         src_shifts = db.query(Shift).filter(Shift.group_id == src_gid).all()
         src_to_default = {s.shift_id: s.default_shift for s in src_shifts if s.default_shift}
-        tgt_shifts = db.query(Shift).filter(Shift.group_id == group_id).all()
+        # ★ 중복 shift_id 대비 — _persist_entries 와 **같은 순서**로 정렬해 같은 행을 고른다.
+        #   여기만 다른 행을 고르면 파견/병동이동 전달분만 다른 코드 행을 가리킨다.
+        tgt_shifts = (
+            db.query(Shift)
+            .filter(Shift.group_id == group_id)
+            .order_by(Shift.sequence.asc(), Shift.id.asc())
+            .all()
+        )
         default_to_tgt = {}
         for s in tgt_shifts:
             if s.default_shift and s.default_shift not in default_to_tgt:
                 default_to_tgt[s.default_shift] = s.shift_id
-        tgt_shift_id_to_int = {s.shift_id: s.id for s in tgt_shifts}
+        tgt_shift_id_to_int: dict[str, int] = {}
+        for s in tgt_shifts:
+            tgt_shift_id_to_int.setdefault(s.shift_id, s.id)
 
         # 전달 기간
         a_end = a.end_date or a.expected_end_date or month_end
@@ -6191,25 +6258,20 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                         )
                         .all()
                     )
-                    _team_min_by_team: dict[str, dict[str, int]] = {}
-                    # teams.min_shift 미사용 — 활성 팀 중 '멤버가 배정된 팀'에만 디폴트 최소
-                    # (D:1, E:1, N:0[, use_mid면 M:0]). 인원 0 팀은 솔버가 무시하므로 team_min 에서도
-                    # 제외(안 그러면 TEAM_SIZE_INSUFFICIENT 로 오블로킹). 멤버십은 솔버와 동일 기준.
-                    _use_mid = bool(precheck_config.get("use_mid", False))
-                    _default_tm: dict[str, int] = {"D": 1, "E": 1, "N": 0}
-                    if _use_mid:
-                        _default_tm["M"] = 0
+                    # ★ 생성 경로와 **같은 함수**를 쓴다. 예전엔 여기만 `teams.min_shift` 를
+                    #   무시하고 디폴트만 넣어서, 사전검증과 실제 생성이 서로 다른 제약을
+                    #   검사했다(저장값이 엄하면 통과 후 솔버 실패, D 를 0 으로 둔 팀이면
+                    #   없는 제약으로 오블로킹).
                     _member_team_ids = {
                         str(_n.get("team_id"))
                         for _n in _nurses_dict_for_precheck
                         if _n.get("team_id") not in (None, "", 0)
                     }
-                    for _t in _team_rows:
-                        if str(_t.team_id) not in _member_team_ids:
-                            continue
-                        _cleaned = {k: v for k, v in _default_tm.items() if v > 0}
-                        if _cleaned:
-                            _team_min_by_team[str(_t.team_id)] = _cleaned
+                    _team_min_by_team = build_team_min_by_team(
+                        _team_rows,
+                        _member_team_ids,
+                        bool(precheck_config.get("use_mid", False)),
+                    )
                     if _team_min_by_team:
                         precheck_config["team_min_by_team"] = _team_min_by_team
                 except Exception as _team_exc:
