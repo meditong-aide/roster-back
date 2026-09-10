@@ -626,7 +626,15 @@ def remove_shift_service(req, current_user, db, override_group_id: str | None = 
         raise Exception("Permission denied")
     # 그룹 스코프: 조회(LIST)와 동일하게 토큰 group_id 기준으로 group_access 모듈에서 해석+권한검증.
     target_group_id = resolve_effective_group(db, current_user, override_group_id or current_user.group_id)
-    existing_shift = db.query(Shift).filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id).first()
+    # ★ 중복 행이 있으면 정렬 없는 `.first()` 는 **어느 행을 지울지 보장하지 않는다.**
+    #   목록이 보여 주는 행(= sequence ASC, id ASC 첫 행)을 지워야 사용자가 화면에서
+    #   고른 것과 실제 삭제분이 일치한다(정본 `shift_service_mssql.SHIFT_LIST_ORDER`).
+    existing_shift = (
+        db.query(Shift)
+        .filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
+        .first()
+    )
     if not existing_shift:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")
     schedule_entries_count = db.query(ScheduleEntry).filter(
@@ -657,7 +665,14 @@ def move_shift_service(req, current_user, db, override_group_id: str | None = No
         raise Exception("Permission denied")
     # 그룹 스코프: 조회(LIST)와 동일하게 토큰 group_id 기준으로 group_access 모듈에서 해석+권한검증.
     target_group_id = resolve_effective_group(db, current_user, override_group_id or current_user.group_id)
-    shift_to_move = db.query(Shift).filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id).first()
+    # ★ 중복 행이 있으면 정렬 없는 `.first()` 가 **화면에 안 보이는 행**을 옮길 수 있다.
+    #   목록과 같은 첫 행을 집는다(정본 `shift_service_mssql.SHIFT_LIST_ORDER`).
+    shift_to_move = (
+        db.query(Shift)
+        .filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
+        .first()
+    )
     if not shift_to_move:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")
     old_sequence = shift_to_move.sequence

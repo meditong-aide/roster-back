@@ -506,10 +506,19 @@ def _create_draft_with_copy(
 
 
 def _resolve_shifts_table_id(db: Session, group_id: str, shift_code: str) -> int | None:
-    """Map shift_id → shifts.id for a group."""
+    """Map shift_id → shifts.id for a group.
+
+    ★ 대표 행은 목록 조회와 같은 (sequence ASC, id ASC) **첫 행**이다
+      (정본 `shift_service_mssql.SHIFT_LIST_ORDER`). `shifts` 에 UNIQUE 가 없어
+      같은 (group, shift_id) 행이 여럿일 수 있고, 정렬 없는 `.first()` 는 어느 행이
+      올지 보장되지 않는다 — 반환값이 `nurse_shift_requests.shifts_table_id` 로
+      저장되므로 흔들리면 화면과 저장값이 갈린다.
+      (office_id 는 걸지 않는다 — `group_id` 가 `groups` 의 PK 라 이미 오피스 단위로 유일하다.)
+    """
     row = (
         db.query(Shift.id)
         .filter(Shift.group_id == group_id, Shift.shift_id == shift_code)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
         .first()
     )
     return row[0] if row else None

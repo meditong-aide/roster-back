@@ -2014,15 +2014,30 @@ async def save_roster(
     #     에러 없이 200 이라 조용히 망가진다(실측: 589칸 소실).
     #     ADM 은 assert_caller_can_access_group 에서 office 무관하게 통과하므로 실제로
     #     도달 가능한 경로다. 그룹 접근 권한은 위 `_load_schedule_for_caller` 가 이미 본다.
+    # ★ 대표 행은 목록 조회와 같은 (sequence ASC, id ASC) **첫 행**이다
+    #   (정본 `shift_service_mssql.SHIFT_LIST_ORDER`). 정렬 없이 dict 로 접으면
+    #   중복 행 중 마지막이 이겨, 저장되는 `schedule_entries.id` 가 화면과 갈린다.
     shifts_for_group = (
         db.query(Shift)
         .filter(Shift.group_id == target_group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
         .all()
     )
     valid_shift_ids = {s.shift_id for s in shifts_for_group}
-    shift_id_to_int_id = {s.shift_id: s.id for s in shifts_for_group}
-    # 클라이언트가 보낸 schedule_ids 검증용 — 그 그룹에 실재하는 shifts.id 만 허용한다.
-    valid_int_ids = {s.id for s in shifts_for_group if s.id is not None}
+    shift_id_to_int_id: dict = {}
+    for _s in shifts_for_group:
+        shift_id_to_int_id.setdefault(_s.shift_id, _s.id)
+    # 클라이언트가 보낸 schedule_ids 검증용.
+    # ★★ 예전엔 "그 그룹에 실재하는 shifts.id" 만 봤는데, 그러면 **다른 근무코드의 id** 도 통과한다. 그러면 한 셀에
+    #   `shift_id='D'` 인데 `id` 는 'N' 행을 가리키는 상태로 저장되고, 이력·발행본이
+    #   그걸 그대로 물려받아 "그때 무슨 근무였나" 가 영영 어긋난다.
+    #   코드별로 허용 id 집합을 만들어 **그 코드의 행인지까지** 본다.
+    #   (같은 코드의 중복 행끼리는 그대로 둔다 — 어느 쪽이 맞는지는 중복 정리에서
+    #    병원이 정할 문제이지, 저장 경로가 조용히 바꿔칠 일이 아니다.)
+    ids_by_shift_id: dict = {}
+    for _s in shifts_for_group:
+        if _s.id is not None:
+            ids_by_shift_id.setdefault(_s.shift_id, set()).add(_s.id)
 
     def _normalize_shift_id_for_save_router(raw_shift: str) -> str:
         if raw_shift in valid_shift_ids:
@@ -2051,7 +2066,9 @@ async def save_roster(
                 # ★ 클라이언트가 보낸 값이므로 **그 그룹의 유효한 shifts.id 인지** 확인한다.
                 #   낡거나 조작된 값을 그대로 쓰면 근무표에 남을 뿐 아니라 이력에도
                 #   그대로 박혀 나중에 "그때 무슨 근무였나" 를 영원히 잘못 가리킨다.
-                if int_id is not None and int_id not in valid_int_ids:
+                #   ★ 그룹 소속만이 아니라 **이 코드의 행인지**까지 본다.
+                #     아니면 버리고 대표 행으로 되돌린다.
+                if int_id is not None and int_id not in ids_by_shift_id.get(norm_shift, ()):
                     int_id = None
                 if int_id is None:
                     int_id = shift_id_to_int_id.get(norm_shift)
@@ -2991,6 +3008,9 @@ async def create_roster_with_weekly_off(
             Shift.office_id == current_user.office_id,
             Shift.shift_id == "주",
         )
+        # ★ '주' 도 중복 행이 있을 수 있다. 정렬 없는 `.first()` 는 어느 행이 올지
+        #   보장되지 않으므로 목록과 같은 첫 행으로 못박는다(SHIFT_LIST_ORDER 규약).
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
         .first()
     )
     weekly_off_shift_int_id = weekly_off_shift.id if weekly_off_shift else None

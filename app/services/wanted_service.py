@@ -662,10 +662,20 @@ def _persist_shift_results(
     rows = 0
 
     # shifts.id 매핑
+    # ★ 대표 행 선정은 목록 조회와 **같은 규칙**이어야 한다 —
+    #   정본은 `shift_service_mssql.SHIFT_LIST_ORDER` = (sequence ASC, id ASC) 의 **첫 행**.
+    #   `shifts` 에 UNIQUE 가 없어 같은 (group, shift_id) 행이 여럿이다(실측 9병동 75조합).
+    #   정렬 없이 dict comprehension 으로 접으면 DB 가 마지막에 돌려준 행이 이겨서,
+    #   화면이 보여 주는 코드와 저장된 `shifts_table_id` 가 갈린다.
     _shift_id_to_table_id: Dict[str, int] = {}
     if group_id:
-        _shift_q = db.query(Shift.shift_id, Shift.id).filter(Shift.group_id == group_id)
-        _shift_id_to_table_id = {sid: tid for sid, tid in _shift_q.all()}
+        _shift_q = (
+            db.query(Shift.shift_id, Shift.id)
+            .filter(Shift.group_id == group_id)
+            .order_by(Shift.sequence.asc(), Shift.id.asc())
+        )
+        for _sid, _tid in _shift_q.all():
+            _shift_id_to_table_id.setdefault(_sid, _tid)
 
     print(f"shift_map 저장 시작 (request_id={request_id}): {shift_map}")
 
@@ -2991,7 +3001,12 @@ def save_fixed_wanted_service(
     shift_q = db.query(Shift).filter(Shift.group_id == group_id)
     if office_id:
         shift_q = shift_q.filter(Shift.office_id == office_id)
-    shift_id_to_table_id: Dict[str, int] = {s.shift_id: s.id for s in shift_q.all()}
+    # ★ office_id 를 걸어도 (office, group, shift_id) 중복은 남는다 — 대표 선정은
+    #   목록과 같은 (sequence ASC, id ASC) 첫 행이어야 한다(SHIFT_LIST_ORDER 규약).
+    shift_q = shift_q.order_by(Shift.sequence.asc(), Shift.id.asc())
+    shift_id_to_table_id: Dict[str, int] = {}
+    for _s in shift_q.all():
+        shift_id_to_table_id.setdefault(_s.shift_id, _s.id)
 
     # ── 1단계: 교차 저장 검증 (caller 관할 외 일자 — entry 단위로 자동 skip) ──
     cross_errors, cross_blocked = _validate_cross_save_entries(

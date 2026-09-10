@@ -621,12 +621,19 @@ def _replace_shift_requests(
         NurseShiftRequest.shift_date < end_date,
     ).delete(synchronize_session=False)
 
-    shift_table_ids = {
-        sid: tid
-        for sid, tid in db.query(Shift.shift_id, Shift.id)
+    # ★ 대표 행은 목록 조회와 같은 (sequence ASC, id ASC) **첫 행**이어야 한다
+    #   (정본 `shift_service_mssql.SHIFT_LIST_ORDER`). `shifts` 에 UNIQUE 가 없어
+    #   같은 (group, shift_id) 행이 여럿이고, 정렬 없이 dict 로 접으면 마지막 행이 이긴다.
+    #   ★★ 이 경로는 바로 위에서 그 달 요청을 **전량 delete 후 재삽입**한다 —
+    #      대표가 흔들리면 저장할 때마다 다른 `shifts_table_id` 가 박힌다.
+    shift_table_ids: dict = {}
+    for _sid, _tid in (
+        db.query(Shift.shift_id, Shift.id)
         .filter(Shift.group_id == group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
         .all()
-    }
+    ):
+        shift_table_ids.setdefault(_sid, _tid)
     for detailed_id, entry in enumerate(entries, start=1):
         db.add(NurseShiftRequest(
             nurse_id=nurse_id,
@@ -1000,12 +1007,18 @@ def submit_preferences_service(
     # shifts.id 매핑
     _nurse_row = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
     _grp_id = _nurse_row.group_id if _nurse_row else None
+    # ★ 위 `_replace_shift_requests` 와 **같은 대표 선정 규칙**을 쓴다(첫 행 우선).
+    #   두 경로가 서로 다른 행을 고르면 같은 간호사의 같은 코드가 경로에 따라
+    #   다른 `shifts_table_id` 로 저장된다.
     _shift_id_to_table_id = {}
     if _grp_id:
-        _shift_id_to_table_id = {
-            s.shift_id: s.id
-            for s in db.query(Shift.shift_id, Shift.id).filter(Shift.group_id == _grp_id).all()
-        }
+        for _s in (
+            db.query(Shift.shift_id, Shift.id)
+            .filter(Shift.group_id == _grp_id)
+            .order_by(Shift.sequence.asc(), Shift.id.asc())
+            .all()
+        ):
+            _shift_id_to_table_id.setdefault(_s.shift_id, _s.id)
 
     detailed_id = 1
     for date_str, shift_id in data_to_save.items():
