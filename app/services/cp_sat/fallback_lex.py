@@ -332,6 +332,29 @@ def optimize_fallback_lex_hard_first(
     print(f"{logger_prefix} 폴백(서열) 최적화 시작…")
 
     # 동적 시간 배분(대략): 45% / 35% / 20%
+    #
+    # ★★ `time_limit_seconds` 는 **총 상한이 아니라 단계별 배분의 기준**이다.
+    #   각 단계가 자기 몫을 따로 받고, 그 위에 후속 패스가 더 얹는다:
+    #     · lex 7패스 = tl2 × (비율 합 **2.0**)
+    #       `LEX_PASS_ORDER_DEFAULT`(:142) 기준 off_range .2 + grade .3 + team .3
+    #       + n_range .2 + n2n .5 + de .3 + pref .2 — 7개 전부 기본 활성이다
+    #       (`de_balance_enable` 은 roster_config.py 기본 True, `pref` 는 항이 있으면 항상).
+    #     · mutex-lex = `max(8, int(tl3))` 를 한 번 더(:4252)
+    #   그래서 실제 소요가 이 값을 크게 넘는다 —
+    #   실측(중환자실1 · 2026-09-09): 설정 60초, 실제 160~178초.
+    #     tl1 27 + tl2 21 + lex 42 + mutex-lex 12 + 서비스 계층 ≈ 29 로 계산이 닫힌다.
+    #   ★ 이걸 '초과' 로 읽고 조이면 안 된다. stage3 가 시간에 쫓겨 UNKNOWN 으로
+    #     죽으면 stage2 해가 커밋되고 **선호·공정성이 통째로 버려진다** —
+    #     grade 중복 수정으로 방금 되살린 바로 그 문제로 되돌아간다.
+    #   ★★ 다만 상한이 **없지는 않다.** SQS 소비자는 ECS 가 아니라 **Lambda** 다
+    #     (`app/lambda_handler.py` 가 진입점 · `Dockerfile.lambda` · deploy-lambda.yml
+    #      이 `roster-solver-{prod,dev}` 를 갱신. worker.py 의 `main()` 은 ECS 진입점이나
+    #      SQS 가 아니라 `JOB_JSON` 을 읽는다 — SQS 를 소비하는 ECS 경로는 없다).
+    #     실측(2026-09-10 · AWS 조회): Lambda Timeout **600초** · MemorySize 4096,
+    #     큐 `roster-job-queue` VisibilityTimeout 720초 · maxReceiveCount 3 → DLQ.
+    #     즉 600초에서 잘리고, 잘리면 720초 뒤 **같은 근무표를 3번 다시 생성한 뒤** DLQ 로 간다.
+    #     현재 160~178초는 그 30% 수준이라 여유가 있지만, 예산을 더 올릴 때는 이 벽을 봐야 한다.
+    #     (전역 데드라인 시도는 2026-09-08 기각 — 아래 주석 참조)
     tl1 = max(5, int(time_limit_seconds * 0.45))
     tl2 = max(5, int(time_limit_seconds * 0.35))
     tl3 = max(3, time_limit_seconds - tl1 - tl2)
@@ -4178,19 +4201,63 @@ def optimize_fallback_lex_hard_first(
         #   stage3 상세로그). 실패했으면 건너뛴다 — 예전에는 여기서 `return` 했는데,
         #   그러면 함수 끝의 프리셉티 동기화까지 건너뛰어 미러링이 빠진 근무표가 나갔다.
         if not _stage3_failed:
-            # ── 최종 lex 패스: DDDDD 보장 강화 (기본 자동 ON, AIDE_D5_LEX=0 으로 끔) ──
+            # ── 최종 lex 패스: DDDDD 보장 강화 (기본 OFF · AIDE_D5_LEX=1 로 켬) ──
             # stage3 목적값을 동결(무회귀)한 뒤 D5 viol 합만 최소화하는 별도 solve.
-            # 자기-게이트: 잔여 D5=0 이면 스킵(무비용) → DDDDD 남은 병동에서만 자동 재-solve.
+            # 자기-게이트: 잔여 D5=0 이면 스킵(무비용) → DDDDD 남은 병동에서만 재-solve.
             # payload/사용자 입력 불필요. (주의) postprocess/preceptee 경로 재유입은 별도.
             #
             # 인원수 게이트: 대형 병동은 freeze 재-solve 가 시간 내 못 풀고(UNKNOWN) 헛돎 →
-            # lex 가 실제로 잘 듣고 빠른 소인원 병동(기본 N<=15)에서만 자동 실행.
-            # AIDE_D5_LEX_MAXN 으로 임계 조절, AIDE_D5_LEX=0 으로 완전 비활성.
+            # 소인원 병동(기본 N<=15)에서만 실행. AIDE_D5_LEX_MAXN 으로 임계 조절.
+            #
+            # ── [기각] 기본 ON → OFF · 2026-09-09 (근거 정정 2026-09-10) ──────
+            #   ★★ 기각의 **결정적 근거는 통계가 아니라 인과 통로가 없다는 것**이다.
+            #     실패(UNKNOWN)한 패스는 `s3` 를 재대입하지 않고(:4313-4321 의 and 조건),
+            #     `m3` 는 :4325 이후 참조가 0건이다 — 이 패스가 m3 에 얹은 동결 부등식·
+            #     Minimize·AddHint 는 solve 반환 직후 전부 죽은 코드가 된다.
+            #     즉 **실패 회차는 최종 근무표에 도달하는 경로가 하나도 없다.** 벽시계만 쓴다.
+            #   ★ 발동 대비 성공 ― 확정 A/B 에서 **20회 중 성공 0회**(전부 UNKNOWN).
+            #     ※ 40런 중 절반은 `AIDE_D5_LEX=0` 팔이라 게이트가 False → 발동 자체를 안 한다.
+            #     ※ 사전 관측 26회(성공 1 · 별관1)는 **분모로 쓰지 않는다** — grade 중복 수정
+            #       (`c90626f` · 2026-09-09 09:41) 전후가 섞여 있어 stage3 가 죽던 코드
+            #       상태의 관측이 포함된다. 지형이 달라진 뒤의 수치와 합산할 수 없다.
+            #     ※ "N회 발동" 을 런 수로 세지 말 것 — `_run_cp_sat_basic` 호출부가 8곳이라
+            #       한 생성 요청이 이 게이트를 여러 번 지날 수 있다. 정확한 발동 수는 미계수다.
+            #   ★ 판정축은 패스의 성공/실패가 아니라 **최종 근무표의 D5 건수**로 잡았다
+            #     (실패 회차엔 `D5 before→after` 가 안 찍혀 로그로는 못 잰다).
+            #     쌍별 차이(현행-끔) 합 +11 / 20쌍 · 회당 4.95 대 4.40 · 부호검정 p=0.238.
+            #     ★ 이 차이를 "끈 쪽이 더 좋다" 로 읽으면 안 된다. 성공 0회면 두 팔은
+            #       **알고리즘적으로 동일**하므로 이 ±는 전부 솔버 비결정성이다.
+            #       역으로 그게 증거다 — 켜 둬도 출력이 안 바뀐다는 뜻이니까.
+            #       (같은 이유로 검정력 논의는 성립하지 않는다. 열린 통로가 없다.)
+            #     소요는 회당 52s → 44s (-8s) 로 패스가 쓰던 시간만큼 줄었다.
+            #   ★ 측정 기준선 주의 ― 이 A/B 는 워킹트리에 `teams.min_shift` 반영
+            #     (roster_create_service.py:3255~ · 당시 미커밋)이 함께 있는 상태에서 돌았다.
+            #     솔버 입력이 바뀌는 변경이므로, 절대 수치를 뒤 세션과 비교할 땐 이걸 감안한다.
+            #     (같은 트리 안 두 팔 비교이므로 이번 판정 자체는 영향받지 않는다.)
+            #   ★★ 껐다고 D5 가 방치되는 게 아니다 ― `fallback_objectives.py` 의
+            #     `obj.append(-_d5_w * v5)` 로 **stage3 목적에 이미 페널티가 들어가 있다**
+            #     (기본 가중치 1200). 이 패스는 그 위에 "한 번 더" 얹던 시도일 뿐이다.
+            #   ★ 예산만 줄이는 안(②)도 함께 기각했다 ― 유일한 성공 회차가 10.49초라
+            #     예산을 깎으면 그 1건마저 놓쳐 끄는 것과 실질이 같다.
+            #   ★ 동결을 푸는 안(③)은 손대지 않는다 ― 같은 세션에서 S4-② 빈 제약과
+            #     grade 중복 계수로 **동결이 어긋나면 품질이 무너지는 것**을 실측했다.
+            #   ★ 되살리려면 고칠 것은 **모델**이다 — 이 패스는 애초에 실행가능해를
+            #     하나도 못 찾는다(UNKNOWN). 정지 조건을 손대는 시도는 아래에서 기각됐다.
+            #   ★★ 되살리기가 `AIDE_D5_LEX=1` 한 줄로 끝나지 않는다.
+            #     운영 소비자는 Lambda(`roster-solver-{prod,dev}`)인데
+            #     `.github/workflows/deploy-lambda.yml` 은 `update-function-code`(이미지 URI)만
+            #     호출하고 `update-function-configuration`(환경변수)은 **부르지 않는다.**
+            #     즉 이 플래그를 넣을 자리가 레포에 없다 — 콘솔/CLI 로 함수 설정을 직접
+            #     건드려야 하고, 그건 다음 배포 때 코드와 어긋날 수 있다.
+            #   ★ 끈 뒤에는 로그에 흔적이 없다 — `if _lex_on:` 이 False 면 성공·실패 한 줄도
+            #     안 남아 "꺼짐" 과 "코드에서 제거됨" 이 로그상 구별되지 않는다.
+            #     그래서 아래에 `AIDE_LEX_TRACE=1` 일 때만 스킵 사실을 한 줄 남긴다.
             _lex_maxn = int(_os_tl3.environ.get("AIDE_D5_LEX_MAXN", 15) or 15)
             # ── mutex lex 패스(D5-lex 앞=상위 우선): "grade/team 바로 밑" ──
             # grade/team 소프트 품질을 동결(무회귀)한 뒤 상호배제 위반합만 최소화 →
             # mutex 가 선호/야간분포보다 위, grade/team·하드보다 아래. 동결 부등식이라 infeasible 불가(soft).
-            # 자기게이트(mutex=0 skip)·인원게이트(N<=_lex_maxn)는 D5-lex 와 동일.
+            # 자기게이트(mutex=0 skip)는 D5-lex 와 같은 방식이나, 인원게이트는 **별도 임계**다
+            # (`_mx_lex_maxn` 기본 40 · D5-lex 는 15). 같다고 읽으면 발동 범위를 오판한다.
             # mutex-lex 는 grade/team 만 동결(총품질 아님)해 D5 보다 가벼움 + 자기게이트(위반 0 skip)
             # + 타임리밋(초과 시 원해 유지)이라, D5(15)보다 높은 40 을 기본으로 실병동(19·35명 등) 커버.
             _mx_lex_maxn = int(_os_tl3.environ.get("AIDE_MUTEX_LEX_MAXN", 40) or 40)
@@ -4221,11 +4288,20 @@ def optimize_fallback_lex_hard_first(
                         _s3m = cp_model.CpSolver()
                         _s3m.parameters.max_time_in_seconds = max(8, int(tl3))
                         _s3m.parameters.num_search_workers = 8
-                        # ★ 미검증 착상: 앞 단계는 0.15/0.05 로 느슨히 끊는데 후속 패스
-                        #   (mutex-lex · D5-lex)만 `relative_gap_limit` 기본 0.0 이라
-                        #   **완전 최적 증명까지 돈다**. 뒤로 갈수록 느슨해야 할 것이
-                        #   역전돼 있다. s3 와 같은 0.05 로 맞추는 안은 품질 영향을
-                        #   재지 않아 보류한다 — 손대려면 A/B 로 함께 측정할 것.
+                        # ── [기각] 후속 패스 gap_limit 완화 · 2026-09-09 ──────────────
+                        #   착상: 후속 패스(mutex-lex · D5-lex)만 `relative_gap_limit` 기본 0.0
+                        #     이라 완전 최적 증명까지 돈다. 앞 단계는 0.15(stage1·2)/0.05(stage3)
+                        #     로 느슨히 끊는데 뒤로 갈수록 조여지는 역전으로 보였다.
+                        #   ★ 기각: 0.05 를 걸어도 **아무것도 안 바뀐다**(9B 실측).
+                        #     d5-lex 12.08s→12.19s · 둘 다 UNKNOWN.
+                        #   ★★ 이유는 gap 계산이 아니라 **비교 대상이 없다는 것**이다.
+                        #     OR-Tools 정의: `abs(O - B) / max(1, abs(O))`, O = best **feasible**
+                        #     objective. 최적화 모델의 UNKNOWN 은 실행가능해를 하나도 못 찾았다는
+                        #     뜻이라(찾았으면 FEASIBLE) **O 자체가 없어** 이 파라미터는 bound 가
+                        #     어떻든 구조적으로 발화하지 못한다. 분모도 obj 가 아니라 max(1,|O|) 다.
+                        #     즉 병목은 정지 조건이 아니라 **해를 아예 못 찾는 것**이다.
+                        #   ★ 손대려면 gap 이 아니라 모델 쪽이다 — 이 패스는 `Minimize(sum(_mx_vars))`
+                        #     처럼 목적이 0/1 변수 합인데 하한 근거가 약해 LP 완화가 0 을 준다.
                         _st3m = _solve_traced(_s3m, m3, logger_prefix, "stage3:mutex-lex")
                         if _st3m in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                             _mx_after = sum(int(_s3m.Value(v)) for v in _mx_vars)
@@ -4243,7 +4319,15 @@ def optimize_fallback_lex_hard_first(
                         pass  # 위반 0 → 스킵
                     except Exception as _mx_lex_e:
                         print(f"{logger_prefix} 폴백3 mutex-lex 패스 예외: {_mx_lex_e}")
-            _lex_on = (_os_tl3.environ.get("AIDE_D5_LEX", "1") != "0") and (N <= _lex_maxn)
+            # 기본 "0" ― 위 기각 주석 참조. 되살리려면 AIDE_D5_LEX=1.
+            _lex_on = (_os_tl3.environ.get("AIDE_D5_LEX", "0") != "0") and (N <= _lex_maxn)
+            if not _lex_on:
+                # ★ 끈 상태를 로그로 구별할 수 있게 남긴다 — 없으면 "꺼짐" 과
+                #   "코드에서 제거됨" 이 로그상 같아 보인다(위 기각 주석 참조).
+                #   `_trace` 가 자체적으로 AIDE_LEX_TRACE 를 보므로 평소엔 조용하다.
+                _trace(logger_prefix, "stage3:d5-lex", skip="off",
+                       AIDE_D5_LEX=_os_tl3.environ.get("AIDE_D5_LEX", "(unset)"),
+                       maxn=_lex_maxn, N=N)
             if _lex_on:
                 _d5_vars = getattr(m3, "_ms_d5_lex_vars", None) or []
                 _obj_terms = getattr(m3, "_stage3_obj_terms", None)
@@ -4271,7 +4355,7 @@ def optimize_fallback_lex_hard_first(
                         _s3b = cp_model.CpSolver()
                         _s3b.parameters.max_time_in_seconds = max(8, int(tl3))
                         _s3b.parameters.num_search_workers = 8
-                        # (위 mutex-lex 의 gap_limit 주석과 같은 사안)
+                        # (위 mutex-lex 의 gap_limit 기각 주석과 같은 사안)
                         _st3b = _solve_traced(_s3b, m3, logger_prefix, "stage3:d5-lex")
                         if _st3b in (cp_model.OPTIMAL, cp_model.FEASIBLE) and \
                                 sum(int(_s3b.Value(v)) for v in _d5_vars) <= _d5_before:
