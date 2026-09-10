@@ -939,6 +939,9 @@ def get_personnel_basic_info(
                     "phone_number": _gw.get("PortableTel"),
                     "email": _gw.get("Email") or None,
                     "profile_image_url": None,
+                    # 관리자는 `nurses` 행 자체가 없어 온마음 가입일이 없다.
+                    #   키를 빼면 프론트가 필드 유무로 분기해야 하므로 null 로 명시한다.
+                    "onmaum_joined_at": None,
                 }
             raise HTTPException(
                 status_code=404, detail="간호사 정보를 찾을 수 없습니다."
@@ -1001,6 +1004,16 @@ def get_personnel_basic_info(
             "tenure": tenure_display,
             "work_place": work_place,
             "profile_image_url": get_profile_image_url(nurse.profile_image_key),
+            # 온마음 가입**일** = `nurses.created_at` 의 날짜 부분.
+            #   바로 위 `joining_date`(병원 입사일)와 다르다 — 입사는 몇 년 전이어도
+            #   온마음에는 병동 온보딩 시점에 한꺼번에 들어온다(실측: 병동 단위로
+            #   같은 시각을 공유). 모바일이 첫 진입 환영 메시지 판정에 쓴다.
+            # ★ 시각을 빼고 날짜만 준다. `created_at` 은 MSSQL `DATETIME` 이라 타임존이
+            #   없는데, 오프셋 없는 ISO datetime 을 내려보내면 런타임에 따라 local 로도
+            #   UTC 로도 해석돼 자정 근처 사용자의 날짜가 하루 어긋난다.
+            "onmaum_joined_at": (
+                nurse.created_at.date().isoformat() if nurse.created_at else None
+            ),
         }
     except HTTPException:
         raise
