@@ -802,7 +802,8 @@ def _parse_avoid_results(
       기피는 잉여다("10일은 E 말고 D로 줘"). 그대로 두면 저장에서 422 duplicate_date 로
       막혀 요청 전체가 실패한다. fixed 셀의 banned 를 drop 하는 규칙과 같은 논리.
 
-    반환: [{"date": "YYYY-MM-DD", "shift_id": "E", "intent": "avoid", "comment": ""}]
+    반환: [{"date": "YYYY-MM-DD", "shift_id": "E", "intent": "avoid", "comment": "부담이 됩니다"}]
+      `comment` 는 AIDE 가 문장에서 뽑은 **사유**다. 없으면 빈 문자열(선호 경로와 같은 계약).
     """
     if not isinstance(avoid_results, list):
         return []
@@ -826,7 +827,11 @@ def _parse_avoid_results(
                 if allowed_shift_map and code not in allowed_shift_map:
                     print(f"[avoid 파싱] 원티드 미노출 코드 → 제외: {code}")
                     continue
-                for raw_day in (sr.get("date") or []):
+                # 사유는 `date` 와 같은 길이의 리스트로 온다(선호 쪽 `_parse_shift_results` 와 같은 규약).
+                # 예전에는 여기서 무조건 "" 로 눌러 버려서, 간호사가 쓴 기피 사유가
+                # `banned_wanted_entries.reason` 에 저장될 자리가 있는데도 항상 비어 있었다.
+                sr_comments = sr.get("comment") or []
+                for idx, raw_day in enumerate(sr.get("date") or []):
                     try:
                         day = int(raw_day)
                     except (ValueError, TypeError):
@@ -839,11 +844,13 @@ def _parse_avoid_results(
                     date_str = f"{year}-{month:02d}-{day:02d}"
                     if date_str in by_date:
                         continue
+                    _c = sr_comments[idx] if idx < len(sr_comments) else None
                     by_date[date_str] = {
                         "date": date_str,
                         "shift_id": code,
                         "intent": "avoid",
-                        "comment": "",
+                        # 계약은 선호와 동일 — 사유가 없으면 빈 문자열이다(None 아님).
+                        "comment": str(_c).strip() if _c else "",
                     }
     parsed = [by_date[k] for k in sorted(by_date)]
     if parsed:

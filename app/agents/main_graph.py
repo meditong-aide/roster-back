@@ -43,6 +43,9 @@ class ContextAnalyticsState(TypedDict):
     # query_analyzer 는 예전부터 Except 를 뽑아냈지만 이 상태에 선언이 없어 그래프
     # 경계에서 통째로 버려지고 있었다("10일은 E 피하고 싶습니다" 가 무시됨).
     query_except: List[str]
+    # 기피 사유. `query_except` 와 **인덱스가 짝**이다(선호 쪽 query_shift_comments 와 같은 규약).
+    # 선언이 없으면 그래프 경계에서 통째로 버려진다 — query_except 가 예전에 그랬다.
+    query_except_comments: List[str | None]
     query_preference: List[str]
     query_chat: List[str]
     query_others: List[str]

@@ -411,12 +411,25 @@ async def create_avoid_analyzer(parent_state):
     if not requests:
         return {"avoid_results": []}
 
-    print(f"[create_avoid_analyzer] 기피 요청 {len(requests)}건 분석")
+    # ★ 사유는 요청과 **인덱스로 짝**을 이룬다. 길이가 어긋나면 **되살리려 하지 않고 전부 버린다.**
+    #   빠진 자리가 뒤쪽이라는 보장이 없어서다 — 요청 [A,B] 에 사유 [B사유] 가 오면
+    #   앞에서부터 맞추는 순간 B 의 사유가 A 에게 붙고, 그 값이 그대로
+    #   `banned_wanted_entries.reason` 에 저장돼 **조용히 남의 사유로 남는다.**
+    #   사유가 비는 것은 되돌릴 수 있지만 잘못 붙은 사유는 구분할 방법이 없다.
+    _raw_comments = list(parent_state.get('query_except_comments') or [])
+    if _raw_comments and len(_raw_comments) != len(requests):
+        print(f"[create_avoid_analyzer][WARN] 사유 {len(_raw_comments)}건 vs 요청 {len(requests)}건 — "
+              f"인덱스 정합이 깨져 사유를 전부 버린다(잘못 귀속하느니 비운다)")
+        _raw_comments = []
+    avoid_comments = _raw_comments or [None] * len(requests)
+
+    print(f"[create_avoid_analyzer] 기피 요청 {len(requests)}건 분석 "
+          f"(사유 {sum(1 for c in avoid_comments if c)}건)")
     sub_state = {
         # case 병합 경로를 타지 않도록 명시 — case 는 선호(wanted) 전용이다.
         "case_results": None,
         "query_shift": requests,
-        "query_shift_comments": [None] * len(requests),
+        "query_shift_comments": avoid_comments,
         "year": parent_state['year'],
         "month": parent_state['month'],
         "allowed_shift_map": parent_state.get('allowed_shift_map', {}),
