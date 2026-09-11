@@ -254,6 +254,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
     # 2️⃣ 각 간호사별 submitted → draft 순으로 선호도 가져오기
     _wr_deno_count = 0
     _wr_special_count = 0
+    # ★ request_id 는 (간호사, 월) 스코프로 1부터 다시 채번된다(`wanted_service._next_request_id`).
+    #   그래서 같은 (nurse_id, request_id) 가 여러 달에 존재하고, 아래 셀 조회를 월로 묶지
+    #   않으면 다른 달 셀이 딸려 와 **일(day)만 떼어 쓰는 DENO 경로에서 같은 날짜로 잘못
+    #   반영된다.** 특수코드 분기는 이미 year/month 를 확인하는데 DENO 만 빠져 있었다.
+    _wr_start = date(req.year, req.month, 1)
+    _wr_end = _wr_start + timedelta(days=calendar.monthrange(req.year, req.month)[1])
     for nurse_id in nurse_ids:
         submitted_wr = (
             db.query(WantedRequest)
@@ -279,7 +285,10 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             .filter(
                 NurseShiftRequest.nurse_id == nurse_id,
                 NurseShiftRequest.request_id == target_wr.request_id,
-                # cast(NurseShiftRequest.shift_date, String).like(f"{month_str}-%"),
+                # 반열린 구간 [1일, 다음달 1일) — `wanted_service.py:1086-1088` 과 같은 형태다.
+                # 문자열 LIKE 는 SARGable 이 아니라 쓰지 않는다.
+                NurseShiftRequest.shift_date >= _wr_start,
+                NurseShiftRequest.shift_date < _wr_end,
             )
             .all()
         )
