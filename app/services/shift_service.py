@@ -249,23 +249,24 @@ def _remove_shift_manage_code(
     shift_gb: str | None,
 ) -> bool:
     """
-    shift_manage.codes 에서 shift_id 를 제거합니다(슬롯=shift_gb 매핑).
+    shift_manage.codes 에서 shift_id 를 제거합니다.
 
     - 근무코드 삭제/변경 시 orphan code 가 codes 에 남지 않도록 정리하는 공용 헬퍼.
     - 커밋은 호출자 책임(원자적 트랜잭션 보존).
+    - ★ 슬롯을 `shift_gb` 로 좁히지 않는다. 예전엔 좁혔는데, 두 경우에 고아가 남았다.
+      ① `shift_gb` 가 슬롯으로 안 풀리면(None·비표준값) 아무 것도 못 지우고 반환했다.
+      ② 코드의 `shift_gb` 를 바꿔 온 이력이 있으면 **이전 슬롯**의 등록이 그대로 남았다.
+      남은 고아는 그 슬롯의 대체코드로 읽혀 커버리지 계산에 조용히 섞인다.
+      근무코드는 그룹 안에서 정확히 한 슬롯에만 속하므로 그룹 전체를 훑어 지우는 편이
+      안전하다. `shift_gb` 는 이제 쓰지 않지만 호출부 시그니처 호환을 위해 남겨 둔다.
     """
     if not office_id or not shift_id:
-        return False
-    target_slot, main_code = _resolve_slot_main(shift_gb)
-    if target_slot is None:
         return False
     rows = (
         db.query(ShiftManage)
         .filter(
             ShiftManage.office_id == office_id,
             ShiftManage.group_id == group_id,
-            ShiftManage.shift_slot == target_slot,
-            ShiftManage.main_code == main_code,
         )
         .all()
     )
@@ -286,6 +287,7 @@ def _append_shift_manage_code(
     shift_gb: str | None,
     old_shift_id: str | None = None,
     old_shift_gb: str | None = None,
+    commit: bool = True,
 ) -> None:
     """
     shift_manage.codes에 근무코드를 중복 없이 추가합니다.
@@ -293,6 +295,9 @@ def _append_shift_manage_code(
     - shift_gb가 D/E/N/M(또는 한글)일 때만 동작하며, slot은 1/2/3/5에 매핑됩니다.
     - 기존에 코드가 있으면 추가하지 않습니다.
     - update 시 shift_id 또는 shift_gb가 바뀌면 이전 슬롯에서 제거한 뒤 새 슬롯에 추가합니다.
+    - `commit=False` 면 커밋하지 않는다. 여러 코드를 한 트랜잭션으로 묶어야 하는 호출부
+      (근무코드 일괄 가져오기)가 쓴다 — 코드마다 커밋하면 중간에 실패했을 때 앞쪽 코드는
+      확정되고 뒤쪽은 누락된 채로 남는다.
     """
     if not office_id:
         return
@@ -325,8 +330,44 @@ def _append_shift_manage_code(
 
     added_any = _append(shift_gb, shift_id)
 
-    if removed_any or added_any:
+    if commit and (removed_any or added_any):
         db.commit()
+
+
+def shift_code_taken(
+    db: Session,
+    office_id: str | None,
+    group_id: str,
+    shift_id: str,
+    exclude_row_id: int | None = None,
+) -> bool:
+    """같은 병동에 이 근무코드가 이미 있는지.
+
+    ★ 유일성 키는 **(office_id, group_id, shift_id)** 다. `group_id` 만으로 잡으면 안 된다 —
+      `group_id` 가 빈 문자열인 행이 오피스마다 따로 존재해서(ADM 이 병동 지정 없이 목록을
+      열면 그 오피스 몫으로 기본코드가 깔린다) `group_id` 만 보면 남의 오피스 행을 자기
+      중복으로 오판한다. 조회 경로도 전부 office_id + group_id 로 필터한다.
+    ★ `shifts` 에는 이 조합의 UNIQUE 제약이 아직 없다. 그래서 이 검사가 유일한 방어선이고,
+      동시 요청 두 건은 여전히 함께 통과할 수 있다(제약이 생기면 IntegrityError 로 막힌다).
+      그때까지의 순차 중복만이라도 여기서 끊는다.
+
+    Args:
+        exclude_row_id: 수정 중인 자기 자신(`shifts.id`)은 충돌에서 제외한다.
+    """
+    if not shift_id:
+        return False
+    q = db.query(Shift.id).filter(
+        Shift.group_id == group_id,
+        Shift.shift_id == shift_id,
+    )
+    if office_id is not None:
+        q = q.filter(Shift.office_id == office_id)
+    if exclude_row_id is not None:
+        q = q.filter(Shift.id != exclude_row_id)
+    # ★ `db.query(q.exists()).scalar()` 를 쓰면 안 된다 — SQLAlchemy 가 `SELECT EXISTS(...)`
+    #   를 만드는데 MSSQL 에는 그 문법이 없어 "Incorrect syntax near the keyword 'EXISTS'"
+    #   로 죽는다(실측). 한 행만 집어 유무를 본다.
+    return q.first() is not None
 
 
 def add_shift_service(req, current_user, db, override_group_id: str | None = None):
@@ -348,11 +389,7 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         if not nurse or not nurse.group:
             raise Exception("User group information not found")
         office_id = nurse.group.office_id
-    existing_shift = db.query(Shift).filter(
-        Shift.shift_id == req.shift_id,
-        Shift.group_id == target_group_id
-    ).first()
-    if existing_shift:
+    if shift_code_taken(db, office_id, target_group_id, req.shift_id):
         raise Exception("이미 존재하는 근무코드입니다.")
     _assert_off_swap_target_valid(
         db,
@@ -390,6 +427,9 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         auto_schedule=req.auto_schedule,
         sequence=max_sequence + 1,
         shift_gb=req.shift_gb,
+        # ★ 요청의 default_shift 를 저장한다. 빠뜨리면 NULL 로 들어가 주휴 식별
+        #   (SSOT 가 shifts.default_shift 다)·MID 판정 같은 하위 로직이 조용히 어긋난다.
+        default_shift=getattr(req, "default_shift", None),
         # 추가
         show_in_preference=getattr(req, "show_in_preference", False), # 프론트 미 전송 시 False
         off_swap_target=bool(getattr(req, "off_swap_target", False) or False),
@@ -398,15 +438,24 @@ def add_shift_service(req, current_user, db, override_group_id: str | None = Non
         description=getattr(req, "description", None),
     )
     db.add(new_shift)
-    db.commit()
+    # ★ 근무코드 저장과 슬롯 등록을 한 트랜잭션으로 확정한다(업로드·가져오기 경로와 동일).
+    #   먼저 커밋해 버리면 슬롯 등록에서 실패했을 때 코드만 남고, 같은 코드를 다시 넣으려
+    #   해도 중복검사에 걸려 **슬롯 누락을 복구할 방법이 없다.**
+    db.flush()
     db.refresh(new_shift)
-    _append_shift_manage_code(
-        db=db,
-        office_id=office_id,
-        group_id=target_group_id,
-        shift_id=new_shift.shift_id,
-        shift_gb=req.shift_gb,
-    )
+    try:
+        _append_shift_manage_code(
+            db=db,
+            office_id=office_id,
+            group_id=target_group_id,
+            shift_id=new_shift.shift_id,
+            shift_gb=req.shift_gb,
+            commit=False,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {
         "message": "근무코드가 성공적으로 추가되었습니다.",
         "shift": {
@@ -474,16 +523,51 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     )
     old_shift_id = existing_shift.shift_id
     old_shift_gb = getattr(existing_shift, "shift_gb", None)
+    # ★ 코드 개명 충돌 검사. 예전엔 이 검사가 **아예 없었다** — 이미 있는 코드로 이름을
+    #   바꿔도 그대로 저장돼 같은 병동에 같은 코드가 두 행이 됐고, 그 뒤로는 화면이 집는 행과
+    #   근무표 생성이 집는 행이 갈렸다(목록은 sequence 순 첫 행, 생성은 dict 마지막 행).
+    #   실측된 '같은 shifts.id 에 N→N1, O→OFF, D→Dㅇ' 이력이 이 경로에서 나왔다.
+    if str(req.shift_id) != str(old_shift_id) and shift_code_taken(
+        db,
+        getattr(existing_shift, "office_id", None),
+        target_group_id,
+        req.shift_id,
+        exclude_row_id=existing_shift.id,
+    ):
+        raise Exception("이미 존재하는 근무코드입니다.")
+    # shift_id · name · color · type 은 스키마상 필수라 항상 실려 온다.
     existing_shift.shift_id = req.shift_id
     existing_shift.name = req.name
     existing_shift.color = req.color
-    existing_shift.start_time = req.start_time
-    existing_shift.end_time = req.end_time
     existing_shift.type = req.type
-    existing_shift.duration = req.duration
-    existing_shift.allday = req.allday
-    existing_shift.auto_schedule = req.auto_schedule
-    existing_shift.shift_gb = req.shift_gb
+    # ★ 아래 5개는 스키마가 **생략을 허용**한다(Optional + 기본값). 무조건 대입하면 이름만
+    #   바꾸는 부분 수정 요청이 근무시간을 NULL 로, allday 를 0 으로, auto_schedule 을 1 로
+    #   되돌린다 — 주휴처럼 auto_schedule=0 인 코드가 자동편성 대상으로 바뀌는 식이다.
+    #   `shift_gb`·`default_shift` 와 같은 규칙(생략은 보존, 명시적 null 은 반영)으로 맞춘다.
+    #   ★ 현재 웹·모바일 프론트는 둘 다 행 전체를 보내므로 이 가드로 동작이 달라지지 않는다.
+    #     계약상 열려 있는 구멍만 막는 것이다.
+    _sent = getattr(req, "model_fields_set", ())
+    for _f in ("start_time", "end_time", "duration", "allday", "auto_schedule"):
+        if _f in _sent:
+            setattr(existing_shift, _f, getattr(req, _f))
+    # ★★ `default_shift` 와 **똑같은 이유로** 보낸 경우에만 반영한다. 스키마 기본값이 None
+    #   이라 무조건 대입하면, 이 필드를 안 싣는 화면이 이름만 바꿔 저장해도 기존 '데이' 가
+    #   NULL 로 날아간다. 게다가 그러면 old_shift_gb 와 값이 달라져
+    #   `_append_shift_manage_code` 가 **모든 슬롯에서 코드를 지우고 어디에도 넣지 못한다**
+    #   — 근무코드가 `shift_manage` 에서 사라진 채 커밋된다(실측으로 재현함).
+    #   아래 슬롯 등록에도 이 실효값을 넘겨야 저장값과 등록이 어긋나지 않는다.
+    if "shift_gb" in getattr(req, "model_fields_set", ()):
+        existing_shift.shift_gb = req.shift_gb
+    effective_shift_gb = existing_shift.shift_gb
+    # ★ 추가와 같은 이유로 수정에서도 반영한다(누락 시 화면에서 바꾼 구분이 저장되지 않는다).
+    # ★★ 단 **보낸 경우에만** 반영한다. 스키마 기본값이 None 이라 무조건 대입하면, 이 필드를
+    #   모르는 기존 화면이 다른 항목만 고쳐 저장할 때마다 default_shift 가 조용히 지워진다
+    #   (주휴 식별·MID 판정이 그때 깨진다).
+    # ★★★ 그렇다고 `is not None` 으로 거르면 **명시적 해제(null)** 를 생략과 구분 못 해,
+    #   D/E/N 이던 코드를 일반 근무로 되돌릴 방법이 없어진다. `model_fields_set` 은
+    #   "요청에 실제로 담겨 온 필드"만 담으므로 생략과 명시적 null 을 정확히 가른다.
+    if "default_shift" in getattr(req, "model_fields_set", ()):
+        existing_shift.default_shift = req.default_shift
     # 원티드 페이지 노출 여부 업데이트
     if hasattr(req, "show_in_preference") and req.show_in_preference is not None:
         existing_shift.show_in_preference = req.show_in_preference
@@ -496,19 +580,31 @@ def update_shift_service(req, current_user, db, override_group_id: str | None = 
     # 수면OFF 부여 대상 코드 업데이트 (None 이면 기존 값 유지)
     if hasattr(req, "sleep_off_target") and req.sleep_off_target is not None:
         existing_shift.sleep_off_target = bool(req.sleep_off_target)
-    # 근무코드 설명 업데이트 — 프론트가 빈 값을 null 로 전송하므로 클리어 허용(항상 반영).
-    existing_shift.description = getattr(req, "description", None)
-    db.commit()
+    # ★ 설명도 같은 규칙 — **생략은 보존, 명시적 null 은 삭제.**
+    #   예전엔 무조건 대입해서, 필수 필드만 실은 부분 수정 요청이 설명을 지웠다. 게다가
+    #   스키마 주석은 "None 이면 기존 값 유지" 라고 정반대로 적혀 있어 계약이 서로 어긋나
+    #   있었다. 프론트가 설명을 지울 때는 null 을 **명시해서** 보내므로 클리어도 그대로 된다.
+    if "description" in _sent:
+        existing_shift.description = req.description
+    # ★ 추가와 같은 이유로 한 트랜잭션이다. 개명 시에는 이전 슬롯 제거와 새 슬롯 등록이
+    #   함께 일어나므로, 중간에 끊기면 코드가 **두 슬롯 어디에도 없거나 양쪽에 남는다.**
+    db.flush()
     db.refresh(existing_shift)
-    _append_shift_manage_code(
-        db=db,
-        office_id=existing_shift.office_id,
-        group_id=target_group_id,
-        shift_id=existing_shift.shift_id,
-        shift_gb=req.shift_gb,
-        old_shift_id=old_shift_id,
-        old_shift_gb=old_shift_gb,
-    )
+    try:
+        _append_shift_manage_code(
+            db=db,
+            office_id=existing_shift.office_id,
+            group_id=target_group_id,
+            shift_id=existing_shift.shift_id,
+            shift_gb=effective_shift_gb,
+            old_shift_id=old_shift_id,
+            old_shift_gb=old_shift_gb,
+            commit=False,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     return {
         "message": "근무코드가 성공적으로 수정되었습니다.",
         "shift": {
@@ -530,7 +626,15 @@ def remove_shift_service(req, current_user, db, override_group_id: str | None = 
         raise Exception("Permission denied")
     # 그룹 스코프: 조회(LIST)와 동일하게 토큰 group_id 기준으로 group_access 모듈에서 해석+권한검증.
     target_group_id = resolve_effective_group(db, current_user, override_group_id or current_user.group_id)
-    existing_shift = db.query(Shift).filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id).first()
+    # ★ 중복 행이 있으면 정렬 없는 `.first()` 는 **어느 행을 지울지 보장하지 않는다.**
+    #   목록이 보여 주는 행(= sequence ASC, id ASC 첫 행)을 지워야 사용자가 화면에서
+    #   고른 것과 실제 삭제분이 일치한다(정본 `shift_service_mssql.SHIFT_LIST_ORDER`).
+    existing_shift = (
+        db.query(Shift)
+        .filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
+        .first()
+    )
     if not existing_shift:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")
     schedule_entries_count = db.query(ScheduleEntry).filter(
@@ -561,7 +665,14 @@ def move_shift_service(req, current_user, db, override_group_id: str | None = No
         raise Exception("Permission denied")
     # 그룹 스코프: 조회(LIST)와 동일하게 토큰 group_id 기준으로 group_access 모듈에서 해석+권한검증.
     target_group_id = resolve_effective_group(db, current_user, override_group_id or current_user.group_id)
-    shift_to_move = db.query(Shift).filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id).first()
+    # ★ 중복 행이 있으면 정렬 없는 `.first()` 가 **화면에 안 보이는 행**을 옮길 수 있다.
+    #   목록과 같은 첫 행을 집는다(정본 `shift_service_mssql.SHIFT_LIST_ORDER`).
+    shift_to_move = (
+        db.query(Shift)
+        .filter(Shift.shift_id == req.shift_id, Shift.group_id == target_group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
+        .first()
+    )
     if not shift_to_move:
         raise Exception("해당 근무코드를 찾을 수 없습니다.")
     old_sequence = shift_to_move.sequence
@@ -832,12 +943,31 @@ def shift_upload_confirm(
     errors: List[Dict[str, Any]] = []
     saved_items: List[Dict[str, Any]] = []
 
+    # ★ 확정(confirm) 단계에는 중복 검사가 **하나도 없었다**. 검사는 별도 요청인
+    #   upload-validate 에만 있어서, 검증과 확정 사이에 코드가 추가되거나 사용자가 검증을
+    #   건너뛰고 확정만 호출하면 중복이 그대로 들어갔다. 파일 안 중복도 막지 못했다.
+    #   여기서 (기존 DB 행) + (같은 파일 앞쪽 행) 양쪽을 본다.
+    seen_in_file: Set[str] = set()
+
     for idx, item in enumerate(rows, 1):
         try:
             shift_id = str(item.get("shift_id", "")).strip()
             if not shift_id:
                 errors.append({"row": item.get("row", 0), "reason": "shift_id 누락"})
                 continue
+            if shift_id in seen_in_file:
+                errors.append({"row": item.get("row", 0),
+                               "reason": f"파일 안에 '{shift_id}' 가 중복입니다."})
+                continue
+            if shift_code_taken(db, office_id, target_group_id, shift_id):
+                errors.append({"row": item.get("row", 0),
+                               "reason": f"이미 존재하는 근무코드입니다: {shift_id}"})
+                continue
+            seen_in_file.add(shift_id)
+            # ★ `shift_gb` 도 한 번만 다듬어 저장·슬롯등록 양쪽에 같은 값을 쓴다.
+            #   다듬지 않으면 `" 데이 "` 가 SHIFT_GB_TO_SLOT_CODE 매칭에 실패해 슬롯 등록이
+            #   **조용히 건너뛰어진다**(오류도 안 난다).
+            shift_gb = (str(item.get("shift_gb")).strip() or None) if item.get("shift_gb") else None
 
             max_seq += 1
 
@@ -847,7 +977,7 @@ def shift_upload_confirm(
                 group_id=target_group_id,
                 name=str(item.get("name", "")).strip(),
                 color=str(item.get("color", "#CF847A")).strip(),
-                shift_gb=item.get("shift_gb") or None,
+                shift_gb=shift_gb,
                 start_time=_parse_time_str(item.get("start_time")),
                 end_time=_parse_time_str(item.get("end_time")),
                 type=str(item.get("type", "근무")).strip(),
@@ -861,25 +991,38 @@ def shift_upload_confirm(
             )
             db.add(new_shift)
             saved += 1
-            saved_items.append(item)
+            # ★ 원본 item 을 그대로 담으면 안 된다. `shift_id` 는 위에서 strip() 한 값으로
+            #   저장하는데 item 에는 다듬기 전 값이 남아 있어서, 아래 shift_manage 등록이
+            #   `"  D1  "` 같은 공백 포함 코드를 넣는다. 그러면 슬롯 코드가 실제 근무코드와
+            #   달라져 커버리지 계산에서 빠지고, 나중에 그 코드를 지워도 슬롯에는 고아로 남는다.
+            #   (confirm 은 rows 가 List[dict] 라 validate 를 거치지 않고도 호출된다.)
+            saved_items.append({"shift_id": shift_id, "shift_gb": shift_gb})
 
         except Exception as e:
             errors.append({"row": item.get("row", 0), "reason": str(e)})
 
-    db.commit()
-
-    # ShiftManage codes 업데이트 (데이/이브닝/나이트 → D/E/N 변환)
-    for item in saved_items:
-        sg = item.get("shift_gb")
-        slot_code = SHIFT_GB_TO_SLOT_CODE.get(sg)
-        if slot_code:
-            _append_shift_manage_code(
-                db=db,
-                office_id=office_id,
-                group_id=target_group_id,
-                shift_id=item["shift_id"],
-                shift_gb=slot_code,
-            )
+    # ★★ Shift 삽입과 shift_manage 등록을 **한 트랜잭션**으로 확정한다(import 경로와 동일).
+    #   예전엔 Shift 를 먼저 커밋하고 그 뒤 코드마다 따로 커밋했다. 등록 도중 실패하면
+    #   근무코드만 저장되고 슬롯 등록이 빠지는데, 같은 파일을 다시 올려도 위쪽 중복검사가
+    #   "이미 존재하는 근무코드" 로 걸러 버려 **누락된 슬롯 등록이 영영 복구되지 않는다.**
+    try:
+        # ShiftManage codes 업데이트 (데이/이브닝/나이트 → D/E/N 변환)
+        for item in saved_items:
+            sg = item.get("shift_gb")
+            slot_code = SHIFT_GB_TO_SLOT_CODE.get(sg)
+            if slot_code:
+                _append_shift_manage_code(
+                    db=db,
+                    office_id=office_id,
+                    group_id=target_group_id,
+                    shift_id=item["shift_id"],
+                    shift_gb=slot_code,
+                    commit=False,
+                )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
     return {"success": saved, "saved": saved, "errors": errors}
 
@@ -915,7 +1058,9 @@ def get_available_shifts_for_import(
             Shift.group_id.in_(other_group_ids),
             Shift.office_id == office_id,
         )
-        .order_by(Group.group_name, Shift.sequence)
+        # ★ import_shifts_to_group 의 원본 선택 정렬과 반드시 같아야 한다.
+        #   화면에 보인 행과 실제로 복사되는 행이 갈리면 설정이 조용히 바뀐다.
+        .order_by(Group.group_name, Shift.sequence, Group.group_id, Shift.id)
         .all()
     )
 
@@ -949,18 +1094,34 @@ def import_shifts_to_group(
     target_group_id: str,
     office_id: str,
     db: Session,
+    sources: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
-    """선택된 근무코드를 다른 그룹에서 현재 그룹으로 복사."""
+    """선택된 근무코드를 다른 그룹에서 현재 그룹으로 복사.
+
+    `sources` 는 `{shift_id: source_group_id}` — 사용자가 후보 목록에서 실제로 본 병동이다.
+    ★ 배치 하나에 **여러 병동**에서 고른 코드가 섞일 수 있어 코드별 매핑으로 받는다.
+      원본을 배치 전체에 하나만 두면, 화면에서 두 병동의 코드를 함께 고른 사용자는
+      나머지가 전부 "원본을 찾을 수 없습니다" 로 떨어진다.
+    매핑에 없는 코드는 후보 조회와 **같은 정렬**로 같은 행을 고른다.
+    ★ 예전엔 정렬 없이 `.first()` 였다. 같은 오피스의 여러 병동에 같은 `shift_id` 가 있으면
+      DB 가 고르는 대로라, 화면에 보인 것과 다른 병동의 행이 복사될 수 있었다. 특히
+      `default_shift` 가 NULL 인 행(=이 경로로 기본코드를 채운 병동)이 뽑히면 대표코드
+      표식이 또 유실돼 같은 장애가 재발한다.
+    """
     if not shift_ids:
         return {"imported": 0, "skipped": 0, "errors": []}
 
+    # ★ 유일성 키는 (office_id, group_id, shift_id) 다 — shift_code_taken 참조.
+    #   group_id 만으로 잡으면 group_id 가 빈 행에서 남의 오피스 코드를 자기 것으로 읽는다.
     existing_ids: Set[str] = set(
         row[0] for row in
-        db.query(Shift.shift_id).filter(Shift.group_id == target_group_id).all()
+        db.query(Shift.shift_id)
+        .filter(Shift.group_id == target_group_id, Shift.office_id == office_id)
+        .all()
     )
     max_seq = (
         db.query(func.max(Shift.sequence))
-        .filter(Shift.group_id == target_group_id)
+        .filter(Shift.group_id == target_group_id, Shift.office_id == office_id)
         .scalar() or 0
     )
     other_group_ids = [
@@ -969,6 +1130,8 @@ def import_shifts_to_group(
         .filter(Group.office_id == office_id, Group.group_id != target_group_id)
         .all()
     ]
+    other_group_set = set(other_group_ids)
+    sources = sources or {}
 
     imported = 0
     skipped = 0
@@ -980,13 +1143,29 @@ def import_shifts_to_group(
             skipped += 1
             continue
 
+        # 지정된 원본은 같은 오피스의 다른 병동이어야 한다(타 오피스·자기 자신 차단).
+        # 코드 하나가 막혀도 나머지는 정상 처리한다 — 배치 전체를 되돌리면 사용자가
+        # 어느 항목이 문제인지 알 수 없다.
+        requested_src = sources.get(sid)
+        if requested_src is not None and requested_src not in other_group_set:
+            errors.append({"shift_id": sid, "reason": "원본 병동에 접근할 수 없습니다."})
+            continue
+        allowed_group_ids = [requested_src] if requested_src else other_group_ids
+
         source = (
             db.query(Shift)
+            .join(Group, Shift.group_id == Group.group_id)
             .filter(
                 Shift.shift_id == sid,
-                Shift.group_id.in_(other_group_ids),
+                Shift.group_id.in_(allowed_group_ids),
                 Shift.office_id == office_id,
             )
+            # 후보 조회(get_available_shifts_for_import)와 같은 순서로 골라
+            # 화면에 보인 행과 복사되는 행을 일치시킨다.
+            # ★ `group_name` 과 `sequence` 는 둘 다 유일하지 않다(같은 그룹 안에서도
+            #   sequence 가 겹치는 행이 실재한다). 마지막에 유일 키를 붙여야 두 쿼리가
+            #   확실히 같은 행을 고른다 — 양쪽 정렬을 한 글자도 다르지 않게 유지할 것.
+            .order_by(Group.group_name, Shift.sequence, Group.group_id, Shift.id)
             .first()
         )
         if not source:
@@ -1009,7 +1188,16 @@ def import_shifts_to_group(
             auto_schedule=source.auto_schedule,
             duration=source.duration,
             sequence=max_seq,
-            default_shift=None,
+            # ★ `default_shift` 를 원본 그대로 옮긴다. 예전엔 None 으로 박았다.
+            #   이 값은 두 가지를 겸한다 — 기본코드에서는 "이 코드가 대표코드다" 라는 표식
+            #   (주휴 식별자이기도 하다), 파생코드에서는 **대표코드 매핑**이다
+            #   (실제 데이터에 D1→D · E1→E · N1→N · MD→M · OFF→O 가 있다).
+            #   지우면 전자는 주휴 판정과 대표코드 접기가 깨지고, 후자는 가져온 파생코드가
+            #   슬롯 미분류로 떨어진다.
+            #   ★ 신규 그룹은 `GET /shifts` 가 행 0건일 때만 기본 6종(D/E/N/M/O/주)을 깔아
+            #     준다. 다른 코드를 먼저 import 하면 그 분기를 못 타서 기본코드까지 이 경로로
+            #     채우게 되고, 그때 대표코드 표식이 통째로 사라졌다.
+            default_shift=source.default_shift,
             is_weekly_off=source.is_weekly_off,
             show_in_preference=source.show_in_preference,
         )
@@ -1018,17 +1206,26 @@ def import_shifts_to_group(
         imported += 1
         saved_items.append({"shift_id": sid, "shift_gb": source.shift_gb})
 
-    db.commit()
-
-    for item in saved_items:
-        slot_code = SHIFT_GB_TO_SLOT_CODE.get(item["shift_gb"] or "")
-        if slot_code:
-            _append_shift_manage_code(
-                db=db,
-                office_id=office_id,
-                group_id=target_group_id,
-                shift_id=item["shift_id"],
-                shift_gb=slot_code,
-            )
+    # ★★ Shift 삽입과 shift_manage 등록을 **한 트랜잭션**으로 확정한다.
+    #   예전엔 Shift 를 먼저 커밋하고 그 뒤에 코드마다 따로 커밋했다. 등록 도중 실패하면
+    #   Shift 행만 남고 shift_manage 등록이 빠지는데, 재시도해도 `existing_ids` 에 걸려
+    #   skipped 로 넘어가 **영영 복구되지 않는다**(가져오기는 성공한 것처럼 보이지만
+    #   커버리지·인력 설정에서는 그 코드가 계속 빠져 있다).
+    try:
+        for item in saved_items:
+            slot_code = SHIFT_GB_TO_SLOT_CODE.get(item["shift_gb"] or "")
+            if slot_code:
+                _append_shift_manage_code(
+                    db=db,
+                    office_id=office_id,
+                    group_id=target_group_id,
+                    shift_id=item["shift_id"],
+                    shift_gb=slot_code,
+                    commit=False,
+                )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
     return {"imported": imported, "skipped": skipped, "errors": errors}

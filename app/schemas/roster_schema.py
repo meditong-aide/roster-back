@@ -39,7 +39,30 @@ class RemoveShiftRequest(BaseModel):
     shift_id: str
 
 
-class ShiftUpdateRequest(BaseModel):
+class _ShiftCodeNormalizeMixin(BaseModel):
+    """근무코드 요청의 문자열 키를 입력 경계에서 한 번만 다듬는다.
+
+    ★★ 왜 스키마에서 하는가 — `shift_gb` 는 저장(`shifts.shift_gb`)과 슬롯 등록
+      (`SHIFT_GB_TO_SLOT_CODE` 매칭) **두 군데**에서 쓰인다. 다듬지 않으면 `" 데이 "` 가
+      저장은 되는데 슬롯 매칭에만 실패해 **등록이 오류 없이 조용히 생략된다.**
+      더 나쁜 건 수정이다. 기존 `"데이"` 를 `" 데이 "` 로 보내면 `old_shift_gb` 와 달라
+      기존 슬롯 등록은 지워지는데 새 값은 매핑되지 않아, 코드가 `shift_manage` 에서
+      **사라진 채로 커밋된다.**
+    ★ 다듬기만 하고 허용값 검증은 하지 않는다. 운영에 `shift_gb='O'` 가 126건 있는데
+      `VALID_SHIFT_GB` 에는 없어서, 허용값을 강제하면 기존 근무코드 수정이 전부 막힌다.
+    """
+
+    # check_fields=False — 이 믹스인 자체에는 해당 필드가 없고 상속받는 모델에만 있다.
+    @field_validator("shift_id", "shift_gb", "default_shift", mode="before", check_fields=False)
+    @classmethod
+    def _strip_code_fields(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
+        return v
+
+
+class ShiftUpdateRequest(_ShiftCodeNormalizeMixin):
     """시프트 수정 요청 모델."""
 
     default_shift: Optional[str] = None
@@ -60,10 +83,13 @@ class ShiftUpdateRequest(BaseModel):
     off_swap_target: Optional[bool] = None  # None이면 기존 값 유지 (초과 OFF 변환 타깃)
     health_leave_target: Optional[bool] = None  # None이면 기존 값 유지 (보건휴가 부여 대상 코드)
     sleep_off_target: Optional[bool] = None  # None이면 기존 값 유지 (수면OFF 부여 대상 코드)
-    description: Optional[str] = None  # 근무코드 설명. None이면 기존 값 유지
+    # ★ 아래 Optional 필드들의 계약은 하나로 통일돼 있다 — **미전송이면 기존 값 유지,
+    #   명시적 null 은 해제.** 판별은 `model_fields_set` 으로 한다(기본값 None 만으로는
+    #   "안 보냄" 과 "null 을 보냄" 을 구분할 수 없다).
+    description: Optional[str] = None  # 근무코드 설명. 미전송 시 유지, 명시적 null 은 삭제
 
 
-class ShiftAddRequest(BaseModel):
+class ShiftAddRequest(_ShiftCodeNormalizeMixin):
     """시프트 등록 요청 모델."""
 
     default_shift: Optional[str] = None
@@ -336,6 +362,10 @@ class RosterConfigBase(BaseModel):
     health_leave_weekend: Optional[bool] = Field(
         default=None,
         description="보건휴가 주말 배치 허용 — False 시 평일에만 배치. health_leave_enabled=True 일 때만 의미가 있다. 미전송(None) 시 기존 값 유지",
+    )
+    ban_night_before_fixed_wanted_off: Optional[bool] = Field(
+        default=None,
+        description="확정 원티드로 굳힌 OFF 직전일에 N 배치 금지 — 신청해서 받은 휴일이 직전 N 의 회복 OFF 시작점으로 소비되면 실질적으로 쉰 것이 아니므로 휴가·공가와 같은 취급을 한다. 대상은 확정 원티드로 굳힌 **O** 셀이다(주휴 코드로 신청한 셀도 대표코드가 O 로 접혀 포함). 자동으로 배정된 OFF 는 대상이 아니고, 휴가·공가 계열은 기존 설정이 담당한다. 당월 1일이 확정 OFF 인 경우는 전월 N 마감의 회복분이라 면제. 미전송(None) 시 기존 값 유지",
     )
     sleep_off_enabled: Optional[bool] = Field(
         default=None,
@@ -747,6 +777,15 @@ class ShiftImportRequest(BaseModel):
 
     shift_ids: List[str]
     group_id: str
+    sources: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "근무코드별 원본 병동 — `{shift_id: source_group_id}`. 후보 조회"
+            "(`/shifts/available-imports`)는 코드마다 다른 `source_group_id` 를 줄 수 있으므로, "
+            "화면에서 고른 항목의 값을 코드별로 그대로 돌려준다. 여기 없는 코드는 후보 조회와 "
+            "같은 규칙(병동명 → sequence 순)으로 서버가 같은 행을 고른다. 전체 미전송도 허용."
+        ),
+    )
 
 
 # 마이 페이지 테스트

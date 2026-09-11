@@ -27,6 +27,7 @@ _FIX_BY_KEY: dict[str, tuple[str, str, str, bool]] = {
     "ban_n_to_e":               ("roster_config.transition",        "설정 > 근무 규칙 > 밤 다음날 저녁 근무 금지", "auto_apply", True),
     "banned_day_after_eve":     ("roster_config.transition",        "설정 > 근무 규칙 > 저녁 다음날 낮 근무 금지", "auto_apply", True),
     "ban_night_before_fixed_off": ("roster_config.transition",      "설정 > 근무 규칙 > 쉬는 날 전날 밤 근무 금지", "auto_apply", True),
+    "ban_night_before_fixed_wanted_off": ("roster_config.transition", "설정 > 근무 규칙 > 신청한 휴무 전날 밤 근무 금지", "auto_apply", True),
     "weekend_off_only_enable":  ("roster_config.weekend_off",       "설정 > 근무 규칙 > 주말 무조건 휴무",       "auto_apply", True),
     "team_min_soft_fallback":   ("roster_config.team_min",          "설정 > 팀 최소 인원",                      "auto_apply", True),
     "preceptee_on":             ("roster_config.preceptee",         "설정 > 교육(프리셉티) 함께 근무",           "auto_apply", True),

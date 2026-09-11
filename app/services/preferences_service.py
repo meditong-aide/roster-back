@@ -621,12 +621,19 @@ def _replace_shift_requests(
         NurseShiftRequest.shift_date < end_date,
     ).delete(synchronize_session=False)
 
-    shift_table_ids = {
-        sid: tid
-        for sid, tid in db.query(Shift.shift_id, Shift.id)
+    # ★ 대표 행은 목록 조회와 같은 (sequence ASC, id ASC) **첫 행**이어야 한다
+    #   (정본 `shift_service_mssql.SHIFT_LIST_ORDER`). `shifts` 에 UNIQUE 가 없어
+    #   같은 (group, shift_id) 행이 여럿이고, 정렬 없이 dict 로 접으면 마지막 행이 이긴다.
+    #   ★★ 이 경로는 바로 위에서 그 달 요청을 **전량 delete 후 재삽입**한다 —
+    #      대표가 흔들리면 저장할 때마다 다른 `shifts_table_id` 가 박힌다.
+    shift_table_ids: dict = {}
+    for _sid, _tid in (
+        db.query(Shift.shift_id, Shift.id)
         .filter(Shift.group_id == group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
         .all()
-    }
+    ):
+        shift_table_ids.setdefault(_sid, _tid)
     for detailed_id, entry in enumerate(entries, start=1):
         db.add(NurseShiftRequest(
             nurse_id=nurse_id,
@@ -1000,12 +1007,18 @@ def submit_preferences_service(
     # shifts.id 매핑
     _nurse_row = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
     _grp_id = _nurse_row.group_id if _nurse_row else None
+    # ★ 위 `_replace_shift_requests` 와 **같은 대표 선정 규칙**을 쓴다(첫 행 우선).
+    #   두 경로가 서로 다른 행을 고르면 같은 간호사의 같은 코드가 경로에 따라
+    #   다른 `shifts_table_id` 로 저장된다.
     _shift_id_to_table_id = {}
     if _grp_id:
-        _shift_id_to_table_id = {
-            s.shift_id: s.id
-            for s in db.query(Shift.shift_id, Shift.id).filter(Shift.group_id == _grp_id).all()
-        }
+        for _s in (
+            db.query(Shift.shift_id, Shift.id)
+            .filter(Shift.group_id == _grp_id)
+            .order_by(Shift.sequence.asc(), Shift.id.asc())
+            .all()
+        ):
+            _shift_id_to_table_id.setdefault(_s.shift_id, _s.id)
 
     detailed_id = 1
     for date_str, shift_id in data_to_save.items():
@@ -1318,12 +1331,8 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
         raise Exception("Not authenticated")
     month_str = f"{year}-{month:02d}"
 
-    # override_group_id 미지정 시 호출자 home group.
-    # ★ 여기서 정의되지 않은 `home_gid` 를 참조해 왔다 → group_id 없이 호출하면
-    #   NameError → 500. `override_group_id` 가 있으면 단축평가로 넘어가므로
-    #   ADM 은 멀쩡하고 **일반 간호사만 100% 실패**해서 오래 안 드러났다.
-    #   클라이언트(req.ts:preferences_all)는 !ok 를 [] 로 삼켜서, 에러 없이
-    #   원티드 화면의 동료 선호 데이터만 조용히 사라졌다.
+    # override_group_id 미지정 시 호출자 home group. (과거 정의되지 않은 home_gid 를
+    # 참조해 group_id 없이 호출하면 NameError → 500 이었다.)
     target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
