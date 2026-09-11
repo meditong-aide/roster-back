@@ -141,10 +141,24 @@ ARMS = [("현행", {}), ("정체종료", {"AIDE_LEX_STALL": "1"}),
         #     막는 몫이다. 총합만 동결하는 현행에서는 30만 항목끼리 자유롭게 맞바꿀 수 있다.
         #   ★★ 반드시 gapABS 를 **깔고** 비교한다 — S4-① 단독 팔과 견주면 두 처치가 섞인다.
         ("S4-1+gapABS", {"AIDE_LEX_S4_STAGE2": "1",
-                         "AIDE_S2_GAP": "0", "AIDE_S2_ABS_GAP": "0.99"})]
+                         "AIDE_S2_GAP": "0", "AIDE_S2_ABS_GAP": "0.99"}),
+        # ── ② stage2 정체 종료 + 상한 확장 ── (2026-09-11 · dev 코드 기준)
+        #   ★ 별도 게이트를 만들지 않고 **기존 워치독을 stage2 로 확장**했다.
+        #     "마지막개선/wall >= 임계면 연장" 과 "N초 정체면 종료" 는 같은 정보를 쓰는
+        #     같은 규칙이라 임계를 사전에 정할 필요가 없다(경계값 0.9 가 소거된 이유).
+        #   ★ `AIDE_S2_STALL=1` 이면 상한 배수가 자동 3배(tl2 21s → 63s).
+        #     개선이 이어지는 병동은 63s 까지 가고, 멈춘 병동은 임계(7s)에서 끊겨
+        #     **현행보다 빨라진다.** 전역 tl2x3 기각 사유(+31% 소요)를 구조적으로 회피.
+        #   ★★ 판정축 — 지도 실측으로 **stage3 가 아니라 소요**로 옮겼다.
+        #     시화중환2 stage3 폭이 10회에서 **5,100,005**(고립OFF 17건)라 5회로는 판정 불가.
+        #     소요는 폭 14s 로 좁아 시간 회수가 직접 읽힌다.
+        #     품질은 **폭 0 병동**(9A·9B·중환1)에서 **비회귀**로 본다 — 거기선 1만 움직여도 신호.
+        #   ★ 대조군은 "현행" 이다 — gapABS 가 이제 **기본값**이라 아무것도 안 켜면 그 상태다.
+        ("s2stall", {"AIDE_S2_STALL": "1"})]
 _KEYS = ("AIDE_LEX_STALL", "AIDE_LEX_GAP", "AIDE_S3_SAFETY", "AIDE_LEX_S4_STAGE2",
          "LEX_PASS_ORDER", "AIDE_S2_TL_MULT", "AIDE_S2_BEST_N",
-         "AIDE_S2_GAP", "AIDE_S2_ABS_GAP", "AIDE_S2_CARRY", "AIDE_GRADE_OFF0_W")
+         "AIDE_S2_GAP", "AIDE_S2_ABS_GAP", "AIDE_S2_CARRY", "AIDE_GRADE_OFF0_W",
+         "AIDE_S2_STALL", "AIDE_S2_STALL_IDLE", "AIDE_S1_GAP", "AIDE_S1_ABS_GAP")
 if os.getenv("ARMS"):
     _w = {x.strip() for x in os.getenv("ARMS").split(",") if x.strip()}
     ARMS = [a for a in ARMS if a[0] in _w] or ARMS
