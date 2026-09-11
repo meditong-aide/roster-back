@@ -71,7 +71,12 @@ ALL = ACTIVE + LEGACY                       # G= 로 지정하면 레거시도 �
 only = [x.strip() for x in (os.getenv("G", "") or "").split(",") if x.strip()]
 # ★ 기본 모수는 ACTIVE 뿐이다. 레거시를 재려면 G 로 **명시**해야 한다 —
 #   그래야 "전량 배치" 가 조용히 레거시를 섞어 판정을 오염시키지 못한다.
-_pool = ALL if only else ACTIVE
+# ★ 임시 검증용 — **판정 모수에 넣지 않고** 한 번만 검사할 병동. `이름:group_id` 형식.
+#   온보딩 중이거나 타 세션이 보고한 병동을 ACTIVE 에 섞으면 모수 정본이 오염되고,
+#   그러면 이후 A/B 의 부호검정 기준이 조용히 달라진다(세브2 사례).
+EXTRA = [tuple(x.split(":", 1)) for x in (os.getenv("EXTRA", "") or "").split(",")
+         if ":" in x]
+_pool = (ALL if only else ACTIVE) + EXTRA
 GROUPS = [(n, g) for n, g in _pool if not only or g in only or n in only]
 REPS = int(os.getenv("R", "3"))
 MAIN_SET = {"D", "E", "N", "M", "O", "주", "W"}

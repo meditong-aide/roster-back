@@ -145,7 +145,35 @@ LEX_PASS_ORDER_DEFAULT = "off_range,grade,team,n_range,n2n,de,pref"
 #   성격(고정된 커버리지 안에서의 재배치)이라 같은 층이되 team 을 앞세운다.
 #   ★ cascade 의 대체 단계(off≥1) 는 2M/6M 이라 여기에 넣지 않는다 — 넣으면 team 과
 #     safety 를 압도해 lex 우선순위가 뒤집힌다. 그 단계는 Stage 3 목적함수가 맡는다.
-GRADE_OFF0_LEX_WEIGHT = 150_000
+# ★★ 2026-09-11 · 15만 → 16만. **정수배를 깨는 것이 목적이다.**
+#   종전 15만은 고립OFF(30만)와 정확히 2:1 이라
+#     `고립OFF 1건 + 미달 3건` = 30만 + 45만 = **75만**
+#     `고립OFF 2건 + 미달 1건` = 60만 + 15만 = **75만**   ← 완전 동률
+#   16만이면 78만 대 76만이 되어 **뒤쪽(미달 1건)이 이긴다.**
+#   그래서 어느 구성이 나올지를 한 자릿수 항목(off_quota 등) **1단위가 결정**했고,
+#   달마다 작은 항목 지형이 바뀌면 반대 구성이 나왔다 —
+#   사용자에겐 "같은 규칙인데 결과 성격이 다르다" 로 보인다. 이건 데이터가 아니라 설계 문제였다.
+#   실측(9A · 2026-09-11): stage2 최적해가 750,013 대 750,014 로 **1 차이**였고
+#   큰 항목 합은 양쪽 75만으로 같았다.
+#   ★ 사용자 결정(2026-09-11): **등급 순수미달이 고립OFF 보다 나쁘다.**
+#     (미달 = 그날 그 근무에 요구 등급 간호사가 목표 수에 못 미친 인원.
+#      대체 등급으로 메운 건은 제외한 순수 미달이라 환자 안전 쪽 항목이다.
+#      2026-05-13 주석이 team/grade 를 커버리지 다음의 안전 항목으로 두는 것과 같은 층.)
+#   ★ 16만이면 `미달 2건(32만) > 고립OFF 1건(30만)` 이라 동률이 깨지고,
+#     솔버가 **고립OFF 를 받더라도 미달을 줄이는** 해를 일관되게 고른다.
+#   ★ 정수배(30만/15만·30만/10만)로 되돌리지 말 것 — 동률이 되살아난다.
+#
+#   ★★ **롤백 조건 (사용자 지시 · 2026-09-11)**
+#     이 변경은 "미달을 줄이는 대신 고립OFF 를 **받는**" 방향이다. 그 대가가 예상보다
+#     크면 되돌린다 — 구체적으로 **실측에서 고립OFF 건수가 유의하게 늘면 동급으로 되돌린다.**
+#       · 판정: 같은 병동 현행(15만) 5회의 고립OFF 건수 **노이즈 폭**을 기준선으로 잡고,
+#         16만 팔의 중앙값이 그 폭을 넘어 증가하면 회귀로 본다.
+#       · 되돌릴 때는 15만이 아니라 **동률이 안 되는 값**을 쓴다(정수배 금지 원칙은 유효).
+#         "동급으로" 는 우선순위 판단을 되돌린다는 뜻이지 15만 복귀가 아니다 —
+#         15만으로 가면 어느 구성이 나올지를 다시 한 자릿수 항목이 정하게 된다.
+#       · 되돌림도 `AIDE_GRADE_OFF0_W` 로 즉시 가능하다(코드 수정 불요).
+GRADE_OFF0_LEX_WEIGHT = int(
+    _os_lex.environ.get("AIDE_GRADE_OFF0_W", "160000") or 160_000)
 
 
 # ── 계측(S0) ────────────────────────────────────────────────────────────────
@@ -176,6 +204,185 @@ def _apply_trace_params(solver) -> None:
         solver.parameters.log_search_progress = True
 
 
+# ── [S1 재정의] 정체 기반 조기 종료 + stage3 이월 · 2026-09-10 ─────────────────
+#   S1 의 **전역 데드라인** 형태는 기각됐다(시간 이득 0). 그러나 그 측정이 실제로
+#   말한 것은 "리밋이 사실상 안 걸린다" 가 아니라 **"패스마다 걸리는 회차와 안 걸리는
+#   회차가 섞여 있다"** 였다. 9A 6회 실측(2026-09-10):
+#
+#     총 소요 36.4~58.5s(변동 22.0s). 40% 이상 단일 구간 **없음** —
+#     lex2 26% · lex5 26% · lex6 24% · lex7 17% · 비-solve 15% 로 고르게 분산.
+#     거의 모든 lex 패스가 **이중분포**다(증명 성공→조기 종료 ↔ 증명 실패→리밋 소진).
+#     리밋까지 돈 27건의 '마지막 개선 시각 / wall' 분포:
+#       >=70% 11건(리밋 직전까지 개선 중 — 시간이 더 필요)
+#       <=30%  7건(초반에 멈추고 bound 만 상승 — 이미 최적인데 증명을 못 함)
+#
+#   ★ 그래서 예산을 일률로 늘리거나 줄이면 **양쪽 다 손해**다. 기준을 시간이 아니라
+#     **개선 정체**로 바꾼다 — 최소 시간은 보장하고, 그 뒤 일정 시간 새 해가 없으면 끊는다.
+#     리밋 직전까지 개선 중이던 회차는 안 건드리고, 초반에 멈춘 회차에서만 시간이 회수된다.
+#   ★ 회수분은 **stage3 로 이월**한다. stage3 는 6/6 리밋 소진에 개선 시각이
+#     58·82·44·32·74·99% 라 **시간을 더 주면 품질이 오르는 유일한 구간**이다.
+#     전역 컷 형태에선 stage3 가 먼저 손해를 봤지만, 이월 형태에선 수혜자가 된다.
+#   ★ lex 패스 목적은 전부 **정수 카운트**라 `absolute_gap_limit` 을 1 미만으로 두면
+#     `best - bound < 1` = 사실상 최적에서 끊긴다. bound 가 오르는 패스에서 증명 완료를
+#     기다릴 필요가 없어진다. LP 완화가 0 인 패스(고립OFF 등)엔 효과가 없지만 비용도 0 이다.
+#
+#   기본 off. `AIDE_LEX_STALL=1` 로 켠다. 회수 시간은 `_STALL_SAVED` 에 누적된다.
+_STALL_SAVED: list = []          # [초...] — 생성 1회분. stage3 직전에 합산해 tl3 에 얹는다
+# ★ stage2 의 **원래** 예산(tl2). 상한을 배수로 올려도 이월은 이 값을 넘지 않는다 —
+#   안 그러면 늘려 준 시간이 회수분으로 둔갑해 stage3 로 흘러 총 소요가 폭증한다(:368).
+_S2_BASE_TL: list = [0.0]
+
+
+def _stall_config():
+    """(정체종료 활성, 최소보장초, 정체판정초, gap처치 활성, absolute gap). 둘 다 기본 off.
+
+    ★ 게이트를 **둘로 나눈다.** 처음엔 한 플래그에 묶여 있었는데, 그러면 A/B 에서
+      "정체 종료" 와 "relative 0 + absolute gap" 의 기여가 안 갈린다.
+        AIDE_LEX_STALL=1  정체 기반 조기 종료 + stage3 이월
+        AIDE_LEX_GAP=1    lex 패스의 relative_gap_limit 0 + absolute_gap_limit 0.99
+    """
+    import os as _os_s
+    _stall = _os_s.environ.get("AIDE_LEX_STALL") == "1"
+    _gap = _os_s.environ.get("AIDE_LEX_GAP") == "1"
+    return (_stall,
+            float(_os_s.environ.get("AIDE_LEX_STALL_MIN", "2") or 2),
+            float(_os_s.environ.get("AIDE_LEX_STALL_IDLE", "3") or 3),
+            _gap,
+            float(_os_s.environ.get("AIDE_LEX_ABS_GAP", "0.99") or 0.99))
+
+
+def _s2_stall_config():
+    """stage2 본 solve 전용 (활성, 최소보장초, 정체판정초). 기본 off.
+
+    ★★ 왜 lex 값을 그대로 안 쓰는가 — **stage2 는 시간을 더 줘야 하는 구간**이라
+      판정이 반대 방향이다. lex 는 "정체하면 빨리 끊고 넘긴다"(IDLE 3초)지만,
+      stage2 는 "개선이 이어지는 한 상한까지 간다" 가 목적이라 임계가 보수적이어야 한다.
+      실측(2026-09-11 · 시화중환2)에서 stage2 는 리밋 직전까지(wall 대비 90~100%)
+      개선 중이었다 — 3초 임계면 그 개선을 중간에 끊는다.
+
+    ★ 이 처치가 겨냥하는 것: 종료 사유가 똑같이 "시간리밋" 이어도 속은 정반대다.
+        시화중환2  마지막개선 90·97%  → 개선 중인데 잘렸다  → 상한까지 줘야 한다
+        세브7      마지막개선 47·15%  → 3.2초에 멈추고 21초까지 돌았다 → 끊어야 한다
+      정체 워치독은 **그 둘을 자동으로 가른다.** 임계를 사전에 정할 필요가 없다.
+    """
+    import os as _os_s2
+    return (_os_s2.environ.get("AIDE_S2_STALL") == "1",
+            float(_os_s2.environ.get("AIDE_S2_STALL_MIN", "3") or 3),
+            float(_os_s2.environ.get("AIDE_S2_STALL_IDLE", "7") or 7))
+
+
+class _LastImprove(cp_model.CpSolverSolutionCallback):
+    """새 해가 나올 때마다 시각을 갱신한다 — 정체 판정의 기준."""
+
+    def __init__(self):
+        super().__init__()
+        import time as _t
+        self._t = _t
+        self.last = _t.perf_counter()
+        self.count = 0
+
+    def on_solution_callback(self):
+        self.last = self._t.perf_counter()
+        self.count += 1
+
+
+def _solve_with_stall_stop(solver, model, phase: str):
+    """정체하면 끊는다. `stop_search()` 는 다른 스레드에서 부르도록 만들어져 있다.
+
+    걸리는 곳: lex 패스 전부 + **stage2 본 solve**(`phase == "stage2"` · 2026-09-11 확장).
+    ★ stage3 에는 걸지 않는다 — 거기는 시간을 **더** 줘야 하는 구간이다.
+    ★ stage2 를 넣는 것은 그 원칙과 모순이 아니다: 상한을 3배로 올려 주면서(:3723)
+      정체했을 때만 끊으므로 **주는 쪽**이다. 개선이 이어지는 병동은 63초까지 가고,
+      3.2초에 멈추는 병동은 임계에서 끊겨 현행(21초)보다 오히려 빨라진다.
+    """
+    import threading
+    import time as _t
+
+    on, min_sec, idle_sec, gap_on, abs_gap = _stall_config()
+    # ── stage2 본 solve 로 확장 (2026-09-11) ──────────────────────────────────
+    #   ★ 별도 게이트를 만들지 않는다. "마지막개선/wall ≥ 임계면 연장" 과
+    #     "N초 정체면 종료" 는 **같은 정보를 쓰는 같은 규칙**이라, 이미 있는 워치독을
+    #     stage2 로 확장하고 상한만 올리면 된다(:3680 에서 tl2 × 3).
+    #   ★★ `phase == "stage2"` 로 **정확히** 좁힌다 — `startswith` 를 쓰면
+    #     best-of-N 의 서브 solve(`stage2#1`·`stage2#2`…)와 `stage2:best` 에 각각
+    #     상한 3배가 걸려 총 예산이 **N×3 배**가 된다. best-of-N 은 기본 off(:3679)라
+    #     지금은 안 닿지만, 켜는 순간 조용히 터진다.
+    _s2_phase = (phase == "stage2")
+    if _s2_phase:
+        on, min_sec, idle_sec = _s2_stall_config()
+    elif not phase.startswith("lex"):
+        return solver.Solve(model)
+    if not (on or gap_on):
+        return solver.Solve(model)
+    if _s2_phase:
+        gap_on = False          # stage2 의 gap 은 :3690 에서 따로 건다(AIDE_S2_GAP)
+
+    # ★★ lex 패스는 `s2` 를 **재사용**한다(:3570 에서 한 번 만들고 max_time 만 바꾼다).
+    #   거기 `relative_gap_limit = 0.15`(:3573)가 걸려 있는데, lex 목적은 정수 카운트라
+    #   목적값 20 이면 **gap 3 에서 끊긴다** — `absolute_gap_limit=0.99` 보다 훨씬 먼저다.
+    #   그러면 absolute 는 영영 발화하지 못하고, 더 나쁜 것은 **동결값이 최적보다 최대 15%
+    #   나쁜 채로 다음 패스에 고정**된다는 것이다(품질 누수).
+    #   정체 종료가 시간 낭비를 막아 주므로 lex 패스에서는 relative 를 0 으로 두고
+    #   absolute 만 남긴다. 큰 목적값을 다루는 stage2 본 solve 는 0.15 를 그대로 쓴다.
+    _prev_rel = float(getattr(solver.parameters, "relative_gap_limit", 0.0) or 0.0)
+    if gap_on:                                   # ★ gap 처치는 독립 게이트다
+        solver.parameters.relative_gap_limit = 0.0
+        if abs_gap > 0:
+            solver.parameters.absolute_gap_limit = abs_gap
+
+    if not on:
+        # gap 처치만 켠 팔 — 워치독 없이 그대로 푼다.
+        try:
+            return solver.Solve(model)
+        finally:
+            solver.parameters.relative_gap_limit = _prev_rel
+
+    cb = _LastImprove()
+    budget = float(getattr(solver.parameters, "max_time_in_seconds", 0) or 0)
+    started = _t.perf_counter()
+    done = threading.Event()
+    stopped = threading.Event()      # 워치독이 실제로 끊었는가
+
+    def _watch():
+        while not done.wait(0.2):
+            now = _t.perf_counter()
+            if now - started < min_sec:
+                continue
+            if now - cb.last >= idle_sec:
+                stopped.set()
+                solver.stop_search()
+                return
+
+    th = threading.Thread(target=_watch, daemon=True)
+    th.start()
+    try:
+        st = solver.SolveWithSolutionCallback(model, cb)
+    finally:
+        done.set()
+        # ★★ 반드시 합류시킨다. `s2` 가 **공유 객체**라, 살아남은 워치독이 다음 패스의
+        #   `stop_search()` 를 부르면 그 패스가 이유 없이 일찍 끝난다 —
+        #   로그에도 안 보이고 "왜 갑자기 품질이 나쁘지" 로만 나타난다.
+        th.join(timeout=1.0)
+        solver.parameters.relative_gap_limit = _prev_rel     # 다음 패스에 새지 않게 복원
+
+    spent = _t.perf_counter() - started
+    # ★ 이월하는 것은 **정체로 끊어 회수한 시간뿐**이다.
+    #   증명으로 일찍 끝난 여유까지 넘기면 그건 현행에서도 안 쓰던 시간이라
+    #   총 소요가 늘어난다(1회 샘플에서 48.1s → 53.3s 로 는 것이 이 때문이다).
+    # ★★ stage2 는 **상한을 3배로 올려 놓았기 때문에** `budget - spent` 로 재면 안 된다.
+    #   세브7 을 예로 들면 상한 63초에서 10초에 정체로 끊기는데, 그대로 재면 53초가
+    #   "회수" 로 잡힌다. 그중 42초는 현행(tl2=21초)에 **애초에 없던 시간**이라
+    #   이월하면 총 소요가 폭증한다 — 바로 위 주석이 경고하는 함정과 같은 것이고,
+    #   상한을 올리는 순간 그 전제("워치독이 남긴 시간은 어차피 안 쓰던 시간")가 깨진다.
+    #   그래서 **원래 예산(tl2)을 상한으로 잘라서** 잰다.
+    _cap = budget
+    if _s2_phase and _S2_BASE_TL[0] > 0:
+        _cap = min(budget, _S2_BASE_TL[0])
+    if stopped.is_set() and _cap > 0 and spent < _cap:
+        _STALL_SAVED.append(_cap - spent)
+    return st
+
+
 def _solve_traced(solver, model, logger_prefix: str, phase: str):
     """Solve 를 감싸 wall time·status·objective·bound 를 남긴다.
 
@@ -185,7 +392,8 @@ def _solve_traced(solver, model, logger_prefix: str, phase: str):
     from time import perf_counter as _pc
     _apply_trace_params(solver)
     _t0 = _pc()
-    st = solver.Solve(model)
+    # 정체 조기 종료(기본 off · AIDE_LEX_STALL=1). lex 패스에만 걸린다 — 위 주석 참조.
+    st = _solve_with_stall_stop(solver, model, phase)
     _dt = _pc() - _t0
     if _trace_on():
         _obj = _bnd = None
@@ -358,6 +566,9 @@ def optimize_fallback_lex_hard_first(
     tl1 = max(5, int(time_limit_seconds * 0.45))
     tl2 = max(5, int(time_limit_seconds * 0.35))
     tl3 = max(3, time_limit_seconds - tl1 - tl2)
+    # ★ 생성 1회분 누적이다. 리셋하지 않으면 같은 프로세스의 두 번째 생성부터
+    #   이월이 계속 부풀어 stage3 예산이 무한정 늘어난다(in-process 하네스에서 즉시 드러난다).
+    _STALL_SAVED.clear()
     import os as _os_tl3
     _tl3_override = int(_os_tl3.environ.get("AIDE_FB_TL3", 0) or 0)
     if _tl3_override > 0:
@@ -3144,6 +3355,27 @@ def optimize_fallback_lex_hard_first(
                         obj.append(-60 * _adj)
             if _fb_max_cov_off_equalize_terms:
                 obj.extend(_fb_max_cov_off_equalize_terms)
+            # ── [안건 (가)] stage3 목적에 safety 를 넣는다 · 기본 off ─────────────
+            #   ★ 이것은 **결함 수리가 아니라 상한 아래에서 공짜로 얻는 개선**이다.
+            #     S4-② 동결(`sum(safety3) <= stage2 값`)이 이미 상위 목적을 지켜 주므로
+            #     (가)가 safety 를 나쁘게 만들 수는 없고, 좋게 만들 수만 있다.
+            #   ★ 왜 개선 여지가 있나 — stage2 본 solve 는 tl2 안에서 찾은 값에서 멈춘다.
+            #     고립OFF 제약의 LP 완화가 항등적으로 0 이라 bound 가 안 올라와 **최적을
+            #     증명하지 못하고**, 그 값이 최적이라는 보장이 없다. 그런데 지금 stage3 는
+            #     목적에 safety 가 없어 **더 낮출 수 있어도 낮출 동기가 없다.**
+            #     목적에 넣으면 stage3 가 받는 12~20초를 safety 감소에도 쓴다.
+            #   ★★ 위험은 **스케일 지배**다. safety 슬랙은 이미 30만·10만 가중이라
+            #     pref(수천 단위)를 눌러 버릴 수 있다. 그러면 선호가 뒷전이 되어 실패다.
+            #     판정 축에 want·PrefRate 비회귀를 반드시 넣는다(S2 (a) 에서 겪은 문제).
+            #   ★ `relative_gap_limit=0.05` 도 함께 봐야 한다 — 목적 스케일이 커지면
+            #     5% 가 15,000 이라 safety 한 항목을 통째로 포기해도 gap 이 발화한다.
+            if stage == 3 and _os_lex.environ.get("AIDE_S3_SAFETY") == "1":
+                _s3w = float(_os_lex.environ.get("AIDE_S3_SAFETY_W", "1") or 1)
+                _flat = [v for _k, _arr in (safety or {}).items() for v in (_arr or [])]
+                if _flat:
+                    obj.append(-_s3w * sum(_flat))     # maximize 라 음수로 넣는다
+                    print(f"{logger_prefix} [(가)] stage3 목적에 safety {len(_flat)}항 "
+                          f"추가 (w={_s3w})")
             # 최종 lex 패스(옵션)용: stage3 목적식 항을 side-channel 에 보존.
             try:
                 m._stage3_obj_terms = list(obj)  # type: ignore[attr-defined]
@@ -3375,7 +3607,23 @@ def optimize_fallback_lex_hard_first(
             s1 = cp_model.CpSolver()
             s1.parameters.max_time_in_seconds = time_per_attempt
             s1.parameters.num_search_workers = 8
-            s1.parameters.relative_gap_limit = 0.15
+            # ── [6c-3] stage1 gap 조이기 · 기본 현행(0.15) ──────────────────────
+            #   ★★ stage2 는 stage1 결과를 **동결로 물려받는다**(`coverage == best_short`,
+            #     `over <= best_over`). stage1 이 gap 0.15 로 끝나면 그 동결값이 회차마다
+            #     달라지고, 그러면 **stage2 가 매번 다른 문제를 푼다.**
+            #     그때는 stage2 를 아무리 조여도(gapABS) 회차 간 값이 안 모인다 —
+            #     최적값 자체가 회차마다 다르기 때문이다.
+            #   ★ 실측 정황(시화중환2 · 2026-09-11): gapABS 인데도 6,300,065 / 5,700,273 /
+            #     9,300,074 로 흩어졌다. 셋이 각각 최적으로 증명됐다면 같은 문제일 수 없다.
+            #     작은 병동은 stage1 이 늘 같은 값에 도달해 이 층이 안 보였다.
+            #   ★ abs 임계 주의: stage1 목적에는 **OFF 총량 × 30** 항이 있어 `0.99` 로 두면
+            #     "OFF 한 개 단위까지 증명" 을 요구하게 된다. `29`(OFF 한 단위 미만)가 현실적이고,
+            #     부족(10만)·과잉 항은 그 임계로도 충분히 잡힌다.
+            _s1_relgap = float(_os_tl3.environ.get("AIDE_S1_GAP", "0.15") or 0.15)
+            s1.parameters.relative_gap_limit = _s1_relgap
+            if _s1_relgap <= 0:
+                s1.parameters.absolute_gap_limit = float(
+                    _os_tl3.environ.get("AIDE_S1_ABS_GAP", "29") or 29)
             # MUS 추출용 assumption registry attach
             _reg_s1 = getattr(m1, "_cpsat_assumption_registry", None)
             if _reg_s1 is not None:
@@ -3470,13 +3718,130 @@ def optimize_fallback_lex_hard_first(
             broad_soft=used_broad_soft,
         )
         s2 = cp_model.CpSolver()
-        s2.parameters.max_time_in_seconds = tl2
+        # ── [6c 실험] stage2 편차가 **시간 부족**인가 **국소해**인가 · 2026-09-10 ──────
+        #   같은 병동 같은 입력이 회차마다 고립OFF 1~2개를 오간다. 그 편차의 정체를
+        #   같은 비용의 두 처치로 가른다:
+        #     AIDE_S2_TL_MULT=3   tl2 를 3배 — 시간이 모자란 것이면 분포가 좁아진다
+        #     AIDE_S2_BEST_N=3    독립 3회 풀어 safety 합 최선 선택 — 국소해면 이쪽이 듣는다
+        #   ★ 둘 다 못 좁히면 남는 카드는 레벨 정책(고립OFF 를 team 위로)뿐이다.
+        #     그건 "grade·team 을 내주고 고립OFF 를 없앤다" 는 제품 판단이라 별건이다.
+        from time import perf_counter as _pc_one
+        # ★ 정체 종료가 켜지면 상한 기본을 3배로 올린다 — 워치독이 "개선이 멈춘 병동" 을
+        #   알아서 끊으므로, 상한은 **개선이 이어지는 병동이 갈 수 있는 곳**만 정하면 된다.
+        #   실측(2026-09-11): 전역 3배는 기각됐지만(11곳 중 개선 1·악화 1·동일 9,
+        #   소요 +31%) 그건 **끊는 장치 없이** 전부에게 3배를 준 경우다. 워치독이 붙으면
+        #   증명 8곳은 애초에 상한이 바인딩이 아니고(0.7~1.0초 OPTIMAL · :3744 주석),
+        #   개선이 멈춘 병동은 임계에서 끊긴다.
+        _s2_stall_on = _s2_stall_config()[0]
+        _s2_mult = float(_os_tl3.environ.get(
+            "AIDE_S2_TL_MULT", "3" if _s2_stall_on else "1") or 1)
+        _s2_bestn = int(_os_tl3.environ.get("AIDE_S2_BEST_N", "1") or 1)
+        _S2_BASE_TL[0] = float(tl2)      # 이월 상한(:368) — 늘린 몫은 회수분이 아니다
+        s2.parameters.max_time_in_seconds = tl2 * _s2_mult
         s2.parameters.num_search_workers = 8
-        s2.parameters.relative_gap_limit = 0.15
+        # ── [6c-2] stage2 gap 조이기 · 기본 현행(0.15) ──────────────────────────
+        #   ★★ 작은 safety 항목(off_quota_short · week_off_missing · pattern_eod)을
+        #     최소화하는 자리가 **파이프라인 전체에서 stage2 본 solve 뿐**이다.
+        #     lex 패스 목적은 off_range·grade·team·n_range·n2n·de·pref 이고,
+        #     작은 항목은 총합 동결 아래에서 **교환만 될 뿐 아무 패스도 안 줄인다.**
+        #     stage3 도 (가) 없이는 안 건드린다. 그런데 stage2 가 gap 0.15 로 **1초 만에**
+        #     끝나므로(실측 9A: 0.5~1.2초 · tl2 21초 중 20초 미사용)
+        #     그 항목들은 **최적화되는 순간이 아예 없다.**
+        #   ★ 이건 우선순위를 바꾸는 게 아니라 **같은 우선순위 안에서 더 잘 푸는 것**이라
+        #     제품 판단이 필요 없다(가중치·순서 불변).
+        #   ★ 0.01 은 75만 목적에서 7,500 단위라 grade_off0 10만 이상치는 잡지만
+        #     한 자릿수 항목(16~24)은 여전히 못 잡는다. 그건 `absolute_gap_limit=0.99`
+        #     (정수 목적이라 "bound 와 1 미만 차이")가 필요하고, 증명 부담이 커 tl2 까지 돌 수 있다.
+        _s2_relgap = float(_os_tl3.environ.get("AIDE_S2_GAP", "0.15") or 0.15)
+        s2.parameters.relative_gap_limit = _s2_relgap
+        if _s2_relgap <= 0:
+            s2.parameters.absolute_gap_limit = float(
+                _os_tl3.environ.get("AIDE_S2_ABS_GAP", "0.99") or 0.99)
         _reg_s2 = getattr(m2, "_cpsat_assumption_registry", None)
         if _reg_s2 is not None:
             _reg_s2.attach_to_model()
-        st2 = _solve_traced(s2, m2, logger_prefix, "stage2")
+        if _s2_bestn > 1:
+            # ★★ best-of-N — **더 좋은 해를 찾는 게 아니라, 동률 최적해 중에서 고르는 것**이다.
+            #   실측(2026-09-11 · 9A): stage2 본 solve 가 **0.7~1.0초에 OPTIMAL** 로 끝나고
+            #   bound 750,002 대 obj 750,014~750,021 로 gap 이 0.003% 다. 즉 tl2(21초)는
+            #   전혀 바인딩이 아니고(=`AIDE_S2_TL_MULT` 는 구조적 no-op), gap 종료도 아니다.
+            #   그런데 **seed 마다 목적값이 다르다** — 같은 모델을 최적으로 푸는데 750,014/016/020/021.
+            #   목적 안에서 safety 와 team·grade_off0 이 **서로 상쇄되어 동등한 해가 여럿**이라
+            #   솔버가 그중 아무거나 고르기 때문이다. 이것이 회차 편차의 정체다.
+            #
+            #   ★★ 선택 기준은 **stage2 본 목적값 하나뿐**이다. 동률이면 먼저 나온 해를 쓴다.
+            #     처음엔 2차 기준으로 safety 벡터(고립OFF → off_quota)를 넣었다가 **뺐다** —
+            #     고립OFF(30만)와 팀 커버(30만)가 목적에서 **동급**이라, "동률이면 고립OFF 가
+            #     낮은 쪽" 은 곧 **팀 커버를 내주고 고립OFF 를 사는 선택**이다. 그건 성능이 아니라
+            #     "환자 안전(팀 최소커버) 대 간호사 근무 품질(고립 OFF)" 의 제품 판단이고,
+            #     2026-05-13 정책 주석("팀 커버 무너지면 환자 안전 영향 큼")과 반대 방향이다.
+            #     ★ 사용자 판단(2026-09-11): **현행 순서 유지** — 가중치도 우선순위도 안 바꾼다.
+            #       따라서 이 선택은 목적값만 보고, 동률 해 사이의 구성 선택에는 개입하지 않는다.
+            #   ★★ seed 를 반복마다 바꾸는 이유는 **다양성 확보**다. 메모리 규칙의
+            #     "seed 고정 ≠ 결정론" 은 골든 시드·재현성 얘기이고 여기는 정반대 용도다.
+            #     이걸 안 하면 vCPU 가 적은 환경(Lambda)에서 N 회가 같은 해로 수렴해 무효가 된다.
+            #   ★ N 은 고정이 아니라 **예산 안에서 최대 N회**다. 남은 예산이 한 번치 아래면 중단.
+            _flat2 = [v for _a in safety2.values() for v in (_a or [])]
+            from time import perf_counter as _pc_s2   # ★ 313행의 `_pc` 는 다른 함수 스코프다
+            _budget2 = float(tl2 * _s2_mult)
+            _t_s2 = _pc_s2()
+            _best_key, _best_hint, st2 = None, None, cp_model.UNKNOWN
+            _tries = 0
+            for _i in range(_s2_bestn):
+                _left = _budget2 - (_pc_s2() - _t_s2)
+                if _i > 0 and _left < max(2.0, _budget2 / (_s2_bestn * 2)):
+                    print(f"{logger_prefix} [6c] 예산 소진 — {_i}회에서 중단(남은 {_left:.1f}s)")
+                    break
+                s2.parameters.random_seed = _i
+                s2.parameters.max_time_in_seconds = max(2.0, _left)
+                _sti = _solve_traced(s2, m2, logger_prefix, f"stage2#{_i + 1}")
+                _tries += 1
+                if _sti not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    continue
+                try:
+                    _obj2 = float(s2.ObjectiveValue())
+                except Exception:
+                    _obj2 = float("inf")
+                # ★ 목적값 **하나만** 본다(위 주석 참조). `<` 이라 동률이면 먼저 나온 해가 남는다.
+                _key = (_obj2,)
+                if _best_key is None or _key < _best_key:
+                    _best_key, st2 = _key, _sti
+                    _best_hint = {(n, d, s): int(s2.Value(X2(n, d, s)))
+                                  for n in range(N)
+                                  for d in iter_nurse_days(n, join, leave, blocked_by_nurse)
+                                  for s in range(S)}
+            print(f"{logger_prefix} [6c] stage2 best-of-{_tries}/{_s2_bestn}: "
+                  f"obj={_best_key[0] if _best_key else None} (목적값 단일 기준)")
+            if _best_hint:
+                m2.ClearHints()
+                for (n, d, s), v in _best_hint.items():
+                    try:
+                        m2.AddHint(X2(n, d, s), v)
+                    except Exception:
+                        pass
+                # 최선 해를 실제 s2 상태로 되돌린다(이후 코드가 s2.Value 를 읽는다).
+                _sti = _solve_traced(s2, m2, logger_prefix, "stage2:best")
+                if _sti in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    st2 = _sti
+        else:
+            _t_s2_one = _pc_one()
+            st2 = _solve_traced(s2, m2, logger_prefix, "stage2")
+            # ★ stage2 본 solve 는 실측 **0.5~1.0초**에 끝나는데 tl2 는 21초다(9A · 2026-09-11).
+            #   매 회차 20초가 그냥 버려진다. S1 재정의의 이월 통로가 이미 있으니 그리로 보낸다 —
+            #   stage3 는 리밋 직전까지 개선 중인 유일한 구간이라 그 시간이 실제로 쓰인다.
+            #   ★ 정책과 무관하고 위험이 없다: 안 쓰던 시간을 옮길 뿐 제약을 건드리지 않는다.
+            #   ★★ 게이트를 **정체 종료와 분리한다**(`AIDE_S2_CARRY`). 정체 종료는 품질 판단이
+            #     붙은 처치라 기본 off 인데, 미사용분 이월은 위험 0 이라 거기 묶일 이유가 없다.
+            #     이런 묶임이 또 생기는 걸 막는 것이 6b(플래그 인벤토리)의 취지이기도 하다.
+            _spent_s2 = _pc_one() - _t_s2_one
+            # ★★ 정체 종료가 켜져 있으면 **여기서 이월하지 않는다** — 워치독이 이미
+            #   같은 시간을 넘겼다(:375). 둘 다 켜면 같은 회수분이 두 번 얹혀
+            #   세브7 처럼 일찍 끊기는 병동에서 tl3 가 배로 부풀고, 그 증상은
+            #   "왜 총 소요가 늘지" 로만 나타나 추적이 어렵다.
+            if (_os_tl3.environ.get("AIDE_S2_CARRY") == "1"
+                    and not _s2_stall_on and _spent_s2 < tl2):
+                _STALL_SAVED.append(tl2 - _spent_s2)
+                print(f"{logger_prefix} [S2이월] stage2 미사용 {tl2 - _spent_s2:.1f}s → stage3")
         if st2 == cp_model.INFEASIBLE and _reg_s2 is not None:
             try:
                 _fb_cores = _reg_s2.extract_conflict_cores(s2, solver_phase="fallback")
@@ -3526,15 +3891,72 @@ def optimize_fallback_lex_hard_first(
                     flat_safety.extend(arr)
                 if flat_safety:
                     best_sum2 = sum(int(s2.Value(v)) for v in flat_safety)
+                    # ── [계측] lex 진입 시점 값 · 2026-09-10 ────────────────────────
+                    #   ★ 두 결함을 가르는 기준선이다:
+                    #     진입값 = lex후 = stage3  → 전부 **stage2 본 solve 편차**.
+                    #                               항목별 동결로는 못 막는다(진입 전에 이미 나쁨).
+                    #     진입값 < lex후            → **lex 안에서 교환**. S4-①이 직접 막는 몫.
+                    #   ★ team 슬랙·grade_off0 은 **동결 범위 밖**이다(아래 _prep_team 주석 참조).
+                    #     stage2 본 목적에는 30만/15만 가중으로 들어가는데 lex 진입 시 안 묶여,
+                    #     lex1·lex2 가 도는 동안 자유롭게 나빠진다. 함께 찍어 비중을 본다.
+                    try:
+                        _entry = {k: sum(int(s2.Value(v)) for v in (a or []))
+                                  for k, a in safety2.items() if a}
+                        _tm_e = sum(int(s2.Value(v)) for v in
+                                    (getattr(roster_system, "_team_min_cover_slacks", []) or []))
+                        _g0_e = sum(int(s2.Value(v)) for v in
+                                    (getattr(m2, "_grade_off0_shorts", []) or []))
+                        print(f"{logger_prefix} [lex진입] safety합={best_sum2} "
+                              f"team슬랙={_tm_e} grade_off0={_g0_e} — "
+                              + ", ".join(f"{k}={v}" for k, v in sorted(_entry.items()) if v))
+                    except Exception as _e_entry:
+                        print(f"{logger_prefix} [lex진입] 계측 실패(무시): {_e_entry}")
                     # [S4-①] 항목별 동결 (AIDE_LEX_S4_STAGE2 · 기본 off · 파일 상단 참조)
                     if _s4_stage2:
-                        _s4_n = 0
+                        # ★★ 하이브리드(2026-09-11) — **큰 항목만** 항목별로 묶고,
+                        #   한 자릿수 항목은 총합 동결에 맡겨 lex 패스의 운신 폭으로 남긴다.
+                        #
+                        #   왜: S4-① 은 **렉시코 정의보다 엄격하다.** stage2 목적이 "safety 합"
+                        #   이면 합이 같은 교환(고립OFF 30만 1건 ↔ 10만 항목 3건)은 정의상
+                        #   동급이고, 그 아래서 lex 패스 값이 좋아지면 렉시코적으로는 **더 좋은
+                        #   해**다. 항목별 동결은 그 교환을 금지해 해 공간을 자른다.
+                        #   실측(11곳 × 3회 · 2026-09-11)에서 잘린 쪽에 상위 패스 개선이 있었다:
+                        #     시화9A   lex5:n2n  20[16~20] → 47[47~57]  (현행폭 4 · 2배 이상 악화)
+                        #     시화중환1 lex5:n2n   3[1~5]  → 10[8~141] (현행폭 4 · 최대 141)
+                        #   ★ 이 악화는 **stage3 최종값에 안 잡힌다**(시화9A 는 600,014 로 동일).
+                        #     n2n 은 stage3 목적 축이 아니기 때문이다 — 축 셋을 같이 봐야 보인다.
+                        #   반면 세브2 가 보여준 **해로운** 교환은 큰 항목끼리의 맞바꿈이었다
+                        #   (진입 고립OFF 0 → lex후 2건 · 등급미달은 29 로 동일).
+                        #   → 큰 항목만 막으면 둘 다 얻는다.
+                        #
+                        #   ★★ 가를 때 **현재 값이 아니라 가중치**를 본다. 30만 항목이 이번
+                        #     회차에 0 이면 값은 0 이지만 여전히 큰 항목이고, 항목별 동결의
+                        #     핵심이 정확히 **"0 인 것을 0 으로 묶는 것"** 이다(세브2 가 그 케이스).
+                        #     `s2.Value` 로 가르면 값이 0 인 큰 항목이 작은 항목으로 분류돼
+                        #     막아야 할 것을 정확히 놓친다.
+                        #     가중치는 변수에 이미 곱해져 있고(`scaled == slack * penalty` · :1983)
+                        #     **도메인 상한이 곧 가중치**라 거기서 읽는다. 항목 이름을 하드코딩
+                        #     하지 않는 이유도 이것 — `off_cap_bounded_slack` 은 가중치가 cfg 에서
+                        #     와서(:1956) 병동마다 다르다.
+                        _w_min = int(_os_tl3.environ.get("AIDE_S4_ITEM_W_MIN", "10000") or 10000)
+                        _s4_n = _s4_skip = 0
                         for _k4, _arr4 in safety2.items():
                             if not _arr4:
                                 continue
+                            try:
+                                _ub4 = max(int(_v4.Proto().domain[-1]) for _v4 in _arr4)
+                            except Exception:
+                                _ub4 = _w_min          # 못 읽으면 큰 항목으로 보수적 처리
+                            if _ub4 < _w_min:
+                                _s4_skip += 1
+                                continue
                             m2.Add(sum(_arr4) <= sum(int(s2.Value(_v4)) for _v4 in _arr4))
                             _s4_n += 1
-                        print(f"{logger_prefix} [S4-1] stage2 safety 항목별 동결 {_s4_n}개")
+                        # ★ 작은 항목은 여전히 총합으로 묶어야 한다 — 안 그러면 무제한이 된다.
+                        #   (현행은 항목별/총합이 배타였는데, 하이브리드에서는 **둘 다** 건다.)
+                        m2.Add(sum(flat_safety) <= best_sum2)
+                        print(f"{logger_prefix} [S4-1] stage2 safety 항목별 동결 {_s4_n}개 "
+                              f"(가중치<{_w_min} {_s4_skip}개는 총합 동결에 위임)")
                     else:
                         m2.Add(sum(flat_safety) <= best_sum2)
                     use_mid_h1 = bool(getattr(cfg, "use_mid", False))
@@ -3590,6 +4012,72 @@ def optimize_fallback_lex_hard_first(
                     night_idx_h1 = (
                         cfg.shift_types.index("N") if "N" in cfg.shift_types else None
                     )
+                    # ── 시프트 개수 상·하한 ── (2026-09-11)
+                    #   ★★ range 패스(max-min)는 **목적식에서 상수인 사람 하나에 무력화**된다.
+                    #     N 을 구조적으로 못 하는 사람이 섞이면 min 이 0 에 못박혀, 조절 가능한
+                    #     사람을 아무리 고르게 만들어도 range 가 안 줄어든다.
+                    #     (실측 2026-09-11 · 성남시의료원 중환자실-RN 2026-10:
+                    #      N=0 이 4명 — 송순진·남경준은 확정원티드로 한 달이 고정, 김은경은
+                    #      allowed_shifts=["D"], **임옥희만 설정이 전무한데 0**. 9월엔 N 6회 한
+                    #      정상 3교대자다. 그들 때문에 min=0 이 상수라 `lex n_range OPTIMAL=7`
+                    #      이 나온다 — 솔버는 맞고 목적함수가 무력화된 것이다.)
+                    #   ★ **원인이 아니라 결과로 판정한다.** allowed_shifts 든 확정원티드 고정이든
+                    #     구조적 창 부족이든, 결과가 같은 상수면 똑같이 뺀다. 설정 기반 가드만
+                    #     두면 확정원티드로 고정된 사람을 못 잡는다(`_prep_de` 가 그 상태다 —
+                    #     :4188 은 `allowed_shifts` 만 보는데 빈 값은 "제한 없음" 으로 읽힌다).
+                    #   ★ 제외는 **range 계산에서만**이고 배정 자체는 건드리지 않는다.
+                    _fx_lex: dict[tuple[int, int], int] = {}
+                    for _c in getattr(roster_system, "fixed_cells", []) or []:
+                        try:
+                            _sm = _normalize_fixed_to_main(_c.get("shift"))
+                            if _sm in cfg.shift_types:
+                                _fx_lex[(_c["nurse_index"], _c["day_index"])] = \
+                                    cfg.shift_types.index(_sm)
+                        except Exception:
+                            continue
+                    # 1N 금지가 켜지면 N 은 최소 2일 연속이라 자유 셀도 그만큼 이어져야 한다.
+                    _n_block_min = 2 if bool(getattr(cfg, "not_one_night", False)) else 1
+
+                    def _count_bounds(_n: int, _sidx: int) -> tuple[int, int]:
+                        """(lo, hi) — 그 사람이 그 시프트를 받을 수 있는 최소·최대 개수.
+
+                        `lo == hi` 면 그 패스의 목적식에서 **상수**라 range 대상이 아니다.
+                        ★ 오진 비용이 비대칭이라 **확실할 때만** 좁힌다 — 상수가 아닌데
+                          상수로 보면 조절 가능한 사람을 빼서 목적식을 약화시키고(새 결함),
+                          상수인데 아니라고 보면 현행과 같다(기존 결함 유지).
+                        """
+                        _days = list(iter_nurse_days(_n, join, leave, blocked_by_nurse))
+                        _lo = sum(1 for _d in _days if _fx_lex.get((_n, _d)) == _sidx)
+                        _free = [_d for _d in _days if (_n, _d) not in _fx_lex]
+                        if not _free:
+                            return (_lo, _lo)          # 한 달이 통째로 고정됨
+                        try:
+                            # ★ `is_code_blocked_by_profile` 은 이 모듈에 import 되어 있지 않다
+                            #   (:39-43). 이미 들어온 `normalize_allowed_shift_codes` 를 쓴다.
+                            #   ★ **빈 집합은 "제한 없음"** 이다(:4254 와 같은 해석) — 빈 값을
+                            #     "아무것도 못 함" 으로 읽으면 전원이 제외돼 대상이 사라진다.
+                            _al_b = normalize_allowed_shift_codes(
+                                getattr(roster_system.nurses[_n], "allowed_shifts", None),
+                                use_mid=use_mid_h1)
+                            if _al_b and cfg.shift_types[_sidx] not in _al_b:
+                                return (_lo, _lo)      # 프로필이 그 코드를 막음
+                        except Exception:
+                            pass
+                        if _sidx == night_idx_h1 and _n_block_min > 1:
+                            # 자유 셀의 연속 구간이 N 블록을 한 번도 못 담으면 더 못 받는다.
+                            _run = _best = 0
+                            _prev = None
+                            for _d in _free:
+                                _run = _run + 1 if _prev is not None and _d == _prev + 1 else 1
+                                _best = max(_best, _run)
+                                _prev = _d
+                            if _best < _n_block_min:
+                                return (_lo, _lo)
+                        return (_lo, _lo + len(_free))
+
+                    def _is_range_const(_n: int, _sidx: int) -> bool:
+                        _lo, _hi = _count_bounds(_n, _sidx)
+                        return _lo == _hi
 
                     # ── 패스 정의 ──
                     #   각 prep 은 (목적식, 동결콜백, 최소초, 시간비율) 또는 None(대상 없음).
@@ -3644,16 +4132,27 @@ def optimize_fallback_lex_hard_first(
                     def _prep_n_range():
                         if night_idx_h1 is None:
                             return None
-                        _cnts = []
+                        _cnts, _skip = [], []
                         for _n in range(N):
                             if leave[_n] < join[_n] or _n in range_excluded_idx:
+                                continue
+                            # ★ N 이 구조적으로 상수인 사람을 뺀다 — 안 빼면 min 이 0 에
+                            #   못박혀 목적식이 무력화된다(위 `_count_bounds` 주석).
+                            if _is_range_const(_n, night_idx_h1):
+                                _skip.append(getattr(roster_system.nurses[_n], "name", _n))
                                 continue
                             _cnts.append(sum(
                                 X2(_n, _d, night_idx_h1)
                                 for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse)
                             ))
-                        if not _cnts:
-                            return None
+                        # ★★ 제외 인원을 반드시 찍는다. 이 집합이 조용히 커지면 대상이 사라져
+                        #   range 가 0 이 되고 **항상 OPTIMAL** 이 나온다 — "OPTIMAL=7 인데
+                        #   목적함수가 무력화" 의 거울상이고, 좋아 보이는 숫자라 더 위험하다.
+                        if _skip:
+                            print(f"{logger_prefix} [n_range] N 상수라 제외 {len(_skip)}명: "
+                                  f"{', '.join(str(x) for x in _skip)} / 대상 {len(_cnts)}명")
+                        if len(_cnts) < 2:
+                            return None            # 대상이 1명 이하면 range 는 의미가 없다
                         _mx = m2.NewIntVar(0, D, "lex_max_n")
                         _mn = m2.NewIntVar(0, D, "lex_min_n")
                         for _c in _cnts:
@@ -3741,7 +4240,7 @@ def optimize_fallback_lex_hard_first(
                         ) or 0)
                         _di = cfg.shift_types.index("D")
                         _ei = cfg.shift_types.index("E")
-                        _excs = []
+                        _excs, _de_skip = [], []
                         for _n in range(N):
                             # ★ 부분근무자는 제외하지 않는다 — |D-E| 는 개인 내 차이의
                             #   **합산**이라 특이값에 무너지지 않고, 빼면 그들의 D/E 가
@@ -3753,17 +4252,21 @@ def optimize_fallback_lex_hard_first(
                             #      N전담만 걸러서 D전담·E전담이 그대로 샜다.)
                             if leave[_n] < join[_n] or _n in nightonly_idx:
                                 continue
-                            _al = normalize_allowed_shift_codes(
-                                getattr(roster_system.nurses[_n], "allowed_shifts", None),
-                                use_mid=use_mid_h1,
-                            )
-                            # 빈 집합은 "제한 없음"이다(is_code_blocked_by_profile 과 같은 해석).
                             #   실측(9병동-9A × 5회): 제외하면 목적식 대상자들의 D/E 균등이
                             #   4.00 → 3.35, 커버부족도 4.00 → 3.60. 하드 위반 0 불변.
                             #   ※ 표본은 **병동 1곳 · 실효 대상 1명**(김유정)이라 이 수치로
                             #     크기를 단정할 수 없다. 다만 목적식에서 상수 페널티를 빼는
                             #     것이라 방향은 논리적으로 분명하다.
-                            if _al and not {"D", "E"} <= _al:
+                            # ★★ 판정을 `allowed_shifts` 에서 `_count_bounds` 로 바꿨다(2026-09-11).
+                            #   구 가드 `if _al and not {"D","E"} <= _al` 는 **빈 배열을 "제한 없음"
+                            #   으로 읽어** 확정원티드로 한쪽만 하는 사람을 못 걸렀다.
+                            #   실측(성남시의료원 중환자실-RN 2026-10): N=0 인 4명이 **전원
+                            #   `allowed_shifts=[]`** 였다 — 설정 기반 가드로는 한 명도 못 뺀다.
+                            #   그래서 **원인(설정·원티드·창 부족)이 아니라 결과(상수인가)로**
+                            #   판정한다. D 든 E 든 한쪽이 상수면 |D-E| 를 줄일 수 없다.
+                            if (_is_range_const(_n, _di) or _is_range_const(_n, _ei)):
+                                _de_skip.append(
+                                    getattr(roster_system.nurses[_n], "name", _n))
                                 continue
                             _ad = list(iter_nurse_days(_n, join, leave, blocked_by_nurse))
                             _td = sum(X2(_n, _d, _di) for _d in _ad)
@@ -3774,6 +4277,11 @@ def optimize_fallback_lex_hard_first(
                             _ex = m2.NewIntVar(0, D, f"lex_de_exc_{_n}")
                             m2.Add(_ex >= _df - _tol)
                             _excs.append(_ex)
+                        # ★★ 제외 인원을 찍는다 — 이 집합이 조용히 커지면 대상이 사라져
+                        #   목적값이 0 이 되고 "완벽" 해 보인다(n_range 와 같은 함정의 거울상).
+                        if _de_skip:
+                            print(f"{logger_prefix} [de] D/E 상수라 제외 {len(_de_skip)}명: "
+                                  f"{', '.join(str(x) for x in _de_skip)} / 대상 {len(_excs)}명")
                         if not _excs:
                             return None
                         return (sum(_excs), lambda v: m2.Add(sum(_excs) <= v), 5.0, 0.3)
@@ -4059,6 +4567,7 @@ def optimize_fallback_lex_hard_first(
             #   `lex_safety_val` 은 성공한 패스에서만 갱신되므로(3943) 그쪽이 정확하다.
             _s4n3 = 0
             _s4_frozen, _s4_skipped = [], []
+            _s4_caps: dict = {}      # 계측용 — 항목별 동결 상한. stage3 최종값과 대조한다
             for k in safety3.keys():
                 _lhs3 = safety3.get(k) or []
                 _vals2 = lex_safety_val.get(k)
@@ -4071,6 +4580,7 @@ def optimize_fallback_lex_hard_first(
                 m3.Add(sum(_lhs3) <= sum(int(_v) for _v in _vals2))
                 _s4n3 += 1
                 _s4_frozen.append(k)
+                _s4_caps[k] = sum(int(_v) for _v in _vals2)    # 계측용 상한 보관
             print(f"{logger_prefix} [S4-2] stage3 safety 동결 {_s4n3}개 (값 기준)")
             print(f"{logger_prefix} [S4-2] 동결됨: {', '.join(_s4_frozen) or '없음'}")
             print(f"{logger_prefix} [S4-2] 제외됨: {', '.join(_s4_skipped) or '없음'}")
@@ -4113,7 +4623,17 @@ def optimize_fallback_lex_hard_first(
                     except Exception:
                         pass
         s3 = cp_model.CpSolver()
-        s3.parameters.max_time_in_seconds = tl3
+        # ★ lex 패스에서 정체로 조기 종료해 회수한 시간을 **여기로 이월**한다.
+        #   stage3 는 6/6 리밋 소진에 마지막 개선 시각이 58·82·44·32·74·99% 라
+        #   시간을 더 주면 품질이 오르는 유일한 구간이다(9A 6회 실측 · 2026-09-10).
+        #   기본 off — `AIDE_LEX_STALL=1` 일 때만 `_STALL_SAVED` 에 값이 쌓인다.
+        _tl3_eff = tl3
+        if _STALL_SAVED:
+            _carry = sum(_STALL_SAVED)
+            _tl3_eff = tl3 + _carry
+            print(f"{logger_prefix} [S1-재정의] lex 정체 회수 {_carry:.1f}s → "
+                  f"stage3 예산 {tl3}s → {_tl3_eff:.1f}s")
+        s3.parameters.max_time_in_seconds = _tl3_eff
         s3.parameters.num_search_workers = 8
         s3.parameters.relative_gap_limit = 0.05
         _mark("pre_stage3_solve")
@@ -4389,6 +4909,42 @@ def optimize_fallback_lex_hard_first(
                     total_k = sum(int(s3.Value(v)) for v in arr)
                     if total_k > 0:
                         print(f"{logger_prefix} [Stage3 위반] {k} = {total_k}")
+                # ── [계측] stage3 최종 safety vs S4-2 동결 상한 · 2026-09-10 ──────────
+                #   ★ 이 대조가 필요한 이유: `폴백 완료: 안전위반합=` 은 **stage2 확정값**이라
+                #     (`best_safe_sum` 이 stage2 블록에서 계산되고 재대입이 없다)
+                #     stage3 가 상한까지 safety 를 더 써도 그 숫자에는 안 나타난다.
+                #   ★ stage3 목적에는 safety 가 없고 동결은 `<= 상한` 이다. 그래서 stage3 는
+                #     선호를 더 얻는 방향으로 **상한까지 safety 를 소비할 수 있다.**
+                #     최종 ≈ 상한이면 그 교환이 실제로 일어난 것이고, 최종 < 상한이면
+                #     시간이 모자라 다 못 쓴 것이다(= 지금까지의 낮은 값은 잔여물일 뿐).
+                try:
+                    _cap_rows, _s3_tot, _cap_tot = [], 0, 0
+                    for k in sorted(safety3.keys()):
+                        _cur = sum(int(s3.Value(v)) for v in (safety3.get(k) or []))
+                        _cap = _s4_caps.get(k)
+                        _s3_tot += _cur
+                        if _cap is not None:
+                            _cap_tot += _cap
+                            if _cur or _cap:
+                                _cap_rows.append(f"{k}={_cur}/{_cap}")
+                    # ★★ 판정 축은 **절대값이 아니라 Δ(= stage2 확정값 − stage3 최종값)** 다.
+                    #   절대값은 stage2 노이즈가 지배해서 stage3 처치의 효과가 안 보인다
+                    #   (실측: (가) 회차가 절대값은 낮았지만 그건 stage2 가 낮았던 것이고,
+                    #    stage3 안에서 낮춘 양은 오히려 현행이 컸다).
+                    #   Δ > 0 이면 stage3 가 safety 를 더 낮췄다는 뜻이다.
+                    _delta = _cap_tot - _s3_tot
+                    _use = (_s3_tot / _cap_tot * 100) if _cap_tot else 0.0
+                    print(f"{logger_prefix} [S4-2계측] stage3 safety {_s3_tot} / 상한 {_cap_tot} "
+                          f"({_use:.2f}%) **Δ={_delta}** — {', '.join(_cap_rows) or '항목없음'}")
+                    # ★★ 완료 로그의 `안전위반합` 을 **커밋된 해 기준**으로 바꾼다.
+                    #   지금까지는 stage2 확정값만 찍혔다. stage3 는 동결 상한(=stage2 값)을
+                    #   넘을 수 없으므로 두 값이 같아 티가 안 났지만, stage3 목적에 safety 를
+                    #   넣으면(안건 '(가)') stage3 가 상한 **아래로** 내려갈 수 있어 갈라진다.
+                    #   그때 stage2 값을 계속 찍으면 개선이 통째로 안 보인다.
+                    if _cap_tot:
+                        best_safe_sum = _s3_tot
+                except Exception as _cap_exc:
+                    print(f"{logger_prefix} [S4-2계측] 실패(무시): {_cap_exc}")
                 # 실제 배정된 휴무 카운트(O/주휴/휴가) 요약
                 if off_idx is not None:
                     for n, nu in enumerate(roster_system.nurses):
@@ -4453,5 +5009,9 @@ def optimize_fallback_lex_hard_first(
     # ★ 완료 로그는 동기화 함수 밖이어야 한다. best_safe_sum 은 stage2 이후에야
     #   대입되는데, 함수 안에 두면 stage2 실패 경로에서 부르는 순간 UnboundLocalError 가 난다.
     _mark("post_stage3")
-    print(f"{logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum}")
+    # ★★ `안전위반합` 은 **stage2 확정값**이다(best_safe_sum 은 stage2 블록에서만 대입된다).
+    #   최종 근무표가 stage3 해인지 stage2 해인지에 따라 이 숫자의 뜻이 달라지므로
+    #   어느 해가 커밋됐는지 함께 남긴다 — 없으면 표에서 어느 값이 최종인지 못 읽는다.
+    print(f"{logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum} "
+          f"(커밋해={'stage2(선호 미반영)' if _stage3_failed else 'stage3'} 기준)")
     return best_short == 0 and best_safe_sum == 0
