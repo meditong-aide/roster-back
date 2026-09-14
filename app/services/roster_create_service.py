@@ -6518,7 +6518,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         # 자연 soft 트리거: 엔진이 실근무를 못 배정한 infeasible-empty 신호(실제 플래그)
         # 를 본다. 과거처럼 휴리스틱이 만든 NO_ASSIGNMENT/grade_max 문자열을 매칭하지 않음.
         _trigger_soft = bool(getattr(roster_system, "_infeasible_empty", False))
-        if _trigger_soft and not bool(config_dict.get("_team_min_soft_retry_attempted")):
+
+        # ── 1차 완화: team_min hard → soft (기존) ────────────────────────────
+        if validation_error and _trigger_soft and not bool(config_dict.get("_team_min_soft_retry_attempted")):
             print("[TeamMinFallback] infeasible 감지 → team_min hard→soft 자동 전환으로 1회 재시도 (grade hard 유지)")
             soft_cfg = dict(config_dict)
             soft_cfg["team_min_soft_fallback"] = True
@@ -6609,6 +6611,78 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             else:
                 print(f"[TeamMinFallback][AUTO-SOFT][fail] 재시도 실패: {retry_validation_error}")
                 validation_error = retry_validation_error
+
+        # ── 2차 완화: same_shift hard → soft ──────────────────────────────────
+        # ★★ 순서 주의 — **team_min 을 먼저 푼다.** 처음엔 "나중에 얹은 제약부터" 라는
+        #   생각으로 same_shift 를 앞에 뒀는데 실측에서 뒤집혔다: 이 병동의 INFEASIBLE
+        #   원인은 team_min(1/1/1) 이라 same_shift 만 풀면 **1차가 실패**하고, 결국
+        #   team_min 까지 풀리면서 **지킬 수 있었던 same_shift 하드까지 잃었다**
+        #   (같은시프트 4연속 0~1건 → 7건). 원인 아닌 제약을 먼저 풀면 손해만 본다.
+        # 전환 방식: `same_shift_hard_k` 를 0 으로 내린다 → 하드가 사라지고
+        #   기존 `max_same_shift` soft 벌점(D/E/N 4연속 창)이 그대로 이어받는다.
+        #   별도 slack 을 만들지 않는 이유는 그 soft 인프라가 이미 있기 때문이다.
+        # ★ 기본값(3)을 함께 본다 — `same_shift_hard_k` 는 **DB 컬럼이 아니라서**
+        #   `config_dict`(= latest_config.__dict__) 에 키 자체가 없다. 기본값을 빼고
+        #   `.get(...) or 0` 로만 보면 **항상 False** 가 되어 이 완화가 죽는다(실측).
+        _ss_hard_on = int(config_dict.get("same_shift_hard_k", 3) or 0) > 0
+        # ★ `validation_error` 필수 — 1차(team_min)로 이미 살아났으면 여기 들어오면 안 된다.
+        #   빠뜨리면 성공한 해를 버리고 same_shift 까지 푼 해로 덮어쓴다.
+        if (validation_error and _trigger_soft and _ss_hard_on
+                and not bool(config_dict.get("_same_shift_soft_retry_attempted"))):
+            print("[SameShiftFallback] infeasible 감지 → same_shift hard→soft 자동 전환으로 1회 재시도 "
+                  "(team_min·grade hard 유지)")
+            _ss_cfg = dict(config_dict)
+            _ss_cfg["same_shift_hard_k"] = 0
+            _ss_cfg["_same_shift_soft_retry_attempted"] = True
+            try:
+                _ss_generated, _, _ss_rs = _run_cp_sat_basic(
+                    db, current_user, nurses_for_engine, preferences, latest_config, req,
+                    shift_manage_data,
+                    fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                    time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
+                    config_override=_ss_cfg,
+                    _assignments=_assignments,
+                    _inbound_assignments=_inbound_assignments,
+                    _outbound_assignments=_outbound_assignments,
+                )
+                if isinstance(_ss_generated, dict):
+                    _ss_generated.update(fixed_roster)
+                else:
+                    _ss_generated = fixed_roster
+                if _alloff_roster:
+                    if isinstance(_ss_generated, dict):
+                        _ss_generated.update(_alloff_roster)
+                    else:
+                        _ss_generated = dict(_alloff_roster)
+                _ss_err = _validate_generated_roster(
+                    _ss_generated, _ss_rs,
+                    nurses_context=list(nurses_for_engine or []),
+                    config_context=_ss_cfg,
+                    grade_config_context=_fetch_grade_config_dict(
+                        db, current_user.office_id, current_user.group_id),
+                )
+            except Exception as _ss_e:
+                _ss_err = f"same_shift soft 재시도 예외: {type(_ss_e).__name__}: {_ss_e}"
+                _ss_generated = _ss_rs = None
+            if not _ss_err:
+                generated = _ss_generated
+                roster_system = _ss_rs
+                applied_relaxations.append("same_shift_hard_to_soft")
+                if _ctx is not None:
+                    _ctx["relaxed"] = True
+                weekly_off_warnings.append({
+                    "type": "same_shift_hard_to_soft_applied",
+                    "detail": ("같은 시프트 연속 하드 제한이 infeasible 로 자동 soft 전환되어 재생성됐습니다. "
+                               "일부 간호사에게 같은 시프트가 4회 이상 연속될 수 있습니다."),
+                })
+                print("[SameShiftFallback][AUTO-SOFT][success] same_shift hard→soft 자동 전환으로 근무표 생성. "
+                      "applied_relaxations=['same_shift_hard_to_soft']")
+                validation_error = None
+            else:
+                # 실패 → 이후 team_min 완화 단계가 **same_shift soft 를 물고** 가도록 남긴다.
+                print(f"[SameShiftFallback][AUTO-SOFT][fail] 재시도 실패: {_ss_err}")
+                config_dict["same_shift_hard_k"] = 0
+                config_dict["_same_shift_soft_retry_attempted"] = True
 
     if validation_error:
         print(f"[RosterGenerate][UNRECOVERABLE] {validation_error}")
