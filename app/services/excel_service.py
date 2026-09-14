@@ -982,6 +982,83 @@ def _sort_team_ids_by_name(team_name_map: dict) -> list:
     return sorted(team_name_map.keys(), key=_key)
 
 
+#: 요일 라벨. `calendar.weekday()` 가 월=0 이므로 그 순서다.
+_WD = ["월", "화", "수", "목", "금", "토", "일"]
+
+#: 헤더 글자색 — 병원이 준 시트의 실측값을 그대로 쓴다(2026-10 시트).
+#:   토 파랑 · 일 빨강 · 공휴일 빨강. **공휴일이 토요일을 이긴다**(10/3 개천절이 토인데 빨강).
+_C_SAT = "FF0000FF"
+_C_SUN_HOL = "FFFF0000"
+
+
+def _kr_holidays_in_month(year: int, month: int) -> set:
+    """그 달의 한국 공휴일(대체공휴일 포함). 조회 실패 시 **빈 집합**.
+
+    ★ `holiday_pack` 을 쓰지 않는다 — 그쪽은 import 실패 시 `ImportError` 를 그대로
+      raise 해서 모듈이 통째로 깨지고, 쓰지도 않는 `langchain_core.tools` 를 끌어온다.
+      엑셀 다운로드가 패키지 문제 하나로 죽으면 안 되므로,
+      `roster_create_service._kr_holidays_in_month` 와 같은 방어형으로 간다.
+    ★ 표시용이라 그룹 설정(`fixed_holiday_off_yn`)과 무관하게 **달력 기준**으로 칠한다.
+      그 설정은 고정근무자 배정용이지 표시 규칙이 아니다.
+    """
+    try:
+        import holidays as _h
+
+        return {d.day for d in _h.KR(years=[year]) if d.year == year and d.month == month}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Excel] 공휴일 조회 실패 — 주말만 칠한다: {exc}")
+        return set()
+
+
+def _day_font_color(year: int, month: int, day: int, holidays: set):
+    """일자/요일 헤더의 글자색. 해당 없으면 None(기본 검정)."""
+    import calendar as _cal
+
+    if day in holidays:
+        return _C_SUN_HOL
+    wd = _cal.weekday(year, month, day)
+    if wd == 6:
+        return _C_SUN_HOL
+    if wd == 5:
+        return _C_SAT
+    return None
+
+
+def _norm_hex(color) -> Optional[str]:
+    """`shifts.color` → openpyxl 이 받는 `RRGGBB`. 못 읽으면 None.
+
+    ★ openpyxl 은 `#` 를 붙이면 값을 버리거나 예외를 낸다. 반드시 떼야 한다.
+    ★ 값 검증이 어디에도 없어 `#RGB` 축약형과 빈 문자열이 실제로 들어온다.
+      **빈 값을 흰색으로 떨어뜨리면 안 된다** — 흰 배경에 흰 글자가 되어 완전히 안 보인다.
+      읽을 수 없으면 None 을 돌려 호출부가 색을 아예 안 칠하게 한다.
+    """
+    s = str(color or "").strip().lstrip("#")
+    if len(s) == 3 and all(ch in "0123456789abcdefABCDEF" for ch in s):
+        s = "".join(ch * 2 for ch in s)          # #abc → aabbcc
+    if len(s) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in s):
+        return None
+    return s.upper()
+
+
+#: 이 명도 이상이면 **검은 글자**, 아니면 흰 글자. YIQ 기준.
+#:
+#: ★★ 프론트(`getReadableShiftCodeTextColor`)는 **225** 를 쓰는데, 엑셀에는 그대로
+#:   못 쓴다. 실제 근무코드 색이 전부 **149~212** 구간이라 225 로는 **18개 코드가 전부
+#:   흰 글자**가 된다(실측). `#FFA0D2`(OFF, 명도 194)·`#C8E0B8`(보수, 212) 같은 파스텔에
+#:   흰 글자면 종이로 뽑았을 때 사실상 안 보인다.
+#:   150 이면 17/18 이 검은 글자가 되고, 어두운 `DA`(#7E9BB5, 149.3) 만 흰 글자로 남는다.
+#: ★ 화면과 판정이 갈리는 것은 **의도한 것**이다 — 엑셀은 작은 셀에 인쇄되는 매체라
+#:   가독성을 우선한다. 화면과 맞추고 싶으면 이 값만 225 로 되돌리면 된다.
+_YIQ_DARK_TEXT_THRESHOLD = 150
+
+
+def _readable_text_color(bg_hex: str) -> str:
+    """배경 위에 얹을 글자색. 계산식은 프론트와 같고 **임계만** 다르다(위 상수 참조)."""
+    r, g, b = int(bg_hex[0:2], 16), int(bg_hex[2:4], 16), int(bg_hex[4:6], 16)
+    yiq = (r * 299 + g * 587 + b * 114) / 1000
+    return "FF101828" if yiq >= _YIQ_DARK_TEXT_THRESHOLD else "FFFFFFFF"
+
+
 def export_schedule_excel_bytes(
     schedule_id: str, current_user, db, target_group_id: str, group_by_team: bool = False
 ) -> tuple[bytes, bool]:
@@ -1160,6 +1237,79 @@ def export_schedule_excel_bytes(
     for e in entries:
         by_nurse.setdefault(e.nurse_id, {})[e.work_date.day] = e.shift_id
 
+    # ───────── 2-b) 표시용 부가 데이터 ─────────
+    #   ★ `shifts` 는 **group_id 로 좁혀** 읽는다. PK·FK 가 없고 `shifts.id` 가 병동 간
+    #     중복되므로(id=1874 가 동탄시티 'OFF' 와 시화 '반반반' 양쪽) 전역 조회하면
+    #     남의 병동 색을 집는다.
+    #   ★ 코드→색은 `sequence`·`id` 순 **대표 1건**만 쓴다. 같은 `(group_id, shift_id)` 가
+    #     여러 행인 경우가 실재한다(전사 중복 81개).
+    _shift_rows = (
+        db.query(Shift)
+        .filter(Shift.group_id == target_group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
+        .all()
+    )
+    code_bg: Dict[str, str] = {}
+    for _s in _shift_rows:
+        _code = str(_s.shift_id or "").strip()
+        if not _code or _code in code_bg:
+            continue
+        _hex = _norm_hex(_s.color)
+        if _hex:
+            code_bg[_code] = _hex
+
+    holidays = _kr_holidays_in_month(year, month)
+
+    # 연차 잔여 — 장부의 `opening` 만 읽는다. '사용'·'당월잔여' 는 **이 근무표 기준**으로
+    #   실시간 계산한다(draft 를 받아도 "이대로 마감하면 잔여가 얼마" 가 보여야 한다).
+    #: ★★ 장부 **조회**와 사용량 **계산**을 따로 감싼다.
+    #:   하나로 묶으면 계산만 실패해도 `leave_opening` 이 비워져 **연차 3열이 통째로
+    #:   사라진 채 정상 파일처럼** 내려간다. 사용자는 그게 장애인지 원래 없는 병동인지
+    #:   구분할 수 없다 — 조용한 실패가 성공처럼 보이는 것이 가장 나쁘다.
+    leave_opening: Dict[str, Any] = {}
+    leave_stale = False
+    leave_used: Optional[Dict[str, Any]] = {}   # None = 계산 못 함(빈 dict 와 구분한다)
+    leave_error: Optional[str] = None
+    try:
+        from db.models import NurseAnnualLeaveBalance
+
+        for _b in (
+            db.query(NurseAnnualLeaveBalance)
+            .filter(
+                NurseAnnualLeaveBalance.group_id == target_group_id,
+                NurseAnnualLeaveBalance.year == year,
+                NurseAnnualLeaveBalance.month == month,
+            )
+            .all()
+        ):
+            leave_opening[str(_b.nurse_id)] = _b.opening
+            # ★★ 장부가 **뒤처졌는지** 여기서 판정한다. 재계산 훅은 fail-open 이라
+            #   실패해도 근무표는 커밋된다 — 그러면 틀린 잔여가 맞는 것처럼 보인다.
+            #   그 달 마감본이 있는데 `used` 가 비었거나 다른 근무표를 가리키면 stale 이다.
+            if schedule.status == "issued":
+                if _b.used is None or str(_b.source_schedule_id or "") != str(schedule_id):
+                    leave_stale = True
+    except Exception as _lv_exc:  # noqa: BLE001
+        # 장부 자체를 못 읽었다 → 열을 낼 근거가 없다. 대신 **경고를 남긴다.**
+        print(f"[Excel] 연차 장부 조회 실패: {_lv_exc}")
+        leave_opening = {}
+        leave_error = "연차 장부를 읽지 못했습니다"
+
+    if leave_opening:
+        try:
+            from services.leave.annual_leave_service import compute_leave_used
+
+            leave_used = compute_leave_used(db, schedule)
+        except Exception as _lu_exc:  # noqa: BLE001
+            # ★ 계산만 실패했다 → **열은 유지**하고 `사용`·`당월잔여` 만 비운다.
+            #   `전월잔여` 는 장부에서 읽은 확정값이라 그대로 보여줄 수 있다.
+            print(f"[Excel] 연차 사용량 계산 실패(사용/당월잔여 생략): {_lu_exc}")
+            leave_used = None
+            leave_error = "연차 사용량을 계산하지 못했습니다"
+
+    #: 연차 열은 **장부가 있는 병동에서만** 낸다(성남시의료원 중환자실 선제공).
+    leave_labels = ["전월잔여", "사용", "당월잔여"] if leave_opening else []
+
     # ───────── 3) 워크북/시트 ─────────
     wb = Workbook()
     ws = wb.active
@@ -1185,7 +1335,8 @@ def export_schedule_excel_bytes(
     role_col = name_col + 1           # 구분
     exp_col  = name_col + 2           # 경력
     spacer_cols = 2
-    total_cols = static_cols + days_in_month + spacer_cols + summary_cols
+    leave_cols = len(leave_labels)
+    total_cols = static_cols + days_in_month + spacer_cols + summary_cols + leave_cols
 
     ws.merge_cells(start_row=2, start_column=1, end_row=3, end_column=total_cols)
     ws.cell(row=2, column=1, value=title).font = title_font
@@ -1208,10 +1359,21 @@ def export_schedule_excel_bytes(
         cell.border = border_all
         cell.fill = gray_fill
 
+    # ★ 요일 행 — 헤더 바로 위(그동안 비어 있던 자리)에 넣는다. `header_row` 를 건드리면
+    #   본문·풋터 오프셋이 전부 파생돼 어긋나므로 **행을 늘리지 않고** 빈 줄을 쓴다.
+    wd_row = header_row - 1
     for d in range(1, days_in_month + 1):
         col = static_cols + d
+        _fc = _day_font_color(year, month, d, holidays)
+        wcell = ws.cell(row=wd_row, column=col, value=_WD[calendar.weekday(year, month, d)])
+        wcell.font = Font(bold=True, size=10, color=_fc) if _fc else Font(bold=True, size=10)
+        wcell.alignment = center
+        wcell.border = border_all
+        wcell.fill = gray_fill
+
         cell = ws.cell(row=header_row, column=col, value=d)
-        cell.font = header_font
+        # 일자도 같은 색 — 병원 시트가 두 행을 같은 색으로 칠한다(실측).
+        cell.font = Font(bold=True, size=12, color=_fc) if _fc else header_font
         cell.alignment = center
         cell.border = border_all
         cell.fill = gray_fill
@@ -1224,6 +1386,43 @@ def export_schedule_excel_bytes(
         cell.alignment = center
         cell.border = border_all
         cell.fill = gray_fill
+        # ★ 본문 셀과 **같은 규약**으로 채운다 — 색이 있는 코드는 전부.
+        #   본문만 칠하고 집계는 안 칠하면 같은 코드가 두 형식으로 보여 오히려 헷갈린다.
+        _bg = code_bg.get(lab)
+        if _bg:
+            cell.fill = PatternFill("solid", fgColor=_bg)
+            cell.font = Font(bold=True, size=12, color=_readable_text_color(_bg))
+
+    # 요일 행의 빈 구간(정적 컬럼·스페이서·요약열)도 같은 배경·테두리로 이어 붙인다.
+    #   그렇지 않으면 일자 위에만 띠가 있고 좌우가 끊겨 표가 깨져 보인다.
+    for _c in list(range(1, static_cols + 1)) + list(
+            range(static_cols + days_in_month + 1, tail_start_col + summary_cols)):
+        _cell = ws.cell(row=wd_row, column=_c)
+        _cell.border = border_all
+        _cell.fill = gray_fill
+
+    leave_start_col = tail_start_col + summary_cols
+    for i, lab in enumerate(leave_labels):
+        cell = ws.cell(row=header_row, column=leave_start_col + i, value=lab)
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border_all
+        cell.fill = gray_fill
+    if leave_labels:
+        # ★★ **병합하지 않는다.** `merge_cells` 는 좌상단을 뺀 나머지를 `MergedCell` 로
+        #   갈아치우면서 스타일을 버려, 마지막 열에 테두리가 빠지고 박스가 깨진다
+        #   (병합 전에 스타일을 걸어도 마찬가지다 — 실측으로 두 순서 다 확인).
+        #   `centerContinuous` 는 셀을 합치지 않고 **글자만 가로로 펼쳐** 가운데 정렬한다.
+        #   테두리·배경이 셀마다 그대로 남아 박스가 온전하다.
+        _span = Alignment(horizontal="centerContinuous", vertical="center")
+        for i in range(leave_cols):
+            _c = ws.cell(row=wd_row, column=leave_start_col + i)
+            _c.border = border_all
+            _c.fill = gray_fill
+            _c.alignment = _span
+        _lh = ws.cell(row=wd_row, column=leave_start_col, value="연차사용현황")
+        _lh.font = header_font
+        _lh.alignment = _span
 
     # 열 너비 (팀별보기: A=팀8, B=번호5 / 기본: A=번호5)
     if team_view:
@@ -1241,6 +1440,8 @@ def export_schedule_excel_bytes(
     for i, lab in enumerate(tail_labels):
         col_letter = get_column_letter(tail_start_col + i)
         ws.column_dimensions[col_letter].width = 6 if len(lab) > 1 else 5
+    for i, lab in enumerate(leave_labels):
+        ws.column_dimensions[get_column_letter(leave_start_col + i)].width = 9
 
     # ───────── 6) 본문 ─────────
     start_row = header_row + 1
@@ -1271,7 +1472,16 @@ def export_schedule_excel_bytes(
             cell = ws.cell(row=r, column=static_cols + d, value=shift_code)
             cell.alignment = center
             cell.border = border_all
-            if is_current_user:
+            # ★★ `shifts.color` 는 이 저장소에서 **예외 없이 배경색**이다(프론트·모바일·
+            #   서버 템플릿 전부). 글자색으로 쓰면 신규 병동 기본 6색이 파스텔이라
+            #   흰 배경에서 아예 안 보인다. 배경으로 칠하고 글자색은 명도로 고른다 —
+            #   프론트 `getReadableShiftCodeTextColor` 와 같은 계약(YIQ, 임계 225).
+            _bg = code_bg.get(str(shift_code).strip())
+            if _bg:
+                cell.fill = PatternFill("solid", fgColor=_bg)
+                cell.font = Font(color=_readable_text_color(_bg))
+            if is_current_user and not _bg:
+                # 색이 없는 코드만 본인 강조를 쓴다 — 덮어쓰면 코드 색이 사라진다.
                 cell.fill = highlight_fill
 
             base = to_base(shift_code)
@@ -1288,6 +1498,29 @@ def export_schedule_excel_bytes(
             cell.border = border_all
             if is_current_user:
                 cell.fill = highlight_fill
+
+        # 연차 3열 — `전월잔여` 는 장부에서, `사용`·`당월잔여` 는 **이 근무표**에서.
+        #   ★ 장부의 `used`/`closing` 을 읽지 않는 이유: draft 를 내려받아도 "이대로
+        #     마감하면 잔여가 얼마가 되는지" 가 보여야 한다. 장부는 마감본 전용이다.
+        #   ★ 행이 없는 간호사(전월 기록 없음)는 **빈칸**으로 둔다 — 0 으로 찍으면
+        #     "연차가 없다" 로 오해된다.
+        if leave_labels:
+            _op = leave_opening.get(str(n.nurse_id))
+            _us = leave_used.get(str(n.nurse_id)) if leave_used is not None else None
+            if _op is None:
+                _vals = [None, None, None]
+            elif leave_used is None:
+                # 계산 실패 — 전월잔여(확정값)만 보여주고 나머지는 비운다.
+                _vals = [float(_op), None, None]
+            else:
+                _u = _us if _us is not None else 0
+                _vals = [float(_op), float(_u), float(_op) - float(_u)]
+            for i, v in enumerate(_vals):
+                cell = ws.cell(row=r, column=leave_start_col + i, value=v)
+                cell.alignment = center
+                cell.border = border_all
+                if is_current_user:
+                    cell.fill = highlight_fill
 
     # 본문은 팀별보기·기본 모두 동일한 연속 행으로 작성한다(레이아웃 동일). 팀별보기면
     # 작성하면서 같은 팀 라벨의 연속 행 구간을 모아 컬럼2를 세로 병합한다.
@@ -1323,7 +1556,14 @@ def export_schedule_excel_bytes(
     ws.cell(row=footer_start, column=name_col, value="일일 근무 현황").font = header_font
 
     def write_footer_row(label: str, values: list[int], row_idx: int):
-        ws.cell(row=row_idx, column=role_col, value=label).font = header_font
+        lab_cell = ws.cell(row=row_idx, column=role_col, value=label)
+        lab_cell.font = header_font
+        lab_cell.alignment = center
+        # ★ 요약 열·본문과 같은 규약 — 색이 있는 코드는 전부 채운다.
+        _bg = code_bg.get(label)
+        if _bg:
+            lab_cell.fill = PatternFill("solid", fgColor=_bg)
+            lab_cell.font = Font(bold=True, size=12, color=_readable_text_color(_bg))
         for c in range(1, static_cols):
             ws.cell(row=row_idx, column=c).border = border_all
 
@@ -1333,7 +1573,7 @@ def export_schedule_excel_bytes(
             cell.alignment = center
             cell.border = border_all
 
-        for i in range(spacer_cols + summary_cols):
+        for i in range(spacer_cols + summary_cols + leave_cols):
             col = static_cols + days_in_month + 1 + i
             ws.cell(row=row_idx, column=col).border = border_all
 
@@ -1343,12 +1583,27 @@ def export_schedule_excel_bytes(
         write_footer_row(lab, vals, row_idx)
 
     # ───────── 8) 테두리 보정 ─────────
-    max_col = tail_start_col + len(tail_labels) - 1
-    for row in ws.iter_rows(min_row=header_row, max_row=footer_start + len(tail_labels) + 1,
+    max_col = tail_start_col + len(tail_labels) + leave_cols - 1
+    for row in ws.iter_rows(min_row=wd_row, max_row=footer_start + len(tail_labels) + 1,
                             min_col=1, max_col=max_col):
         for cell in row:
             if cell.value is not None and (cell.border is None or cell.border.left.style is None):
                 cell.border = border_all
+
+    # ★★ 연차 장부가 현재 마감본과 어긋나면 그 사실을 **보이게** 한다.
+    #   재계산 훅은 fail-open 이라 실패해도 근무표는 커밋된다(데드락·유니크 경합 등).
+    #   그때 `전월잔여` 가 옛값인 채 남는데, 숫자만 보면 맞는지 알 수 없다.
+    _warn_msg = None
+    if leave_error:
+        _warn_msg = f"※ {leave_error} — 연차 값이 불완전합니다"
+    elif leave_labels and leave_stale:
+        _warn_msg = "※ 연차 잔여가 최신 마감본과 다릅니다 — 재계산 필요"
+    if _warn_msg:
+        # ★ 장부가 없는 병동이라 열이 아예 없을 때도 **실패는 알린다** —
+        #   조용히 빠진 것과 원래 없는 것을 사용자가 구분할 수 있어야 한다.
+        _warn = ws.cell(row=footer_start, column=tail_start_col, value=_warn_msg)
+        _warn.font = Font(bold=True, color=_C_SUN_HOL)
+        print(f"[Excel] {schedule_id} {_warn_msg}")
 
     # ───────── 저장 ─────────
     bio = BytesIO()
