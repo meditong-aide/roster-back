@@ -286,6 +286,69 @@ class NurseNightCycle(Base):
     )
 
 
+class NurseAnnualLeaveBalance(Base):
+    """연차 잔여 — **월별 스냅샷**. 위 `NurseNightCycle` 과 같은 층위다.
+
+    ★ 왜 월별인가 — 병원이 쓰는 근무표 시트가 `전월잔여 / 사용 / 당월잔여` 3열이다.
+      그룹웨어는 연 단위(`vacation_tbl`)라 월 개념이 없어, 월 축은 우리 확장이다.
+
+    ★★ **확정(`used`·`closing`)은 마감(issued) 근무표 기준이다.**
+      엑셀에 보이는 '사용' 은 이 컬럼이 아니라 **내려받는 그 근무표에서 실시간 계산**한다
+      (draft 를 받아도 "이대로 마감하면 잔여가 얼마" 가 보여야 하기 때문).
+      즉 이 테이블은 *확정 장부*, 엑셀 표시는 *현재 안(案)* 이다.
+
+    ★ 행이 없는 사람은 **집계하지 않는다** — 전월 기록이 없으면 차감할 근거가 없다
+      (성남시의료원 중환자실의 파트장·휴직자·PA 3명이 그렇다).
+
+    ## 그룹웨어 정렬 (연동은 아직 하지 않음)
+
+    `eun_gw.bizwiz20db.vacation_tbl (OfficeCode, EmpSeqNo, vca_year)` 에
+    `vca_countall/countspend/countremain DECIMAL(6,3)` 이 있다. 나중에 붙일 때
+    재설계가 없도록 **정밀도와 키 모양만** 맞췄다. 성립해야 하는 롤업 등식:
+
+        SUM(used) over 그 해        ==  vca_countspend
+        그 해 마지막 달 closing      ==  vca_countremain
+
+    ★ 연동 시 함정: 그쪽 `OfficeCode`·`EmpSeqNo` 는 `char(6)` 고정폭이라 공백 패딩된다.
+      SQL 조인은 collation 이 맞춰 주지만 **파이썬 딕셔너리 조회는 조용히 빗나간다.**
+    """
+
+    __tablename__ = "nurse_annual_leave_balance"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    office_id = Column(VARCHAR(50), nullable=False)   # = vacation_tbl.OfficeCode
+    group_id = Column(VARCHAR(50), nullable=False)    # 그룹웨어엔 없는 우리 스코프
+    nurse_id = Column(VARCHAR(50), nullable=False)    # = vacation_tbl.EmpSeqNo
+    year = Column(SMALLINT, nullable=False)           # = vacation_tbl.vca_year
+    month = Column(TINYINT, nullable=False)
+
+    #: 그 달 시작 잔여. 전월 `closing` 을 이어받고, 최초 달은 시드값이다.
+    opening = Column(DECIMAL(6, 3), nullable=False)
+    #: 그 달 사용량 = 마감본에서 `shifts.annual_leave_unit` 합. **미마감이면 NULL.**
+    used = Column(DECIMAL(6, 3), nullable=True)
+    #: `opening - used`. `used` 가 NULL 이면 NULL — 다음 달 `opening` 을 못 정한다는 뜻이다.
+    closing = Column(DECIMAL(6, 3), nullable=True)
+
+    #: `used` 를 계산한 마감본. 마감취소 후 다른 근무표로 재마감되면 여기가 바뀐다.
+    #: NULL 이면 그 달은 아직 마감되지 않았다는 뜻이다(= 마감 여부의 판별자).
+    source_schedule_id = Column(VARCHAR(50), nullable=True)
+    #: **`opening` 의 출처**. 'seed'(사람이 넣은 최초값) | 'carried'(전월 closing 승계).
+    #:   ★ 마감 여부를 여기 담으면 안 된다 — 재발행 때 seed 행이 덮여 앵커 자격을 잃고,
+    #:     다음 재계산에서 그 달 장부가 통째로 지워진다. 마감 여부는 `source_schedule_id` 다.
+    source = Column(VARCHAR(20), nullable=True)
+    #: 그룹웨어 반영 시각. **예약 컬럼** — 지금은 아무도 읽지도 쓰지도 않는다.
+    gw_synced_at = Column(DATETIME, nullable=True)
+    note = Column(VARCHAR(200), nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id", "nurse_id", "year", "month", name="ux_nalb_cell"
+        ),
+    )
+
+
 class EffectiveDatedPeriodMixin:
     """시점 속성(effective-dated) 공통 컬럼.
 
@@ -589,6 +652,16 @@ class Shift(Base):
     # 수면OFF 부여 대상 코드 표식. 그룹당 1건만 True (앱단 검증).
     #   보건휴가와 같은 관례. 코드가 없는 그룹(응급실-AN)은 켤 행이 없어 자동 미사용.
     sleep_off_target = Column(BOOLEAN, nullable=False, default=False)
+    # 연차 **차감 단위**. NULL = 차감 대상 아님(기본) · 1.000 종일 · 0.500 반차 · 0.250 반반차.
+    #   ★ 위 `*_target` 들과 달리 불리언이 아닌 이유 — 마스터에 `VYH 반연차+HALF`(6개 그룹)·
+    #     `V2/V3 오후반차` 같은 코드가 실재하는데 담을 자리가 없다. `duration` 은 전사
+    #     전 행 NULL 이고 `allday` 도 휴가 계열에서 0 고정이다.
+    #   ★ `type='휴가'` 로는 못 가른다 — 전사 98종·한 그룹 최대 38개이고 출산휴가·병가·
+    #     교육까지 섞인다(실증: 잔여 0 인 사람에게 '특별' 1건이 있어 -1 이 된다).
+    #   ★ 정밀도 DECIMAL(6,3) 은 그룹웨어 `eun_gw.bizwiz20db.vacation_tbl` 의
+    #     `vca_countall/spend/remain` 과 동일하게 맞춘 값이다(연동 시 반올림 손실 방지).
+    #     **연동은 아직 하지 않는다** — 모양만 맞춰 둔다.
+    annual_leave_unit = Column(DECIMAL(6, 3), nullable=True)
     # 근무코드 설명(자유 텍스트). MSSQL NVARCHAR(MAX) = NVARCHAR(-1).
     description = Column(NVARCHAR(None), nullable=True)
 

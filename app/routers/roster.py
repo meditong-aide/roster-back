@@ -1069,12 +1069,30 @@ async def drop_schedule(
     #     이 근무표를 여전히 살아있는 것으로 보고 앵커를 남긴다.
     #   ★ 실패해도 삭제 자체는 막지 않는다.
     if str(getattr(schedule, "status", "") or "") == "issued":
+        # ★★ 근무표 변경은 **훅 밖에서** 먼저 확정한다. `begin_nested()` 는 savepoint 를
+        #   만들기 앞서 pending 을 flush 하는데, 그 flush 가 실패하면 세션이 깨진 채로
+        #   except 에 들어가 훅 실패로 오인되고, 나중 commit 이 PendingRollbackError 로
+        #   터진다. 여기서 먼저 flush 해 두면 근무표 자체의 오류는 훅 방어에 걸리지 않고
+        #   정상적으로 위로 전파된다(같은 파일 이력 적재 블록과 동일한 규약).
+        db.flush()
         try:
-            db.flush()
-            from services.leave.night_cycle_service import rebuild_night_cycle_from
-            rebuild_night_cycle_from(db, schedule.group_id, schedule.year, schedule.month)
+            with db.begin_nested():
+                from services.leave.night_cycle_service import rebuild_night_cycle_from
+                rebuild_night_cycle_from(db, schedule.group_id, schedule.year, schedule.month)
         except Exception as _nc_exc:
             print(f"[NightCycle] 삭제 후 앵커 재계산 실패(무시): {_nc_exc}")
+        # 연차 장부도 같은 이유로 되돌린다 — 지운 마감본의 차감이 남으면 잔여가 덜 보인다.
+        #   ★ 앵커와 별도 try 로 감싼다. 한쪽 실패가 다른 쪽을 가리면 안 된다.
+        try:
+            # ★★ savepoint 안에서 돈다. 재계산은 새 행을 add 하고 flush 하는데, flush 가
+            #   실패하면(유니크 충돌 등) 세션이 '롤백 대기' 상태가 되어 **아래 db.commit()
+            #   이 PendingRollbackError 로 죽는다.** 그러면 "실패해도 삭제는 막지 않는다"
+            #   는 보장이 거짓이 된다. savepoint 만 되돌리면 바깥 트랜잭션은 멀쩡하다.
+            with db.begin_nested():
+                from services.leave.annual_leave_service import rebuild_leave_balance_from
+                rebuild_leave_balance_from(db, schedule.group_id, schedule.year, schedule.month)
+        except Exception as _lb_exc:
+            print(f"[LeaveBalance] 삭제 후 재계산 실패(무시): {_lb_exc}")
 
     db.commit()
     return {"message": "스케줄이 삭제(숨김)되었습니다.", "schedule_id": schedule_id}
@@ -1665,16 +1683,33 @@ async def publish_roster(
     #   커밋 전에 호출해 발행 트랜잭션에 함께 묶는다. 실패해도 발행은 막지 않는다.
     #   ★ 그 달만이 아니라 **이후 모든 마감월을 연쇄 재계산**한다 — 앵커는 전월 값을
     #     이어받으므로 과거가 바뀌면 뒤가 전부 틀어진다(재발행이 대표적인 경우).
+    # ★★ flush 가 반드시 먼저다 (autoflush=False 세션).
+    #   바로 위에서 `schedule.status = "issued"` 를 세팅했지만 flush 전까지 세션에만 있다.
+    #   rebuild 는 `status='issued'` 로 대상 월을 고르므로, flush 없이 부르면 DB 의
+    #   옛 draft 를 읽어 **대상 0건**이 된다(실측: publish 13건 전부 200 인데 앵커 미생성).
+    #   ★ 훅 **밖에서** 한다 — savepoint 앞의 flush 가 실패하면 훅 실패로 오인돼 삼켜지고
+    #     나중 commit 이 PendingRollbackError 로 터진다. 여기 실패는 발행 자체의 오류다.
+    db.flush()
     try:
-        # ★★ flush 가 반드시 먼저다 (autoflush=False 세션).
-        #   바로 위에서 `schedule.status = "issued"` 를 세팅했지만 flush 전까지 세션에만 있다.
-        #   rebuild 는 `status='issued'` 로 대상 월을 고르므로, flush 없이 부르면 DB 의
-        #   옛 draft 를 읽어 **대상 0건**이 된다(실측: publish 13건 전부 200 인데 앵커 미생성).
-        db.flush()
-        from services.leave.night_cycle_service import rebuild_night_cycle_from
-        rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
+        with db.begin_nested():
+            from services.leave.night_cycle_service import rebuild_night_cycle_from
+            rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
     except Exception as _nc_exc:
         print(f"[NightCycle] 앵커 스냅샷 실패(무시): {_nc_exc}")
+    # ── 연차 장부 차감 ──
+    #   마감본이 확정됐으므로 그 달 `used`/`closing` 을 확정하고 **이후 달로 연쇄**한다
+    #   (`opening` 이 전월 `closing` 을 이어받으므로 재발행이면 뒤가 전부 틀어진다).
+    #   ★ 위 flush 가 이미 끝나 있어야 한다 — rebuild 가 `status='issued'` 로 대상을 고른다.
+    #   ★ 잔액 행이 없는 간호사는 만들지 않는다(전월 기록이 없으면 차감 근거가 없다).
+    #   ★ 실패해도 발행은 막지 않는다.
+    try:
+        # ★★ savepoint — flush 실패가 바깥 발행 트랜잭션을 깨뜨리지 않게 한다.
+        #   (없으면 아래 db.commit() 이 PendingRollbackError 로 죽어 발행 자체가 실패한다)
+        with db.begin_nested():
+            from services.leave.annual_leave_service import rebuild_leave_balance_from
+            rebuild_leave_balance_from(db, target_group_id, schedule.year, schedule.month)
+    except Exception as _lb_exc:
+        print(f"[LeaveBalance] 발행 후 차감 실패(무시): {_lb_exc}")
     # NOTE: ShiftTransferLog 기반 전달은 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     db.commit()
     nurses_in_group = (
@@ -1799,12 +1834,24 @@ async def unpublish_roster(
     #    ★ flush 가 먼저다(autoflush=False). 위에서 status='draft' 를 세팅했지만 세션에만
     #      있어, flush 없이 부르면 재계산이 이 달을 여전히 issued 로 보고 앵커를 남긴다.
     #    ★ 실패해도 발행취소 자체는 막지 않는다.
+    # ★★ 근무표 변경(status='draft')을 **훅 밖에서** 먼저 확정한다 — savepoint 앞의
+    #   flush 실패가 훅 실패로 오인되면 나중 commit 이 PendingRollbackError 로 터진다.
+    db.flush()
     try:
-        db.flush()
-        from services.leave.night_cycle_service import rebuild_night_cycle_from
-        rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
+        with db.begin_nested():
+            from services.leave.night_cycle_service import rebuild_night_cycle_from
+            rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
     except Exception as _nc_exc:
         print(f"[NightCycle] 발행취소 후 앵커 재계산 실패(무시): {_nc_exc}")
+    # 연차 장부 되돌리기 — 이 달이 draft 로 내려갔으므로 `used`/`closing` 을 NULL 로
+    #   되돌리고 이후 달 `opening` 도 끊는다. `opening` 자체는 남긴다(시드·이월값이다).
+    try:
+        # ★★ savepoint — 위 발행 경로와 같은 이유.
+        with db.begin_nested():
+            from services.leave.annual_leave_service import rebuild_leave_balance_from
+            rebuild_leave_balance_from(db, target_group_id, schedule.year, schedule.month)
+    except Exception as _lb_exc:
+        print(f"[LeaveBalance] 발행취소 후 재계산 실패(무시): {_lb_exc}")
 
     db.commit()
 
@@ -2118,17 +2165,29 @@ async def save_roster(
     #     **이후 달까지 연쇄로** 재계산해야 정합이 유지된다.
     #   ★ draft 저장은 대상이 아니다 — 확정이 아닌 것을 앵커에 반영하면 안 된다.
     if str(getattr(schedule, "status", "") or "") == "issued":
+        # ★★ flush 가 반드시 먼저다 (autoflush=False 세션).
+        #   위 `query(...).delete()` 는 bulk 라 **즉시 DB 에서 지워지지만**,
+        #   재삽입한 `db.add()` 는 flush 전까지 세션에만 있다. 그 상태로 재계산하면
+        #   compute_snapshot 이 "근무표가 텅 빈" DB 를 읽어 조용히 0행을 돌려준다
+        #   (실측: 훅은 정상 진입·무예외인데 앵커가 안 생겼다).
+        #   ★ 훅 **밖에서** 한다 — 여기 실패는 근무표 저장 자체의 오류다.
+        db.flush()
         try:
-            # ★★ flush 가 반드시 먼저다 (autoflush=False 세션).
-            #   위 `query(...).delete()` 는 bulk 라 **즉시 DB 에서 지워지지만**,
-            #   재삽입한 `db.add()` 는 flush 전까지 세션에만 있다. 그 상태로 재계산하면
-            #   compute_snapshot 이 "근무표가 텅 빈" DB 를 읽어 조용히 0행을 돌려준다
-            #   (실측: 훅은 정상 진입·무예외인데 앵커가 안 생겼다).
-            db.flush()
-            from services.leave.night_cycle_service import rebuild_night_cycle_from
-            rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
+            with db.begin_nested():
+                from services.leave.night_cycle_service import rebuild_night_cycle_from
+                rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
         except Exception as _nc_exc:
             print(f"[NightCycle] 마감본 수정 후 재계산 실패(무시): {_nc_exc}")
+        # 마감본의 셀이 바뀌었으면 연차 사용량도 바뀐다 — 같은 자리에서 다시 센다.
+        #   ★ 위 flush 가 선행돼야 한다. bulk delete 는 즉시 반영되지만 재삽입한
+        #     `db.add()` 는 flush 전까지 세션에만 있어, 안 하면 텅 빈 근무표를 읽는다.
+        try:
+            # ★★ savepoint — 위 발행 경로와 같은 이유.
+            with db.begin_nested():
+                from services.leave.annual_leave_service import rebuild_leave_balance_from
+                rebuild_leave_balance_from(db, target_group_id, schedule.year, schedule.month)
+        except Exception as _lb_exc:
+            print(f"[LeaveBalance] 마감본 수정 후 재계산 실패(무시): {_lb_exc}")
     db.commit()
     return {"message": "Roster saved successfully"}
 
