@@ -604,7 +604,14 @@ class CPSATBasicEngine:
             max_conseq_off_penalty_weight=int(config_data.get("max_conseq_off_penalty_weight", 5000) or 0),
             # 같은 시프트(D/E/N) 연속 ≤3 soft
             max_same_shift=bool(config_data.get("max_same_shift", True)),
+            # ★ 300 유지 — 2000 상향은 **활성 5곳 실측으로 기각**(2026-09-14).
+            #   D/E/N 4연속 창에 **함께** 걸리는 값이라 올리면 E4 를 피하느라 E 가 흩어지고
+            #   그 자리를 D 가 메워 **D4 가 되레 늘었다**(9A 6→8 · 중환1 6→8 · 중환2 5→11).
+            #   고립근무도 3곳 악화·2곳 동일로 악화 방향이 일관됐다.
+            #   D 만 조이려면 `AIDE_SAME_SHIFT_MODE=dmul`(D 전용 곱연산)을 쓴다.
             max_same_shift_penalty_weight=int(config_data.get("max_same_shift_penalty_weight", 300) or 0),
+            # 같은 시프트 연속 하드 상한(0=미적용). INFEASIBLE 시 호출부가 0 으로 내려 재생성한다.
+            same_shift_hard_k=int(config_data.get("same_shift_hard_k", 3) or 0),
             # 4O 연속 휴무 hard 제약 (디폴트 False = 해제)
             enforce_4o_hard=bool(config_data.get("enforce_4o_hard", False)),
             # N 블록 간 간격 soft (목표 10일, 한쪽 페널티: 10일 미만만 벌점)

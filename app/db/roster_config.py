@@ -58,6 +58,11 @@ class NurseRosterConfig:
     # 같은 시프트(D/E/N) 연속 ≤3 soft. True면 4연속 같은 시프트 (예: D D D D)에 패널티.
     max_same_shift: bool = True
     max_same_shift_penalty_weight: int = 10000
+    # 같은 시프트 연속 **하드** 상한. **기본 3** = D/E/N 각 4연속 이상 금지. 0 이면 미적용.
+    # ★ 하드로 걸어보고 INFEASIBLE 이면 `team_min` 과 같은 규약으로 **자동 soft 전환**한다
+    #   (roster_create_service 가 이 값을 0 으로 내려 1회 재생성 → 위 soft 벌점이 이어받는다).
+    #   단일 시프트 전담은 그 코드 연속이 강제되므로 제약에서 제외된다.
+    same_shift_hard_k: int = 3
     # 4O 연속 휴무 hard 제약(당월 내 + 월경계). True면 4연속 OFF 금지. False면 제약 제거.
     # 디폴트는 False(해제): 운영 검증 결과 자연 발생률 ~10-13%로 무리 없는 수준.
     enforce_4o_hard: bool = False

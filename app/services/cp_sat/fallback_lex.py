@@ -2271,6 +2271,48 @@ def optimize_fallback_lex_hard_first(
                 else:
                     m.Add(_mcw_expr_fb)
 
+        # 동일 시프트 연속 상한 — `AIDE_SAME_SHIFT_HARD_K=3` 이면 D/E/N 각각
+        #   **4연속 이상 금지**를 HARD 로 건다(= (K+1) 창의 합 <= K). 기본 OFF(0).
+        # 정책:
+        #   - ★ 단일 시프트 전담(allowed == {code})은 **제외**한다. 그 코드 연속이 강제되므로
+        #     넣으면 근무 4연속만으로 확정 INFEASIBLE 이다(성남ICU 김은경 = D 전담).
+        #   - blocked day 포함 창은 스킵 — 연속근무 하드(위)와 같은 규약.
+        #   - fixed_wanted 로 같은 코드가 K+1 연속 박혀 있으면 INFEASIBLE 로 보고된다.
+        #   - N 은 이미 `max_consecutive_nights` 하드가 있어 중복이지만 그대로 건다(무해).
+        #   build_model 은 stage 1/2/3 마다 호출되므로 이 제약도 전 스테이지에 걸린다.
+        import os as _os_ssh
+        # 설정(`roster_config.same_shift_hard_k`)이 정본. 환경변수는 A/B 용 오버라이드.
+        # ★ cfg 가 **0 이면 자동 완화로 내려간 상태**이므로 환경변수로 되살리지 않는다.
+        #   (안 그러면 A/B 중 INFEASIBLE 이 나도 재시도에서 하드가 그대로 살아 완화가 죽는다.)
+        _ssh_cfg_k = int(getattr(cfg, "same_shift_hard_k", 0) or 0)
+        _ssh_env = _os_ssh.environ.get("AIDE_SAME_SHIFT_HARD_K", "")
+        _ssh_k = 0 if _ssh_cfg_k == 0 else (int(_ssh_env or 0) or _ssh_cfg_k)
+        if _ssh_k > 0:
+            _use_mid_ssh = bool(getattr(cfg, "use_mid", False))
+            _ssh_cnt = 0
+            for _code_ssh in ("D", "E", "N"):
+                if _code_ssh not in cfg.shift_types:
+                    continue
+                _s_idx_ssh = cfg.shift_types.index(_code_ssh)
+                for n in range(N):
+                    _al_ssh = normalize_allowed_shift_codes(
+                        getattr(roster_system.nurses[n], "allowed_shifts", None),
+                        use_mid=_use_mid_ssh)
+                    if _al_ssh and _al_ssh == {_code_ssh}:
+                        continue  # 단일 시프트 전담 — 연속 강제라 제외
+                    T0, T1 = join[n], leave[n]
+                    _blk_ssh = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+                    # ★ `+1` 필수 — 없으면 **월말을 끝으로 하는 창이 통째로 빠진다**
+                    #   (위 연속근무 하드의 `range(T0, T1 - K + 1)` 와 같은 규약).
+                    #   실측: 빠뜨렸을 때 D4/E4 가 회차당 0~1건씩 새어나왔다.
+                    for d0 in range(T0, T1 - _ssh_k + 1):
+                        _win_ssh = [d0 + t for t in range(_ssh_k + 1)]
+                        if any(d in _blk_ssh for d in _win_ssh):
+                            continue
+                        m.Add(sum(X(n, d, _s_idx_ssh) for d in _win_ssh) <= _ssh_k)
+                        _ssh_cnt += 1
+            print(f"{logger_prefix} [SameShiftHard] k={_ssh_k} 제약 {_ssh_cnt}건 (stage={stage})")
+
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
         for n in range(N):
