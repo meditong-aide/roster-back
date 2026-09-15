@@ -63,6 +63,13 @@ class NurseRosterConfig:
     #   (roster_create_service 가 이 값을 0 으로 내려 1회 재생성 → 위 soft 벌점이 이어받는다).
     #   단일 시프트 전담은 그 코드 연속이 강제되므로 제약에서 제외된다.
     same_shift_hard_k: int = 3
+    # 고립근무(O-W-O · OFF 사이 단일 근무) **하드** 금지. 기본 True.
+    # ★ soft 벌점(ISOLATED_WORK_PENALTY 1500)만으로는 못 줄인다 — 스윕 실측에서
+    #   1500/4000/10000/30000 이 9·9·7·9 로 **방향성이 없었다**(가중치 문제가 아니다).
+    # ★ `same_shift_hard_k` 와 같은 규약으로 INFEASIBLE 시 **자동 soft 전환**한다
+    #   (roster_create_service 가 False 로 내려 재생성 → 위 soft 벌점이 이어받는다).
+    #   N 단독(O-N-O)은 하드락 7(1N 금지)이 별도 관리하므로 여기서 제외한다.
+    isolated_work_hard: bool = True
     # 4O 연속 휴무 hard 제약(당월 내 + 월경계). True면 4연속 OFF 금지. False면 제약 제거.
     # 디폴트는 False(해제): 운영 검증 결과 자연 발생률 ~10-13%로 무리 없는 수준.
     enforce_4o_hard: bool = False
