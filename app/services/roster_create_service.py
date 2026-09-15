@@ -6747,10 +6747,72 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                       "applied_relaxations=['same_shift_hard_to_soft']")
                 validation_error = None
             else:
-                # 실패 → 이후 team_min 완화 단계가 **same_shift soft 를 물고** 가도록 남긴다.
+                # 실패 → 이후 완화 단계가 **same_shift soft 를 물고** 가도록 남긴다.
                 print(f"[SameShiftFallback][AUTO-SOFT][fail] 재시도 실패: {_ss_err}")
                 config_dict["same_shift_hard_k"] = 0
                 config_dict["_same_shift_soft_retry_attempted"] = True
+
+        # ── 3차 완화: isolated_work hard → soft ───────────────────────────────
+        # 전환 방식: `isolated_work_hard` 를 False 로 내린다 → 하드가 사라지고 기존
+        #   `ISOLATED_WORK_PENALTY`(1500) soft 벌점이 그대로 이어받는다.
+        # ★ 앞 단계(team_min·same_shift)가 풀린 상태를 **물고** 간다 — config_dict 가
+        #   누적 갱신되므로 여기까지 왔다는 건 그것들로도 안 풀렸다는 뜻이다.
+        _iw_hard_on = bool(config_dict.get("isolated_work_hard", True))
+        if (validation_error and _trigger_soft and _iw_hard_on
+                and not bool(config_dict.get("_isolated_work_soft_retry_attempted"))):
+            print("[IsolatedWorkFallback] infeasible 감지 → isolated_work hard→soft 자동 전환으로 "
+                  "1회 재시도")
+            _iw_cfg = dict(config_dict)
+            _iw_cfg["isolated_work_hard"] = False
+            _iw_cfg["_isolated_work_soft_retry_attempted"] = True
+            try:
+                _iw_generated, _, _iw_rs = _run_cp_sat_basic(
+                    db, current_user, nurses_for_engine, preferences, latest_config, req,
+                    shift_manage_data,
+                    fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                    time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
+                    config_override=_iw_cfg,
+                    _assignments=_assignments,
+                    _inbound_assignments=_inbound_assignments,
+                    _outbound_assignments=_outbound_assignments,
+                )
+                if isinstance(_iw_generated, dict):
+                    _iw_generated.update(fixed_roster)
+                else:
+                    _iw_generated = fixed_roster
+                if _alloff_roster:
+                    if isinstance(_iw_generated, dict):
+                        _iw_generated.update(_alloff_roster)
+                    else:
+                        _iw_generated = dict(_alloff_roster)
+                _iw_err = _validate_generated_roster(
+                    _iw_generated, _iw_rs,
+                    nurses_context=list(nurses_for_engine or []),
+                    config_context=_iw_cfg,
+                    grade_config_context=_fetch_grade_config_dict(
+                        db, current_user.office_id, current_user.group_id),
+                )
+            except Exception as _iw_exc:
+                _iw_err = f"isolated_work soft 재시도 예외: {type(_iw_exc).__name__}: {_iw_exc}"
+                _iw_generated = _iw_rs = None
+            if not _iw_err:
+                generated = _iw_generated
+                roster_system = _iw_rs
+                applied_relaxations.append("isolated_work_hard_to_soft")
+                if _ctx is not None:
+                    _ctx["relaxed"] = True
+                weekly_off_warnings.append({
+                    "type": "isolated_work_hard_to_soft_applied",
+                    "detail": ("고립근무 금지가 infeasible 로 자동 soft 전환되어 재생성됐습니다. "
+                               "일부 간호사에게 휴무 사이 단일 근무가 생길 수 있습니다."),
+                })
+                print("[IsolatedWorkFallback][AUTO-SOFT][success] isolated_work hard→soft 자동 전환으로 "
+                      "근무표 생성. applied_relaxations=['isolated_work_hard_to_soft']")
+                validation_error = None
+            else:
+                print(f"[IsolatedWorkFallback][AUTO-SOFT][fail] 재시도 실패: {_iw_err}")
+                config_dict["isolated_work_hard"] = False
+                config_dict["_isolated_work_soft_retry_attempted"] = True
 
     if validation_error:
         print(f"[RosterGenerate][UNRECOVERABLE] {validation_error}")

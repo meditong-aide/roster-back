@@ -231,6 +231,15 @@ _STALL_SAVED: list = []          # [초...] — 생성 1회분. stage3 직전에
 # ★ stage2 의 **원래** 예산(tl2). 상한을 배수로 올려도 이월은 이 값을 넘지 않는다 —
 #   안 그러면 늘려 준 시간이 회수분으로 둔갑해 stage3 로 흘러 총 소요가 폭증한다(:368).
 _S2_BASE_TL: list = [0.0]
+# ★ 정체 회수분의 **목적지**를 고른다(기본 off = 종전대로 stage3 로만).
+#   `AIDE_LEX_CARRY=1` 이면 **뒤따르는 lex 패스**에 먼저 주고, 남으면 stage3 로 간다.
+#   왜 분리했나: `AIDE_LEX_STALL` 은 "끊는" 처치이고 이건 "어디에 쓰는가" 라, 묶으면
+#   A/B 에서 두 기여가 안 갈린다(6b 의 게이트 분리 원칙과 같다).
+#   ★★ **모듈 상수로 잡으면 안 된다** — import 시점에 고정돼 A/B 에서 런마다 환경변수를
+#     바꿔도 반영되지 않는다(측정이 조용히 한 조건만 반복한다). 다른 게이트가 전부
+#     `_stall_config()` 처럼 함수 안에서 읽는 이유가 이것이다.
+def _lex_carry_on() -> bool:
+    return _os_lex.environ.get("AIDE_LEX_CARRY") == "1"
 
 
 def _stall_config():
@@ -1963,11 +1972,33 @@ def optimize_fallback_lex_hard_first(
             bool(getattr(cfg, "sequential_offs", True))
         ):
             slack_penalty = int(getattr(cfg, "isolated_off_slack_penalty", 300000) or 0)
+            # ★★ 휴가·공가가 낀 자리는 **고립 OFF 판정에서 뺀다.**
+            #   솔버의 shift_types 는 D/E/N/O 넷뿐이라 연차·반차·공가가 전부 `O` 로 접힌다
+            #   (`_build_special_fixed_cells` → special_off_days). 그래서 이 식이
+            #   `off_idx` 하나만 보면 **본인이 신청한 휴가를 "근무 사이에 낀 고립 OFF"** 로
+            #   읽고 30만 가중치로 회피하려 든다. 반대로 옆에 연차가 붙은 **진짜 고립 OFF** 는
+            #   양옆이 off 로 보여 판정을 빠져나간다. 두 방향 모두 틀린다.
+            #   실측(성남ICU-RN 2026-10): 최신 판의 실제 고립OFF 0 건인데 엔진은 3 건으로
+            #   셌고 전부 연차·반차·공가였다.
+            #   ★ 셋 중 하나라도 휴가·공가면 스킵한다 — 가운데가 휴가면 고립이 아니고,
+            #     양옆이 휴가면 "근무 사이" 자체가 성립하지 않는다.
+            _iso_leave_types = {"휴가", "공가"}
+
+            def _iso_has_leave(_n: int, _d: int) -> bool:
+                return any(
+                    fixed_type_by_cell.get((_n, _dd)) in _iso_leave_types
+                    for _dd in (_d - 1, _d, _d + 1)
+                )
+
+            _iso_skip_cnt = 0
             for n in range(N):
                 if _is_preceptee_at(n):
                     continue
                 t0, t1 = join[n], leave[n]
                 for d in range(t0, t1 + 1):
+                    if _iso_has_leave(n, d):
+                        _iso_skip_cnt += 1
+                        continue
                     neighbours = []
                     if d - 1 >= t0:
                         neighbours.append(X(n, d - 1, off_idx))
@@ -1984,6 +2015,8 @@ def optimize_fallback_lex_hard_first(
                         safety["isolated_off_slack"].append(scaled)
                     else:
                         safety["isolated_off_slack"].append(slack)
+            print(f"{logger_prefix} [IsoOffLeaveSkip] 휴가·공가로 판정 제외 {_iso_skip_cnt}셀 "
+                  f"(stage={stage})")
 
         # 전이 위반: 정확한 reification (iff) — Option C: 프리셉티도 적용(등가로 프리셉터에 전파)
         for n in range(N):
@@ -2284,9 +2317,17 @@ def optimize_fallback_lex_hard_first(
         # 설정(`roster_config.same_shift_hard_k`)이 정본. 환경변수는 A/B 용 오버라이드.
         # ★ cfg 가 **0 이면 자동 완화로 내려간 상태**이므로 환경변수로 되살리지 않는다.
         #   (안 그러면 A/B 중 INFEASIBLE 이 나도 재시도에서 하드가 그대로 살아 완화가 죽는다.)
+        # ★★ 환경변수는 **빈 문자열과 "0" 을 구분**한다. `int(env or 0) or cfg` 로 쓰면
+        #   env="0" 이 falsy 라 cfg(기본 3)로 되돌아가 **하드를 끌 수가 없다** — A/B 의
+        #   "현행(하드 off)" 팔 자체를 만들지 못한다.
         _ssh_cfg_k = int(getattr(cfg, "same_shift_hard_k", 0) or 0)
         _ssh_env = _os_ssh.environ.get("AIDE_SAME_SHIFT_HARD_K", "")
-        _ssh_k = 0 if _ssh_cfg_k == 0 else (int(_ssh_env or 0) or _ssh_cfg_k)
+        if _ssh_cfg_k == 0:
+            _ssh_k = 0          # cfg 0 = 자동 완화로 내려간 상태 → 환경변수로 되살리지 않는다
+        elif _ssh_env != "":
+            _ssh_k = int(_ssh_env)   # 명시값 존중(0 이면 끈다)
+        else:
+            _ssh_k = _ssh_cfg_k
         if _ssh_k > 0:
             _use_mid_ssh = bool(getattr(cfg, "use_mid", False))
             _ssh_cnt = 0
@@ -2312,6 +2353,75 @@ def optimize_fallback_lex_hard_first(
                         m.Add(sum(X(n, d, _s_idx_ssh) for d in _win_ssh) <= _ssh_k)
                         _ssh_cnt += 1
             print(f"{logger_prefix} [SameShiftHard] k={_ssh_k} 제약 {_ssh_cnt}건 (stage={stage})")
+
+        # 고립근무(O-W-O) HARD 금지 — `isolated_work_hard`(기본 True).
+        #   "양옆이 OFF 면 가운데는 근무 불가" 를 직접 건다.
+        #   soft 항(`ISOLATED_WORK_PENALTY` 1500)과 **같은 식**을 부등식으로 바꾼 것이다:
+        #     soft: iw >= off[d-1] + off[d+1] + mid_work - 2   (위반량을 벌점으로)
+        #     hard:       off[d-1] + off[d+1] + mid_work <= 2   (위반 자체를 금지)
+        # ★ soft 만으로는 못 줄인다 — 벌점 스윕(1500/4000/10000/30000)이 9·9·7·9 로
+        #   **방향성이 없었다**. 가중치가 약한 게 아니라 다른 제약이 그 자리를 강제한다.
+        # ★ N 단독(O-N-O)은 제외한다 — 하드락 7(1N 금지)이 별도로 관리하고,
+        #   `n_max==1` 면제와 충돌한다(soft 항의 `mid_work` 정의와 동일하게 맞춘다).
+        # ★ 경계일(d=T0/T1)은 양옆 확인이 불가해 자연히 빠진다(range(T0+1, T1)).
+        # ★ 고정 셀은 건드릴 수 없으므로 셋 중 하나라도 fixed 면 스킵한다 —
+        #   확정 원티드로 O-W-O 가 이미 박혀 있으면 INFEASIBLE 로 보고되는 게 아니라
+        #   그 자리는 제약 대상이 아니어야 한다(사용자가 지정한 것이다).
+        # build_model 은 stage 1/2/3 마다 호출되므로 이 제약도 전 스테이지에 걸린다.
+        if bool(getattr(cfg, "isolated_work_hard", False)) and "O" in cfg.shift_types:
+            _ih_off = cfg.shift_types.index("O")
+            _ih_has_n = "N" in cfg.shift_types
+            _ih_night = cfg.shift_types.index("N") if _ih_has_n else None
+            # 커버리지 0 근무(교육류·전담)가 접히는 가상 코드. 없는 병동도 있다.
+            _ih_w = cfg.shift_types.index("W") if "W" in cfg.shift_types else None
+            _ih_cnt = 0
+            _ih_fx = 0
+            for n in range(N):
+                T0, T1 = join[n], leave[n]
+                _ih_blk = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
+                for d in range(T0 + 1, T1):
+                    if any(dd in _ih_blk for dd in (d - 1, d, d + 1)):
+                        continue
+                    # ★ **가운데(d)가 고정일 때만** 스킵한다. 양옆이 고정 OFF 여도
+                    #   가운데가 자유로우면 제약을 걸어야 거기에 근무가 안 들어간다.
+                    #   처음엔 셋 중 하나라도 고정이면 통째로 건너뛰었는데, 확정 원티드로
+                    #   **양옆 OFF 만** 박힌 자리가 그대로 뚫려 고립근무가 남았다
+                    #   (실측: 하드 447건을 걸고도 3~6건 잔존 · 전부 순수 O-근무-O).
+                    if (n, d) in fixed:
+                        # ★★ 가운데가 **고정 근무**면 위 식은 못 쓴다(가운데를 못 바꾼다).
+                        #   대신 **양옆이 둘 다 OFF 가 되는 것**을 막아야 한다 — 이걸 빼면
+                        #   확정 원티드 D 한 칸 주변을 엔진이 O 로 채워 O-D-O 가 완성된다
+                        #   (실측 성남ICU-RN 2026-10: 잔존 4건이 전부 이 경로 ·
+                        #    임옥희 13/27 은 뒤가 고정 O · 오정 7 은 양옆 둘 다 자유였다).
+                        _ih_s = fixed[(n, d)]
+                        if _ih_s == _ih_off or (_ih_has_n and _ih_s == _ih_night):
+                            continue        # 고정 OFF·N 은 고립근무가 아니다
+                        if _ih_w is not None and _ih_s == _ih_w:
+                            # ★★ W = **커버리지 0 근무**(교육·노조교육·보수교육·직무교육·DA·DD).
+                            #   `shifts.type` 은 '근무' 지만 `daily_shift_requirements` 에 요구가
+                            #   없어 병동 인원으로 안 잡힌다(`:1763-1777`). 그래서 옆에 근무를
+                            #   붙여도 **병동이 얻는 게 없다** — 교육일 커버리지는 0 그대로다.
+                            #   ★ 교육 날짜는 병원이 정해 옮길 수도 없다. 옆에 근무를 붙여도
+                            #     그 날 병동 인원은 그대로라 **아무것도 개선되지 않는다**.
+                            #   ★ 실측 2026-09-15 성남ICU-RN: 이 제외로 고정근무 주변 제약이
+                            #     20건 → 4건이 되고, 커버리지 근무 고립은 5회 전부 0건을 유지했다.
+                            continue
+                        # 양옆이 **둘 다** 고정이면 손댈 칸이 없다 → 걸면 INFEASIBLE 만 난다
+                        if (n, d - 1) in fixed and (n, d + 1) in fixed:
+                            continue
+                        m.Add(X(n, d - 1, _ih_off) + X(n, d + 1, _ih_off) <= 1)
+                        _ih_fx += 1
+                        continue
+                    # W 는 커버리지 0 근무라 고립근무로 세지 않는다(위 고정 분기와 같은 기준).
+                    _ih_mid = (1 - X(n, d, _ih_off)
+                               - (X(n, d, _ih_night) if _ih_has_n else 0)
+                               - (X(n, d, _ih_w) if _ih_w is not None else 0))
+                    m.Add(X(n, d - 1, _ih_off) + X(n, d + 1, _ih_off) + _ih_mid <= 2)
+                    _ih_cnt += 1
+            print(
+                f"{logger_prefix} [IsolatedWorkHard] 제약 {_ih_cnt}건 "
+                f"(+고정근무 주변 {_ih_fx}건) (stage={stage})"
+            )
 
         # 연속 Night 상한 L → 초과량 정량화
         L = cfg.max_consecutive_nights
@@ -3323,6 +3433,45 @@ def optimize_fallback_lex_hard_first(
                 + TEAM_COVER_LEX_WEIGHT * sum(_tm_cover_slacks)
                 + GRADE_OFF0_LEX_WEIGHT * sum(_grade_off0)
             )
+            # ── [S6] stage3 목적을 **같은 모델(m2)** 에 지어 lex 패스 8 로 쓴다 ──
+            #   (2026-09-11 · `AIDE_S6_PASS8=1` · 기본 off)
+            #   ★★ 왜 이 방향인가 — 대안은 lex 목적 6개(off_range·team·n_range·n2n·de·pref)를
+            #     **m3 에 X3 로 다시 짓는 것**인데, 그건 "같은 목적을 두 모델에 두 번 짓기" 라
+            #     이 세션에서 결함 3건을 낸 바로 그 구조다(S4-② 빈 제약 · grade 중복 등록 ·
+            #     de 가 산출물에 안 박힘). 그걸 6배로 늘리는 셈이고 n2n 쌍 변수는 사본이
+            #     미묘하게 어긋나기 쉽다.
+            #   ★ 반대로 stage3 목적은 **이미 주입 구조**다 — `build_fallback_stage3_objective_terms`
+            #     가 `m`·`X` 를 인자로 받고(fallback_objectives.py:26) 나머지 인자도 전부
+            #     stage 분기 **이전**에 정의된다(over_vars_by_day:1748 · structural_off_cells:1079
+            #     · off_exception_cells:674 · weekly_off_by_idx:849). m3 전용 의존이 없다.
+            #   → m3 를 없애면 **발산 클래스가 통째로 사라지고**(m2≠m3 가 성립 불가)
+            #     stage3 예산 tl3(12초)이 자연히 체인 예산으로 들어온다.
+            #   ★ 여기서는 **목적항만 만들어 보관**한다. lex 패스가 `m2.Minimize` 를 교체하며
+            #     도는 구조라, 지금 Minimize 를 걸면 위의 stage2 본 목적을 덮어쓴다.
+            if _os_lex.environ.get("AIDE_S6_PASS8") == "1":
+                try:
+                    m._s6_stage3_terms = build_fallback_stage3_objective_terms(
+                        m=m,
+                        roster_system=roster_system,
+                        X=X,
+                        join=join,
+                        leave=leave,
+                        fixed_cnt=fixed_cnt,
+                        over_vars_by_day=over_vars_by_day,
+                        forced_off_cells=(structural_off_cells | vacation_off_cells),
+                        off_exception_cells=off_exception_cells,
+                        weekly_off_by_idx=weekly_off_by_idx,
+                        logger_prefix=logger_prefix,
+                        add_preceptor_terms_fn=add_preceptor_terms_fn,
+                        add_grade_constraints_fn=add_grade_constraints_fn,
+                        blocked_by_nurse=blocked_by_nurse,
+                    )
+                    print(f"{logger_prefix} [S6] stage3 목적을 m2 에 빌드: "
+                          f"{len(m._s6_stage3_terms)}개 항")
+                except Exception as _s6_exc:
+                    m._s6_stage3_terms = None
+                    print(f"{logger_prefix} [S6] m2 빌드 실패(무시·기존 경로 유지): "
+                          f"{type(_s6_exc).__name__}: {_s6_exc}")
         else:
             if coverage_eq is not None:
                 m.Add(sum(short_terms) == coverage_eq)
@@ -4068,6 +4217,10 @@ def optimize_fallback_lex_hard_first(
                     night_idx_h1 = (
                         cfg.shift_types.index("N") if "N" in cfg.shift_types else None
                     )
+                    # ★ D 균등 패스(`d_range`)용. N 과 같은 방식으로 잡는다.
+                    day_idx_h1 = (
+                        cfg.shift_types.index("D") if "D" in cfg.shift_types else None
+                    )
                     # ── 시프트 개수 상·하한 ── (2026-09-11)
                     #   ★★ range 패스(max-min)는 **목적식에서 상수인 사람 하나에 무력화**된다.
                     #     N 을 구조적으로 못 하는 사람이 섞이면 min 이 0 에 못박혀, 조절 가능한
@@ -4211,6 +4364,51 @@ def optimize_fallback_lex_hard_first(
                             return None            # 대상이 1명 이하면 range 는 의미가 없다
                         _mx = m2.NewIntVar(0, D, "lex_max_n")
                         _mn = m2.NewIntVar(0, D, "lex_min_n")
+                        for _c in _cnts:
+                            m2.Add(_c <= _mx)
+                            m2.Add(_c >= _mn)
+                        return (_mx - _mn, lambda v: m2.Add(_mx - _mn <= v), 2.0, 0.2)
+
+                    def _prep_d_range():
+                        """D 개수 균등(max-min) — `n_range` 의 D 판(2026-09-14).
+
+                        ★ 왜 필요한가 — **D 균등을 보는 패스가 하나도 없었다.**
+                          `off_range` 는 OFF, `n_range` 는 N, `de` 는 개인 내 |D-E| 를 보는데
+                          **D 자체의 사람 간 균등은 아무도 안 본다.**
+                          실측(성남ICU 2026-10 · schedule 856e14283992):
+                            김은경 D18(전담·정상) · **임옥희 D11** · 그 외 21명 D 4~8(대부분 6~7)
+                          임옥희 혼자 3~4개 더 받았고, 그 11개 중 **10개가 D5 두 구간**
+                          (10/09~13 · 10/23~27)이었다. "D 가 많다" 와 "D 가 뭉쳤다" 가 같은 현상이다.
+                        ★ 수요 구조: 전담 3명 중 김은경만 D 코드로 18일을 채우고
+                          송순진(DA)·남경준(DD)은 **D 커버리지에 안 잡힌다.** 남은 D 를
+                          24명이 나누는데 배분을 보는 축이 없으니 한 명에게 몰린다.
+                        ★ D5 를 직접 겨냥한 세 경로가 모두 실패한 뒤 나온 처방이다 —
+                          소프트 가중치(고립근무에 밀림) · `d5-lex`(20회 성공 0) ·
+                          D5 체인 패스(창이 이미 확정돼 운신 폭 없음). D 를 흩으면
+                          5일 창을 D 로 채울 이유 자체가 줄어든다.
+                        ★ 가드는 `n_range` 와 동일 — `_count_bounds` 가 D 상수인 사람을 뺀다
+                          (전담 3명이 자동 제외된다).
+                        """
+                        if day_idx_h1 is None:
+                            return None
+                        _cnts, _skip = [], []
+                        for _n in range(N):
+                            if leave[_n] < join[_n] or _n in range_excluded_idx:
+                                continue
+                            if _is_range_const(_n, day_idx_h1):
+                                _skip.append(getattr(roster_system.nurses[_n], "name", _n))
+                                continue
+                            _cnts.append(sum(
+                                X2(_n, _d, day_idx_h1)
+                                for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse)
+                            ))
+                        if _skip:
+                            print(f"{logger_prefix} [d_range] D 상수라 제외 {len(_skip)}명: "
+                                  f"{', '.join(str(x) for x in _skip)} / 대상 {len(_cnts)}명")
+                        if len(_cnts) < 2:
+                            return None
+                        _mx = m2.NewIntVar(0, D, "lex_max_d")
+                        _mn = m2.NewIntVar(0, D, "lex_min_d")
                         for _c in _cnts:
                             m2.Add(_c <= _mx)
                             m2.Add(_c >= _mn)
@@ -4440,7 +4638,54 @@ def optimize_fallback_lex_hard_first(
                     #   lex 는 사전식이라 앞 순위가 절대 우선이다. 즉 이 순서가 곧
                     #   "무엇을 더 중요하게 볼 것인가" 라는 정책이다. env 로 주입해
                     #   순열을 실측할 수 있게 둔다.
+                    def _prep_s6():
+                        """[S6] stage3 목적을 lex 패스 8 로 — m3 없이 같은 모델에서 푼다.
+
+                        ★★ **부호**: stage3 는 `m.Maximize(sum(obj))`(:3432) 인데 lex 체인은
+                          Minimize 라, 여기서는 `-sum(terms)` 를 최소화한다. 목적값을 비교할
+                          때 **부호를 뒤집어야** stage3 값과 같은 축이 된다.
+                        ★ 예산은 `tl3` 와 같게 준다 — "같은 목적 · 같은 시간 · 다른 모델" 이라야
+                          패스 8 과 stage3 의 비교가 공정하다. 시간 재배분은 m3 를 걷어낸 뒤 일.
+                        ★ 동결은 다른 패스와 같은 규약(`<= v`)이다. 부호를 뒤집었으므로
+                          "이 값 이하" 가 곧 "선호·공정성이 이만큼 이상" 을 뜻한다.
+                        """
+                        _terms = getattr(m2, "_s6_stage3_terms", None)
+                        if not _terms:
+                            return None
+                        _neg = -sum(_terms)
+                        # tl2 비율로 환산해 tl3 와 같은 시간을 준다(_budget = tl2 * _frac).
+                        _frac8 = float(tl3) / float(tl2) if tl2 else 0.5
+                        return (_neg, lambda v: m2.Add(_neg <= v), float(tl3), _frac8)
+
+                    def _prep_d5():
+                        """D 5연속(D5) 최소화 — 체인 패스(2026-09-14).
+
+                        ★ 실무 요청: "5연D 는 힘드니 D2/E2 로 꺾어달라 · D3 까지는 허용".
+                          실측(성남ICU 2026-10 · schedule 856e14283992): 임옥희가
+                          10/09~13 · 10/23~27 **D5 두 구간**. 하드락 1번(연속근무 5일)은
+                          지키므로 위반이 아니고, 같은 시프트 연속을 막는 건
+                          **소프트 벌점(D5 가중 1200)** 뿐인데 고립근무(1500) 아래로
+                          **의도적으로 낮게** 설정돼 있다(fallback_objectives.py 주석).
+                        ★★ 왜 패스인가 — 세 갈래를 실측으로 좁혔다:
+                          · 소프트 가중치 상향 → 올리면 고립근무가 밀린다(g0 와 같은 자리)
+                          · 하드 제약 → 27명·N 요구 큼·D 전담 존재로 INFEASIBLE 위험
+                          · `d5-lex`(stage3 뒤 freeze re-solve) → **실측 기각**
+                            (인원게이트 열어도 개선 0·악화 2·소요 +11~21s · 20회 성공 0)
+                          남는 건 체인 패스뿐이고, 레벨이라 가중치 경쟁을 안 한다.
+                        ★ 전제: `AIDE_S6_PASS8=1`. D5 핸들(`_ms_d5_lex_vars`)은
+                          stage3 목적 빌더 안에서만 만들어지므로(fallback_objectives.py:396),
+                          S6 으로 그 빌더를 m2 에 호출해야 이 패스가 성립한다.
+                        ★ 자리: `de` 뒤 · `pref` 앞 — 근무품질 축이라 선호보다 상위.
+                        """
+                        _d5v = getattr(m2, "_ms_d5_lex_vars", None) or []
+                        if not _d5v:
+                            return None
+                        return (sum(_d5v), lambda v: m2.Add(sum(_d5v) <= v), 3.0, 0.15)
+
                     _PASS_PREP = {
+                        "s6": _prep_s6,
+                        "d5": _prep_d5,
+                        "d_range": _prep_d_range,
                         "off_range": _prep_off,
                         "grade": _prep_grade,
                         "n_range": _prep_n_range,
@@ -4480,7 +4725,23 @@ def optimize_fallback_lex_hard_first(
                         _obj, _freeze, _min_t, _frac = _spec
                         try:
                             m2.Minimize(_obj)
-                            s2.parameters.max_time_in_seconds = max(_min_t, float(tl2) * _frac)
+                            # ★★ 정체로 회수한 시간을 **뒤따르는 lex 패스**에 먼저 쓴다
+                            #   (2026-09-11). 기존엔 회수분이 전부 stage3 로만 갔는데
+                            #   (`_STALL_SAVED` → tl3 · :4644), 그러면 앞 패스에서 끊어 번 시간이
+                            #   **같은 lex 체인 안에서 시간이 모자란 패스에 닿지 못한다.**
+                            #   실측(시화9B · 3회): `lex4:n_range` 는 0.3s 에 개선이 멈추고
+                            #   4.3s 까지 도는데(8%), `lex6:de` 는 6.0/6.3s(96%)·5.2/6.3s(83%)
+                            #   로 **리밋 직전까지 개선 중**이다. n_range 에서 끊은 4초가
+                            #   de 로 가야 27 이 더 내려간다 — stage3 로 보내면 de 는 그대로다.
+                            #   ★ 남은 회수분은 그대로 stage3 로 간다(:4644). 순서만 바뀐다.
+                            _budget = max(_min_t, float(tl2) * _frac)
+                            if _lex_carry_on() and _STALL_SAVED:
+                                _add = sum(_STALL_SAVED)
+                                _STALL_SAVED.clear()      # 소비 — stage3 중복 가산 방지
+                                _budget += _add
+                                print(f"{logger_prefix} [lex이월] 회수 {_add:.1f}s → "
+                                      f"lex{_i}:{_pname} 예산 {_budget:.1f}s")
+                            s2.parameters.max_time_in_seconds = _budget
                             _hint_lex_solution()
                             _st_p = _solve_traced(s2, m2, logger_prefix, f"lex{_i}:{_pname}")
                             if _st_p in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -4591,6 +4852,7 @@ def optimize_fallback_lex_hard_first(
     # ───── 3단계: 선호/공정성 ─────
     # 아래 with 블록 안에서 대입되지만, 함수 끝(4154)에서도 읽으므로 미리 잡아 둔다.
     _stage3_failed = False
+    _s6_chain_commit = False
     with timer_cls("폴백 3단계: 선호/공정성 최대화"):
         (
             m3,
@@ -4759,8 +5021,27 @@ def optimize_fallback_lex_hard_first(
         #   반환값도 최종 `return` 과 같으므로, stage3 전용 후속 블록만 건너뛰고
         #   공용 마무리로 흘려보낸다.
         _stage3_failed = st3 not in (cp_model.OPTIMAL, cp_model.FEASIBLE)
-        if _stage3_failed:
-            print(f"{logger_prefix} 폴백3 실패: 선호 단계 불가능 → 2단계 해 사용")
+        # ── [S6] 커밋 출처 ── `AIDE_S6_COMMIT=chain` 이면 **체인(m2) 해를 커밋**하고
+        #   stage3 는 돌리되 결과를 쓰지 않는다(기록만).
+        #   ★★ 왜 필요한가: 처치 팔에서 stage3 를 그대로 커밋하면 **stage3 가 여전히
+        #     lex 값을 되돌려서** 패스 8 의 효과가 산출물에 안 나타난다. 두 경로를 모두
+        #     둬야 "패스 8 커밋" 과 "stage3 커밋" 을 같은 배치에서 비교할 수 있다.
+        #   ★ stage3 는 패스 8 해를 힌트로 받아 돌므로 (c) 축(stage3 Δ = 패스 8 에서
+        #     stage3 가 더 바꾼 양)이 그대로 측정된다. Δ ≈ 0 이면 m3 제거 근거다.
+        #   ★ `_stage3_failed` 를 건드리면 **stage3 계측 로그까지 사라져**(`[S4-2계측]`)
+        #     판정축 (a) 목적값 비교와 (c) stage3 Δ 를 못 잰다. 커밋 자리만 막는다(:5082).
+        _s6_chain_commit = (_os_lex.environ.get("AIDE_S6_COMMIT") == "chain"
+                            and not _stage3_failed)
+        if _s6_chain_commit:
+            print(f"{logger_prefix} [S6] 커밋 출처=chain — stage3 는 정상 수행·계측하되 "
+                  f"결과는 쓰지 않고 체인(m2) 해를 커밋한다")
+        # ★ [S6] chain 커밋도 **이 경로를 탄다** — `lex_x2_val`(체인 해)로 roster 를 채우는
+        #   코드가 여기뿐이라, 커밋 자리만 막으면 roster 가 비어 INFEASIBLE 로 끝난다
+        #   (스모크에서 실제로 그랬다 · 2026-09-11).
+        if _stage3_failed or _s6_chain_commit:
+            print(f"{logger_prefix} "
+                  + ("[S6] 체인(m2) 해를 커밋한다 — stage3 결과는 기록만"
+                     if _s6_chain_commit else "폴백3 실패: 선호 단계 불가능 → 2단계 해 사용"))
             roster_system.roster.fill(0)
             for n in range(N):
                 for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
@@ -5037,7 +5318,7 @@ def optimize_fallback_lex_hard_first(
     # ★ stage3 가 실패했으면 s3 에 해가 없다. 여기서 무조건 추출하면 위에서 채워 둔
     #   stage2 해를 지우고 빈 값(또는 예외)으로 덮는다. 실패 시에는 이미 채워진
     #   roster 를 그대로 두고, 아래 공용 마무리(프리셉티 동기화 등)만 이어간다.
-    if not _stage3_failed:
+    if not _stage3_failed and not _s6_chain_commit:      # [S6] chain 커밋이면 stage3 해를 안 쓴다
         roster_system.roster.fill(0)
         for n in range(N):
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
@@ -5069,5 +5350,5 @@ def optimize_fallback_lex_hard_first(
     #   최종 근무표가 stage3 해인지 stage2 해인지에 따라 이 숫자의 뜻이 달라지므로
     #   어느 해가 커밋됐는지 함께 남긴다 — 없으면 표에서 어느 값이 최종인지 못 읽는다.
     print(f"{logger_prefix} 폴백 완료: 커버리지부족={best_short}, 안전위반합={best_safe_sum} "
-          f"(커밋해={'stage2(선호 미반영)' if _stage3_failed else 'stage3'} 기준)")
+          f"(커밋해={'stage2(선호 미반영)' if _stage3_failed else ('chain(패스8)' if _s6_chain_commit else 'stage3')} 기준)")
     return best_short == 0 and best_safe_sum == 0

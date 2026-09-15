@@ -453,6 +453,13 @@ class CPSATBasicEngine:
         print('config_data', config_data.get('shift_priority'))
         # 법규 제약사항 (Hard Constraints)
         max_conseq_work = config_data.get('max_conseq_work', 5)
+        # 연속근무 하드 상한 A/B 주입구. 하드락 #1 은 "최대 5일 **이하**" 라
+        # **낮추는 방향만** 허용한다 — min() 으로 상향을 막는다(올리면 정책 위반).
+        import os as _os_mcw
+        _mcw_env = _os_mcw.environ.get("AIDE_MAX_CONSEC_WORK")
+        if _mcw_env:
+            max_conseq_work = min(int(max_conseq_work or 5), int(_mcw_env))
+            print(f"[MaxConsecWork] hard={max_conseq_work} (env={_mcw_env})")
         banned_day_after_eve = config_data.get('banned_day_after_eve', True)
         three_seq_nig = config_data.get('three_seq_nig', True)
         two_offs_after_three_nig = config_data.get('two_offs_after_three_nig', True)
@@ -612,6 +619,8 @@ class CPSATBasicEngine:
             max_same_shift_penalty_weight=int(config_data.get("max_same_shift_penalty_weight", 300) or 0),
             # 같은 시프트 연속 하드 상한(0=미적용). INFEASIBLE 시 호출부가 0 으로 내려 재생성한다.
             same_shift_hard_k=int(config_data.get("same_shift_hard_k", 3) or 0),
+            # 고립근무 하드 금지(기본 True). INFEASIBLE 시 호출부가 False 로 내려 재생성한다.
+            isolated_work_hard=bool(config_data.get("isolated_work_hard", True)),
             # 4O 연속 휴무 hard 제약 (디폴트 False = 해제)
             enforce_4o_hard=bool(config_data.get("enforce_4o_hard", False)),
             # N 블록 간 간격 soft (목표 10일, 한쪽 페널티: 10일 미만만 벌점)

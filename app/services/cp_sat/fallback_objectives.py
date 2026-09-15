@@ -285,8 +285,26 @@ def build_fallback_stage3_objective_terms(
 
     # 연속근무 소프트 상한
     try:
-        soft_k = int(getattr(cfg, "soft_max_consecutive_work_days", 0) or 0)
-        w_soft = int(getattr(cfg, "soft_consecutive_work_penalty_weight", 0) or 0)
+        # ★ 소프트 연속근무 상한 — `AIDE_SOFT_MAX_CONSEC` 로 덮어쓴다(2026-09-14).
+        #   cfg 기본은 None 이고 `roster_config.py:152` 가 **하드값(5)으로 채우므로**
+        #   소프트 상한이 사실상 무력화돼 엔진이 5일을 꽉 채운다.
+        #   실측(성남ICU 2026-10 vs 9월 실제 운영) — **연속근무 길이 분포**
+        #     9월 사람  1일×10 · 2일×43 · 3일×61 · 4일×26 · **5일×3**
+        #     10월 엔진 1일×15 · 2일×36 · 3일×29 · 4일×31 · **5일×31**  ← 10배
+        #   사람은 3일을 주력으로 쓰고 5일은 예외인데, 엔진은 하드 상한(5)까지 채운다.
+        #   ★ D5(같은 시프트 5연속) 문의의 **근본 원인이 이것**이다 — 5일 창이 31개나
+        #     있으니 그중 하나가 D 로 채워진다. D5 가중치를 1200→3000 으로 올려도
+        #     `escalate` 로 바꿔도 12런 전부 D5 가 1건 남았다(창 자체가 널려 있어서).
+        import os as _os_sc
+        soft_k = int(_os_sc.environ.get(
+            "AIDE_SOFT_MAX_CONSEC",
+            getattr(cfg, "soft_max_consecutive_work_days", 0) or 0) or 0)
+        w_soft = int(_os_sc.environ.get(
+            "AIDE_SOFT_CONSEC_W",
+            getattr(cfg, "soft_consecutive_work_penalty_weight", 0) or 0) or 0)
+        # 계측은 A/B(환경변수 지정) 때만 — 평시 로그 노이즈를 만들지 않는다.
+        if _os_sc.environ.get("AIDE_SOFT_MAX_CONSEC") or _os_sc.environ.get("AIDE_SOFT_CONSEC_W"):
+            print(f"{logger_prefix} [SoftConsec] k={soft_k} w={w_soft}")
         if soft_k > 0 and w_soft > 0:
             off_idx = cfg.shift_types.index("O")
             for n in range(N):
@@ -329,6 +347,8 @@ def build_fallback_stage3_objective_terms(
             if w_ms_base > 0:
                 _use_mid_ms = bool(getattr(cfg, "use_mid", False))
                 _ms_mode = _os_ms.environ.get("AIDE_SAME_SHIFT_MODE", "d5add")
+                if _os_ms.environ.get("AIDE_SAME_SHIFT_BASE") or _os_ms.environ.get("AIDE_SAME_SHIFT_MODE"):
+                    print(f"{logger_prefix} [SameShift] base={w_ms_base} mode={_ms_mode}")
                 _ms_factor = float(_os_ms.environ.get(
                     "AIDE_SAME_SHIFT_FACTOR",
                     getattr(cfg, "max_same_shift_growth_factor", 4)) or 4)
@@ -370,6 +390,46 @@ def build_fallback_stage3_objective_terms(
                                 m.Add(v5 >= sum_d - 4)
                                 obj.append(-_d5_w * v5)
                                 _d5_lex_vars.append(v5)
+                elif _ms_mode == "dmul":
+                    # ★ D 전용 곱연산 — E/N 은 현행(4연속 창 base) 그대로 두고 **D 만** 조인다.
+                    #   왜 D 만인가: base 를 D/E/N 에 함께 올렸더니(300→2000) 활성 4곳에서
+                    #   **D4 가 일관되게 늘었다**(9A 6→8 · 중환1 6→8 · 중환2 5→11).
+                    #   E4 를 피하느라 E 가 흩어지고 그 자리를 D 가 메운 것이다. 실무 요청도
+                    #   "D3 까지 허용"이라 E/N 을 건드릴 이유가 없다.
+                    #   D 는 창 4..K 를 겹쳐 곱연산 → 런 길이 L 의 총비용이 볼록하게 급증한다
+                    #   (base=300·factor=4 → L4=300, L5=300*2+1200=1800, L6=…).
+                    _dmul_start = int(_os_ms.environ.get("AIDE_D_MUL_START", 4) or 4)
+                    _dmul_base = int(_os_ms.environ.get("AIDE_D_MUL_BASE", 0) or 0) or w_ms_base
+                    for code in ("E", "N"):
+                        if code not in cfg.shift_types:
+                            continue
+                        s_idx = cfg.shift_types.index(code)
+                        for n in range(N):
+                            if _allowed_ms(n) == {code}:
+                                continue
+                            T0, T1 = join[n], leave[n]
+                            for d0 in range(T0, T1 - 3):
+                                sum_s = sum(X(n, d0 + t, s_idx) for t in range(4))
+                                viol = m.NewIntVar(0, 1, f"max_same_shift_fb_{code}_{n}_{d0}")
+                                m.Add(viol >= sum_s - 3)
+                                obj.append(-w_ms_base * viol)
+                    if "D" in cfg.shift_types:
+                        d_idx = cfg.shift_types.index("D")
+                        for wlen in range(_dmul_start, _ms_kmax + 1):
+                            w_d = int(round(_dmul_base * (_ms_factor ** (wlen - _dmul_start))))
+                            if w_d <= 0:
+                                continue
+                            for n in range(N):
+                                if _allowed_ms(n) == {"D"}:
+                                    continue  # D 전담: 연속 강제 → 유령 벌점 방지
+                                T0, T1 = join[n], leave[n]
+                                for d0 in range(T0, T1 - (wlen - 1)):
+                                    sum_d = sum(X(n, d0 + t, d_idx) for t in range(wlen))
+                                    viol = m.NewIntVar(0, 1, f"d_mul_fb_{wlen}_{n}_{d0}")
+                                    m.Add(viol >= sum_d - (wlen - 1))
+                                    obj.append(-w_d * viol)
+                                    if wlen == 5:
+                                        _d5_lex_vars.append(viol)
                 else:
                     # escalate(기본): 겹치는 다중 길이 창(4..K) + 길이별 급증 가중치.
                     for code in ("D", "E", "N"):
@@ -403,19 +463,31 @@ def build_fallback_stage3_objective_terms(
     # 경계일(d=T0/T1)은 양옆 OFF 확인 불가라 자연히 제외(range(T0+1, T1)).
     try:
         if bool(getattr(cfg, "sequential_offs", True)) and "O" in cfg.shift_types:
+            # 고립근무 벌점 — A/B 주입구(`AIDE_ISO_WORK_W`) → 설정 → 상수(1500) 순.
+            import os as _os_iw
+            _iw_w = int(_os_iw.environ.get("AIDE_ISO_WORK_W", "") or 0) \
+                or int(getattr(cfg, "isolated_work_penalty_weight", 0) or 0) \
+                or ISOLATED_WORK_PENALTY
             _iw_off = cfg.shift_types.index("O")
             _iw_has_n = "N" in cfg.shift_types
             _iw_night = cfg.shift_types.index("N") if _iw_has_n else None
+            # ★ W(교육·노조·보수·직무·DA·DD)는 **커버리지 0 근무**라 고립근무로 세지 않는다.
+            #   하드(`fallback_lex` [IsolatedWorkHard])와 같은 기준이어야 완화 시에도
+            #   교육 옆에 근무를 붙이려는 압력이 안 생긴다.
+            _iw_has_w = "W" in cfg.shift_types
+            _iw_wk = cfg.shift_types.index("W") if _iw_has_w else None
             for n in range(N):
                 T0, T1 = join[n], leave[n]
                 for d in range(T0 + 1, T1):
-                    _iw_mid = 1 - X(n, d, _iw_off) - (X(n, d, _iw_night) if _iw_has_n else 0)
+                    _iw_mid = (1 - X(n, d, _iw_off)
+                               - (X(n, d, _iw_night) if _iw_has_n else 0)
+                               - (X(n, d, _iw_wk) if _iw_has_w else 0))
                     _iw = m.NewBoolVar(f"isow_fb_{n}_{d}")
                     m.Add(_iw <= X(n, d - 1, _iw_off))
                     m.Add(_iw <= X(n, d + 1, _iw_off))
                     m.Add(_iw <= _iw_mid)
                     m.Add(_iw >= X(n, d - 1, _iw_off) + X(n, d + 1, _iw_off) + _iw_mid - 2)
-                    obj.append(-ISOLATED_WORK_PENALTY * _iw)
+                    obj.append(-_iw_w * _iw)
     except Exception:
         pass
 
