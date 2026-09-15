@@ -869,7 +869,20 @@ def build_main_objective_terms(
 
     # (4-0b) 연속근무 소프트 상한
     try:
-        soft_k = int(getattr(cfg, "soft_max_consecutive_work_days", 0) or 0)
+        # ★ 소프트 연속근무 상한 — `AIDE_SOFT_MAX_CONSEC` 로 덮어쓴다(2026-09-14).
+        #   cfg 기본은 None 이고 `roster_config.py:152` 가 **하드값(5)으로 채우므로**
+        #   소프트 상한이 사실상 무력화돼 엔진이 5일을 꽉 채운다.
+        #   실측(성남ICU 2026-10 vs 9월 실제 운영) — **연속근무 길이 분포**
+        #     9월 사람  1일×10 · 2일×43 · 3일×61 · 4일×26 · **5일×3**
+        #     10월 엔진 1일×15 · 2일×36 · 3일×29 · 4일×31 · **5일×31**  ← 10배
+        #   사람은 3일을 주력으로 쓰고 5일은 예외인데, 엔진은 하드 상한(5)까지 채운다.
+        #   ★ D5(같은 시프트 5연속) 문의의 **근본 원인이 이것**이다 — 5일 창이 31개나
+        #     있으니 그중 하나가 D 로 채워진다. D5 가중치를 1200→3000 으로 올려도
+        #     `escalate` 로 바꿔도 12런 전부 D5 가 1건 남았다(창 자체가 널려 있어서).
+        import os as _os_sc
+        soft_k = int(_os_sc.environ.get(
+            "AIDE_SOFT_MAX_CONSEC",
+            getattr(cfg, "soft_max_consecutive_work_days", 0) or 0) or 0)
         w_soft = int(getattr(cfg, "soft_consecutive_work_penalty_weight", 0) or 0)
         if soft_k > 0 and w_soft > 0:
             for n in range(N):
@@ -954,6 +967,40 @@ def build_main_objective_terms(
                                 v5 = m.NewIntVar(0, 1, f"d5_{n}_{d0}")
                                 m.Add(v5 >= sum_d - 4)
                                 obj.append(-_d5_w * v5)
+                elif _ms_mode == "dmul":
+                    # ★ D 전용 곱연산 — E/N 은 현행(4연속 창 base) 유지, D 만 조인다.
+                    #   fallback_objectives.py 의 같은 이름 분기와 **동일 규약**이다
+                    #   (값이 실리는 자리가 둘이므로 양쪽을 함께 둔다).
+                    _dmul_start = int(_os_ms.environ.get("AIDE_D_MUL_START", 4) or 4)
+                    _dmul_base = int(_os_ms.environ.get("AIDE_D_MUL_BASE", 0) or 0) or w_ms_base
+                    for code in ("E", "N"):
+                        if code not in cfg.shift_types:
+                            continue
+                        s_idx = cfg.shift_types.index(code)
+                        for n in range(N):
+                            if _allowed_ms(n) == {code}:
+                                continue
+                            T0, T1 = join[n], leave[n]
+                            for d0 in range(T0, T1 - 3):
+                                sum_s = sum(X(n, d0 + t, s_idx) for t in range(4))
+                                viol = m.NewIntVar(0, 1, f"max_same_shift_{code}_{n}_{d0}")
+                                m.Add(viol >= sum_s - 3)
+                                obj.append(-w_ms_base * viol)
+                    if "D" in cfg.shift_types:
+                        d_idx = cfg.shift_types.index("D")
+                        for wlen in range(_dmul_start, _ms_kmax + 1):
+                            w_d = int(round(_dmul_base * (_ms_factor ** (wlen - _dmul_start))))
+                            if w_d <= 0:
+                                continue
+                            for n in range(N):
+                                if _allowed_ms(n) == {"D"}:
+                                    continue
+                                T0, T1 = join[n], leave[n]
+                                for d0 in range(T0, T1 - (wlen - 1)):
+                                    sum_d = sum(X(n, d0 + t, d_idx) for t in range(wlen))
+                                    viol = m.NewIntVar(0, 1, f"d_mul_{wlen}_{n}_{d0}")
+                                    m.Add(viol >= sum_d - (wlen - 1))
+                                    obj.append(-w_d * viol)
                 else:
                     for code in ("D", "E", "N"):
                         if code not in cfg.shift_types:
@@ -1064,6 +1111,12 @@ def build_main_objective_terms(
             obj.append(-NOD_NOE_PENALTY * _var)
 
     # (4-5) 고립 OFF (sequential_offs ON일 때만, fallback과 동일)
+    # ★★ 여기에는 **휴가·공가 제외가 없다.** 연차·반차·공가는 솔버에서 전부 `off` 로 접히므로
+    #   이 식은 본인이 신청한 휴가를 "근무 사이에 낀 고립 OFF" 로 읽는다.
+    #   실제로 도는 경로(`fallback_lex` 의 isolated_off_slack · 가중치 30만)에는 제외를
+    #   넣었다. 이쪽은 `SKIP_PRIMARY` 기본값이 "1" 이라 비활성이어서 손대지 않았다 —
+    #   **primary 를 되살릴 때 같은 제외를 반드시 함께 넣어야 한다**
+    #   (`fixed_type_by_cell` 을 인자로 받아 (d-1, d, d+1) 중 휴가·공가면 스킵).
     if getattr(cfg, "sequential_offs", True):
         for n in range(N):
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
@@ -1077,6 +1130,12 @@ def build_main_objective_terms(
     # (4-5c) 고립 근무 (O W O: 단일 근무가 OFF 사이에 낀 "퐁당퐁당") — N 제외.
     # 단일 N(O N O)은 not_one_night(1N 금지)이 별도 관리하고 n_max==1 면제와 충돌하므로 제외.
     if getattr(cfg, "sequential_offs", True):
+        # 고립근무 벌점 — `fallback_objectives` 의 동명 항과 **같은 규약**으로 주입한다
+        # (값이 실리는 자리가 둘이므로 한쪽만 고치면 반쪽 검증이 된다).
+        import os as _os_isw
+        _isw_w = int(_os_isw.environ.get("AIDE_ISO_WORK_W", "") or 0) \
+            or int(getattr(cfg, "isolated_work_penalty_weight", 0) or 0) \
+            or ISOLATED_WORK_PENALTY
         _has_night = "N" in cfg.shift_types
         for n in range(N):
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
@@ -1087,7 +1146,7 @@ def build_main_objective_terms(
                 m.Add(isw <= X(n, d + 1, off))
                 m.Add(isw <= mid_work)
                 m.Add(isw >= X(n, d - 1, off) + X(n, d + 1, off) + mid_work - 2)
-                obj.append(-ISOLATED_WORK_PENALTY * isw)
+                obj.append(-_isw_w * isw)
 
     # (4-5d) 단일 E 패널티 (lone-E): E를 쌍으로 유도(DDDE→DDEE). E→N 로테이션은 면제(옵션 B).
     # primary는 기본 SKIP이라 실제 효과는 fallback_objectives 의 동명 항이 담당(여기는 정합용).

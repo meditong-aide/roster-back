@@ -41,7 +41,13 @@ _orig_traced = FL._solve_traced
 
 def _traced(solver, model, prefix, phase):
     st = _orig_traced(solver, model, prefix, phase)
-    if phase.startswith("lex"):
+    # ★★ `stage3` 도 잡는다(2026-09-11) — S6 판정축 (a)는 **패스 8 목적값 vs stage3
+    #   목적값**인데, 기존엔 lex 패스만 잡아 비교 대상이 없었다. 그래서 63런을 돌리고도
+    #   "대가의 크기" 를 못 쟀다.
+    #   ★ 부호: stage3 는 `m.Maximize`(:3432) 라 obj 가 **클수록 좋고**, 패스 8 은
+    #     `-sum(terms)` 를 Minimize 라 **작을수록 좋다**. 비교하려면 패스 8 값에 -1.
+    #     즉 `-lex8:s6` 와 `stage3` 를 같은 축에서 견준다.
+    if phase.startswith("lex") or phase == "stage3":
         try:
             _FROZEN[phase] = int(round(solver.ObjectiveValue()))
         except Exception:
@@ -154,11 +160,36 @@ ARMS = [("현행", {}), ("정체종료", {"AIDE_LEX_STALL": "1"}),
         #     소요는 폭 14s 로 좁아 시간 회수가 직접 읽힌다.
         #     품질은 **폭 0 병동**(9A·9B·중환1)에서 **비회귀**로 본다 — 거기선 1만 움직여도 신호.
         #   ★ 대조군은 "현행" 이다 — gapABS 가 이제 **기본값**이라 아무것도 안 켜면 그 상태다.
-        ("s2stall", {"AIDE_S2_STALL": "1"})]
+        ("s2stall", {"AIDE_S2_STALL": "1"}),
+        # ── lex 패스 정체 종료 + 회수분을 다음 lex 패스로 ── (2026-09-11)
+        #   ★ 실측(시화9B · time_breakdown 3회)이 가른 자리:
+        #     lex4:n_range  0.3s/4.3s(8%)  → 이미 최적인데 4초를 태운다
+        #     lex6:de       6.0/6.3s(96%) · 5.2/6.3s(83%) → 리밋 직전까지 개선 중
+        #     즉 de 의 obj=27 은 최적이 아니라 **시간이 끊긴 값**이다.
+        #   ★★ 두 게이트를 나눠 잰다 — `AIDE_LEX_STALL` 은 "끊는" 처치이고
+        #     `AIDE_LEX_CARRY` 는 "회수분을 어디에 쓰나" 다. 묶으면 기여가 안 갈린다.
+        #     STALL 만 켜면 회수분이 **stage3 로만** 가서 de 는 그대로 6.3초에 잘린다.
+        ("lexstall", {"AIDE_LEX_STALL": "1"}),
+        ("lexstall+carry", {"AIDE_LEX_STALL": "1", "AIDE_LEX_CARRY": "1"}),
+        # ── [S6] stage3 목적을 lex 패스 8 로 ── (2026-09-11)
+        #   ★ 배경: lex 체인 2~7 이 **산출물에 안 박힌다**(de 43→20 인데 stage3 최종 동일).
+        #     stage3 가 물려받는 동결은 커버리지·safety 항목별·grade 뿐이라, 나머지 여섯은
+        #     stage3 가 선호·KLD 를 위해 자유롭게 되돌린다.
+        #   ★★ 처방 두 갈래 중 **싼 쪽**을 골랐다 — lex 목적 6개를 m3 에 X3 로 재구성하면
+        #     "같은 목적을 두 모델에 두 번 짓기"(이 세션 결함 3건의 구조)를 6배로 늘린다.
+        #     반대로 stage3 목적은 이미 `m`·`X` 주입 구조라 m2 로 그대로 옮겨진다(8,579개 항 실측).
+        #   판정축 3층: (a) 패스8 목적값 vs stage3 목적값(부호 뒤집어 비교)
+        #               (b) 체인 커밋 해의 lex 6값이 동결값 이하로 유지되는가
+        #               (c) stage3 Δ — ≈0 이면 m3 제거 근거
+        ("s6-stage3커밋", {"AIDE_S6_PASS8": "1",
+                           "LEX_PASS_ORDER": "off_range,grade,team,n_range,n2n,de,pref,s6"}),
+        ("s6-chain커밋", {"AIDE_S6_PASS8": "1", "AIDE_S6_COMMIT": "chain",
+                          "LEX_PASS_ORDER": "off_range,grade,team,n_range,n2n,de,pref,s6"})]
 _KEYS = ("AIDE_LEX_STALL", "AIDE_LEX_GAP", "AIDE_S3_SAFETY", "AIDE_LEX_S4_STAGE2",
          "LEX_PASS_ORDER", "AIDE_S2_TL_MULT", "AIDE_S2_BEST_N",
          "AIDE_S2_GAP", "AIDE_S2_ABS_GAP", "AIDE_S2_CARRY", "AIDE_GRADE_OFF0_W",
-         "AIDE_S2_STALL", "AIDE_S2_STALL_IDLE", "AIDE_S1_GAP", "AIDE_S1_ABS_GAP")
+         "AIDE_S2_STALL", "AIDE_S2_STALL_IDLE", "AIDE_S1_GAP", "AIDE_S1_ABS_GAP",
+         "AIDE_LEX_CARRY", "AIDE_S6_PASS8", "AIDE_S6_COMMIT")
 if os.getenv("ARMS"):
     _w = {x.strip() for x in os.getenv("ARMS").split(",") if x.strip()}
     ARMS = [a for a in ARMS if a[0] in _w] or ARMS
@@ -195,20 +226,39 @@ for name, gid in GROUPS:
             buf, db2 = io.StringIO(), SessionLocal()
             _FROZEN.clear()
             t0 = time.perf_counter()
-            try:
-                with contextlib.redirect_stdout(buf):
-                    RCS.generate_roster_service(
-                        RosterRequest(year=Y, month=M, group_id=gid), user, db2)
-            except Exception as e:
-                print(f"  {name:<9}{r:>3}{arm:>10}  생성실패 {type(e).__name__}: "
-                      f"{str(e)[:40]}", flush=True)
-                continue
-            finally:
+            # ★★ 생성 1회가 70~80초라 그 사이 DB 연결이 끊기면 세션이 죽는다
+            #   (`PendingRollbackError: Can't reconnect until invalid transaction is
+            #    rolled back`). 엔진에 `pool_pre_ping=True` 가 있어도 **이미 바인딩된
+            #   커넥션이 중간에 끊기는 것**은 못 막는다 — pre_ping 은 꺼낼 때만 본다.
+            #   이 세션에서 3회 겪었고(시화9B·나사렛7B·시화중환1) 그때마다 표본이 깎였다.
+            #   → 실패하면 **세션을 버리고 새로 만들어 1회 재시도**한다.
+            _err = None
+            for _try in range(2):
                 try:
-                    db2.rollback()
-                except Exception:
-                    pass
-                db2.close()
+                    with contextlib.redirect_stdout(buf):
+                        RCS.generate_roster_service(
+                            RosterRequest(year=Y, month=M, group_id=gid), user, db2)
+                    _err = None
+                    break
+                except Exception as e:
+                    _err = e
+                    try:
+                        db2.invalidate()      # 오염된 커넥션을 풀에서 제거
+                    except Exception:
+                        pass
+                    db2.close()
+                    if _try == 0:
+                        db2, buf = SessionLocal(), io.StringIO()
+                        t0 = time.perf_counter()
+            if _err is not None:
+                print(f"  {name:<9}{r:>3}{arm:>10}  생성실패(재시도 후) "
+                      f"{type(_err).__name__}: {str(_err)[:36]}", flush=True)
+                continue
+            try:
+                db2.rollback()
+            except Exception:
+                pass
+            db2.close()
             dt = time.perf_counter() - t0
             log = buf.getvalue()
             cap, fin, pm = CAP.search(log), FIN.search(log), PREF.search(log)
