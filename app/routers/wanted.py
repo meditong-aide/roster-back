@@ -261,12 +261,39 @@ def get_all_wanted(
     wanted_list = db.query(Wanted).filter(
         Wanted.group_id == target_group_id
     ).order_by(Wanted.year.desc(), Wanted.month.desc()).all()
+
+    # 로그인 사용자 **본인**의 월별 제출 상태를 쿼리 1회로 덧붙인다(월 수와 무관).
+    #   `status` 는 병동의 요청 상태 그대로 두고 덮어쓰지 않는다 — 축이 다르다.
+    # ★ `nurse_id` 가 없는 호출자(관리자 등)에겐 **None** 을 준다.
+    #   not_started 로 채우면 "작성 전" 과 "알 수 없음" 이 구분되지 않는다.
+    # ★ 판정 축은 `/preferences/latest`·`/wanted/me/dashboard` 와 **동일**하다
+    #   (`wanted_requests`). 세 화면이 갈리지 않게 같은 헬퍼를 쓴다.
+    from services.preferences_service import load_wanted_request_states
+
+    _nurse_id = getattr(current_user, "nurse_id", None)
+    _states = (
+        load_wanted_request_states(
+            db, _nurse_id, {f"{w.year}-{w.month:02d}" for w in wanted_list}
+        )
+        if _nurse_id
+        else {}
+    )
+
+    def _submission_status(w) -> Optional[str]:
+        if not _nurse_id:
+            return None
+        hit = _states.get(f"{w.year}-{w.month:02d}")
+        if hit is None:
+            return "not_started"
+        return "submitted" if hit else "draft"
+
     return [{
         "year": wanted.year,
         "month": wanted.month,
         "status": wanted.status,
         "exp_date": wanted.exp_date.isoformat() if wanted.exp_date else None,
-        "created_at": wanted.created_at.isoformat() if wanted.created_at else None
+        "created_at": wanted.created_at.isoformat() if wanted.created_at else None,
+        "submission_status": _submission_status(wanted),
     } for wanted in wanted_list]
 
 
