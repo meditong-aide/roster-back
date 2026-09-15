@@ -150,6 +150,11 @@ def _roster_config_to_dict(config) -> dict:
         "show_preceptor": config.show_preceptor,
         "off_first": bool(getattr(config, "off_first", False)),
         "off_swap_enabled": bool(getattr(config, "off_swap_enabled", False)),
+        # 확정 원티드 O 직전일 N 금지 — NULL(미설정) = 꺼짐.
+        # 기존 ban_night_before_fixed_off 는 NULL→True 규약인데 이쪽은 **반대**다.
+        "ban_night_before_fixed_wanted_off": bool(
+            getattr(config, "ban_night_before_fixed_wanted_off", False)
+        ),
         # 보건휴가 자동 부여 — NULL(미설정)은 False 로 떨어져야 한다.
         "health_leave_enabled": bool(getattr(config, "health_leave_enabled", False)),
         "health_leave_weekend": bool(getattr(config, "health_leave_weekend", False)),

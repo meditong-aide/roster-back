@@ -269,6 +269,9 @@ def materialize_generation_config(
 _PRESERVE_IF_NONE = (
     "health_leave_enabled", "health_leave_weekend",
     "sleep_off_enabled", "sleep_off_cycle",
+    # 확정 원티드 O 직전일 N 금지. 켜 둔 병동이 이 필드를 모르는 화면에서 저장하면
+    # 조용히 꺼지므로 보존 대상이다.
+    "ban_night_before_fixed_wanted_off",
 )
 
 

@@ -736,6 +736,12 @@ class RosterConfig(Base):
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
     off_first = Column(BOOLEAN, nullable=False, default=False)
     off_swap_enabled = Column(BOOLEAN, nullable=False, default=False)
+    # 확정 원티드로 굳힌 **O(휴무)** 직전일 N 금지.
+    #   위 `ban_night_before_fixed_off` 와 축이 다르다 — 저쪽은 shift **type**(휴가·공가)으로,
+    #   이쪽은 **출처**(fixed_wanted)로 대상을 고른다. 그래서 컬럼으로 존속한다.
+    # ★ NULL(미설정) = **꺼짐**. 저쪽의 NULL→True 규약과 **반대**이므로
+    #   판정은 항상 bool(getattr(cfg, ..., False)) 로 한다.
+    ban_night_before_fixed_wanted_off = Column(BOOLEAN, nullable=True, default=None)
     # ── 보건휴가 자동 부여 ──
     #   NULL = 미설정(= 꺼짐). 기존 row 를 건드리지 않으려 nullable 로 둔다.
     #   판정은 항상 bool(getattr(cfg, ..., False)) — None 이 False 로 떨어져야 한다.
