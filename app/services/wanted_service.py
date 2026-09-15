@@ -31,7 +31,6 @@ from db.models import (
     Schedule,
     ScheduleEntry,
     Shift,
-    ShiftPreference,
     Wanted,
     WantedRequest,
     WeeklyOffSetting,
@@ -4369,11 +4368,18 @@ def get_my_wanted_dashboard_service(current_user: UserSchema, db: Session) -> di
     정렬 — `exp_date` 오름차순, **없는 것은 뒤로**. 급한 것부터 위에 온다.
       마감일이 같거나 없으면 (year, month) 오름차순으로 안정 정렬한다.
 
-    제출 상태 — `shift_preferences` 는 PK 에 `created_at` 이 있는 **이력 테이블**이라
-      한 사람·월에 행이 여러 개다. **월별 최신 행 하나**가 현재 상태다.
-        행 없음            → not_started
-        최신 is_submitted  → submitted
-        그 외              → draft
+    제출 상태 — **`wanted_requests` 가 정본**이다(`load_wanted_request_states`).
+        요청 이력 없음        → not_started
+        제출된 요청 있음      → submitted
+        임시 요청만 있음      → draft
+      `/preferences/latest` 가 제출 요청을 우선 선택하는 것과 **같은 판정**이라
+      두 화면의 상태가 갈리지 않는다.
+
+      ★★ 예전엔 `shift_preferences` 를 봤는데 **제출·철회 경로가 그 테이블을 건드리지
+        않는다**(둘 다 `wanted_requests` 만 쓴다). 그래서 제출해도 영영 `not_started`
+        였다 — 2026-09 운영 실측으로 `wanted_requests` 제출 **242건**인데
+        `shift_preferences` 는 **0행**이었고, 그 테이블은 2026-04 이후 기록이 끊겼다.
+        9월만의 문제가 아니라 **최근 전 기간**이 미작성으로 보이던 상태였다.
     """
     nurse_id = getattr(current_user, "nurse_id", None)
     if not nurse_id:
@@ -4407,40 +4413,26 @@ def get_my_wanted_dashboard_service(current_user: UserSchema, db: Session) -> di
     if not rows:
         return {"items": []}
 
-    # 대상 월의 내 작성 이력만 읽는다. 한 사람분이라 가볍고, 월별 최신 선택은
-    # 파이썬에서 한다(window 함수를 쓰면 dialect 를 타고 읽기도 어렵다).
+    # 대상 월의 내 요청 상태를 **한 번의 쿼리**로 읽는다(월 수와 무관하게 1회).
+    # ★ 정본은 `wanted_requests` 다 — `/preferences/latest` 와 같은 축을 쓴다.
+    #   예전엔 `shift_preferences` 를 봤는데 그 테이블은 제출 경로가 건드리지 않아
+    #   제출해도 영영 not_started 였다(2026-09 운영 실측: 제출 242건 vs 그 테이블 0행).
+    from services.preferences_service import load_wanted_request_states
+
     targets = {(w.year, w.month) for w in rows}
-    prefs = (
-        db.query(
-            ShiftPreference.year,
-            ShiftPreference.month,
-            ShiftPreference.created_at,
-            ShiftPreference.is_submitted,
-        )
-        .filter(
-            ShiftPreference.nurse_id == nurse_id,
-            ShiftPreference.year.in_({y for y, _ in targets}),
-        )
-        .all()
+    states = load_wanted_request_states(
+        db, nurse_id, {f"{y}-{m:02d}" for y, m in targets}
     )
-    latest: dict[tuple[int, int], tuple] = {}
-    for p in prefs:
-        key = (p.year, p.month)
-        if key not in targets:
-            continue                      # year 로만 좁혔으니 month 는 여기서 건다
-        cur = latest.get(key)
-        if cur is None or (p.created_at and cur[0] and p.created_at > cur[0]):
-            latest[key] = (p.created_at, p.is_submitted)
 
     items = []
     for w in rows:
-        hit = latest.get((w.year, w.month))
+        hit = states.get(f"{w.year}-{w.month:02d}")
         if hit is None:
-            state = "not_started"
-        elif bool(hit[1]):
-            state = "submitted"
+            state = "not_started"     # 요청 이력 없음
+        elif hit:
+            state = "submitted"       # 제출된 요청이 있음
         else:
-            state = "draft"
+            state = "draft"           # 임시 요청만 있음
         items.append({
             "year": w.year,
             "month": w.month,

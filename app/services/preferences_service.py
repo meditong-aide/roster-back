@@ -1155,6 +1155,42 @@ def _resolve_submission_status(wanted, target_wr) -> str:
     return "requested"
 
 
+def load_wanted_request_states(
+    db: Session, nurse_id: str, months: set[str]
+) -> dict[str, bool]:
+    """월별 원티드 요청 상태를 **한 번의 쿼리**로 읽는다.
+
+    반환: `{'YYYY-MM': is_submitted}`. 요청 이력이 아예 없는 달은 **키가 없다**.
+      한 달에 여러 요청이 있으면 `is_submitted=True` 가 하나라도 있으면 True —
+      `get_latest_preference_service` 가 제출 요청을 우선 선택하는 것과 같은 판정이다.
+
+    ★★ 제출 상태의 정본은 **`wanted_requests`** 다. 제출(`save_wanted_entries_service`)도
+      철회(`retract_submission_service`)도 이 테이블만 건드린다.
+      `shift_preferences` 는 **별도 이력 축**이라 제출 상태를 따라가지 못한다 —
+      실측(2026-09 운영): `wanted_requests` 제출 242건인데 `shift_preferences` 는 **0행**,
+      전체로도 2026-04 이후 기록이 끊겼다. 그걸 보고 판정하면 전원 미작성으로 보인다.
+      상태를 묻는 자리는 **반드시 이 함수를 거친다.**
+
+    Args:
+        months: `'YYYY-MM'` 문자열 집합. `WantedRequest.month` 가 CHAR(7) 이라 문자열이다.
+    """
+    if not nurse_id or not months:
+        return {}
+    out: dict[str, bool] = {}
+    rows = (
+        db.query(WantedRequest.month, WantedRequest.is_submitted)
+        .filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month.in_(months),
+        )
+        .all()
+    )
+    for m, submitted in rows:
+        key = str(m).strip()
+        out[key] = bool(out.get(key, False) or bool(submitted))
+    return out
+
+
 def _build_request_limit(db: Session, nurse_id: str, group_id: str | None, entries: list[dict]) -> dict:
     """휴무/휴가 요청 한도 사용량. max 는 nurses.wanted_max_requests(없으면 None)."""
     from services.wanted_service import _get_off_shift_ids
