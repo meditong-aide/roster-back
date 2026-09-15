@@ -59,6 +59,53 @@ from services.wanted_service import close_expired_wanted
 _scheduler_logger = logging.getLogger("scheduler")
 
 
+def _run_daily_flush():
+    """병동이동·파견·휴직·영구변경 flush 1회 실행(동기).
+
+    ★ 이벤트 루프에서 직접 부르면 안 된다 — 내부가 전부 **동기 DB** 라
+      루프가 통째로 멈춘다. 호출부는 `asyncio.to_thread` 로 감쌀 것.
+    """
+    db = SessionLocal()
+    try:
+        from services.assignment_service import (
+            flush_all_pending_transfers,
+            flush_expired_dispatches,
+            flush_expired_leaves,
+            flush_pending_permanent_changes,
+            reconcile_nurse_attrs,
+        )
+        count = flush_all_pending_transfers(db)
+        if count > 0:
+            _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
+        # [도려내기] 프리셉티 만료 flush 제거 — nurse_preceptee_period as-of resolver 가 자동 처리.
+        disp_count = flush_expired_dispatches(db)
+        if disp_count > 0:
+            _scheduler_logger.info("[Scheduler] 파견 자동 디엑티브: %d건", disp_count)
+        leave_count = flush_expired_leaves(db)
+        if leave_count > 0:
+            _scheduler_logger.info("[Scheduler] 휴직 자동 디엑티브: %d건", leave_count)
+        pc_count = flush_pending_permanent_changes(db)
+        if pc_count > 0:
+            _scheduler_logger.info("[Scheduler] 영구 속성변경 발효: %d건", pc_count)
+        # [퇴사자 삭제 비활성화] 퇴사자는 nurses.resignation_date 로만 관리하고 레코드는 보존한다.
+        #   월 명단 노출/미노출은 group_members_in_month 가 resignation_date 로 판정(퇴사月=표시,
+        #   다음 달=제외). hard delete 하면 퇴사月 표시도 사라지고 데이터도 잃으므로 호출하지 않는다.
+        # res_count = flush_resigned_nurses(db)
+        # if res_count > 0:
+        #     _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
+        # Nurses 캐시 vs NurseAssignment effective 값 정합성 점검 (read-only)
+        recon = reconcile_nurse_attrs(db)
+        if recon.get("mismatch_count", 0) > 0:
+            _scheduler_logger.warning(
+                "[Scheduler] reconcile 불일치 %d건 (검사 %d명) — 자동 동기화 없음, 운영자 확인 필요",
+                recon["mismatch_count"], recon["total_checked"],
+            )
+    except Exception as e:
+        _scheduler_logger.error("[Scheduler] 자동 flush 실패: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
 async def _daily_flush_scheduler():
     """매일 자정에 병동이동 flush 실행."""
     from datetime import timedelta
@@ -66,46 +113,7 @@ async def _daily_flush_scheduler():
         now = datetime.now()
         tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         await asyncio.sleep((tomorrow - now).total_seconds())
-
-        db = SessionLocal()
-        try:
-            from services.assignment_service import (
-                flush_all_pending_transfers,
-                flush_expired_dispatches,
-                flush_expired_leaves,
-                flush_pending_permanent_changes,
-                reconcile_nurse_attrs,
-            )
-            count = flush_all_pending_transfers(db)
-            if count > 0:
-                _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
-            # [도려내기] 프리셉티 만료 flush 제거 — nurse_preceptee_period as-of resolver 가 자동 처리.
-            disp_count = flush_expired_dispatches(db)
-            if disp_count > 0:
-                _scheduler_logger.info("[Scheduler] 파견 자동 디엑티브: %d건", disp_count)
-            leave_count = flush_expired_leaves(db)
-            if leave_count > 0:
-                _scheduler_logger.info("[Scheduler] 휴직 자동 디엑티브: %d건", leave_count)
-            pc_count = flush_pending_permanent_changes(db)
-            if pc_count > 0:
-                _scheduler_logger.info("[Scheduler] 영구 속성변경 발효: %d건", pc_count)
-            # [퇴사자 삭제 비활성화] 퇴사자는 nurses.resignation_date 로만 관리하고 레코드는 보존한다.
-            #   월 명단 노출/미노출은 group_members_in_month 가 resignation_date 로 판정(퇴사月=표시,
-            #   다음 달=제외). hard delete 하면 퇴사月 표시도 사라지고 데이터도 잃으므로 호출하지 않는다.
-            # res_count = flush_resigned_nurses(db)
-            # if res_count > 0:
-            #     _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
-            # Nurses 캐시 vs NurseAssignment effective 값 정합성 점검 (read-only)
-            recon = reconcile_nurse_attrs(db)
-            if recon.get("mismatch_count", 0) > 0:
-                _scheduler_logger.warning(
-                    "[Scheduler] reconcile 불일치 %d건 (검사 %d명) — 자동 동기화 없음, 운영자 확인 필요",
-                    recon["mismatch_count"], recon["total_checked"],
-                )
-        except Exception as e:
-            _scheduler_logger.error("[Scheduler] 자동 flush 실패: %s", e, exc_info=True)
-        finally:
-            db.close()
+        await asyncio.to_thread(_run_daily_flush)
 
 
 def _expire_stale_status(db, status_in: str, cutoff_seconds: int, message: str) -> int:
@@ -160,21 +168,30 @@ async def _stale_jobs_janitor():
     """
     while True:
         await asyncio.sleep(60)
-        db = SessionLocal()
-        try:
-            queued, running = _sweep_stale_jobs(db)
-            if queued or running:
-                _scheduler_logger.warning(
-                    "[Scheduler] stale jobs swept: queued→failed=%d, running→failed=%d",
-                    queued,
-                    running,
-                )
-        except Exception as e:
-            _scheduler_logger.error(
-                "[Scheduler] stale jobs sweep 실패: %s", e, exc_info=True
+        await asyncio.to_thread(_run_stale_jobs_sweep)
+
+
+def _run_stale_jobs_sweep():
+    """stale job 정리 1회 실행(동기).
+
+    ★ 이벤트 루프에서 직접 부르면 안 된다 — **동기 DB** 라 루프가 멈춘다.
+      60초 주기라 한 번 물리면 서버가 매분 정지한다.
+    """
+    db = SessionLocal()
+    try:
+        queued, running = _sweep_stale_jobs(db)
+        if queued or running:
+            _scheduler_logger.warning(
+                "[Scheduler] stale jobs swept: queued→failed=%d, running→failed=%d",
+                queued,
+                running,
             )
-        finally:
-            db.close()
+    except Exception as e:
+        _scheduler_logger.error(
+            "[Scheduler] stale jobs sweep 실패: %s", e, exc_info=True
+        )
+    finally:
+        db.close()
 
 
 def _run_nurse_sync():
@@ -200,10 +217,17 @@ def _run_nurse_sync():
 
 
 async def _daily_nurse_sync_scheduler():
-    """서버 시작 시 즉시 1회 실행 후, 매일 새벽 3시에 반복 실행."""
+    """서버 시작 시 즉시 1회 실행 후, 매일 새벽 3시에 반복 실행.
+
+    ★★ `_run_nurse_sync` 는 **동기 DB**(그룹웨어 전 간호사 스윕)라 루프에서 직접 부르면
+       그 쿼리가 끝날 때까지 서버 전체가 정지한다. roster-back 은 **쿼리 타임아웃이 없어서**
+       공용 DB 가 느려지면 무한 대기가 된다(실측: 워커 재기동 후 12분째 전 요청 000 ·
+       CPU 0% · 스택이 `task_step_impl → pymssql execute → poll()` 에 고정).
+       ★ 여기가 특히 위험한 이유는 **시작 즉시 1회** 라 재기동할 때마다 걸린다는 것.
+    """
     from datetime import timedelta
 
-    _run_nurse_sync()
+    await asyncio.to_thread(_run_nurse_sync)
 
     while True:
         now = datetime.now()
@@ -211,7 +235,7 @@ async def _daily_nurse_sync_scheduler():
         if target <= now:
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
-        _run_nurse_sync()
+        await asyncio.to_thread(_run_nurse_sync)
 
 
 @asynccontextmanager
