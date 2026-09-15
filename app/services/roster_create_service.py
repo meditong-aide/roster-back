@@ -6402,6 +6402,74 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             print(f"[Precheck] 실행 실패(무시하고 솔버 진행): {_pre_exc}")
             precheck_result = None
 
+    # ── 고정근무자 몫을 커버리지 요구에서 뺀다 ────────────────────────────────
+    # ★★ 고정근무자(`fixed_shift`)는 `_split_fixed_nurses` 로 갈려 **솔버를 타지 않고**
+    #   나중에 `fixed_roster` 로 병합된다. 그래서 솔버의 커버리지 식은 이들을 못 본다.
+    #   요구 D=4 인 날 솔버가 4명을 채우고 거기에 고정근무자 1명이 얹혀 **5명**이 됐다
+    #   (성남ICU-RN 2026-10 실측: 평일 11일 전부 정확히 +1 · E/N 은 0건 —
+    #    고정 코드가 D 뿐이라 D 에만 생겼다).
+    #   ★ `off_first` 와 무관한 결함이다. `off_first=True` 의 `assigned <= need` 하드는
+    #     정상 작동하고 있었고, **그 상한이 보는 세계 밖에서** 1명이 더해진 것이다.
+    #     `off_first=False` 일 때도 같은 +1 이 얹히지만 그쪽은 초과가 soft 라 덜 보였다.
+    # 일자별로 빼야 한다 — 고정근무자는 평일만 근무하고 주말·공휴일은 OFF 다.
+    if fixed_nurses and nurses_for_engine:
+        try:
+            _fx_roster_pre = _build_fixed_shift_roster(
+                fixed_nurses,
+                req.year,
+                req.month,
+                weekday_off_code="O",
+                sunday_code="주",
+                holiday_off=_holiday_off_enabled(db, current_user.group_id),
+                shift_lookup=_load_shift_lookup(
+                    db, current_user.office_id, current_user.group_id
+                ),
+                weekly_off_active=bool(
+                    config_dict.get("weekly_off_settings_activate", False)
+                ),
+            )
+            # ★★ 오버레이까지 적용한 **최종본**으로 차감해야 한다. `_build_fixed_shift_roster`
+            #   는 평일을 기계적으로 fixed_shift 로 채우는데, 그 뒤 확정 원티드·특수요청이
+            #   덮어써서 실제 근무일이 줄어든다(실측: 평일 22일 중 D 는 11일뿐 —
+            #   나머지는 CO·O·연). 기계적 결과로 빼면 그 차이만큼 **과다 차감**되어
+            #   이번엔 반대로 인원 부족이 난다(부족 11건 = 차이 11일과 정확히 일치했다).
+            _fx_roster_pre = _overlay_fixed_roster_with_fixed_wanted(
+                db, _fx_roster_pre, current_user.group_id, req.year, req.month,
+            )
+            _fx_roster_pre = _overlay_fixed_roster_with_special_requests(
+                fixed_roster=_fx_roster_pre,
+                requests=fixed_special_shift_requests,
+                year=req.year,
+                month=req.month,
+            )
+            _days_in_month = calendar.monthrange(req.year, req.month)[1]
+            _base_req = dict(config_dict.get("daily_shift_requirements") or {}) or {
+                "D": int(config_dict.get("day_req") or 0),
+                "E": int(config_dict.get("eve_req") or 0),
+                "N": int(config_dict.get("nig_req") or 0),
+            }
+            _by_day = config_dict.get("daily_shift_requirements_by_day")
+            if not (isinstance(_by_day, list) and len(_by_day) == _days_in_month):
+                _by_day = [dict(_base_req) for _ in range(_days_in_month)]
+            else:
+                _by_day = [dict(dm or {}) for dm in _by_day]
+            _fx_cut = 0
+            for _codes in _fx_roster_pre.values():
+                for _d, _code in enumerate(_codes or []):
+                    if _d >= _days_in_month:
+                        break
+                    _c = str(_code or "").strip().upper()
+                    if _c in _by_day[_d] and int(_by_day[_d][_c] or 0) > 0:
+                        _by_day[_d][_c] = int(_by_day[_d][_c]) - 1
+                        _fx_cut += 1
+            if _fx_cut:
+                config_dict["daily_shift_requirements_by_day"] = _by_day
+                print(f"[FixedShiftCoverage] 고정근무자 {len(fixed_nurses)}명 · "
+                      f"요구 차감 {_fx_cut}셀 — 솔버는 남은 인원만 채운다")
+        except Exception as _fx_exc:
+            # 차감 실패는 생성을 막지 않는다(기존 동작으로 진행). 다만 초과가 남을 수 있다.
+            print(f"[FixedShiftCoverage] 차감 실패(무시): {type(_fx_exc).__name__}: {_fx_exc}")
+
     if nurses_for_engine:
         # _debug_log(
         #     "cp_sat_start",
