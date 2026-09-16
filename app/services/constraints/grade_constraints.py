@@ -537,6 +537,17 @@ _GRADE_CASCADE_ENABLED = True
 GRADE_CASCADE_W_NEXT = 2_000_000   # 차상위까지 부재 (x/y range 1.2M 위 → near-hard)
 GRADE_CASCADE_W_NONE = 6_000_000   # 시니어 전무 (사실상 hard)
 
+# ※ '같은 자리에 동일 등급이 목표 초과로 몰리는 것'에 페널티를 걸어 미달을 줄이려는
+#   시도를 했다가 **되돌렸다**(2026-08-31). 실측에서 거꾸로 나빠졌다 —
+#   시화 중환자실 2026-08 · 초과 40,000 부여 시 grade 미달 21.0 → 26.0.
+#   총량이 고정이면 '뭉침 1건 = 다른 날 부족 1건' 이라 부족 페널티가 이미 그걸 벌하고 있고,
+#   초과에 값을 더 매기면 solver 가 '뭉치지 않으려 미달을 감수하는' 쪽으로 기운다.
+#   ★ 그렇다고 "탐색 시간이 원인" 이라고 단정하지도 말 것. tl3 를 45초로 늘린 3회 표본에서
+#     미달 23.3 → 15.7 로 보였으나, 총 시간 20~240초 30회 스윕에서는 **재현되지 않았다**.
+#     같은 조건이 15~27 로 흔들려 3회 평균 비교로는 판정이 불가능하다.
+#     확실한 것은 stage3 가 늘 FEASIBLE 로 끝나고(기본 tl3=12초) 잔여 gap 이 시간에 따라
+#     55%→8% 로 단조 감소한다는 것뿐이며, 그 gap 감소가 근무표 품질로 이어지는지는 미확정이다.
+
 
 def _add_minimum_constraints(
     m,
@@ -581,6 +592,24 @@ def _add_minimum_constraints(
                 m.Add(short >= t - cum)  # short = max(0, t - 누적)
                 if off == 0:
                     w = penalty_weight
+                    # [GradeOff0] "요구 등급 자체의 미달분"만 따로 모아 모델에 붙인다.
+                    #   fallback lex 의 Stage 1/2 목적함수가 이걸 최소화한다. cascade 의
+                    #   대체 단계(off≥1: 2M/6M)는 team(30만)·safety(10~30만)를 압도하므로
+                    #   Stage 2 에 넣으면 lex 우선순위가 뒤집힌다 → off=0 만 노출한다.
+                    _off0 = getattr(m, "_grade_off0_shorts", None)
+                    if _off0 is None:
+                        _off0 = []
+                        setattr(m, "_grade_off0_shorts", _off0)
+                    _off0.append(short)
+                    # [GradeCellSpec] 같은 요구를 lex 재배치 패스가 별도 모델(m2)에서
+                    #   다시 세울 수 있도록 (일자, 시프트, 목표, 대상 인덱스) 를 남긴다.
+                    #   목표 계산(_compute_targets·need_map)을 lex 쪽에서 재현하면 로직이
+                    #   갈라지므로 여기서 만든 값을 그대로 넘긴다.
+                    _spec = getattr(m, "_grade_cell_spec", None)
+                    if _spec is None:
+                        _spec = []
+                        setattr(m, "_grade_cell_spec", _spec)
+                    _spec.append((day_idx, shift_idx, t, tuple(members)))
                 elif off == 1:
                     w = GRADE_CASCADE_W_NEXT
                 else:
