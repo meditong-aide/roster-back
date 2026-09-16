@@ -1054,9 +1054,24 @@ _YIQ_DARK_TEXT_THRESHOLD = 150
 
 def _readable_text_color(bg_hex: str) -> str:
     """배경 위에 얹을 글자색. 계산식은 프론트와 같고 **임계만** 다르다(위 상수 참조)."""
+    return "FF101828" if _yiq(bg_hex) >= _YIQ_DARK_TEXT_THRESHOLD else "FFFFFFFF"
+
+
+def _yiq(bg_hex: str) -> float:
+    """`RRGGBB` 의 YIQ 명도. `_norm_hex` 를 통과한 값만 넣는다."""
     r, g, b = int(bg_hex[0:2], 16), int(bg_hex[2:4], 16), int(bg_hex[4:6], 16)
-    yiq = (r * 299 + g * 587 + b * 114) / 1000
-    return "FF101828" if yiq >= _YIQ_DARK_TEXT_THRESHOLD else "FFFFFFFF"
+    return (r * 299 + g * 587 + b * 114) / 1000
+
+
+#: 원티드 표시색 — 가르는 축은 **누가 그 칸을 정했는가** 다.
+#:   · 간호사가 제출한 원티드가 반영된 칸       → 빨강
+#:   · 수간호사가 확정 원티드에 덮어쓰거나 넣은 칸 → 파랑
+#: 원티드와 무관한 칸은 색을 주지 않는다(검정).
+#: ★ 판별은 제출 테이블(`nurse_shift_requests`)과 **직접 대조**한다. `source_type` 은
+#:   저장 시점 판정이라 수간호사가 간호사 제출 전에 넣어 두면 'added' 로 굳어 버린다.
+#: ★ 배정 영역은 대표 코드에만 배경을 칠하므로, 무배경 흰 셀에서도 읽히는 진한 색을 쓴다.
+_C_WANTED_NURSE = "FFFF0000"      # 간호사 제출분이 반영됨 — 빨강
+_C_WANTED_HN = "FF0000FF"         # 수간호사가 확정에 넣거나 바꿈 — 파랑
 
 
 def export_schedule_excel_bytes(
@@ -1080,7 +1095,7 @@ def export_schedule_excel_bytes(
     완전히 동일하게 그리고 team_view=False 를 반환한다(회귀 0).
     """
     from io import BytesIO
-    from datetime import date
+    from datetime import date, timedelta
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
@@ -1250,15 +1265,165 @@ def export_schedule_excel_bytes(
         .all()
     )
     code_bg: Dict[str, str] = {}
+    #: 배정 영역에서 **배경을 칠할** 코드. 3교대 대표(default_shift D/E/N) ·
+    #: OFF 교환 대상(off_swap_target) · **고정근무로 지정된 코드**까지다. 나머지
+    #: 특수코드까지 칠하면 표가 얼룩덜룩해 정작 봐야 할 원티드 표시가 묻힌다.
+    #: 범례·집계는 이 제한을 받지 않는다.
+    fill_codes: set = set()
+    _seen_code: set = set()
     for _s in _shift_rows:
         _code = str(_s.shift_id or "").strip()
-        if not _code or _code in code_bg:
+        # ★ 대표 1건 판정은 **별도 집합**으로 한다. 예전엔 `_code in code_bg` 로 걸렀는데
+        #   색이 없는 코드는 code_bg 에 안 들어가 뒤쪽 중복행이 계속 덮었다.
+        if not _code or _code in _seen_code:
             continue
+        _seen_code.add(_code)
         _hex = _norm_hex(_s.color)
         if _hex:
             code_bg[_code] = _hex
+        if str(_s.default_shift or "").strip().upper() in ("D", "E", "N") or bool(
+            getattr(_s, "off_swap_target", False)
+        ):
+            fill_codes.add(_code)
+
+    # 고정근무 코드도 배경 대상이다 — 그 사람에겐 그게 상시 근무라 3교대와 같은 무게다.
+    #   SSOT 는 `nurse_allowed_shift_period`(as-of 대상월 1일)다. `nurses.fixed_shift`
+    #   컬럼은 as-of-TODAY 단방향 캐시라 미래월에 stale 해 쓰지 않는다.
+    #   ★ 대상은 `Nurse.group_id` 가 아니라 **이 파일에 실제로 실리는 간호사**다.
+    #     전출·인바운드는 현재 소속이 달라도 근무표에 나오므로(위에서 inbound 를 합친다),
+    #     소속으로 거르면 그 사람의 고정근무 칸만 배경이 빠진다.
+    try:
+        from sqlalchemy import or_
+        from db.models import NurseAllowedShiftPeriod
+        #   ★ 월초 시점(as-of)이 아니라 **그 달과 겹치는 구간 전부**를 본다. 고정근무가
+        #     월 중간부터 시작하는 경우가 있는데, 월초 기준으로만 보면 그 뒤 칸들이
+        #     배경을 잃는다. `fetch_periods` 와 같은 반열린 구간 규약이다.
+        _ms = date(year, month, 1)
+        _me = _ms + timedelta(days=days_in_month)
+        _nids = [str(_n.nurse_id) for _n in nurses]
+        if _nids:
+            for _fp in (
+                db.query(NurseAllowedShiftPeriod.fixed_shift)
+                .filter(
+                    NurseAllowedShiftPeriod.nurse_id.in_(_nids),
+                    NurseAllowedShiftPeriod.valid_from < _me,
+                    or_(
+                        NurseAllowedShiftPeriod.valid_to.is_(None),
+                        NurseAllowedShiftPeriod.valid_to > _ms,
+                    ),
+                )
+                .all()
+            ):
+                _fc2 = str(_fp[0] or "").strip()
+                if _fc2:
+                    fill_codes.add(_fc2)
+    except Exception as _fx_exc:
+        print(f"[Excel] 고정근무 코드 조회 실패 — 배경 대상에서 제외: {_fx_exc}")
 
     holidays = _kr_holidays_in_month(year, month)
+
+    # ───────── 2-c) 확정 원티드 ─────────
+    #   그 셀에 원티드가 **반영됐는지**를 글자색으로 나타낸다(파랑=반영, 빨강=못 들어줌).
+    #   ★★ `is_applied` 로 판정하면 안 된다 — 그건 '솔버에 실을지' 하는 **입력 플래그**지
+    #     결과가 아니다. `fixed_wanted_use_yn=False` 면 소프트 선호로만 들어가고, 생성 뒤
+    #     수동 수정도 된다. 그래서 **요청 코드와 실제 배정 코드를 직접 비교**한다.
+    #   ★★ `year`·`month` 필터를 반드시 건다. `request_id` 가 (간호사,월) 스코프로 1부터
+    #     재채번돼, 월 필터 없는 조회가 다른 달 셀을 **일(day)만 떼어** 같은 날짜로 반영한
+    #     사고가 있었다(운영 전사 236건). 날짜 범위도 함께 걸어 이중으로 막는다.
+    #   ★ 조회가 실패해도 근무표 자체는 내려가야 한다 — 표시만 생략한다.
+    #
+    #   ★★ 표시 대상은 **확정 원티드(`is_applied=True`)에 있는 칸뿐**이다. 제출만 하고
+    #     수간호사가 확정에 안 올린 신청은 '반영된 것' 이 아니므로 칠하지 않는다.
+    #   색은 그 칸이 **간호사가 낸 것인지** 로 가른다:
+    #     · 제출분에 같은 코드가 있다  → 신청이 반려 없이 적용됨      → 빨강
+    #     · 제출분에 없거나 코드가 다르다 → 수간호사가 추가·변경한 것  → 파랑
+    #   ★ `source_type` 에 기대지 않고 **제출 테이블과 직접 대조**한다. source_type 은
+    #     저장 시점 판정이라 수간호사가 간호사 제출 전에 넣어 두면 'added' 로 굳는다.
+    wanted_req: Dict[tuple, tuple] = {}   # (간호사,일) → (요청코드, "nurse"|"hn")
+    submitted: Dict[tuple, str] = {}      # (간호사,일) → 제출 코드
+    _wm_start = date(year, month, 1)
+    _wm_end = _wm_start + timedelta(days=days_in_month)
+    try:
+        # ① 간호사 제출분 — **생성이 쓰는 회차와 똑같이** 고른다.
+        #    규약 정본: `roster_create_service.py:264-280`
+        #      `is_submitted == True` 인 것 중 `submitted_at` 최신 한 건, 없으면 그 간호사는
+        #      건너뛴다(미제출 draft 미반영). 엑셀은 '생성에 실제로 쓰인 원티드' 를 보여줘야
+        #      하므로 여기서 규약이 갈리면 근무표와 표시가 어긋난다.
+        #    ★ 단순히 최신 `request_id` 를 집으면 안 된다 — 저장만 한 초안도 번호를 올리므로
+        #      **제출본을 초안이 덮는다.**
+        #    ★ `request_id` 는 (간호사, 월) 스코프로 1부터 **재채번**된다. 날짜 범위를 반드시
+        #      함께 걸어야 다른 달 신청이 일(day)만 떼어 섞이지 않는다.
+        from db.models import NurseShiftRequest, WantedRequest
+        _month_str = f"{year:04d}-{month:02d}"
+        #: 간호사 → (submitted_at, request_id).
+        #: ★ 생성기는 `submitted_at desc` 하나로만 정렬해 `.first()` 를 집는다
+        #:   (`roster_create_service.py:264-272`). 동점이거나 NULL 이면 DB 가 임의로 고르므로,
+        #:   여기서는 **회차번호를 보조키**로 둬 결정적으로 만든다. 실측상 전사 제출본
+        #:   681건 중 `submitted_at` NULL 0건·동점 0건이라 현재는 두 축이 같은 행을 집는다.
+        #:   ★ 동점이 생기면 생성기 쪽이 임의라 어긋날 수 있다 — 그때는 생성기에
+        #:     같은 보조키를 넣어 양쪽을 맞춰야 한다(여기만 고치면 해결되지 않는다).
+        _pick: Dict[str, tuple] = {}
+        for _wr in (
+            db.query(WantedRequest)
+            .filter(
+                WantedRequest.group_id == target_group_id,
+                WantedRequest.month == _month_str,
+                WantedRequest.is_submitted == True,      # noqa: E712
+            )
+            .all()
+        ):
+            _nid = str(_wr.nurse_id)
+            _key = (_wr.submitted_at or datetime.min, int(_wr.request_id or 0))
+            if _key > _pick.get(_nid, (datetime.min, -1)):
+                _pick[_nid] = _key
+        _want_rid = {nid: key[1] for nid, key in _pick.items()}
+        if _want_rid:
+            for _sr in (
+                db.query(NurseShiftRequest)
+                .filter(
+                    NurseShiftRequest.group_id == target_group_id,
+                    NurseShiftRequest.shift_date >= _wm_start,
+                    NurseShiftRequest.shift_date < _wm_end,
+                )
+                .all()
+            ):
+                _c = str(_sr.shift or "").strip()
+                if not _sr.shift_date or not _c:
+                    continue
+                _nid = str(_sr.nurse_id)
+                if _want_rid.get(_nid) != int(_sr.request_id or 0):
+                    continue                    # 미제출 초안이거나 옛 회차
+                submitted[(_nid, _sr.shift_date.day)] = _c
+    except Exception as _sub_exc:
+        print(f"[Excel] 제출 원티드 조회 실패 — 확정분만 표시: {_sub_exc}")
+    try:
+        # ② 확정 원티드 — 같은 셀이면 이쪽이 이긴다.
+        #    ★ `is_applied == False` 는 **수간호사가 꺼 둔 것**이라 제외한다. 안 거르면
+        #      꺼진 요청이 간호사 제출분을 덮어써 '있지도 않은 요청' 기준으로 색이 칠해진다.
+        #      생성·원티드 API 도 전부 `is_applied == True` 만 쓴다
+        #      (`wanted_service.py:2841·3639·3980·4070`). 실측으로 성남시의료원에만
+        #      꺼진 행이 46건 있다.
+        from db.models import FixedWantedEntry
+        for _w in (
+            db.query(FixedWantedEntry)
+            .filter(
+                FixedWantedEntry.group_id == target_group_id,
+                FixedWantedEntry.year == year,
+                FixedWantedEntry.month == month,
+                FixedWantedEntry.is_applied == True,      # noqa: E712
+                FixedWantedEntry.shift_date >= _wm_start,
+                FixedWantedEntry.shift_date < _wm_end,
+            )
+            .all()
+        ):
+            _wc = str(_w.shift_id or "").strip()
+            if _w.shift_date and _wc:
+                _k = (str(_w.nurse_id), _w.shift_date.day)
+                wanted_req[_k] = (
+                    _wc, "nurse" if submitted.get(_k) == _wc else "hn",
+                )
+    except Exception as _w_exc:
+        print(f"[Excel] 확정 원티드 조회 실패: {_w_exc}")
 
     # 연차 잔여 — 장부의 `opening` 만 읽는다. '사용'·'당월잔여' 는 **이 근무표 기준**으로
     #   실시간 계산한다(draft 를 받아도 "이대로 마감하면 잔여가 얼마" 가 보여야 한다).
@@ -1472,17 +1637,30 @@ def export_schedule_excel_bytes(
             cell = ws.cell(row=r, column=static_cols + d, value=shift_code)
             cell.alignment = center
             cell.border = border_all
-            # ★★ `shifts.color` 는 이 저장소에서 **예외 없이 배경색**이다(프론트·모바일·
-            #   서버 템플릿 전부). 글자색으로 쓰면 신규 병동 기본 6색이 파스텔이라
-            #   흰 배경에서 아예 안 보인다. 배경으로 칠하고 글자색은 명도로 고른다 —
-            #   프론트 `getReadableShiftCodeTextColor` 와 같은 계약(YIQ, 임계 225).
-            _bg = code_bg.get(str(shift_code).strip())
+            # ★★ 배정 영역은 **대표 코드에만** 배경을 칠한다(3교대 D/E/N + OFF 교환 대상).
+            #   특수코드까지 칠하면 표가 얼룩덜룩해 정작 봐야 할 원티드 표시가 묻힌다.
+            #   (범례·집계는 이 제한을 받지 않는다 — 거기선 색이 코드를 가리키는 축이다.)
+            _code = str(shift_code).strip()
+            _bg = code_bg.get(_code) if _code in fill_codes else None
             if _bg:
                 cell.fill = PatternFill("solid", fgColor=_bg)
                 cell.font = Font(color=_readable_text_color(_bg))
             if is_current_user and not _bg:
-                # 색이 없는 코드만 본인 강조를 쓴다 — 덮어쓰면 코드 색이 사라진다.
+                # 색이 있는 칸은 덮지 않는다 — 덮으면 코드 색이 사라진다.
                 cell.fill = highlight_fill
+
+            # 원티드 표시 — 배경은 그대로 두고 **글자색만** 덮는다. 누가 정한 칸인지를
+            #   나타내므로 코드 색(무슨 근무인가)과 축이 다르다. 볼드는 쓰지 않는다.
+            #   ★★ **요청 코드와 실제 배정이 같을 때만** 칠한다. 표시하려는 것은
+            #     '반영된 내역' 이므로, 신청했지만 다른 근무가 들어간 칸까지 칠하면
+            #     들어준 것과 못 들어준 것이 같은 색이 되어 구분이 사라진다.
+            #     (확정 원티드는 하드 고정이라 대개 일치하지만, 생성 뒤 수동 수정으로
+            #      어긋날 수 있어 여기서도 같은 기준을 적용한다.)
+            _w = wanted_req.get((str(n.nurse_id), d))
+            if _w and _w[0] == _code:
+                cell.font = Font(
+                    color=_C_WANTED_NURSE if _w[1] == "nurse" else _C_WANTED_HN
+                )
 
             base = to_base(shift_code)
             if base in row_counts:

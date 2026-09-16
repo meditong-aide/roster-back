@@ -2757,6 +2757,17 @@ async def export_schedule_excel(
         # (라우터가 has_team_assignment 로 따로 세면 N전담·비활성팀 게이트가 빠져 화면과 불일치.)
         # 파일명은 프론트(excel.ts)가 결정하므로 Content-Disposition 은 단순 ASCII 고정.
         filename = f"roster_{schedule.year}_{schedule.month}_v{schedule.version}.xlsx"
+        # 파일명에 실을 병동명 — 여러 병동을 받아 두면 어느 병동 것인지 구분이 안 된다.
+        #   ★ HTTP 헤더는 latin-1 만 담는다. 한글 병동명을 그대로 넣으면 응답이
+        #     UnicodeEncodeError 로 죽으므로 **퍼센트 인코딩**해서 보내고 프론트가 푼다.
+        #   ★ 이름을 못 읽어도 다운로드는 되어야 한다 — 빈 값이면 프론트가 병동명을 뺀다.
+        _gname = (
+            db.query(Group.group_name)
+            .filter(Group.group_id == target_group_id)
+            .scalar()
+        )
+        from urllib.parse import quote
+
         from io import BytesIO
 
         output = BytesIO(data)
@@ -2766,7 +2777,8 @@ async def export_schedule_excel(
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "X-Roster-TeamView": "1" if team_view_applied else "0",
-                "Access-Control-Expose-Headers": "X-Roster-TeamView",
+                "X-Roster-GroupName": quote(str(_gname or ""), safe=""),
+                "Access-Control-Expose-Headers": "X-Roster-TeamView, X-Roster-GroupName",
                 # 다운로드는 항상 최신본 — Cache-Control 부재 시 CloudFront/브라우저가 캐싱해
                 # 조건부요청에 304 를 돌려주고 fetch(response.ok=false)가 다운로드 실패 처리함(cf. jobs.py).
                 "Cache-Control": "no-store",

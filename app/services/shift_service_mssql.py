@@ -399,10 +399,19 @@ def get_shifts_service(current_user, db: Session | None = None, override_group_i
         #   그 add 까지 함께 커밋돼 "시프트+codes 한 커밋" 원자성이 깨진다.
 
         if shifts:
-            # ★ 판정은 shift_id 로 한다. 예전엔 `default_shift == 'M'` 로 판정하면서 삽입은
-            #   `shift_id='M'` 으로 해서, shift_id='M' 이 있는데 default_shift 가 M 이 아닌
-            #   병동에서는 **목록을 열 때마다 'M' 이 한 행씩 늘었다.**
-            has_mid = any(str(getattr(s, "shift_id", "") or "").upper() == "M" for s in shifts)
+            # ★★ 이 씨딩은 **사전 세팅을 깔아 주는 것**이지 'M' 이라는 이름을 강제하는 게
+            #   아니다. 병원이 자기 EMR 코드로 바꾸면(예: 성남시의료원 M→D2) 이름은
+            #   달라져도 MID 자리는 이미 있으므로 **다시 만들 이유가 없다.**
+            # ★ 판정은 **두 축을 모두** 본다 — 어느 쪽으로든 MID 가 있으면 안 만든다.
+            #   예전엔 판정만 `default_shift == 'M'` 이고 삽입은 `shift_id='M'` 이라
+            #   축이 어긋나, shift_id='M' 인데 default_shift 가 M 이 아닌 병동에서
+            #   **목록을 열 때마다 'M' 이 한 행씩 늘었다.** 한쪽만 보면 그 사고가 되살아나고,
+            #   shift_id 만 보면 코드명을 바꾼 병동에서 유령 'M' 이 생긴다.
+            has_mid = any(
+                str(getattr(s, "shift_id", "") or "").upper() == "M"
+                or str(getattr(s, "default_shift", "") or "").upper() == "M"
+                for s in shifts
+            )
             if not has_mid:
                 _ensure_manage_rows(("M",))     # add 보다 앞. 슬롯 없으면 여기서 중단
                 mid_shift = Shift(
