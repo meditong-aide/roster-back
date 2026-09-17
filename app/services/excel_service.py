@@ -1070,8 +1070,23 @@ def _yiq(bg_hex: str) -> float:
 #: ★ 판별은 제출 테이블(`nurse_shift_requests`)과 **직접 대조**한다. `source_type` 은
 #:   저장 시점 판정이라 수간호사가 간호사 제출 전에 넣어 두면 'added' 로 굳어 버린다.
 #: ★ 배정 영역은 대표 코드에만 배경을 칠하므로, 무배경 흰 셀에서도 읽히는 진한 색을 쓴다.
-_C_WANTED_NURSE = "FFFF0000"      # 간호사 제출분이 반영됨 — 빨강
-_C_WANTED_HN = "FF0000FF"         # 수간호사가 확정에 넣거나 바꿈 — 파랑
+_EMPTY_SET: frozenset = frozenset()
+_EMPTY_MAP: dict = {}
+#: 팀별보기에서 파트장 행의 그룹 키. `team_of` 의 정상값(int·None)과 겹치지 않아야
+#:   병합이 파트장 구간을 팀 블록과 섞지 않는다.
+_HN_TEAM_KEY = "__hn__"
+
+
+def _as_date(v):
+    """`date`/`datetime`/None 을 `date`(또는 None)로 맞춘다.
+
+    ★ `datetime` 은 `date` 의 **서브클래스**라 `isinstance` 순서를 뒤집으면 안 된다.
+    """
+    if v is None:
+        return None
+    return v.date() if isinstance(v, datetime) else v
+_C_WANTED = "FFFF0000"            # 확정 원티드로 들어간 칸 — 빨강
+_C_SPECIAL = "FF0000FF"           # 기타 특수코드(보수교육·공가·연차 등) — 파랑
 
 
 def export_schedule_excel_bytes(
@@ -1114,7 +1129,10 @@ def export_schedule_excel_bytes(
     year, month = schedule.year, schedule.month
     days_in_month = calendar.monthrange(year, month)[1]
 
-    nurses = db.query(Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role).filter(
+    nurses = db.query(
+        Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role,
+        Nurse.hn_auth,
+    ).filter(
         Nurse.group_id == target_group_id
     ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
 
@@ -1132,7 +1150,8 @@ def export_schedule_excel_bytes(
     _inbound_ids = _entry_nurse_ids - _home_nurse_ids
     if _inbound_ids:
         inbound_nurses = db.query(
-            Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role
+            Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role,
+            Nurse.hn_auth,
         ).filter(
             Nurse.nurse_id.in_(_inbound_ids)
         ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
@@ -1203,6 +1222,32 @@ def export_schedule_excel_bytes(
                     "미등록" if tid is None else (_team_name_map.get(tid) or f"팀 {tid}")
                 )
 
+    # ───────── 파트장(hn_auth='HN')은 항상 맨 위 ─────────
+    #   기본 보기에서는 파트장의 `sequence` 가 1 이라 대개 이미 맨 위지만, **팀별보기는
+    #   팀 순서로 다시 정렬**하므로 팀이 없는 파트장이 '미등록' 블록과 함께 맨 끝으로
+    #   밀린다(실측: 성남 중환자실-RN 송순진 `team_id=None`). 두 레이아웃을 같게 만들기
+    #   위해 **모든 정렬이 끝난 뒤** 한 번 더 끌어올린다.
+    #   ★ 안정 정렬이라 파트장끼리·나머지끼리의 기존 순서(팀 순서·sequence)는 그대로다.
+    #   ★ 판정은 `hn_auth` 한 축이다 — `is_head_nurse` 는 별개 축이고(스위치가 아니라
+    #     표시용) 둘이 어긋난 계정이 실재한다([[feedback_hn_auth_orthogonal]]).
+    def _is_hn(_n) -> bool:
+        return str(getattr(_n, "hn_auth", "") or "").upper() == "HN"
+
+    nurses = sorted(nurses, key=lambda _n: 0 if _is_hn(_n) else 1)
+
+    # ★★ 팀별보기에서는 **팀 컬럼도 같이 옮겨야** 한다. 파트장만 위로 빼고 라벨을 그대로
+    #   두면 그 라벨이 **두 블록으로 쪼개진다** — 병합은 연속 구간만 합치기 때문이다.
+    #   (실측 운영: 파트장 보유 28개 그룹 중 7곳에서 발현 — 6곳은 '미등록' 이 위아래로
+    #    갈리고, 별관1병동은 파트장이 팀2 소속이라 팀2 블록이 둘로 쪼개진다.)
+    #   그래서 파트장 행은 **자체 구간**으로 만든다. 팀을 옮기는 게 아니라 '이 줄은
+    #   파트장' 이라고 표시하는 것이라 정보가 사라지지 않는다.
+    if team_view:
+        for _n in nurses:
+            if _is_hn(_n):
+                _nid = str(_n.nurse_id)
+                team_of[_nid] = _HN_TEAM_KEY
+                nurse_team_label[_nid] = "파트장"
+
     entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
 
     # alias_map 생성
@@ -1265,11 +1310,37 @@ def export_schedule_excel_bytes(
         .all()
     )
     code_bg: Dict[str, str] = {}
-    #: 배정 영역에서 **배경을 칠할** 코드. 3교대 대표(default_shift D/E/N) ·
-    #: OFF 교환 대상(off_swap_target) · **고정근무로 지정된 코드**까지다. 나머지
-    #: 특수코드까지 칠하면 표가 얼룩덜룩해 정작 봐야 할 원티드 표시가 묻힌다.
+    #: 배정 영역에서 **배경을 칠할** 코드 — 셋이다:
+    #:   ① 3교대 대표(`default_shift ∈ D,E,N`)
+    #:   ② OFF 교환 대상(`off_swap_target`)
+    #:   ③ **연차 계열(`annual_leave_unit IS NOT NULL`)** — `Y`(1.0)·`Y1`/`Y2`(0.5)·
+    #:      `Y3`(0.25) 처럼 연차 일수로 환산되는 코드. `off_swap_target` 은 병동마다
+    #:      설정이 엇갈려(같은 `Y` 가 어느 병동은 켜져 있고 어느 병동은 아님) 연차 배경이
+    #:      들쭉날쭉했는데, 이 컬럼은 연차 정산에 쓰이므로 채워져 있어야만 하는 값이라
+    #:      기준으로 삼기에 안정적이다.
+    #: 나머지 고정근무·특수코드까지 칠하면 표가 얼룩덜룩해 글자색 표시가 묻힌다.
     #: 범례·집계는 이 제한을 받지 않는다.
     fill_codes: set = set()
+    #: **OFF 축** — 원티드가 들어주어진 것을 빨간 글자로 표시할 대상.
+    #:   `default_shift == 'O'`(OFF) · `'주'`(주휴) · `off_swap_target`(연차전환대상).
+    #:   ★ 주휴를 여기 넣는 건 파랑(특수코드)으로 새는 것을 막기 위함이다. 주휴는
+    #:     자동 배정이라 원티드로 들어오지 않으므로 빨강이 켜지지는 않는다.
+    off_axis_codes: set = set()
+    #: **근무 축** 코드 — 파랑(특수코드) 판정에서 뺀다.
+    #:   ★ `M`(MID)까지 넣는다. 배경은 병원 요청대로 D/E/N 만 칠하지만, MID 는 교육·공가
+    #:     같은 '특수코드' 가 아니라 엄연한 교대 근무다. 안 빼면 MID 를 쓰는 병동에서
+    #:     근무 칸이 통째로 파래진다(실측 dev 61병동-AN `D2` 22칸).
+    den_codes: set = set()
+    #: `shifts.type == '근무'` 인 코드. 고정근무 코드를 **전역으로** 파랑에서 뺄 때의
+    #:   안전판이다 — `fixed_shift` 컬럼은 아무 코드나 담을 수 있어(스키마상 제약 없음),
+    #:   누가 실수로 연차 코드를 고정근무로 넣으면 그 코드가 **전 병동에서** 파랑을
+    #:   잃는다. 실측 전사 `fixed_shift` 11종·2,044행은 모두 `type='근무'` 라 지금은
+    #:   차이가 없지만, 구멍을 열어 둘 이유가 없다.
+    work_type_codes: set = set()
+    #: 연차 계열(`annual_leave_unit` 이 채워진 코드). 배경을 칠하고 **파랑에서도 뺀다** —
+    #:   연차는 교육·공가 같은 '기타 특수코드' 가 아니라 자체 축이고, 원본 근무표 관례상
+    #:   원티드로 받은 휴가는 빨간 글자로 나타낸다.
+    leave_unit_codes: set = set()
     _seen_code: set = set()
     for _s in _shift_rows:
         _code = str(_s.shift_id or "").strip()
@@ -1281,29 +1352,74 @@ def export_schedule_excel_bytes(
         _hex = _norm_hex(_s.color)
         if _hex:
             code_bg[_code] = _hex
-        if str(_s.default_shift or "").strip().upper() in ("D", "E", "N") or bool(
-            getattr(_s, "off_swap_target", False)
+        # ★ `default_shift` 는 표기가 하나가 아니다. 생성 경로가 `{"OFF","주"} → "O"` 로
+        #   정규화하고 주휴를 `W` 로도 받으므로(`roster_create_service.py:3840-3842`)
+        #   여기서도 같은 규약으로 먼저 접는다. 실측상 두 DB 의 `shifts.default_shift`
+        #   에는 `O`·`주` 만 있으나, 한쪽만 알아들으면 그 병동에서 OFF 가 조용히
+        #   '기타 특수코드'(파랑)로 새고 빨강도 안 켜진다.
+        _axis = str(_s.default_shift or "").strip().upper()
+        if _axis in ("OFF", "주", "W"):
+            _axis = "O"
+        _swap = bool(getattr(_s, "off_swap_target", False))
+        # ★★ **`shift_gb` 가 제품 자신의 분류축**이다. `default_shift` 만 보면 안 된다 —
+        #   전사 1,891행 중 `default_shift` 가 채워진 건 511행뿐인데 `shift_gb` 는
+        #   527행이고, 값이 `O`·데이·이브닝·나이트·미드·고정 여섯뿐이라 `type` 과
+        #   1:1 로 떨어진다(고정/데이/이브닝/나이트/미드=근무 · O=휴무).
+        #   특히 `'고정'` 35행이 파트장·MID고정·탄력근무·일반상근 같은 **고정근무 변형**을
+        #   정확히 집는다. 이걸 안 쓰면 `default_shift` 가 빈 근무 변형이 '기타 특수코드'로
+        #   새어 파랗게 나온다.
+        _gb = str(getattr(_s, "shift_gb", "") or "").strip()
+        if str(getattr(_s, "type", "") or "").strip() == "근무":
+            work_type_codes.add(_code)
+        if _axis in ("D", "E", "N", "M") or _gb in (
+            "데이", "이브닝", "나이트", "미드", "고정",
         ):
+            den_codes.add(_code)
+        if _axis == "O" or _gb == "O" or _swap:
+            off_axis_codes.add(_code)
+        if getattr(_s, "annual_leave_unit", None) is not None:
+            leave_unit_codes.add(_code)
+        if _axis in ("D", "E", "N") or _swap or _code in leave_unit_codes:
             fill_codes.add(_code)
 
-    # 고정근무 코드도 배경 대상이다 — 그 사람에겐 그게 상시 근무라 3교대와 같은 무게다.
+    # 고정근무 — **그 사람의 그 칸은 배경을 칠하지 않는다.** 상시 근무라 한 줄이 통째로
+    #   같은 색이 되고, 정작 봐야 할 글자색 표시가 묻힌다.
+    #   ★★ 축이 **둘**이라 집합도 둘이다. 하나로 묶으면 한쪽이 반드시 틀린다:
+    #     · `fixed_by_nurse` (간호사 단위) = **배경 억제**. 코드 단위로 지우면 안 된다 —
+    #       고정근무가 `D` 인 사람이 한 명만 있어도 **전 병동의 D 배경이 사라진다**
+    #       (실측 성남 중환자실-RN 김은경 `fixed_shift='D'`).
+    #     · `fixed_codes` (코드 단위) = **파랑 제외**. 누군가의 고정근무로 쓰이는 코드는
+    #       교육·공가 같은 특수코드가 아니라 근무 코드이므로, 다른 사람이 하루 받아도
+    #       파랗게 칠하지 않는다.
     #   SSOT 는 `nurse_allowed_shift_period`(as-of 대상월 1일)다. `nurses.fixed_shift`
     #   컬럼은 as-of-TODAY 단방향 캐시라 미래월에 stale 해 쓰지 않는다.
     #   ★ 대상은 `Nurse.group_id` 가 아니라 **이 파일에 실제로 실리는 간호사**다.
     #     전출·인바운드는 현재 소속이 달라도 근무표에 나오므로(위에서 inbound 를 합친다),
-    #     소속으로 거르면 그 사람의 고정근무 칸만 배경이 빠진다.
+    #     소속으로 거르면 그 사람의 고정근무 칸만 처리가 빠진다.
+    fixed_codes: set = set()
+    #: 간호사 → {일(day): {그 날 유효한 고정근무 코드}}.
+    #:   ★★ **날짜까지 봐야 한다.** 달과 겹치기만 하면 그 코드를 한 달 내내 억제하는
+    #:     식으로 짜면, 15일부터 고정근무가 시작된 사람의 1~14일 **일반 배정**까지
+    #:     배경을 잃는다(월 중 코드가 바뀌면 두 코드 모두 한 달 전체가 눌린다).
+    #:     억제 대상은 '그 사람의 그 날 고정근무 칸' 이지 '그 사람의 그 코드' 가 아니다.
+    fixed_by_nurse: Dict[str, Dict[int, set]] = {}
     try:
         from sqlalchemy import or_
         from db.models import NurseAllowedShiftPeriod
-        #   ★ 월초 시점(as-of)이 아니라 **그 달과 겹치는 구간 전부**를 본다. 고정근무가
+        #   ★ 월초 시점(as-of)이 아니라 **그 달과 겹치는 구간 전부**를 읽는다. 고정근무가
         #     월 중간부터 시작하는 경우가 있는데, 월초 기준으로만 보면 그 뒤 칸들이
-        #     배경을 잃는다. `fetch_periods` 와 같은 반열린 구간 규약이다.
+        #     빠진다. `fetch_periods` 와 같은 반열린 구간 규약이다.
         _ms = date(year, month, 1)
         _me = _ms + timedelta(days=days_in_month)
         _nids = [str(_n.nurse_id) for _n in nurses]
         if _nids:
             for _fp in (
-                db.query(NurseAllowedShiftPeriod.fixed_shift)
+                db.query(
+                    NurseAllowedShiftPeriod.nurse_id,
+                    NurseAllowedShiftPeriod.fixed_shift,
+                    NurseAllowedShiftPeriod.valid_from,
+                    NurseAllowedShiftPeriod.valid_to,
+                )
                 .filter(
                     NurseAllowedShiftPeriod.nurse_id.in_(_nids),
                     NurseAllowedShiftPeriod.valid_from < _me,
@@ -1314,93 +1430,47 @@ def export_schedule_excel_bytes(
                 )
                 .all()
             ):
-                _fc2 = str(_fp[0] or "").strip()
-                if _fc2:
-                    fill_codes.add(_fc2)
+                _fc2 = str(_fp[1] or "").strip()
+                if not _fc2:
+                    continue
+                # 전역 제외는 **근무 코드일 때만**. 그래야 잘못 설정된 휴가·교육 코드가
+                #   남의 칸에서까지 파랑을 잃지 않는다(그 사람 칸은 아래 날짜 맵이 맡는다).
+                if _fc2 in work_type_codes:
+                    fixed_codes.add(_fc2)
+                # 구간을 대상월 안으로 자른다. datetime 으로 올 수 있어 date 로 맞춘다.
+                _vf, _vt = _as_date(_fp[2]), _as_date(_fp[3])
+                _d0 = max(1, (_vf - _ms).days + 1) if _vf else 1
+                _d1 = min(days_in_month, (_vt - _ms).days) if _vt else days_in_month
+                if _d1 < _d0:
+                    continue
+                _slot = fixed_by_nurse.setdefault(str(_fp[0]), {})
+                for _dd in range(_d0, _d1 + 1):
+                    _slot.setdefault(_dd, set()).add(_fc2)
     except Exception as _fx_exc:
-        print(f"[Excel] 고정근무 코드 조회 실패 — 배경 대상에서 제외: {_fx_exc}")
+        # 실패하면 고정근무 칸에 배경이 남고, 전용 고정근무 코드는 '기타 특수코드' 로
+        #   흘러 파랗게 나온다. 근무표 자체는 내려가야 하므로 표시만 포기하고 사유를 남긴다.
+        print(f"[Excel] 고정근무 조회 실패 — 배경 억제·특수코드 제외 모두 생략: {_fx_exc}")
 
     holidays = _kr_holidays_in_month(year, month)
 
     # ───────── 2-c) 확정 원티드 ─────────
-    #   그 셀에 원티드가 **반영됐는지**를 글자색으로 나타낸다(파랑=반영, 빨강=못 들어줌).
-    #   ★★ `is_applied` 로 판정하면 안 된다 — 그건 '솔버에 실을지' 하는 **입력 플래그**지
-    #     결과가 아니다. `fixed_wanted_use_yn=False` 면 소프트 선호로만 들어가고, 생성 뒤
-    #     수동 수정도 된다. 그래서 **요청 코드와 실제 배정 코드를 직접 비교**한다.
+    #   **확정 원티드(`fixed_wanted_entries`, `is_applied=True`)에 있는 칸 = 빨간 글자.**
+    #   ★★ **제출 테이블(`wanted_requests`·`nurse_shift_requests`)과 대조하지 않는다.**
+    #     예전엔 '간호사 제출본에도 같은 코드가 있는가' 를 빨강 조건으로 걸었는데,
+    #     **운영에서 빨강이 한 칸도 안 나왔다** — 수간호사가 종이 휴가계획서를 받아
+    #     확정 원티드에 직접 넣는 운용이 흔해서 제출본이 통째로 비어 있기 때문이다
+    #     (실측 2026-09-16 운영 성남시의료원 5개 병동 2026-10: 제출본 **0건** ·
+    #      확정원티드 **249건**). 확정에 올라간 것 자체가 '반영된 원티드' 다.
     #   ★★ `year`·`month` 필터를 반드시 건다. `request_id` 가 (간호사,월) 스코프로 1부터
     #     재채번돼, 월 필터 없는 조회가 다른 달 셀을 **일(day)만 떼어** 같은 날짜로 반영한
     #     사고가 있었다(운영 전사 236건). 날짜 범위도 함께 걸어 이중으로 막는다.
     #   ★ 조회가 실패해도 근무표 자체는 내려가야 한다 — 표시만 생략한다.
-    #
-    #   ★★ 표시 대상은 **확정 원티드(`is_applied=True`)에 있는 칸뿐**이다. 제출만 하고
-    #     수간호사가 확정에 안 올린 신청은 '반영된 것' 이 아니므로 칠하지 않는다.
-    #   색은 그 칸이 **간호사가 낸 것인지** 로 가른다:
-    #     · 제출분에 같은 코드가 있다  → 신청이 반려 없이 적용됨      → 빨강
-    #     · 제출분에 없거나 코드가 다르다 → 수간호사가 추가·변경한 것  → 파랑
-    #   ★ `source_type` 에 기대지 않고 **제출 테이블과 직접 대조**한다. source_type 은
-    #     저장 시점 판정이라 수간호사가 간호사 제출 전에 넣어 두면 'added' 로 굳는다.
-    wanted_req: Dict[tuple, tuple] = {}   # (간호사,일) → (요청코드, "nurse"|"hn")
-    submitted: Dict[tuple, str] = {}      # (간호사,일) → 제출 코드
+    wanted_req: Dict[tuple, str] = {}     # (간호사,일) → 확정 원티드 코드
     _wm_start = date(year, month, 1)
     _wm_end = _wm_start + timedelta(days=days_in_month)
     try:
-        # ① 간호사 제출분 — **생성이 쓰는 회차와 똑같이** 고른다.
-        #    규약 정본: `roster_create_service.py:264-280`
-        #      `is_submitted == True` 인 것 중 `submitted_at` 최신 한 건, 없으면 그 간호사는
-        #      건너뛴다(미제출 draft 미반영). 엑셀은 '생성에 실제로 쓰인 원티드' 를 보여줘야
-        #      하므로 여기서 규약이 갈리면 근무표와 표시가 어긋난다.
-        #    ★ 단순히 최신 `request_id` 를 집으면 안 된다 — 저장만 한 초안도 번호를 올리므로
-        #      **제출본을 초안이 덮는다.**
-        #    ★ `request_id` 는 (간호사, 월) 스코프로 1부터 **재채번**된다. 날짜 범위를 반드시
-        #      함께 걸어야 다른 달 신청이 일(day)만 떼어 섞이지 않는다.
-        from db.models import NurseShiftRequest, WantedRequest
-        _month_str = f"{year:04d}-{month:02d}"
-        #: 간호사 → (submitted_at, request_id).
-        #: ★ 생성기는 `submitted_at desc` 하나로만 정렬해 `.first()` 를 집는다
-        #:   (`roster_create_service.py:264-272`). 동점이거나 NULL 이면 DB 가 임의로 고르므로,
-        #:   여기서는 **회차번호를 보조키**로 둬 결정적으로 만든다. 실측상 전사 제출본
-        #:   681건 중 `submitted_at` NULL 0건·동점 0건이라 현재는 두 축이 같은 행을 집는다.
-        #:   ★ 동점이 생기면 생성기 쪽이 임의라 어긋날 수 있다 — 그때는 생성기에
-        #:     같은 보조키를 넣어 양쪽을 맞춰야 한다(여기만 고치면 해결되지 않는다).
-        _pick: Dict[str, tuple] = {}
-        for _wr in (
-            db.query(WantedRequest)
-            .filter(
-                WantedRequest.group_id == target_group_id,
-                WantedRequest.month == _month_str,
-                WantedRequest.is_submitted == True,      # noqa: E712
-            )
-            .all()
-        ):
-            _nid = str(_wr.nurse_id)
-            _key = (_wr.submitted_at or datetime.min, int(_wr.request_id or 0))
-            if _key > _pick.get(_nid, (datetime.min, -1)):
-                _pick[_nid] = _key
-        _want_rid = {nid: key[1] for nid, key in _pick.items()}
-        if _want_rid:
-            for _sr in (
-                db.query(NurseShiftRequest)
-                .filter(
-                    NurseShiftRequest.group_id == target_group_id,
-                    NurseShiftRequest.shift_date >= _wm_start,
-                    NurseShiftRequest.shift_date < _wm_end,
-                )
-                .all()
-            ):
-                _c = str(_sr.shift or "").strip()
-                if not _sr.shift_date or not _c:
-                    continue
-                _nid = str(_sr.nurse_id)
-                if _want_rid.get(_nid) != int(_sr.request_id or 0):
-                    continue                    # 미제출 초안이거나 옛 회차
-                submitted[(_nid, _sr.shift_date.day)] = _c
-    except Exception as _sub_exc:
-        print(f"[Excel] 제출 원티드 조회 실패 — 확정분만 표시: {_sub_exc}")
-    try:
-        # ② 확정 원티드 — 같은 셀이면 이쪽이 이긴다.
-        #    ★ `is_applied == False` 는 **수간호사가 꺼 둔 것**이라 제외한다. 안 거르면
-        #      꺼진 요청이 간호사 제출분을 덮어써 '있지도 않은 요청' 기준으로 색이 칠해진다.
-        #      생성·원티드 API 도 전부 `is_applied == True` 만 쓴다
+        #    ★ `is_applied == False` 는 **수간호사가 꺼 둔 것**이라 제외한다. 생성·원티드
+        #      API 도 전부 `is_applied == True` 만 쓴다
         #      (`wanted_service.py:2841·3639·3980·4070`). 실측으로 성남시의료원에만
         #      꺼진 행이 46건 있다.
         from db.models import FixedWantedEntry
@@ -1418,10 +1488,7 @@ def export_schedule_excel_bytes(
         ):
             _wc = str(_w.shift_id or "").strip()
             if _w.shift_date and _wc:
-                _k = (str(_w.nurse_id), _w.shift_date.day)
-                wanted_req[_k] = (
-                    _wc, "nurse" if submitted.get(_k) == _wc else "hn",
-                )
+                wanted_req[(str(_w.nurse_id), _w.shift_date.day)] = _wc
     except Exception as _w_exc:
         print(f"[Excel] 확정 원티드 조회 실패: {_w_exc}")
 
@@ -1631,6 +1698,10 @@ def export_schedule_excel_bytes(
 
         row_counts = {code: 0 for code in tail_labels}
         schedule_map = by_nurse.get(n.nurse_id, {})
+        #: 이 사람의 **날짜별** 고정근무 코드 — 그 칸만 배경을 뺀다.
+        #:   코드 단위로 빼면 남의 D 까지 지워지고, 날짜를 안 보면 월 중 고정근무가
+        #:   시작·변경된 사람의 일반 배정까지 지워진다.
+        _my_fixed_days = fixed_by_nurse.get(str(n.nurse_id), _EMPTY_MAP)
 
         for d in range(1, days_in_month + 1):
             shift_code = schedule_map.get(d, '-')
@@ -1641,7 +1712,14 @@ def export_schedule_excel_bytes(
             #   특수코드까지 칠하면 표가 얼룩덜룩해 정작 봐야 할 원티드 표시가 묻힌다.
             #   (범례·집계는 이 제한을 받지 않는다 — 거기선 색이 코드를 가리키는 축이다.)
             _code = str(shift_code).strip()
-            _bg = code_bg.get(_code) if _code in fill_codes else None
+            _bg = (
+                code_bg.get(_code)
+                if (
+                    _code in fill_codes
+                    and _code not in _my_fixed_days.get(d, _EMPTY_SET)
+                )
+                else None
+            )
             if _bg:
                 cell.fill = PatternFill("solid", fgColor=_bg)
                 cell.font = Font(color=_readable_text_color(_bg))
@@ -1656,11 +1734,36 @@ def export_schedule_excel_bytes(
             #     들어준 것과 못 들어준 것이 같은 색이 되어 구분이 사라진다.
             #     (확정 원티드는 하드 고정이라 대개 일치하지만, 생성 뒤 수동 수정으로
             #      어긋날 수 있어 여기서도 같은 기준을 적용한다.)
+            #   글자색 축은 **둘**이고 빨강이 우선한다:
+            #     · 빨강 = **확정 원티드로 들어간 쉬는 날**. 확정 원티드에 있고 실제 배정이
+            #       그 코드이며, 코드가 **OFF축이거나 연차 계열**일 때만 칠한다.
+            #       (제출 테이블과는 대조하지 않는다 — 위 2-c 주석)
+            #       ★ 원티드로 받은 근무(D/E/N)·교육·공가까지 빨갛게 하면 "쉬는 날" 신호가
+            #         흐려진다. 실측 운영 중환자실-RN 2026-10 확정원티드 164건 중
+            #         OFF·연차가 123건, 특수코드 32건, 근무 9건이다.
+            #     · 파랑 = 기타 특수코드(보수교육·직무교육·공가·병가 등). 연차는 자체 축이라
+            #       여기 안 든다(배경을 칠한다).
+            #   ★ 고정근무 코드(`DA`·`DD` 등)는 어느 쪽도 아니다. 그 사람에겐 상시 근무라
+            #     특수코드로 묶으면 한 줄이 통째로 파래진다.
+            #   ★ **요청 코드와 실제 배정이 같을 때만** 칠한다. 확정 원티드는 하드 고정이라
+            #     대개 일치하지만 생성 뒤 수동 수정으로 어긋날 수 있고, 그때 칠하면
+            #     들어준 것과 못 들어준 것이 같은 색이 되어 구분이 사라진다.
             _w = wanted_req.get((str(n.nurse_id), d))
-            if _w and _w[0] == _code:
-                cell.font = Font(
-                    color=_C_WANTED_NURSE if _w[1] == "nurse" else _C_WANTED_HN
-                )
+            if _w and _w == _code and (
+                _code in off_axis_codes or _code in leave_unit_codes
+            ):
+                cell.font = Font(color=_C_WANTED)
+            elif (
+                _code and _code != "-"
+                and _code not in den_codes
+                and _code not in off_axis_codes
+                and _code not in leave_unit_codes
+                # 고정근무 제외는 두 겹이다 — 근무 코드는 전역(남이 하루 받아도 근무다),
+                #   그 밖의 코드는 **그 사람·그 날**에 한해서만.
+                and _code not in fixed_codes
+                and _code not in _my_fixed_days.get(d, _EMPTY_SET)
+            ):
+                cell.font = Font(color=_C_SPECIAL)
 
             base = to_base(shift_code)
             if base in row_counts:
