@@ -17,6 +17,7 @@ from schemas.roster_schema import (
     AssignmentStatusCounts,
 )
 from schemas.auth_schema import User as UserSchema
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -2329,6 +2330,67 @@ def get_transferred_wanted(
     return {"entries": result, "assignment": _assignment_summary(a)}
 
 
+def _target_issued_nurse_ids(
+    db: Session, target_gids: set[str], year: int, month: int
+) -> dict[str, set[str]]:
+    """대상 병동별 **발행본에 실린 nurse_id 집합**. 미발행 병동은 키가 없다.
+
+    키 없음 = 미발행 / 키는 있는데 그 안에 없음 = 발행됐지만 행 누락.
+    이 둘을 구분하려고 집합까지 만든다 — boolean 하나로는 못 가른다.
+
+    쿼리는 1회, JSON 파싱은 대상 병동 수만큼이다(인원·날짜 수와 무관).
+    """
+    if not target_gids:
+        return {}
+    from db.models import IssuedRosterSnapshot
+
+    # ★★ 연월 판정은 **`meta_json` 이 정본**이다. `year`/`month` 컬럼은 nullable 이고
+    #   `get_issued_roster_snapshot_service` 도 컬럼을 보지 않는다(`:995-999`).
+    #   컬럼으로 거르면 정본 조회는 찾아내는 스냅샷을 여기서만 '미발행' 으로 판정해
+    #   **화면이 멀쩡한 근무를 비우고 상태까지 틀리게** 말한다.
+    rows = (
+        db.query(IssuedRosterSnapshot)
+        .filter(
+            IssuedRosterSnapshot.group_id.in_(list(target_gids)),
+            IssuedRosterSnapshot.is_active_issued == True,  # noqa: E712
+        )
+        .order_by(IssuedRosterSnapshot.created_at.desc())
+        .all()
+    )
+
+    def _as_dict(value):
+        """JSON 컬럼 값을 dict 로. 문자열이면 파싱하고, dict 가 아니면 버린다."""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (ValueError, TypeError):
+                return {}
+        return value if isinstance(value, dict) else {}
+
+    out: dict[str, set[str]] = {}
+    for r in rows:
+        # 같은 그룹에 활성 스냅샷이 여럿이면 최신(created_at desc) 하나만 쓴다.
+        if r.group_id in out:
+            continue
+        _meta = _as_dict(r.meta_json)
+        if _meta.get("year") != year or _meta.get("month") != month:
+            continue
+        _roster = _as_dict(r.roster_json)
+        # ★ `nurses` 가 리스트가 아닐 수 있다(JSON 컬럼은 어떤 모양도 담는다).
+        #   여기서 터지면 스냅샷 하나가 깨졌다는 이유로 **근무표 응답 전체가 500** 이 된다.
+        _nurses = _roster.get("nurses")
+        if not isinstance(_nurses, list):
+            logger.warning(
+                "발행 스냅샷의 nurses 형식이 올바르지 않습니다: group_id=%s snapshot_id=%s",
+                r.group_id, getattr(r, "snapshot_id", None),
+            )
+            _nurses = []
+        out[r.group_id] = {
+            str(n.get("nurse_id")) for n in _nurses if isinstance(n, dict)
+        }
+    return out
+
+
 def get_roster_assignments(
     db: Session,
     group_id: str,
@@ -2380,6 +2442,15 @@ def get_roster_assignments(
         groups = db.query(Group).filter(Group.group_id.in_(target_gids)).all()
         gname_map = {g.group_id: g.group_name for g in groups}
 
+    # ── 대상 병동의 발행 상태 ─────────────────────────────────────────────────
+    # ★ 화면이 "파견 띠는 있는데 코드가 없다" 를 보고 **미발행인지 미배정인지 추정**
+    #   해야 했다. 둘은 사용자에게 다른 사건이므로 서버가 판정해 내려준다.
+    # ★ 비용은 **대상 병동 수만큼**이고 인원 수·날짜 수와 무관하다(쿼리 1회 +
+    #   병동당 JSON 1회). 인원마다 발행 여부를 묻는 추가 호출을 막기 위한 설계다.
+    target_rows: dict[str, set[str]] = _target_issued_nurse_ids(
+        db, target_gids, year, month
+    )
+
     result: dict[str, list[dict]] = {}
     for a in eligible:
         entry = {
@@ -2389,6 +2460,16 @@ def get_roster_assignments(
             "start_date": str(a.start_date),
             "end_date": str(a.end_date or a.expected_end_date) if (a.end_date or a.expected_end_date) else None,
         }
+        if a.target_group_id:
+            _ids = target_rows.get(a.target_group_id)
+            if _ids is None:
+                _status = "not_issued"   # 대상이 아직 발행하지 않음
+            elif str(a.nurse_id) in _ids:
+                _status = "issued"       # 발행 + 그 병동에 이 사람 행이 있음
+            else:
+                _status = "no_row"       # 발행됐으나 이 사람 행이 없음(누락)
+            entry["target_status"] = _status
+            entry["target_issued"] = _ids is not None
         result.setdefault(a.nurse_id, []).append(entry)
     for n in _resigning:
         # 퇴사일 당일부터 월말까지 블랭크 (프론트 배지/기간바 용)

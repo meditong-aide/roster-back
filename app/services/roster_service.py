@@ -7,6 +7,7 @@
 
 from datetime import date, datetime, timedelta
 import calendar
+import logging
 import re
 import uuid
 
@@ -36,6 +37,8 @@ from db.models import (
 from db.roster_config import NurseRosterConfig
 from db.nurse_config import Nurse as NurseEngine
 from routers.utils import get_days_in_month
+
+logger = logging.getLogger(__name__)
 from schemas.roster_schema import RosterConfigCreate, PublishRequest, RosterRequest
 from services.roster_system import RosterSystem
 from services.group_access import caller_is_head_nurse, resolve_home_group_id
@@ -246,6 +249,28 @@ def materialize_generation_config(
     differs = True
     if baseline is not None:
         differs = any(getattr(baseline, k, None) != v for k, v in pdict.items())
+    else:
+        # ── baseline 을 못 잡은 경우: **재사용하지 않고 포크한다**(기존 동작 유지) ──
+        #   ★★ 여기에 "최신 config 와 값이 같으면 재사용" 폴백을 넣으면 안 된다.
+        #     `config_id` 가 비어 오는 정상 경로는 사용자가 **'새 설정 만들기'를 명시적으로
+        #     고른 때**뿐이라(프론트 `startNewConfig` 만 configId=null 로 둔다),
+        #     값이 우연히 같다고 기존 row 로 묶으면 사용자 의도를 뒤집는다.
+        #     또 그룹 최신이 `version IS NULL` 인 legacy row 면(운영 45/75 그룹이 그렇다)
+        #     프리셋 목록(`/config/versions` 는 `version.isnot(None)` 만 노출)에
+        #     **보이지도 않는 설정**에 생성 결과·생성 상태가 묶인다.
+        #   ★ 중복 포크의 진짜 원인은 프론트가 멀쩡한 `config_id` 를 버리는 것이라
+        #     그쪽에서 고친다. 여기서는 회귀를 빨리 알아채도록 흔적만 남긴다.
+        if payload.config_id is None:
+            print(
+                "[MaterializeConfig] config_id 미전송 — 새 프리셋으로 포크 "
+                f"(office={office_id}/group={group_id})"
+            )
+        else:
+            # 명시된 config_id 가 이 office/group 에서 해소되지 않았다(삭제·타그룹·오타).
+            print(
+                f"[MaterializeConfig] config_id={payload.config_id} 를 "
+                f"office={office_id}/group={group_id} 에서 찾지 못함 — 새 프리셋으로 포크"
+            )
 
     if baseline is not None and not differs:
         resolved = baseline
@@ -1155,6 +1180,25 @@ def get_issued_roster_snapshot_service(
     }
 
 
+# ── 파견·병동이동 대상 병동의 발행 상태 ────────────────────────────────────
+# ★ 예전에는 boolean `target_issued` 하나뿐이라 **"대상이 아직 발행 안 함" 과
+#   "발행됐는데 내 행이 없음" 이 구분되지 않았다.** 화면이 둘을 같은 회색 점으로
+#   그리게 되어 사용자가 원인을 알 수 없었다.
+TARGET_ISSUED = "issued"          # 대상 발행 + 내 행 있음 → 그 근무가 유효 근무
+TARGET_NO_ROW = "no_row"          # 대상 발행됐으나 내 행 없음 → 누락(문의 필요)
+TARGET_NOT_ISSUED = "not_issued"  # 대상이 아직 발행 안 함 → 기다리면 됨
+
+# ── 일자 셀의 근무 확정 상태 ────────────────────────────────────────────────
+# `code` 가 비어 있다는 사실만으로는 "미배정(쉬는 날)" 과 "대상 병동이 아직
+# 발행하지 않아 모름" 을 구분할 수 없다. 화면이 추정하지 않도록 명시한다.
+CELL_CONFIRMED = "confirmed"              # 이 병동의 확정 근무(빈 코드면 미배정)
+CELL_TARGET_NOT_ISSUED = "target_not_issued"  # 파견지 미발행 — 근무 미확정
+CELL_TARGET_NO_ROW = "target_no_row"          # 파견지 발행됐으나 내 행 없음
+#: 그 날 유효한 파견이 둘 이상이라 **어느 병동이 맞는지 데이터로 정할 수 없다.**
+#: 근무는 정해진 규칙(가장 늦게 시작한 배치)으로 채우되 확정으로 보이면 안 된다.
+CELL_ASSIGNMENT_CONFLICT = "assignment_conflict"
+
+
 def get_my_issued_roster_service(
     year: int,
     month: int,
@@ -1164,6 +1208,10 @@ def get_my_issued_roster_service(
     """
     로그인 사용자 본인의 발행된 근무표만 조회합니다.
     snapshot의 roster_json에서 nurse_id 기준으로 추출.
+
+    파견/병동이동 구간은 **대상 병동의 발행본으로 교체**한다. 대상을 확인할 수
+    없는 구간은 원 소속 코드를 그대로 두지 않고 비운 뒤(`code=""`)
+    `status` 로 이유를 밝힌다 — 남겨 두면 그 근무가 실제로 서는 것처럼 보인다.
     """
     # 토큰 group_id 대신 nurse_id→DB home group 으로 스냅샷 조회(그룹전환/소속변경 안전).
     from services.group_access import resolve_home_group_id
@@ -1231,6 +1279,8 @@ def get_my_issued_roster_service(
             "group_name": src_group_name,
             "is_source": True,
             "reason": None,
+            # 원 소속 발행본의 값이므로 확정이다. 파견 구간은 아래에서 덮인다.
+            "status": CELL_CONFIRMED,
         })
 
     # 파견/병동이동: target 근무표 overlay (복수 assignment 지원)
@@ -1252,215 +1302,403 @@ def get_my_issued_roster_service(
         and a.start_date <= m_end
         and (a.end_date or a.expected_end_date or m_end) >= m_start
     ]
-    # outbound (현재 home 외부로 나간 케이스): target != src_gid
-    my_transfers = [
-        a for a in assignments
-        if a.target_group_id and a.target_group_id != src_gid
-    ]
-    # inbound (영구이동으로 src_gid 에 들어온 케이스): target == src_gid AND source != src_gid
-    my_inbound_transfers = [
-        a for a in assignments
-        if a.reason == "병동이동"
-        and a.target_group_id == src_gid
-        and a.source_group_id
-        and a.source_group_id != src_gid
-    ]
+    # ── 날짜별 '그 날의 소속 병동' 을 먼저 정한다(타임라인) ──────────────────
+    # ★★ 예전에는 outbound(나간 파견)와 inbound(들어온 이동)를 **각각 전체 구간에
+    #   덮어쓰는** 두 루프였다. 연속 이동에서 서로를 지웠다 — 실측: A→B(1/10),
+    #   B→C(1/20), 현재 home=C 일 때 **월 전체가 B** 가 되어 A 구간도 C 구간도
+    #   사라졌다. 날짜마다 유효한 배치를 **하나로 확정한 뒤** 덮어야 한다.
+    #
+    # 규칙
+    #   1) 영구이동(병동이동)이 '그 날의 home' 을 정한다.
+    #      - d >= start 인 이동 중 **가장 늦은 것**의 target 이 home
+    #      - 그런 이동이 없으면(첫 이동 이전) **가장 이른 이동의 source** 가 home
+    #      - 이동 이력이 없으면 현재 home(src_gid)
+    #   2) 파견은 그 위에 [start, end] 구간만 덮는다. 겹치면 start 늦은 쪽이 이긴다.
+    # 정렬은 (start_date, id) 로 고정해 같은 데이터면 항상 같은 결과가 나오게 한다.
+    # ★★ 겹칠 때 **무엇이 이기는지 규칙을 명시**한다. 뒤에 오는 것이 앞을 덮으므로
+    #   정렬 자체가 우선순위다. `id` 만으로 가르면 "행 번호가 큰 쪽이 이긴다" 는
+    #   뜻이 되어, 복원·이관된 데이터나 상태 전이 중인 행이 조용히 승자가 된다.
+    #   순서: ① 시작일 이른 것 먼저 ② 같은 날이면 **completed 보다 active 가 나중**
+    #   (= active 가 이긴다. 진행 중인 배치가 종료된 배치보다 현재 사실에 가깝다)
+    #   ③ 그래도 같으면 `id` 로 결정론만 보장한다.
+    def _precedence(a):
+        return (a.start_date, 1 if str(a.status) == "active" else 0, a.id)
+
+    _moves = sorted(
+        (a for a in _all_my_asgs
+         if a.reason == "병동이동" and a.target_group_id and a.start_date),
+        key=_precedence,
+    )
+    _dispatches = sorted(
+        (a for a in assignments
+         if a.reason == "파견" and a.target_group_id and a.start_date),
+        key=_precedence,
+    )
+
+    _warned_keys: set = set()
+
+    def _warn_conflict(_kind: str, _cands: list) -> None:
+        """모순된 배치 데이터를 **조용히 넘기지 않는다.**
+
+        조회에서 예외를 내지는 않는다 — 배치 하나가 어긋났다고 근무표를 통째로 못 보면
+        더 나쁘다. 대신 운영 모니터링이 잡을 수 있게 구조화 로그를 남긴다.
+        날짜 단위로 dedupe 한다(이 판정은 날짜마다 불린다).
+        """
+        _key = (_kind, tuple(sorted(m.id for m in _cands)))
+        if _key in _warned_keys:
+            return
+        _warned_keys.add(_key)
+        logger.warning(
+            "배치 데이터 충돌 — %s: nurse=%s date=%s candidates=%s",
+            _kind, nurse_id, _cands[0].start_date,
+            [(m.id, m.source_group_id, m.target_group_id, m.status) for m in _cands],
+        )
+
+    def _chain_of(_cands: list):
+        """같은 날 발효된 이동들이 **하나의 유효한 체인**인지 검사하고 (머리, 꼬리)를 준다.
+
+        유효 = `source→target` 간선들이 머리 하나에서 꼬리 하나로 **한 줄로** 이어지고
+        모든 간선이 정확히 한 번씩 쓰인다.
+        ★★ "꼬리가 하나" 만으로는 부족하다 — `A→B, B→C, X→B` 는 꼬리가 C 하나지만
+          머리가 둘이고 B 로 두 간선이 모이는 모순 그래프다. 분기·병합·순환·끊김을
+          모두 걸러야 한다.
+
+        Returns:
+            (머리, 꼬리). 유효한 체인이 아니면 `(None, None)`.
+        """
+        if len(_cands) == 1:
+            return _cands[0], _cands[0]
+        _by_source: dict = {}
+        for _m in _cands:
+            if _m.source_group_id in _by_source:
+                return None, None               # 같은 출발지에서 두 갈래 — 분기
+            _by_source[_m.source_group_id] = _m
+        _targets = [_m.target_group_id for _m in _cands]
+        if len(set(_targets)) != len(_targets):
+            return None, None                   # 같은 도착지로 모임 — 병합
+        _heads = [_m for _m in _cands if _m.source_group_id not in _targets]
+        if len(_heads) != 1:
+            return None, None
+        _head = _heads[0]
+        _seen = [_head]
+        _cur = _head
+        while _cur.target_group_id in _by_source:
+            _cur = _by_source[_cur.target_group_id]
+            if _cur in _seen:
+                return None, None               # 순환
+            _seen.append(_cur)
+        if len(_seen) != len(_cands):
+            return None, None                   # 이어지지 않은 조각이 남음
+        return _head, _cur
+
+    # ── 이동 이력 전체의 연속성을 **한 번** 검증한다 ─────────────────────────
+    # ★★ 같은 날 묶음만 보면 **날짜를 건너뛴 끊김**을 못 잡는다 — A→B 다음이 X→C 면
+    #   B 와 X 가 이어지지 않는데도 각 묶음은 저마다 멀쩡해 보인다. 그리고 충돌을
+    #   찾고도 로그만 남기면 응답은 그대로 `confirmed` 라, 확정할 수 없는 소속이
+    #   확정 사실로 나간다. 충돌이 시작된 날짜를 잡아 그 뒤를 전부 미확정으로 돌린다.
+    _move_conflict_from: date | None = None
+    if _moves:
+        _by_start: dict = {}
+        for _m in _moves:
+            _by_start.setdefault(_m.start_date, []).append(_m)
+        _prev_target = None
+        for _sd in sorted(_by_start):
+            _grp = _by_start[_sd]
+            _h, _t = _chain_of(_grp)
+            if _t is None:
+                _warn_conflict("같은 날 시작한 병동이동", _grp)
+                _move_conflict_from = _sd
+                break
+            if _prev_target is not None and _h.source_group_id != _prev_target:
+                _warn_conflict("이어지지 않는 병동이동 이력", _grp)
+                _move_conflict_from = _sd
+                break
+            _prev_target = _t.target_group_id
+
+    def _home_on(_d: date):
+        """그 날의 소속 병동·사유와 **근거가 된 assignment**."""
+        _applied = [m for m in _moves if m.start_date <= _d]
+        if _applied:
+            # 가장 늦게 발효된 날짜의 이동들만 두고 그 안에서 최종 도착지를 고른다.
+            _last = _applied[-1].start_date
+            _same = [m for m in _applied if m.start_date == _last]
+            _, _tail = _chain_of(_same)
+            if _tail is None:
+                _warn_conflict("같은 날 시작한 병동이동", _same)
+                _tail = _same[-1]
+            return _tail.target_group_id, _tail.reason, _tail
+        if _moves:
+            # 첫 이동 이전 — 그때는 그 이동의 **출발** 병동에 있었다.
+            # ★ 같은 날 체인(A→B, B→C)이면 출발지는 체인의 **머리**인 A 다.
+            #   `_moves[0]` 를 그냥 쓰면 정렬이 `id` 로 갈린 쪽을 집어 B 가 나온다.
+            _first = _moves[0].start_date
+            _same = [m for m in _moves if m.start_date == _first]
+            _head, _ = _chain_of(_same)
+            if _head is None:
+                # ★ 폴백을 꼬리 쪽과 **같은 규칙**(`_same[-1]`)으로 맞춘다. 예전에는
+                #   여기만 `_same[0]` 이라 정렬상 completed·낮은 id 가 뽑혀 반대로 갔고,
+                #   경고도 남지 않아 조용히 엉뚱한 과거 병동을 보여줬다.
+                _warn_conflict("같은 날 시작한 병동이동", _same)
+                _head = _same[-1]
+            return _head.source_group_id or src_gid, _head.reason, _head
+        return src_gid, None, None
+
+    # 날짜별 최종 소유 병동. index 0 = 1일.
+    # ★★ `is_home` 을 **반드시 함께 들고 다닌다.** 병동 ID 가 현재 home 과 같다는 것은
+    #   "그 날 소속이었다" 는 뜻이 아니다 — 지금 home 인 병동으로 **과거에 파견**을
+    #   갔을 수 있다(예: A 소속으로 C 에 1/1~1/5 파견 → 1/20 A→C 영구이동).
+    #   ID 만으로 판정하면 그 파견 구간이 소속 근무로 둔갑해 띠도 사유도 사라진다.
+    _owner: list[dict] = []
+    for _i in range(days_in_month):
+        _d = date(year, month, _i + 1)
+        _gid, _reason, _asg = _home_on(_d)
+        _is_home = True
+        # ★★ 파견 겹침은 **시작일이 같을 때만 생기지 않는다.** A→X(9/1~9/30) 와
+        #   A→Y(9/10~9/20) 처럼 시작일이 달라도 9/10~20 에는 둘 다 유효하다.
+        #   시작일로 묶어 보면 이 흔한 경우를 통째로 놓친다 — **그 날 활성인 것을 센다.**
+        _active_dps = [
+            _dp for _dp in _dispatches
+            if _dp.start_date <= _d
+            and ((_dp.end_date or _dp.expected_end_date) is None
+                 or (_dp.end_date or _dp.expected_end_date) >= _d)
+        ]
+        _dp_conflict = len(_active_dps) > 1
+        if _dp_conflict:
+            _warn_conflict("기간이 겹치는 파견", _active_dps)
+        # 이동 이력이 어긋난 날부터는 소속 자체를 확정할 수 없다.
+        _move_conflict = (
+            _move_conflict_from is not None and _d >= _move_conflict_from
+        )
+        for _dp in _active_dps:
+            _gid, _reason, _is_home, _asg = (
+                _dp.target_group_id, _dp.reason, False, _dp
+            )
+        _owner.append({
+            "group_id": _gid or src_gid,
+            # 그 날 소속(home)이면서 그게 현재 home 과 같을 때만 사유가 없다.
+            "reason": None if (_is_home and (_gid or src_gid) == src_gid) else _reason,
+            "is_home": _is_home,
+            # 근거 assignment — transfers 에 **원본 날짜**를 함께 싣기 위해 들고 간다.
+            "asg_id": getattr(_asg, "id", None),
+            "asg_start": getattr(_asg, "start_date", None),
+            "asg_end": (
+                getattr(_asg, "end_date", None)
+                or getattr(_asg, "expected_end_date", None)
+            ),
+            # 그 날 유효한 파견이 둘 이상이거나 이동 이력이 어긋났다 —
+            # 승자는 규칙으로 정했지만 확정은 아니다.
+            "conflict": _dp_conflict or _move_conflict,
+        })
+
+    # ── 관련 병동 스냅샷을 그룹당 한 번만 읽는다 ─────────────────────────────
+    # ★ `is_home` 이 아니면(=파견이면) 병동이 현재 home 과 같아도 overlay 대상이다.
+    _other_gids = {
+        o["group_id"] for o in _owner
+        if not (o["is_home"] and o["group_id"] == src_gid)
+    }
+    _gname_rows = (
+        db.query(Group).filter(Group.group_id.in_(list(_other_gids))).all()
+        if _other_gids else []
+    )
+    gid_to_name = {g.group_id: g.group_name for g in _gname_rows}
+
+    _snap_cache: dict[str, tuple[dict | None, str]] = {}
+
+    def _load_group_roster(_gid: str) -> tuple[dict | None, str]:
+        """그 병동 발행본의 내 행과 **상태**.
+
+        ★ 예전에는 `dict | None` 만 돌려줘 **"아직 발행 안 됨" 과 "발행됐는데 내 행이
+          없음" 이 같은 None** 이었다. 둘은 사용자에게 다르게 보여야 한다 — 전자는
+          기다리면 되고, 후자는 대상 병동에서 누락됐다는 뜻이라 문의가 필요하다.
+        """
+        if _gid in _snap_cache:
+            return _snap_cache[_gid]
+        # ★ `_expand_target_rosters=False` — 기본값(True)은 그 병동의 관련 병동
+        #   스냅샷까지 재귀로 끌어온다. 여기서 쓰는 건 `roster.nurses` 한 줄뿐이라
+        #   대상 병동이 늘수록 조회가 곱절로 는다(`_load_group_snapshot` 과 같은 이유).
+        _snap = get_issued_roster_snapshot_service(
+            year=year, month=month, current_user=current_user, db=db,
+            target_group_id=_gid, _expand_target_rosters=False,
+        )
+        _out: dict | None = None
+        _status = TARGET_NOT_ISSUED
+        if _snap:
+            _t_roster = _snap.get("roster") or {}
+            _t_nurses = _t_roster.get("nurses") or []
+            _t_my = next(
+                (n for n in _t_nurses if str(n.get("nurse_id")) == str(nurse_id)),
+                None,
+            )
+            # 스냅샷이 있으면 대상은 발행된 것이다. 내 행 유무가 둘을 가른다.
+            _status = TARGET_ISSUED if _t_my else TARGET_NO_ROW
+            if _t_my:
+                _out = {
+                    "schedule": _t_my.get("schedule") or [],
+                    "schedule_ids": _t_my.get("schedule_ids") or [],
+                    "shift_colors": _t_roster.get("shift_colors") or {},
+                }
+        _snap_cache[_gid] = (_out, _status)
+        return _out, _status
+
+    def _color_from(_cell, _code: str, _palette: dict) -> str:
+        """셀 색. **그 병동의 색표**로만 폴백한다.
+
+        ★★ 예전에는 모든 대상 병동 색표를 하나로 머지한 뒤 조회해서, 같은 코드(D·O 등)를
+          쓰는 병동이 둘이면 **머지 순서상 마지막 병동 색이 다른 병동 구간까지 칠했다.**
+          셀에 색이 실려 오지 않는 경로(코드만 있는 스냅샷)에서 조용히 틀린다.
+        """
+        if isinstance(_cell, dict) and _cell.get("color"):
+            return str(_cell.get("color") or "")
+        return str((_palette or {}).get(_code, "") or "")
+
+    # 응답의 통합 `shift_colors` 는 범례/폴백용이다. 셀 색은 위에서 병동별로 정한다.
+    for _gid in sorted(_other_gids):
+        _d_roster, _ = _load_group_roster(_gid)
+        if _d_roster:
+            for _c, _v in (_d_roster.get("shift_colors") or {}).items():
+                shift_colors.setdefault(_c, _v)
+
+    # ── 날짜별 overlay ───────────────────────────────────────────────────────
+    for _i, _own in enumerate(_owner):
+        _gid = _own["group_id"]
+        if _own["is_home"] and _gid == src_gid:
+            # 원 소속 발행본 값을 그대로 둔다(초기화 때 채웠다).
+            # ★ 다만 이동 이력이 어긋난 날은 **그 소속 자체가 확정이 아니다.**
+            #   overlay 를 건너뛴다는 이유로 status 까지 건너뛰면, 확정할 수 없는
+            #   병동의 근무가 `confirmed` 로 나간다(코드는 원 소속 값이라 그럴듯하다).
+            if _own.get("conflict"):
+                schedule_days[_i]["status"] = CELL_ASSIGNMENT_CONFLICT
+            continue
+        _d_roster, _d_status = _load_group_roster(_gid)
+        _gname = gid_to_name.get(_gid, "")
+        if _d_roster:
+            _cells = _d_roster["schedule"]
+            _ids = _d_roster["schedule_ids"]
+            _cell = _cells[_i] if _i < len(_cells) else None
+            _code = _cell_code(_cell)
+            schedule_days[_i].update({
+                "code": _code,
+                "color": _color_from(_cell, _code, _d_roster.get("shift_colors")),
+                "schedule_id": (_ids[_i] if _i < len(_ids) else None),
+                "group_id": _gid,
+                "group_name": _gname,
+                "is_source": False,
+                "reason": _own["reason"],
+                "status": (
+                    CELL_ASSIGNMENT_CONFLICT if _own.get("conflict")
+                    else CELL_CONFIRMED
+                ),
+                "target_status": _d_status,
+            })
+        else:
+            # ★★ 대상 근무를 확인할 수 없는 구간. **원 소속 코드를 반드시 지운다.**
+            #   예전에는 `code`·`color` 를 그대로 둬서, 파견 나간 사람에게 원 병동
+            #   근무가 실제 근무처럼 보였다(병동 띠만 바뀌고 코드는 그대로).
+            #   `counts` 도 그 코드를 세어 근무 횟수까지 부풀었다.
+            schedule_days[_i].update({
+                "code": "",
+                "color": "",
+                "schedule_id": None,
+                "group_id": _gid,
+                "group_name": _gname,
+                "is_source": False,
+                "reason": _own["reason"],
+                # ★ 파견이 겹친다는 사실이 **발행 지연보다 근본 원인**이다. 발행본이
+                #   없다고 `target_not_issued` 로 덮으면 화면은 단순 발행 대기로 오인한다.
+                #   두 조건을 잃지 않도록 `target_status` 를 함께 내린다.
+                "status": (
+                    CELL_ASSIGNMENT_CONFLICT if _own.get("conflict")
+                    else CELL_TARGET_NO_ROW if _d_status == TARGET_NO_ROW
+                    else CELL_TARGET_NOT_ISSUED
+                ),
+                "target_status": _d_status,
+            })
+
+    # ── transfers: 실제로 적용된 연속 구간 단위로 조립 ───────────────────────
+    # assignment 단위가 아니라 **화면에 그려질 구간** 단위다. 겹치거나 잘린 배치가
+    # 있어도 띠와 근무가 어긋나지 않는다.
     transfers_out: list[dict] = []
-
-    if my_transfers:
-        _tgt_gids = {a.target_group_id for a in my_transfers}
-        _grows = db.query(Group).filter(Group.group_id.in_(list(_tgt_gids))).all()
-        tgid_to_name = {g.group_id: g.group_name for g in _grows}
-
-        _tgt_cache: dict[str, dict | None] = {}
-
-        def _load_my_target(_tgid: str) -> dict | None:
-            if _tgid in _tgt_cache:
-                return _tgt_cache[_tgid]
-            _snap = get_issued_roster_snapshot_service(
-                year=year, month=month, current_user=current_user, db=db,
-                target_group_id=_tgid,
-            )
-            _out: dict | None = None
-            if _snap:
-                _t_roster = _snap.get("roster") or {}
-                _t_nurses = _t_roster.get("nurses") or []
-                _t_my = next(
-                    (n for n in _t_nurses if str(n.get("nurse_id")) == str(nurse_id)),
-                    None,
-                )
-                if _t_my:
-                    _out = {
-                        "schedule": _t_my.get("schedule") or [],
-                        "schedule_ids": _t_my.get("schedule_ids") or [],
-                        "shift_colors": _t_roster.get("shift_colors") or {},
-                    }
-            _tgt_cache[_tgid] = _out
-            return _out
-
-        for _a in my_transfers:
-            _a_start = _a.start_date
-            _a_end = _a.end_date or _a.expected_end_date
-            # 월내 실제 overlap 구간 계산 (N_tail 버퍼 only 인 파견은 in_month=False → overlay 스킵)
-            _overlap_start = max(_a_start, m_start)
-            _overlap_end = min(_a_end, m_end) if _a_end else m_end
-            _in_month = _overlap_start <= _overlap_end
-            _p_start = _overlap_start.day if _in_month else 0
-            _p_end = _overlap_end.day if _in_month else 0
-            _tgid = _a.target_group_id
-            _tgt_name = tgid_to_name.get(_tgid, "")
-            _tgt = _load_my_target(_tgid)
-            _target_issued = _tgt is not None
-
-            if _in_month and _target_issued:
-                shift_colors.update(_tgt.get("shift_colors") or {})
-                _t_cells = _tgt["schedule"]
-                _t_ids = _tgt["schedule_ids"]
-                for d in range(_p_start, _p_end + 1):
-                    idx = d - 1
-                    if idx >= days_in_month:
-                        break
-                    _t_cell = _t_cells[idx] if idx < len(_t_cells) else None
-                    _code = _cell_code(_t_cell)
-                    schedule_days[idx].update({
-                        "code": _code,
-                        "color": _cell_color(_t_cell, _code),
-                        "schedule_id": (_t_ids[idx] if idx < len(_t_ids) else None),
-                        "group_id": _tgid,
-                        "group_name": _tgt_name,
-                        "is_source": False,
-                        "reason": _a.reason,
-                    })
-            elif _in_month:
-                for d in range(_p_start, _p_end + 1):
-                    idx = d - 1
-                    if idx >= days_in_month:
-                        break
-                    schedule_days[idx].update({
-                        "schedule_id": None,
-                        "group_id": _tgid,
-                        "group_name": _tgt_name,
-                        "is_source": False,
-                        "reason": _a.reason,
-                    })
-            elif _target_issued:
-                # 버퍼 내 파견이라도 target shift_colors 는 머지하여 후속 조회/렌더에 활용.
-                shift_colors.update(_tgt.get("shift_colors") or {})
-
-            transfers_out.append({
-                "reason": _a.reason,
-                "target_group_id": _tgid,
-                "target_group_name": _tgt_name,
-                "start_date": str(_a_start),
-                "end_date": str(_a_end) if _a_end else None,
-                "period_start_day": _p_start,
-                "period_end_day": _p_end,
-                "target_issued": _target_issued,
-            })
-
-    # 과거 home overlay (영구 병동이동 inbound):
-    # 본인이 src_gid 로 이동해 들어온 경우, transfer.start_date 이전 일자는
-    # 이전 home(source_group_id) 근무표를 참조해 채운다.
-    if my_inbound_transfers:
-        _src_home_gids = {a.source_group_id for a in my_inbound_transfers}
-        _src_grows = db.query(Group).filter(Group.group_id.in_(list(_src_home_gids))).all()
-        _src_gid_to_name = {g.group_id: g.group_name for g in _src_grows}
-        _prev_home_cache: dict[str, dict | None] = {}
-
-        def _load_my_prev_home(_pgid: str) -> dict | None:
-            if _pgid in _prev_home_cache:
-                return _prev_home_cache[_pgid]
-            _snap = get_issued_roster_snapshot_service(
-                year=year, month=month, current_user=current_user, db=db,
-                target_group_id=_pgid,
-            )
-            _out: dict | None = None
-            if _snap:
-                _p_roster = _snap.get("roster") or {}
-                _p_nurses = _p_roster.get("nurses") or []
-                _p_my = next(
-                    (n for n in _p_nurses if str(n.get("nurse_id")) == str(nurse_id)),
-                    None,
-                )
-                if _p_my:
-                    _out = {
-                        "schedule": _p_my.get("schedule") or [],
-                        "schedule_ids": _p_my.get("schedule_ids") or [],
-                        "shift_colors": _p_roster.get("shift_colors") or {},
-                    }
-            _prev_home_cache[_pgid] = _out
-            return _out
-
-        for _a in my_inbound_transfers:
-            _a_start = _a.start_date
-            # 이전 home 구간: 월 시작 ~ transfer 시작일 전날 (월 내 strict overlap)
-            if _a_start <= m_start:
-                continue  # 월 시작 이전에 이미 이동 완료 — 이전 home 표시 불필요
-            _prev_end = min(_a_start - timedelta(days=1), m_end)
-            _prev_start = m_start
-            if _prev_start > _prev_end:
-                continue
-            _pgid = _a.source_group_id
-            _pgname = _src_gid_to_name.get(_pgid, "")
-            _prev = _load_my_prev_home(_pgid)
-            _prev_issued = _prev is not None
-
-            _p_start = _prev_start.day
-            _p_end = _prev_end.day
-
-            if _prev_issued:
-                shift_colors.update(_prev.get("shift_colors") or {})
-                _p_cells = _prev["schedule"]
-                _p_ids = _prev["schedule_ids"]
-                for d in range(_p_start, _p_end + 1):
-                    idx = d - 1
-                    if idx >= days_in_month:
-                        break
-                    _p_cell = _p_cells[idx] if idx < len(_p_cells) else None
-                    _code = _cell_code(_p_cell)
-                    schedule_days[idx].update({
-                        "code": _code,
-                        "color": _cell_color(_p_cell, _code),
-                        "schedule_id": (_p_ids[idx] if idx < len(_p_ids) else None),
-                        "group_id": _pgid,
-                        "group_name": _pgname,
-                        "is_source": False,
-                        "reason": _a.reason,
-                    })
-            else:
-                # 이전 home snapshot 미발행 → cell 비우고 group/reason 만 표시
-                for d in range(_p_start, _p_end + 1):
-                    idx = d - 1
-                    if idx >= days_in_month:
-                        break
-                    schedule_days[idx].update({
-                        "code": "",
-                        "schedule_id": None,
-                        "group_id": _pgid,
-                        "group_name": _pgname,
-                        "is_source": False,
-                        "reason": _a.reason,
-                    })
-
-            # 이전 home: 프론트가 별도 분기 없이도 식별 가능하도록 라벨에 접두어
-            _label = f"이전: {_pgname}" if _pgname else "이전 병동"
-            transfers_out.append({
-                "reason": _a.reason,
-                "target_group_id": _pgid,
-                "target_group_name": _label,
-                "start_date": str(_prev_start),
-                "end_date": str(_prev_end),
-                "period_start_day": _p_start,
-                "period_end_day": _p_end,
-                "target_issued": _prev_issued,
-                "is_prev_home": True,
-            })
+    _i = 0
+    while _i < days_in_month:
+        _gid = _owner[_i]["group_id"]
+        _home = _owner[_i]["is_home"]
+        # ★ 현재 home 에 **소속으로** 있는 날만 건너뛴다. 같은 병동이라도 그 날이
+        #   파견이면 띠를 그려야 한다(ID 만으로 거르면 파견 구간이 사라진다).
+        # ★★ 충돌 구간도 건너뛰지 않는다 — 이동 이력이 어긋난 결과 병동이 마침
+        #   현재 소속과 같으면, 셀은 `assignment_conflict` 인데 그 구간을 나타내는
+        #   `transfers` 항목이 없어 **한 응답 안에서 필드끼리 다른 말을 하게 된다**
+        #   (띠를 정본으로 쓰는 화면은 충돌을 못 본다).
+        if _home and _gid == src_gid and not _owner[_i].get("conflict"):
+            _i += 1
+            continue
+        _j = _i
+        while (_j + 1 < days_in_month
+               and _owner[_j + 1]["group_id"] == _gid
+               and _owner[_j + 1]["reason"] == _owner[_i]["reason"]
+               and _owner[_j + 1]["is_home"] == _home
+               # 같은 병동·사유라도 **다른 배치면 구간을 나눈다** — 원본 날짜가 섞이면
+               # 어느 배치의 기간인지 말할 수 없게 된다.
+               and _owner[_j + 1]["asg_id"] == _owner[_i]["asg_id"]
+               and bool(_owner[_j + 1].get("conflict"))
+                   == bool(_owner[_i].get("conflict"))):
+            _j += 1
+        _, _seg_status = _load_group_roster(_gid)
+        _seg_reason = _owner[_i]["reason"] or ""
+        # 과거 home 구간(이 병동을 **떠나온** 뒤의 달력 앞부분)은 라벨로 구분한다.
+        # ★ 파견 구간에는 붙이지 않는다 — 파견은 '이전 병동' 이 아니다.
+        _is_prev_home = _home and bool(_moves) and any(
+            m.source_group_id == _gid and m.start_date > date(year, month, _i + 1)
+            for m in _moves
+        )
+        _gname = gid_to_name.get(_gid, "")
+        _label = (f"이전: {_gname}" if _gname else "이전 병동") if _is_prev_home else _gname
+        transfers_out.append({
+            "reason": _seg_reason,
+            "target_group_id": _gid,
+            "target_group_name": _label,
+            # ★ `start_date`/`end_date` 는 **그 달에 실제로 보이는 구간**이다.
+            #   달을 넘는 배치는 여기서 잘리므로, 배치 원본 기간이 필요하면
+            #   아래 `assignment_*` 를 본다(옛 응답의 그 값이다).
+            "start_date": str(date(year, month, _i + 1)),
+            "end_date": str(date(year, month, _j + 1)),
+            "assignment_id": _owner[_i]["asg_id"],
+            "assignment_start_date": (
+                str(_owner[_i]["asg_start"]) if _owner[_i]["asg_start"] else None
+            ),
+            "assignment_end_date": (
+                str(_owner[_i]["asg_end"]) if _owner[_i]["asg_end"] else None
+            ),
+            "period_start_day": _i + 1,
+            "period_end_day": _j + 1,
+            # 하위호환 boolean. ★ 의미는 **"그 병동이 발행했는가"** 다
+            #   (`assignment_service.get_roster_assignments` 와 같은 뜻).
+            #   예전에는 여기서만 '본인 행까지 있는가' 로 계산해, 같은 이름의 필드가
+            #   두 응답에서 다른 것을 뜻했다. 본인 행 유무는 `target_status` 로 본다.
+            "target_issued": _seg_status != TARGET_NOT_ISSUED,
+            # 신규 — 미발행/내 행 누락을 구분한다(TARGET_* 중 하나).
+            "target_status": _seg_status,
+            # 이 구간에 기간이 겹치는 파견이 있어 **어느 병동이 맞는지 확정할 수 없다.**
+            # 띠는 그리되 확정으로 보이면 안 된다(셀 `status` 와 같은 사실을 구간 단위로).
+            "has_conflict": any(
+                _owner[_k].get("conflict") for _k in range(_i, _j + 1)
+            ),
+            **({"is_prev_home": True} if _is_prev_home else {}),
+        })
+        _i = _j + 1
 
     # counts 최종 재계산
+    # ★★ `assignment_conflict` 셀은 **확정 통계에서 뺀다.** 겹친 파견 중 정렬 규칙으로
+    #   고른 임시 값이라 후보가 바뀌면 숫자도 바뀐다 — 그걸 확정 근무 횟수로 합산하면
+    #   사용자는 흔들리는 값을 사실로 받는다. 대신 `provisional_counts` 로 따로 알린다.
     counts: dict[str, int] = {code: 0 for code in shift_colors}
+    provisional_counts: dict[str, int] = {}
     for _d in schedule_days:
         _c = _d["code"]
-        if _c:
+        if not _c:
+            continue
+        if _d.get("status") == CELL_ASSIGNMENT_CONFLICT:
+            provisional_counts[_c] = provisional_counts.get(_c, 0) + 1
+        else:
             counts[_c] = counts.get(_c, 0) + 1
 
     # 관련 병동(group) 목록: 본인 소속 + 파견/이동 target 전체
@@ -1487,6 +1725,9 @@ def get_my_issued_roster_service(
         "shift_colors": shift_colors,
         "schedule": schedule_days,
         "counts": counts,
+        # 겹친 파견 구간의 **임시** 근무 횟수. 확정 `counts` 와 분리해 내려,
+        # 화면이 "확인 필요" 로 구분해 보여줄 수 있게 한다(비어 있으면 충돌 없음).
+        "provisional_counts": provisional_counts,
         "transfers": transfers_out,
         "groups": groups_out,
     }
@@ -1580,6 +1821,10 @@ def get_my_issued_week_service(
             "group_name": (cell or {}).get("group_name"),
             "is_today": d == today,
             "issued": data is not None,
+            # ★ `issued=True` + `code=None` 은 두 가지다 — 그 날 쉬는 것(미배정)과
+            #   **파견지가 아직 발행을 안 해 모르는 것**. 대시보드가 둘을 같은
+            #   '미배정' 으로 그리지 않도록 월간 조회가 판정한 셀 상태를 그대로 싣는다.
+            "status": (cell or {}).get("status") or CELL_CONFIRMED,
         })
 
     today_cell = next((c for c in days_out if c["is_today"]), None)
@@ -1654,16 +1899,28 @@ def _shift_meta_by_code(snapshot: dict | None) -> dict[str, dict]:
     return out
 
 
-def _cell_is_unknown(code: str, meta: dict[str, dict]) -> bool:
-    """그 셀의 배정을 **알 수 없는가** — 파견지 발행본이 없는 날.
+def _cell_is_unknown(cell_or_code, meta: dict[str, dict]) -> bool:
+    """그 셀의 배정을 **알 수 없는가** — 파견지 발행본이 없거나 내 행이 없는 날.
 
-    ★ 이때 셀에는 코드가 남아 있지만 그건 **홈 병동의 잔여값**이다
-      (`get_my_issued_roster_service` 의 미발행 분기가 `group_id` 만 바꾸고 `code` 는
-      안 건드린다). `_meta_for_cell` 이 그 경우 빈 메타를 돌려주므로 여기서 가려낸다.
+    ★ 판정은 셀의 `status` 가 정본이다(`CELL_*`). 월간 조회가 그 구간의 코드를
+      비우면서 이유를 함께 실어 주므로, 여기서 추정할 필요가 없다.
+    ★ 옛 경로 호환 — `code` 문자열만 받으면 예전 규칙(코드는 있는데 메타가 비었다
+      = 홈 병동 잔여값)으로 판정한다. 셀을 통째로 넘기는 호출부가 정확하다.
     ★★ 이 판정을 **모든 소비처가 함께** 써야 한다. 한 곳만 막으면 나머지가 낡은 코드를
       진짜 배정처럼 내보낸다(실제로 그렇게 반쪽만 막았다가 지적받았다).
     """
-    return bool(code) and not meta
+    if isinstance(cell_or_code, dict):
+        _status = cell_or_code.get("status")
+        # ★ `assignment_conflict` 도 **미확정이다.** 겹친 파견 중 정렬 규칙으로 고른
+        #   임시 승자를 today 의 `my_shift`·동료, 원티드 반영 판정, 다음 OFF 계산이
+        #   확정 사실로 쓰면 실제 출근 병동을 틀리게 안내한다.
+        if _status in (
+            CELL_TARGET_NOT_ISSUED, CELL_TARGET_NO_ROW, CELL_ASSIGNMENT_CONFLICT
+        ):
+            return True
+        _code = _raw_cell_code(cell_or_code)
+        return bool(_code) and not meta
+    return bool(cell_or_code) and not meta
 
 
 def _code_view(code: str, meta: dict[str, dict]) -> dict:
@@ -1890,7 +2147,7 @@ def _reflection_entries(
         # 파견지 미발행 날은 셀의 코드가 홈 병동 잔여값이다. 그대로 쓰면 문자열 폴백이
         # **반영으로 오판**하고(요청도 홈 코드라 곧잘 맞는다) 배정까지 표시돼 반영률이
         # 부풀려진다. 알 수 없는 날은 배정 없음(`assigned: null`)·미반영으로 둔다.
-        unknown = _cell_is_unknown(asg_code, asg_meta)
+        unknown = _cell_is_unknown(cell, asg_meta)
         shown_code = "" if unknown else asg_code
         out.append({
             "date": req_date.isoformat(),
@@ -2114,6 +2371,9 @@ def _next_off_from(db: Session, current_user, cache: dict, target: date) -> dict
       가 주 경계에서 쓰는 것과 같은 패턴). 다음 달이 아직 미발행이면 알 수 없으므로
       `unknown_not_issued` 로 내린다 — `null`/`0` 으로 눕히면 'OFF 가 없다' 와
       구분이 사라진다.
+    ★ '모름' 도 이유를 가른다 — 겹친 파견이라 근무를 정할 수 없는 날은
+      `unknown_assignment_conflict` 다. 데이터 충돌을 '발행 대기' 로 말하면
+      사용자는 기다리면 된다고 오해하고 운영도 원인을 못 가른다.
     ★ 코드가 비었거나(미배정) 스냅샷에 정의가 없는 코드는 근무로도 OFF 로도 세지
       않고 지나간다. 모르는 것을 근무로 세면 연속근무일이 부풀려진다.
     ★ 코드 정의는 **그 날 셀이 속한 병동** 기준이다(`_meta_for_cell`). 파견 날은
@@ -2132,10 +2392,17 @@ def _next_off_from(db: Session, current_user, cache: dict, target: date) -> dict
         cell = _cell_of_day(my_month, day.day)
         code = _raw_cell_code(cell)
         meta = _meta_for_cell(db, current_user, cache, day.year, day.month, cell, home_meta)
-        # 파견지 미발행 날 — 배정이 있는데도 근무인지 OFF 인지 알 수 없다. 건너뛰고
-        # 계속 세면 그 뒤 연속근무일이 통째로 틀리므로 여기서 '모름' 으로 끊는다.
-        if _cell_is_unknown(code, meta):
-            return _next_off_result("unknown_not_issued", None, None, work_days, None)
+        # 근무를 알 수 없는 날 — 건너뛰고 계속 세면 그 뒤 연속근무일이 통째로 틀리므로
+        # 여기서 '모름' 으로 끊는다.
+        # ★ 왜 모르는지까지 구분한다. 겹친 파견(데이터 충돌)을 '발행 대기' 로 말하면
+        #   사용자는 기다리면 된다고 오해하고, 운영도 원인을 못 가른다.
+        if _cell_is_unknown(cell, meta):
+            _why = (
+                "unknown_assignment_conflict"
+                if (cell or {}).get("status") == CELL_ASSIGNMENT_CONFLICT
+                else "unknown_not_issued"
+            )
+            return _next_off_result(_why, None, None, work_days, None)
         cell_meta = meta.get(code)
         if not code or not cell_meta:
             continue
@@ -2178,7 +2445,7 @@ def get_my_today_service(
 
     # 파견지 미발행 날은 셀에 홈 병동 잔여 코드가 남아 있다. 그걸 `my_shift` 로 내보내면
     # 실제로는 모르는 날에 화면이 D/E/N/O 를 단정해 보여준다. 알 수 없으면 비운다.
-    unknown = _cell_is_unknown(code, meta)
+    unknown = _cell_is_unknown(cell, meta)
     result = {
         "date": target.isoformat(),
         "issued": my_month is not None,
@@ -2190,7 +2457,11 @@ def get_my_today_service(
         "my_shift": None if unknown else (_code_detail(code, meta) if code else None),
     }
     if include_coworkers:
-        result["coworkers"] = _coworkers_of_day(
+        # ★★ 내 근무를 모르는 날은 **동료도 확정할 수 없다.** 겹친 파견 중 정렬로 고른
+        #   임시 병동(`day_gid`)·코드로 동료를 계산하면, 미확정인데도 특정 병동 명단이
+        #   사실처럼 나간다. 라우터 계약도 "`shift_unknown` 이면 빈 목록" 이다
+        #   (문서에는 있었는데 구현이 지키지 않았다).
+        result["coworkers"] = [] if unknown else _coworkers_of_day(
             db, day_snapshot, meta, nurse_id, target.day, code
         )
     if include_next_off:

@@ -765,7 +765,18 @@ async def get_issued_roster_snapshot(
                             "end_date": _a["end_date"],
                             "period_start_day": _p_start,
                             "period_end_day": _p_end,
-                            "target_issued": bool(_tgid and _tgid_issued.get(_tgid)),
+                            # ★★ `get_roster_assignments` 가 **발행 스냅샷**을 정본으로
+                            #   판정해 넣어 준 값을 그대로 전달한다. 여기서 `Schedule` 행
+                            #   유무로 다시 계산하면, 스냅샷은 있는데 issued Schedule 행이
+                            #   없는(또는 그 반대) 상태에서 **같은 병동·월에 대해 응답마다
+                            #   `target_issued` 가 달라진다.** `target_status` 도 함께 넘겨야
+                            #   프론트가 '발행됐지만 내 행 없음' 을 구분할 수 있다.
+                            "target_issued": _a.get(
+                                "target_issued",
+                                bool(_tgid and _tgid_issued.get(_tgid)),
+                            ),
+                            **({"target_status": _a["target_status"]}
+                               if _a.get("target_status") else {}),
                         }
                     )
 
@@ -1365,7 +1376,13 @@ async def get_roster_by_schedule_id(
                         "end_date": _a["end_date"],
                         "period_start_day": _p_start,
                         "period_end_day": _p_end,
-                        "target_issued": bool(_tgid and _tgid_issued.get(_tgid)),
+                        # 위와 같은 이유 — 발행 스냅샷 판정을 정본으로 그대로 전달한다.
+                        "target_issued": _a.get(
+                            "target_issued",
+                            bool(_tgid and _tgid_issued.get(_tgid)),
+                        ),
+                        **({"target_status": _a["target_status"]}
+                           if _a.get("target_status") else {}),
                     }
                 )
             nurse_entry["assignments"] = _assignments_out
