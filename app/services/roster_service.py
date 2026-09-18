@@ -324,7 +324,9 @@ _PRESERVE_IF_NONE = (
 #  `roster_config` 는 dev·prod 스키마가 갈려 있어 모델에 올리지 않고 raw SQL 로만 다룬다
 #  (`roster_create_service._holiday_off_enabled` 의 판단과 같은 규약).
 #  모델 밖이라 `_PRESERVE_IF_NONE` 이 못 잡고, INSERT 에서 통째로 빠져 **NULL 로 저장**된다.
-_PRESERVE_RAW_COLUMNS = ("fixed_holiday_off_yn",)
+#  ★ `n2n_min_gap`(N 블록 간 최소 간격 하드)도 같은 처지다 — 여기 없으면 켜 둔 병동이
+#    **근무표를 한 번 생성할 때마다 꺼진다**(생성이 config 를 포크하기 때문).
+_PRESERVE_RAW_COLUMNS = ("fixed_holiday_off_yn", "n2n_min_gap")
 
 
 def _inherit_raw_columns(db: Session, new_config_id, baseline_config_id) -> None:

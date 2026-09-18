@@ -1208,6 +1208,40 @@ def _holiday_off_enabled(db: Session, group_id: str) -> bool:
         return False
 
 
+def _n2n_min_gap_setting(db: Session, group_id: str) -> int:
+    """`roster_config.n2n_min_gap` — N 블록 간 최소 간격 하드(0=해제, 실효 4부터).
+
+    ★ `_holiday_off_enabled` 와 **같은 규약**으로 raw SQL 로 읽는다.
+      `roster_config` 는 dev·prod 스키마가 갈려 있어(모델에만 있는 컬럼 10개 ·
+      dev 에만 있는 컬럼 11개) 모델에 얹으면 컬럼 없는 환경에서 설정 조회가 통째로
+      깨진다. 존재를 먼저 확인하고 없으면 0(해제)으로 떨어뜨리므로 **코드를 먼저
+      배포하고 DDL 을 나중에 넣어도 안전하다.**
+
+    ★★ 이 함수가 없으면 DDL 을 넣어도 **엔진이 못 읽는다** — ORM 모델에 없는 컬럼이라
+      `latest_config.__dict__` 에 안 담기고, `config_data.get("n2n_min_gap", 0)` 이
+      항상 0 이 되어 하드가 영원히 꺼져 있다.
+    ★ 포크 승계는 `roster_service._PRESERVE_RAW_COLUMNS` 가 맡는다. 거기 없으면
+      **생성할 때마다 설정이 NULL 로 꺼진다**(`cb88978` 이 같은 함정을 고쳤다).
+    """
+    from sqlalchemy import text
+
+    try:
+        has_col = db.execute(text(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'roster_config' AND COLUMN_NAME = 'n2n_min_gap'"
+        )).first()
+        if not has_col:
+            return 0
+        row = db.execute(text(
+            "SELECT TOP 1 n2n_min_gap FROM roster_config "
+            "WHERE group_id = :g ORDER BY config_id DESC"
+        ), {"g": group_id}).first()
+        return int(row[0]) if (row and row[0] is not None) else 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[N2N-MinGap] 설정 조회 실패 — 해제로 진행: {exc}")
+        return 0
+
+
 def _kr_holidays_in_month(year: int, month: int) -> set[int]:
     """그 달의 한국 공휴일(대체공휴일 포함) 일자. 조회 실패 시 빈 집합.
 
@@ -5470,6 +5504,10 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     # 일자별 요구치 우선 적용
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
     config_dict['daily_shift_requirements_max_by_day'] = daily_shift_requirements_max_by_day
+    # N 블록 간 최소 간격 하드 — 모델 밖 컬럼이라 raw SQL 로 읽어 주입한다.
+    #   컬럼이 없는 환경에서는 0(해제)이라 동작 불변. `config_override` 가 아래에서 덮으므로
+    #   A/B·완화 재시도가 이 값을 이긴다(4차 완화가 0 으로 내려 재생성하는 경로).
+    config_dict["n2n_min_gap"] = _n2n_min_gap_setting(db, current_user.group_id)
     # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
     if getattr(req, "not_one_night", None) is not None:
         config_dict["not_one_night"] = bool(req.not_one_night)
