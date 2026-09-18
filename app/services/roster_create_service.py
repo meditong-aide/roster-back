@@ -1220,8 +1220,15 @@ def _n2n_min_gap_setting(db: Session, group_id: str) -> int:
     ★★ 이 함수가 없으면 DDL 을 넣어도 **엔진이 못 읽는다** — ORM 모델에 없는 컬럼이라
       `latest_config.__dict__` 에 안 담기고, `config_data.get("n2n_min_gap", 0)` 이
       항상 0 이 되어 하드가 영원히 꺼져 있다.
-    ★ 포크 승계는 `roster_service._PRESERVE_RAW_COLUMNS` 가 맡는다. 거기 없으면
-      **생성할 때마다 설정이 NULL 로 꺼진다**(`cb88978` 이 같은 함정을 고쳤다).
+
+    ★★ **`n2n_min_gap IS NOT NULL` 조건이 핵심이다.** 생성은 시작할 때 config 를 포크하는데
+      (`materialize_generation_config` · `roster_create_service:5127`), 그 INSERT 는 모델 밖
+      컬럼을 담지 못해 새 config 의 `n2n_min_gap` 이 **NULL** 이 된다. 그런데 이 조회는
+      포크 **뒤**(:5532)에 돌기 때문에, 조건 없이 `ORDER BY config_id DESC` 로 읽으면
+      **방금 만들어진 NULL 행**을 집어 항상 0 이 된다 — 켜 둔 설정이 첫 생성부터 무시된다.
+      NULL 행을 건너뛰면 운영자가 실제로 값을 넣은 config 를 찾으므로
+      `_PRESERVE_RAW_COLUMNS` 승계 여부와 **무관하게** 동작한다(그 승계가 없는 main 에서도).
+    ★ 끄려면 NULL 이 아니라 **0 을 명시**해야 한다. NULL 은 "설정한 적 없음" 이다.
     """
     from sqlalchemy import text
 
@@ -1234,7 +1241,8 @@ def _n2n_min_gap_setting(db: Session, group_id: str) -> int:
             return 0
         row = db.execute(text(
             "SELECT TOP 1 n2n_min_gap FROM roster_config "
-            "WHERE group_id = :g ORDER BY config_id DESC"
+            "WHERE group_id = :g AND n2n_min_gap IS NOT NULL "
+            "ORDER BY config_id DESC"
         ), {"g": group_id}).first()
         return int(row[0]) if (row and row[0] is not None) else 0
     except Exception as exc:  # noqa: BLE001
