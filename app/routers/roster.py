@@ -2,6 +2,7 @@ import pprint
 import uuid
 from datetime import date
 from datetime import datetime
+from datetime import timedelta as _timedelta
 
 from fastapi import APIRouter, HTTPException, Depends, Body, Query
 from fastapi.templating import Jinja2Templates
@@ -729,6 +730,64 @@ async def get_issued_roster_snapshot(
                 # 프론트 전달용 assignments 배열 (period_*, target_issued 포함)
                 _assignments_out: list[dict] = []
 
+                # ── 날짜별 '그 날 유효한 배치' 를 미리 센다 ──────────────────────
+                # ★★ 화면이 `assignments[]` 를 날짜마다 다시 매칭해 상태를 추론하지
+                #   않도록, 아래에서 **셀 자체에** status 를 싣기 위한 준비다.
+                #   둘 이상이면 어느 병동이 맞는지 데이터로 정할 수 없다(충돌).
+                _active_by_day: dict[int, list] = {}
+                for _a0 in _a_list:
+                    _s0 = _coerce_date(_a0.get("start_date"))
+                    if _s0 is None:
+                        continue
+                    _e0 = _coerce_date(_a0.get("end_date")) or _m_end
+                    _f = max(_s0, _m_start)
+                    _t = min(_e0, _m_end)
+                    _d0 = _f
+                    while _d0 <= _t:
+                        _active_by_day.setdefault(_d0.day, []).append(_a0)
+                        _d0 += _timedelta(days=1)
+
+                def _cell_status_for(_day: int, _asg: dict) -> tuple[str, str | None]:
+                    """(셀 status, 대상 병동 발행 상태). 개인 API 계약과 같은 값."""
+                    _ts = _asg.get("target_status")
+                    if len(_active_by_day.get(_day, [])) > 1:
+                        return "assignment_conflict", _ts
+                    # ★★ 휴직·퇴사는 **대상 병동이 없다**(`target_group_id` 가 비어
+                    #   `target_status` 도 안 붙는다). 이걸 '상태 정보 없음' 으로 읽어
+                    #   `confirmed` 로 돌리면 그 기간의 원 소속 코드가 남은 채
+                    #   **확정 근무라고 단언**하게 된다. 근무가 없는 것이 확정이므로
+                    #   코드는 비우되(`_put_cell`) 상태는 확정으로 둔다 —
+                    #   빈 코드 + `confirmed` = 미배정, 사유는 `reason` 이 말한다.
+                    if not (_asg.get("target_group_id") or "").strip():
+                        return "confirmed", None
+                    if _ts == "no_row":
+                        return "target_no_row", _ts
+                    if _ts == "not_issued":
+                        return "target_not_issued", _ts
+                    return "confirmed", _ts
+
+                def _put_cell(_idx: int, _code, _reason: str, _day: int, _asg: dict):
+                    """셀에 코드·사유·상태를 함께 싣는다.
+
+                    ★ 확정이 아닌 날은 **코드를 비운다.** 예전에는 원 소속 코드나
+                      사유 문자열('파견')이 코드 자리에 남아, 파견 나간 사람의 옛 병동
+                      근무가 확정 근무처럼 그려졌다(개인 API 에서 먼저 고친 문제).
+                    """
+                    _st, _ts = _cell_status_for(_day, _asg)
+                    # 대상 병동이 없는 배치(휴직·퇴사)는 그 기간에 이 병동 근무가 없다.
+                    # 상태가 `confirmed` 여도 **코드는 비워야** 원 소속 근무가 안 남는다.
+                    _no_ward = not (_asg.get("target_group_id") or "").strip()
+                    _base = _code if isinstance(_code, dict) else {"code": _code or ""}
+                    _base = dict(_base)
+                    if _st != "confirmed" or _no_ward:
+                        _base["code"] = ""
+                        _base["color"] = ""
+                    _base["reason"] = _reason
+                    _base["status"] = _st
+                    if _ts:
+                        _base["target_status"] = _ts
+                    _sched[_idx] = _base
+
                 _nurse["inbound"] = [
                     {
                         "startDate": _a["start_date"],
@@ -789,16 +848,12 @@ async def get_issued_roster_snapshot(
                             idx = d - 1
                             tgt = _my_tgt_roster.get(d)
                             if tgt and idx < len(_sched):
-                                _cell = tgt[0]
-                                if isinstance(_cell, dict):
-                                    _cell["reason"] = _a["reason"]
-                                else:
-                                    _cell = {"code": _cell, "reason": _a["reason"]}
-                                _sched[idx] = _cell
+                                _put_cell(idx, tgt[0], _a["reason"], d, _a)
                                 if idx < len(_sids):
                                     _sids[idx] = tgt[1]
                             elif idx < len(_sched):
-                                _sched[idx] = {"code": _a["reason"], "reason": _a["reason"]}
+                                # 대상 근무를 못 찾은 날 — 사유를 코드 자리에 넣지 않는다.
+                                _put_cell(idx, "", _a["reason"], d, _a)
                                 if idx < len(_sids):
                                     _sids[idx] = None
                     else:
@@ -814,21 +869,14 @@ async def get_issued_roster_snapshot(
                             idx = d - 1
                             tgt = _tgt_map.get(d)
                             if tgt and idx < len(_sched):
-                                _cell = tgt[0]
-                                if isinstance(_cell, dict):
-                                    _cell["reason"] = _a["reason"]
-                                else:
-                                    _cell = {"code": _cell, "reason": _a["reason"]}
-                                _sched[idx] = _cell
+                                _put_cell(idx, tgt[0], _a["reason"], d, _a)
                                 if idx < len(_sids):
                                     _sids[idx] = tgt[1]
                                 continue
                             if idx < len(_sched):
-                                _cell = _sched[idx]
-                                if isinstance(_cell, dict):
-                                    _cell["reason"] = _a["reason"]
-                                else:
-                                    _sched[idx] = {"code": _cell, "reason": _a["reason"]}
+                                # ★ 기존 셀(= 원 소속 코드)에 사유만 붙이던 자리.
+                                #   확정이 아니면 `_put_cell` 이 코드를 비운다.
+                                _put_cell(idx, _sched[idx], _a["reason"], d, _a)
                             if idx < len(_sids):
                                 _sids[idx] = None
 
