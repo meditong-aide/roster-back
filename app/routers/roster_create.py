@@ -203,6 +203,10 @@ async def roster_create_async(
                 status_code=400, detail=f"설정 materialize 실패: {exc}"
             ) from exc
         req.config_id = resolved.config_id
+        # 포크된 새 config 에 모델 밖 컬럼(`n2n_min_gap`)을 baseline 에서 승계한다.
+        #   운영 주 경로가 여기라 빠뜨리면 설정이 config 마다 흩어져 끄기가 어려워진다.
+        from services.roster_create_service import inherit_n2n_min_gap
+        inherit_n2n_min_gap(_db, target_group_id, resolved.config_id)
         req.config = None  # 워커는 config_id 만 사용 — job_body 슬림화
         materialized = {
             "config_id": resolved.config_id,

@@ -1250,6 +1250,48 @@ def _n2n_min_gap_setting(db: Session, group_id: str) -> int:
         return 0
 
 
+def inherit_n2n_min_gap(db: Session, group_id: str, new_config_id) -> None:
+    """포크된 새 config 에 `n2n_min_gap` 을 승계한다(값이 비어 있을 때만).
+
+    ★ 왜 필요한가 — 생성이 config 를 포크할 때(`materialize_generation_config`) 그 INSERT 는
+      **모델 밖 컬럼을 담지 못해** 새 config 의 `n2n_min_gap` 이 NULL 이 된다.
+      조회(`_n2n_min_gap_setting`)는 `IS NOT NULL` 로 값 있는 행을 찾으므로 **설정은 유지되지만**,
+      config 가 쌓일수록 **끄기가 어려워진다** — 최신 행을 NULL 로 되돌려도 옛 행이 읽힌다.
+      승계해 두면 최신 config 에 항상 값이 있어 **그 행만 0 으로 바꾸면 꺼진다.**
+    ★ `roster_service._PRESERVE_RAW_COLUMNS` 와 같은 목적인데, 그쪽은 `roster_service.py` 가
+      main↔dev 로 크게 갈려 있어(2026-09-18 실측 1474줄) 여기서 처리한다.
+    ★ 컬럼이 없는 환경에서도 안전하도록 존재를 먼저 확인한다.
+    ★ **이미 값이 있으면 건드리지 않는다**(`AND n2n_min_gap IS NULL`) — 운영자가 새 config 에
+      직접 넣은 값을 옛 값으로 덮으면 안 된다.
+    ★★ 출처는 **baseline(포크 직전 config)** 이다 — "값이 있는 아무 config" 가 아니다.
+      운영자가 고른 baseline 을 그대로 따라야 설정 이력이 갈리지 않는다. baseline 이
+      비어 있으면 새 config 도 비는 게 맞다(그 config 에는 원래 설정이 없었다는 뜻).
+    """
+    if not new_config_id:
+        return
+    from sqlalchemy import text
+
+    try:
+        has_col = db.execute(text(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'roster_config' AND COLUMN_NAME = 'n2n_min_gap'"
+        )).first()
+        if not has_col:
+            return
+        db.execute(text(
+            "UPDATE roster_config SET n2n_min_gap = ("
+            "  SELECT TOP 1 n2n_min_gap FROM roster_config "
+            "  WHERE group_id = :g AND config_id < :n "
+            "  ORDER BY config_id DESC"
+            ") WHERE config_id = :n AND n2n_min_gap IS NULL"
+        ), {"g": group_id, "n": new_config_id})
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        # 승계 실패가 생성을 막지 않게 한다 — 조회의 `IS NOT NULL` 이 백업으로 동작한다.
+        db.rollback()
+        print(f"[N2N-MinGap] config 승계 실패(무시): {exc}")
+
+
 def _kr_holidays_in_month(year: int, month: int) -> set[int]:
     """그 달의 한국 공휴일(대체공휴일 포함) 일자. 조회 실패 시 빈 집합.
 
@@ -5115,6 +5157,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             override_group_id=current_user.group_id,
         )
         req.config_id = _mat.config_id
+        # 포크된 새 config 에 모델 밖 컬럼을 baseline 에서 승계한다. 안 하면 값이 NULL 로
+        #   들어가 config 가 쌓일수록 **끄기가 어려워진다**(옛 행이 계속 읽힌다).
+        inherit_n2n_min_gap(db, current_user.group_id, _mat.config_id)
         req.config = None
     wanted = (
         db.query(Wanted)
