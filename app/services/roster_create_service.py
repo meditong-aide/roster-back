@@ -6453,7 +6453,23 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 _by_day = [dict(_base_req) for _ in range(_days_in_month)]
             else:
                 _by_day = [dict(dm or {}) for dm in _by_day]
+            # ★★ max(상한) 맵도 같이 내려야 한다. min 만 빼면 솔버는 [min-1, max] 창을
+            #   보게 되고, 상한까지 채운 날에 고정근무자가 얹혀 **설정 max 를 초과**한다.
+            #   실측 성남ICU-RN 2026-10 VER37(min 4/4/4 · max 5/5/5): 6일 D 솔버 5 +
+            #   김은경(고정 D) 1 = 6 > max 5. 초과 1칸이 정확히 이 경로로 났다.
+            _by_day_max = config_dict.get("daily_shift_requirements_max_by_day")
+            _has_max = isinstance(_by_day_max, list) and len(_by_day_max) == _days_in_month
+            _max_active: list[set] = []
+            if _has_max:
+                _by_day_max = [dict(dm or {}) for dm in _by_day_max]
+                # 원래 상한이 걸려 있던 (일, 코드). 엔진은 max 0 을 '상한 없음' 으로 읽으므로
+                # 차감으로 0 이 된 칸을 그냥 두면 상한이 통째로 사라진다. 아래에서 되살핀다.
+                _max_active = [
+                    {_k for _k, _v in dm.items() if int(_v or 0) > 0}
+                    for dm in _by_day_max
+                ]
             _fx_cut = 0
+            _fx_cut_max = 0
             for _codes in _fx_roster_pre.values():
                 for _d, _code in enumerate(_codes or []):
                     if _d >= _days_in_month:
@@ -6462,10 +6478,34 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                     if _c in _by_day[_d] and int(_by_day[_d][_c] or 0) > 0:
                         _by_day[_d][_c] = int(_by_day[_d][_c]) - 1
                         _fx_cut += 1
+                    # max 는 0 = 상한 없음 이므로 양수일 때만 내린다.
+                    if _has_max and int(_by_day_max[_d].get(_c) or 0) > 0:
+                        _by_day_max[_d][_c] = int(_by_day_max[_d][_c]) - 1
+                        _fx_cut_max += 1
             if _fx_cut:
                 config_dict["daily_shift_requirements_by_day"] = _by_day
+            if _fx_cut_max:
+                # ★ 차감 결과 max 가 0 이 된 칸의 처리.
+                #   · min 도 같이 0 이면 그대로 둔다 — 엔진이 `req_raw == 0` 을 보고
+                #     `m.Add(assigned == 0)` 하드로 막는다(fallback_lex.py:1835
+                #     zero_demand_block_codes). 상한이 새지 않는다.
+                #   · min 이 남아 있는데 max 만 0 이 된 칸은 원설정이 max < min 인 모순이다.
+                #     0 을 그대로 두면 엔진이 '상한 없음' 으로 읽어 초과가 다시 샌다.
+                #     min 까지 되올려 max == min 으로 닫는다.
+                _raised = 0
+                for _d in range(_days_in_month):
+                    for _c in _max_active[_d]:
+                        _mn = int(_by_day[_d].get(_c) or 0)
+                        if int(_by_day_max[_d].get(_c) or 0) < _mn:
+                            _by_day_max[_d][_c] = _mn
+                            _raised += 1
+                config_dict["daily_shift_requirements_max_by_day"] = _by_day_max
+                if _raised:
+                    print(f"[FixedShiftCoverage] max < min 이 된 {_raised}칸을 min 으로 되올림 "
+                          f"(원설정이 max < min 인 칸)")
+            if _fx_cut or _fx_cut_max:
                 print(f"[FixedShiftCoverage] 고정근무자 {len(fixed_nurses)}명 · "
-                      f"요구 차감 {_fx_cut}셀 — 솔버는 남은 인원만 채운다")
+                      f"요구 차감 min {_fx_cut}셀 / max {_fx_cut_max}셀 — 솔버는 남은 인원만 채운다")
         except Exception as _fx_exc:
             # 차감 실패는 생성을 막지 않는다(기존 동작으로 진행). 다만 초과가 남을 수 있다.
             print(f"[FixedShiftCoverage] 차감 실패(무시): {type(_fx_exc).__name__}: {_fx_exc}")
