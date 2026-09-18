@@ -2411,10 +2411,22 @@ def get_roster_assignments(
     _DISPATCH_REASON_ALIASES = frozenset({"파견", "병동이동", "부서이동"})
 
     assignments = get_active_assignments_for_month(db, group_id, year, month)
+    # ★★ 파견·병동이동은 **양방향**으로 잡는다(source 또는 target 이 조회 병동).
+    #   종전에는 `source_group_id == group_id` 뿐이라, 파견을 **받는** 병동(inbound)에서
+    #   전체표를 열면 그 배치가 여기서 탈락해 `{}` 가 되고 `roster.py` 조립부가
+    #   `continue` 로 건너뛰어 **셀에 status·target_status 가 아예 안 붙었다.**
+    #   개인 일자 API 는 별도 경로(`roster.py` 의 `_is_source`)라 정상이었고, 그래서
+    #   "개인은 되는데 전체표만 빈다" 는 비대칭이 생겼다(2026-09-18 프론트 제보).
+    # ★ **휴직은 종전대로 source 만**이다 — target 이 없고 원 소속 기준으로만 성립한다.
+    #   여기를 같이 넓히면 `target_group_id` 가 빈 배치가 엉뚱한 병동에 붙는다.
+    _BIDIR_REASONS = ("파견", "병동이동")
     eligible = [
         a for a in assignments
-        if a.reason in ("파견", "병동이동", "휴직")
-        and a.source_group_id == group_id
+        if (
+            (a.reason in _BIDIR_REASONS
+             and group_id in (a.source_group_id, a.target_group_id))
+            or (a.reason == "휴직" and a.source_group_id == group_id)
+        )
     ]
 
     # 해당 월 퇴사자 (nurses.resignation_date 기반 synthetic entry)
@@ -2436,11 +2448,24 @@ def get_roster_assignments(
     if not eligible and not _resigning:
         return {}
 
-    target_gids = {a.target_group_id for a in eligible if a.target_group_id}
+    # ★ inbound 배치는 "어디서 왔는가"(source)가 관심사라 이름 맵에 source 도 넣는다.
+    #   발행 상태 조회(`_target_issued_nurse_ids`)는 **outbound 대상 병동만** 필요하다 —
+    #   inbound 의 대상 병동은 지금 보고 있는 이 병동이라 물어볼 필요가 없다.
+    _out_target_gids = {
+        a.target_group_id for a in eligible
+        if a.target_group_id and a.target_group_id != group_id
+    }
+    # ★ 이름은 **자기 병동까지** 채운다. 비워 두면 화면이 "대상 병동을 알 수 없음" 으로
+    #   읽는다(inbound 의 target · outbound 의 source 가 곧 조회 병동이다).
+    _name_gids = (
+        {a.target_group_id for a in eligible if a.target_group_id}
+        | {a.source_group_id for a in eligible if a.source_group_id}
+    )
     gname_map: dict[str, str] = {}
-    if target_gids:
-        groups = db.query(Group).filter(Group.group_id.in_(target_gids)).all()
+    if _name_gids:
+        groups = db.query(Group).filter(Group.group_id.in_(_name_gids)).all()
         gname_map = {g.group_id: g.group_name for g in groups}
+    target_gids = _out_target_gids
 
     # ── 대상 병동의 발행 상태 ─────────────────────────────────────────────────
     # ★ 화면이 "파견 띠는 있는데 코드가 없다" 를 보고 **미발행인지 미배정인지 추정**
@@ -2453,14 +2478,29 @@ def get_roster_assignments(
 
     result: dict[str, list[dict]] = {}
     for a in eligible:
+        # inbound = 이 병동이 **받는 쪽**. 그 사람의 근무는 이미 이 병동 스냅샷에 있다.
+        _is_inbound = bool(
+            a.target_group_id == group_id and a.source_group_id != group_id
+        )
         entry = {
             "reason": a.reason,
             "target_group_id": a.target_group_id or "",
             "target_group_name": gname_map.get(a.target_group_id, "") if a.target_group_id else "",
             "start_date": str(a.start_date),
             "end_date": str(a.end_date or a.expected_end_date) if (a.end_date or a.expected_end_date) else None,
+            # ★★ 소비자(`roster.py` 조립부)가 **코드를 지울지 말지**를 이걸로 가른다.
+            #   outbound 는 이 병동 근무가 없는 기간이라 코드를 비우지만,
+            #   inbound 는 **이 병동 발행본의 코드가 곧 정답**이라 건드리면 안 된다.
+            "is_inbound": _is_inbound,
+            "source_group_id": a.source_group_id or "",
+            "source_group_name": gname_map.get(a.source_group_id, "") if a.source_group_id else "",
         }
-        if a.target_group_id:
+        if _is_inbound:
+            # 대상 병동 = 지금 조회 중인 이 병동. 그 발행본을 보고 있으므로 늘 발행·행 존재다
+            # (행이 없으면 애초에 이 루프의 소비자가 그 간호사를 순회하지 않는다).
+            entry["target_status"] = "issued"
+            entry["target_issued"] = True
+        elif a.target_group_id:
             _ids = target_rows.get(a.target_group_id)
             if _ids is None:
                 _status = "not_issued"   # 대상이 아직 발행하지 않음

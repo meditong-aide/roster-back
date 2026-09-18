@@ -648,8 +648,14 @@ async def get_issued_roster_snapshot(
             _my_nid = getattr(current_user, "nurse_id", None)
             _my_a_list = _assignments.get(_my_nid, []) if _my_nid else []
             _my_tgt_roster = {}
+            # ★ 본인 행의 target 스냅샷 병합은 **outbound 일 때만** 의미가 있다.
+            #   inbound 는 대상 병동이 지금 보고 있는 이 병동이라, 여기서 잡으면
+            #   같은 스냅샷을 target 이라며 다시 읽어 제 값으로 덮어쓴다.
             _my_tgt_a = next(
-                (a for a in _my_a_list if a["reason"] in ("파견", "병동이동") and a.get("target_group_id")),
+                (a for a in _my_a_list
+                 if a["reason"] in ("파견", "병동이동")
+                 and a.get("target_group_id")
+                 and not a.get("is_inbound")),
                 None,
             )
             # target_group_id → group_name 맵 (inbound 배지 표시용, batch 1회 조회)
@@ -752,6 +758,13 @@ async def get_issued_roster_snapshot(
                     _ts = _asg.get("target_status")
                     if len(_active_by_day.get(_day, [])) > 1:
                         return "assignment_conflict", _ts
+                    # ★★ inbound(이 병동이 파견을 **받는** 쪽)는 판정 방향이 반대다.
+                    #   outbound 는 "저쪽 병동이 발행했나" 를 물어야 하지만, inbound 의
+                    #   대상 병동은 **지금 보고 있는 이 병동**이고 그 발행본을 읽는 중이라
+                    #   늘 확정이다. 코드도 이 스냅샷 값이 정답이라 `_put_cell` 이
+                    #   비우면 안 된다 — 그래서 여기서 `confirmed` 로 끊는다.
+                    if _asg.get("is_inbound"):
+                        return "confirmed", "issued"
                     # ★★ 휴직·퇴사는 **대상 병동이 없다**(`target_group_id` 가 비어
                     #   `target_status` 도 안 붙는다). 이걸 '상태 정보 없음' 으로 읽어
                     #   `confirmed` 로 돌리면 그 기간의 원 소속 코드가 남은 채
@@ -797,6 +810,13 @@ async def get_issued_roster_snapshot(
                         "target_group_name": _tgid_to_name.get(
                             _a.get("target_group_id")
                         ),
+                        # ★ 방향을 서버가 명시한다 — 프론트가 source/target 을 뒤집어
+                        #   추론하면 같은 배치가 조회 병동에 따라 다르게 읽힌다.
+                        #   `source_group_name` 은 `get_roster_assignments` 가 채워 준다
+                        #   (`_tgid_to_name` 은 target 만 모아서 출발 병동이 없다).
+                        "is_inbound": bool(_a.get("is_inbound")),
+                        "source_group_id": _a.get("source_group_id") or "",
+                        "source_group_name": _a.get("source_group_name") or "",
                     }
                     for _a in _a_list
                 ]
@@ -834,6 +854,10 @@ async def get_issued_roster_snapshot(
                                 "target_issued",
                                 bool(_tgid and _tgid_issued.get(_tgid)),
                             ),
+                            # 방향 — `inbound[]` 와 같은 계약을 구간 배열에도 싣는다.
+                            "is_inbound": bool(_a.get("is_inbound")),
+                            "source_group_id": _a.get("source_group_id") or "",
+                            "source_group_name": _a.get("source_group_name") or "",
                             **({"target_status": _a["target_status"]}
                                if _a.get("target_status") else {}),
                         }
@@ -876,8 +900,13 @@ async def get_issued_roster_snapshot(
                             if idx < len(_sched):
                                 # ★ 기존 셀(= 원 소속 코드)에 사유만 붙이던 자리.
                                 #   확정이 아니면 `_put_cell` 이 코드를 비운다.
+                                # ★★ inbound 는 여기서 **이 병동 스냅샷 코드를 그대로 두고**
+                                #   status·target_status 만 얹는다(`_cell_status_for` 가
+                                #   `confirmed` 를 돌려주므로 `_put_cell` 이 안 지운다).
                                 _put_cell(idx, _sched[idx], _a["reason"], d, _a)
-                            if idx < len(_sids):
+                            # ★ outbound 는 이 병동 근무가 없으니 schedule_id 를 비운다.
+                            #   inbound 는 근무가 **실재**하므로 비우면 셀과 id 가 어긋난다.
+                            if idx < len(_sids) and not _a.get("is_inbound"):
                                 _sids[idx] = None
 
                 _nurse["assignments"] = _assignments_out
