@@ -320,6 +320,44 @@ _PRESERVE_IF_NONE = (
 )
 
 
+#: ORM 모델에 **없는** 컬럼인데 새 config 로 이어져야 하는 것들.
+#  `roster_config` 는 dev·prod 스키마가 갈려 있어 모델에 올리지 않고 raw SQL 로만 다룬다
+#  (`roster_create_service._holiday_off_enabled` 의 판단과 같은 규약).
+#  모델 밖이라 `_PRESERVE_IF_NONE` 이 못 잡고, INSERT 에서 통째로 빠져 **NULL 로 저장**된다.
+_PRESERVE_RAW_COLUMNS = ("fixed_holiday_off_yn",)
+
+
+def _inherit_raw_columns(db: Session, new_config_id, baseline_config_id) -> None:
+    """모델에 없는 설정 컬럼을 baseline 에서 새 config 로 승계한다.
+
+    ★ 없으면 **켜 둔 병동이 근무표를 한 번 생성할 때마다 설정이 꺼진다.**
+      생성은 새 config 를 포크하는데(`materialize_generation_config`), 그 INSERT 에
+      이 컬럼이 없어 NULL 이 되고, `_holiday_off_enabled` 가 NULL 을 False 로 읽는다.
+    ★ 컬럼이 없는 환경에서도 안전하도록 존재를 먼저 확인한다 — 코드를 먼저 배포하고
+      DDL 을 나중에 넣어도 깨지지 않는다.
+    """
+    if not new_config_id or not baseline_config_id:
+        return
+    from sqlalchemy import text as _text
+
+    for _col in _PRESERVE_RAW_COLUMNS:
+        try:
+            _exists = db.execute(_text(
+                "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME='roster_config' AND COLUMN_NAME=:c"
+            ), {"c": _col}).first()
+            if not _exists:
+                continue
+            db.execute(_text(
+                f"UPDATE roster_config SET {_col} = ("
+                f"  SELECT TOP 1 {_col} FROM roster_config WHERE config_id = :b"
+                f") WHERE config_id = :n"
+            ), {"b": baseline_config_id, "n": new_config_id})
+        except Exception as exc:  # noqa: BLE001
+            # 승계 실패가 저장 자체를 막지 않게 한다 — 값은 종전대로 NULL 로 남는다.
+            print(f"[RosterConfig] {_col} 승계 실패(무시): {exc}")
+
+
 def save_roster_config_service(
     config_data: RosterConfigCreate,
     user,
@@ -420,16 +458,18 @@ def save_roster_config_service(
             #   생성 시 포크(materialize_generation_config)는 **사용자가 고른 baseline** 을 넘긴다.
             #   안 넘기면 오래된 프리셋을 골라 다른 설정만 바꿔도 최신 프리셋의 값이 딸려 들어와,
             #   baseline 이 NULL(꺼짐)인 설정이 조용히 켜진 채로 생성된다.
-            if any(config_dict.get(_k) is None for _k in _PRESERVE_IF_NONE):
-                _prev = inherit_from or (
-                    db.query(RosterConfigModel)
-                    .filter(
-                        RosterConfigModel.office_id == target_office_id,
-                        RosterConfigModel.group_id == target_group_id,
-                    )
-                    .order_by(RosterConfigModel.created_at.desc())
-                    .first()
+            # ★ baseline 은 `_PRESERVE_IF_NONE` 조건과 무관하게 **항상** 잡는다 —
+            #   모델 밖 컬럼 승계(`_inherit_raw_columns`)도 같은 기준을 써야 한다.
+            _prev = inherit_from or (
+                db.query(RosterConfigModel)
+                .filter(
+                    RosterConfigModel.office_id == target_office_id,
+                    RosterConfigModel.group_id == target_group_id,
                 )
+                .order_by(RosterConfigModel.created_at.desc())
+                .first()
+            )
+            if any(config_dict.get(_k) is None for _k in _PRESERVE_IF_NONE):
                 for _k in _PRESERVE_IF_NONE:
                     if config_dict.get(_k) is None:
                         config_dict[_k] = getattr(_prev, _k, None) if _prev else None
@@ -442,6 +482,12 @@ def save_roster_config_service(
                 config_memo=config_memo,
             )
             db.add(db_config)
+            # ★ 모델 밖 컬럼은 위 `_PRESERVE_IF_NONE` 이 못 잡는다. baseline 에서 잇는다.
+            #   `flush` 로 config_id 를 확정한 뒤라야 UPDATE 대상이 잡힌다.
+            db.flush()
+            _inherit_raw_columns(
+                db, db_config.config_id, getattr(_prev, "config_id", None)
+            )
         # NOTE: weekly_off 등 나머지 라이브 동기화는 생성 시점(apply_config_side_effects)에
         #   수행. 단, use_mid 는 daily-shift/솔버가 라이브에서 읽어 저장-생성 사이 stale 이
         #   되므로, 사용자 대면 저장(sync_use_mid_live=True)에서는 즉시 동기화한다.
