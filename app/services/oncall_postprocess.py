@@ -295,33 +295,109 @@ def _protected_days(
 _BAN_EVE_TYPES = ("휴가", "공가")
 
 
-def _ban_night_before_off(db: Session, group_id: str) -> bool:
-    """`roster_config.ban_night_before_fixed_off` — 컬럼이 없으면 solver 기본값(True)."""
-    row = db.execute(text(
+def _read_config_flag(
+    db: Session, group_id: str, column: str, *, config_id: int | None, default: bool,
+) -> bool:
+    """`roster_config.<column>` 을 **솔버가 쓴 그 프리셋에서** 읽는다.
+
+    ★ config_id 를 안 받으면 최신 행을 읽게 되는데, 생성이 `req.config_id` 로 **옛 프리셋**을
+      골랐다면 솔버와 다른 값을 보게 된다. 그러면 후처리가 솔버가 막아 둔 자리에 콜을 넣거나
+      (반대로) 멀쩡한 후보를 빼 버린다. 그래서 호출부가 실제 사용된 config_id 를 넘긴다.
+    ★ 컬럼이 없을 수 있다(prod→dev 마이그레이션이 DDL 을 안 옮긴다) — 그때는 default.
+    """
+    exists = db.execute(text(
         "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
-        "WHERE TABLE_NAME='roster_config' AND COLUMN_NAME='ban_night_before_fixed_off'"
-    )).scalar()
-    if not row:
-        return True
-    val = db.execute(
-        text("SELECT TOP 1 ban_night_before_fixed_off FROM roster_config WHERE group_id=:g"),
-        {"g": group_id},
-    ).scalar()
-    return True if val is None else bool(val)
+        "WHERE TABLE_NAME='roster_config' AND COLUMN_NAME=:c"
+    ), {"c": column}).scalar()
+    if not exists:
+        return default
+    if config_id is not None:
+        val = db.execute(
+            text(f"SELECT {column} FROM roster_config WHERE config_id=:i"),
+            {"i": config_id},
+        ).scalar()
+    else:
+        val = db.execute(
+            text(f"SELECT TOP 1 {column} FROM roster_config "
+                 "WHERE group_id=:g ORDER BY created_at DESC"),
+            {"g": group_id},
+        ).scalar()
+    return default if val is None else bool(val)
+
+
+def _ban_night_before_off(db: Session, group_id: str, config_id: int | None = None) -> bool:
+    """`roster_config.ban_night_before_fixed_off` — 컬럼/값이 없으면 solver 기본값(True)."""
+    return _read_config_flag(
+        db, group_id, "ban_night_before_fixed_off", config_id=config_id, default=True,
+    )
+
+
+def _ban_night_before_wanted_off(
+    db: Session, group_id: str, config_id: int | None = None,
+) -> bool:
+    """`roster_config.ban_night_before_fixed_wanted_off` — 확정 원티드 O 직전 N 금지.
+
+    ★ 위 `_ban_night_before_off` 와 **기본값이 반대**다. 컬럼이 없거나 NULL 이면 **False**
+      (꺼짐)로 읽는다 — 병동이 켜야 작동하는 설정이기 때문이다.
+    """
+    return _read_config_flag(
+        db, group_id, "ban_night_before_fixed_wanted_off",
+        config_id=config_id, default=False,
+    )
 
 
 def _call_banned_eves(
     db: Session, group_id: str, year: int, month: int,
+    config_id: int | None = None,
 ) -> dict[str, set[int]]:
-    """확정 원티드 **휴가/공가 직전일** `{nurse_id: {day,...}}` — 콜 금지.
+    """확정 원티드 **비근무 직전일** `{nurse_id: {day,...}}` — 콜 금지.
 
     ★ 콜은 야간 대기라 N 과 같은 판정을 받는다. 쉬기로 굳힌 날 바로 앞에 N 을
-      못 두는 것과 같은 이유로 콜도 둘 수 없다.
+      못 두는 것과 같은 이유로 콜도 둘 수 없다. **솔버만 막고 여기서 놓치면
+      후처리가 그 제약을 무너뜨린다** — 두 축을 솔버와 같은 기준으로 맞춘다.
+    ★ 대상은 솔버(cp_sat_basic·fallback_lex)와 동일하게 두 축이다.
+        ① type  : 휴가·공가        → ban_night_before_fixed_off        (기본 True)
+        ② 출처  : 확정 원티드 O    → ban_night_before_fixed_wanted_off (기본 False)
+      이 테이블 자체가 확정 원티드이므로 ②는 대표코드가 O 인지만 보면 된다.
     ★ 1일의 전날은 전월이라 대상 밖(CP-SAT 도 `prev_d < T0` 를 면제한다).
     """
     from db.models import FixedWantedEntry, Shift
 
-    rows = db.query(FixedWantedEntry, Shift.type).outerjoin(
+    by_type = _ban_night_before_off(db, group_id, config_id)
+    by_wanted = _ban_night_before_wanted_off(db, group_id, config_id)
+    # ★ ② 축은 `fixed_wanted_use_yn` 에 종속된다. 그게 꺼지면 솔버가 확정 원티드를
+    #   고정 셀로 쓰지 않아(roster_create_service: all_fixed_entries 조회 자체를 안 한다)
+    #   `fixed_wanted_cells` 가 비고 제약이 안 걸린다. 여기서만 막으면 **후처리가 솔버보다
+    #   엄격**해져 멀쩡한 콜 후보를 빼 버린다.
+    #   ① 축(휴가·공가)은 special_fixed 경로라 이 플래그와 무관하다.
+    if by_wanted and not _read_config_flag(
+        db, group_id, "fixed_wanted_use_yn", config_id=config_id, default=False
+    ):
+        by_wanted = False
+    if not (by_type or by_wanted):
+        return {}
+
+    # ★ 판정 기준을 솔버와 맞춘다. 솔버는 셀의 **shift 코드**를 대표코드로 정규화해 보는데,
+    #   여기서 `shifts_table_id` 조인 결과만 믿으면 그 값이 NULL·stale 인 행을 놓친다
+    #   (컬럼이 nullable 이다 — 2026-08-31 실측으로는 0건이나 구조상 가능하다).
+    #   놓치면 후처리가 솔버가 막아 둔 자리에 콜을 도로 넣어 제약이 무너진다.
+    #   그래서 그룹의 shift 표를 코드로도 색인해 폴백한다.
+    #   ★★ 대표코드는 솔버와 **같은 별칭 정규화**를 거친다 —
+    #      `_normalize_fixed_to_main`(fallback_lex)이 `OFF`·`주` 를 `O` 로 접는다.
+    #      `주`(주휴)는 special 이 **아니다**: `_load_special_shift_map` 이
+    #      `type ∈ {근무,휴가,공가}` 로 거르는데 `주`·`O` 는 실측상 둘 다 `type='휴무'` 라
+    #      그 맵에 안 들어간다 → `fixed_wanted_cells` 에 남고 솔버가 대상으로 삼는다.
+    #      여기서 접지 않으면 솔버가 막은 자리에 콜이 들어가 제약이 무너진다.
+    def _main(raw: object) -> str:
+        code = str(raw or "").strip().upper()
+        return "O" if code in {"OFF", "주"} else code
+
+    by_code = {
+        str(s.shift_id): (_main(s.default_shift), str(s.type or ""))
+        for s in db.query(Shift).filter(Shift.group_id == group_id).all()
+    }
+
+    rows = db.query(FixedWantedEntry, Shift.type, Shift.default_shift).outerjoin(
         Shift, Shift.id == FixedWantedEntry.shifts_table_id,
     ).filter(
         FixedWantedEntry.group_id == group_id,
@@ -329,8 +405,14 @@ def _call_banned_eves(
         FixedWantedEntry.is_applied == True,  # noqa: E712
     ).all()
     out: dict[str, set[int]] = {}
-    for r, stype in rows:
-        if str(stype or "") not in _BAN_EVE_TYPES:
+    for r, stype, smain in rows:
+        _fb_main, _fb_type = by_code.get(str(r.shift_id), ("", ""))
+        main_code = _main(smain) or _fb_main
+        type_name = str(stype or "") or _fb_type
+        hit = (by_type and type_name in _BAN_EVE_TYPES) or (
+            by_wanted and main_code == "O"
+        )
+        if not hit:
             continue
         if r.shift_date.day <= 1:
             continue
@@ -381,6 +463,7 @@ def _carry_helped(db: Session, group_id: str, year: int, month: int,
 
 def postprocess_oncall(
     db: Session, schedule, generated: dict, current_user, req,
+    config_id: int | None = None,
 ) -> dict:
     """생성 결과에 콜 코드를 얹는다. 실패해도 원본을 그대로 돌려준다."""
     if not isinstance(generated, dict) or not generated:
@@ -435,11 +518,12 @@ def postprocess_oncall(
     # ★ 확정 원티드로 굳힌 날 — 대체 투입으로 덮지 않는다.
     protected = _protected_days(db, group_id, year, month)
 
-    # ★ 콜 = 야간 대기 → 확정 원티드 휴가/공가 **직전일**은 N 과 같이 막는다.
-    unavailable = (_call_banned_eves(db, group_id, year, month)
-                   if _ban_night_before_off(db, group_id) else {})
+    # ★ 콜 = 야간 대기 → 확정 원티드 비근무 **직전일**은 N 과 같이 막는다.
+    #   설정 판정(두 축)은 _call_banned_eves 안에서 한다 — 여기서 한쪽만 보면
+    #   확정 원티드 O 축만 켠 병동을 놓친다.
+    unavailable = _call_banned_eves(db, group_id, year, month, config_id)
     if unavailable:
-        print(f"[Oncall] 원티드 휴가/공가 직전일 콜 금지 "
+        print(f"[Oncall] 원티드 비근무 직전일 콜 금지 "
               f"{sum(len(v) for v in unavailable.values())}건")
 
     # ★ 직전 달에서 못 갚은 품앗이를 이어받는다(월 경계 유지).
