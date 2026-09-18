@@ -145,6 +145,32 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
     preferences = []
     special_shift_map = _load_special_shift_map(db, current_user.group_id, current_user.office_id)
     special_fixed_requests: list[dict] = []
+    # ★★ 원본 `shift_id` 를 대표코드(D/E/N/O)로 옮기는 맵.
+    #   아래 DENO 분류가 `shift_id` 를 리터럴 {"D","E","N","O"} 와 **직접 비교**하고 있었다.
+    #   병동이 OFF 를 `OF`·`오프` 로 쓰면 `"OF" in {...}` 가 False 라 **원티드 OFF 가 통째로
+    #   미분류로 버려진다**(실측 2026-09-17 성남 중환자실-RN: 확정 원티드 168건 중 `OF` 91건이
+    #   미분류. 그 병동은 `fixed_wanted_use_yn=True` 라 다른 경로로 살아나 드러나지 않았다).
+    #   지금 26/27 병동이 OFF 코드를 `O` 로 써서 **우연히** 동작할 뿐이다.
+    #   ★ `fixed_wanted_use_yn=True` 경로는 원본 코드를 그대로 넘겨 솔버가 정규화한다 —
+    #     같은 데이터를 두 경로가 다르게 분류하던 비대칭을 여기서 맞춘다.
+    #   ★★ `shifts` 는 PK·UNIQUE 가 없어 같은 `(group_id, shift_id)` 가 **여러 행**일 수 있다.
+    #     정렬 없이 `=` 로 대입하면 **DB 반환 순서에 따라 대표 `default_shift` 가 달라져**
+    #     같은 원티드가 실행마다 다른 D/E/N/O 버킷으로 분류될 수 있다.
+    #     코드베이스의 다른 자리와 같은 규약으로 `(sequence, id)` 오름차순 + 첫 행 채택.
+    _deno_main_map: dict[str, str] = {}
+    try:
+        _shift_rows = (
+            db.query(Shift)
+            .filter(Shift.group_id == current_user.group_id)
+            .order_by(Shift.sequence.asc(), Shift.id.asc())
+            .all()
+        )
+        for _s in _shift_rows:
+            _ds = str(getattr(_s, "default_shift", "") or "").strip().upper()
+            if _ds in ("D", "E", "N", "O"):
+                _deno_main_map.setdefault(str(_s.shift_id).strip().upper(), _ds)
+    except Exception as _dm_exc:
+        print(f"[RosterCreate][WARN] DENO 대표코드 맵 구성 실패 — 원본 코드로 진행: {_dm_exc}")
 
     # FixedWantedEntry 존재 여부 확인 (단일 테이블 구조)
     # → 해당 년/월에 확정 원티드가 존재하면 자동으로 사용 (프론트에서 플래그 전달 불필요)
@@ -180,9 +206,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                 shift_code = shift_code_raw.upper()
                 day_str = str(fe.shift_date.day)
 
-                if shift_code in shift_data:
+                # ★ 원본 코드가 대표코드와 우연히 같은 경우(`D`·`O`)뿐 아니라
+                #   `OF`·`오프` 처럼 다른 경우도 `default_shift` 로 옮겨 잡는다.
+                _deno = _deno_main_map.get(shift_code, shift_code)
+                if _deno in shift_data:
                     # 확정 원티드는 최고 우선순위 (score=10)
-                    shift_data[shift_code][day_str] = 10
+                    shift_data[_deno][day_str] = 10
                     _fw_deno_count += 1
                     continue
 
@@ -297,8 +326,11 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             shift_code_raw = str(s.shift or "").strip()
             shift_code = shift_code_raw.upper()
             day_str = str(int(str(s.shift_date).split("-")[-1]))
-            if shift_code in shift_data:
-                shift_data[shift_code][day_str] = int(s.score) if s.score is not None else 0
+            # ★ FixedWantedEntry 경로와 **같은 기준**으로 대표코드를 맞춘다.
+            #   한쪽만 고치면 `FixedWantedEntry` 가 없는 달에서 도로 `OF` 가 버려진다.
+            _deno_wr = _deno_main_map.get(shift_code, shift_code)
+            if _deno_wr in shift_data:
+                shift_data[_deno_wr][day_str] = int(s.score) if s.score is not None else 0
                 _wr_deno_count += 1
                 continue
             if (
