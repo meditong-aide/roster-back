@@ -78,6 +78,16 @@ class NurseRosterConfig:
     n_to_n_interval_target: int = 10
     n_to_n_interval_penalty_weight: int = 50
     n_to_n_interval_max_window: int = 15
+    # N 블록 간 **최소 간격 하드**(일). 0=해제. 3 이하는 2N/3N 후 2OFF 하드가 이미 보장하므로
+    # 실효는 4부터 — `N O O N`(회복 OFF 직후 재-N)을 막는다.
+    # ★★ 위 soft(`n_to_n_interval_target`)로는 이 바닥이 **안 올라간다**. 실측(성남 중환자실-RN
+    #   2026-10 · 동일조건 10판)에서 최소 간격이 10판 전부 정확히 3이었다. `n2n` 은 lex 5번째
+    #   패스라 앞 패스(off_range·grade·team·n_range)가 굳혀 놓은 뒤에는 못 민다.
+    #   목적식 축으로 여섯 번 시도해 여섯 번 다 기각됐고, target 을 낮추는 건 **역효과**였다
+    #   (벌점이 `target−gap` 한쪽이라 target 이 곧 압력의 도달 거리다).
+    # ★ `isolated_work_hard`·`same_shift_hard_k` 와 같은 규약으로 INFEASIBLE 시
+    #   **자동 soft 전환**한다(roster_create_service 가 0 으로 내려 재생성 → 위 soft 가 이어받는다).
+    n2n_min_gap: int = 0
     # D/E(데이·이브닝) per-nurse 균등 — fallback stage2 lex 5-pass.
     # OFF/N/n2n 동결 후 nurse별 |D-E| 의 tolerance 초과분만 최소화(완전 동일이 아닌 밴드).
     # 수렴된 균등해가 stage3 warm-start hint로 상속되어 X축(D/E 1.5배) 균형을 안정화한다.

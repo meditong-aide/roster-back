@@ -627,6 +627,12 @@ class CPSATBasicEngine:
             n_to_n_interval_target=int(config_data.get("n_to_n_interval_target", 10) or 0),
             n_to_n_interval_penalty_weight=int(config_data.get("n_to_n_interval_penalty_weight", 300) or 0),
             n_to_n_interval_max_window=int(config_data.get("n_to_n_interval_max_window", 15) or 0),
+            # N 블록 간 **최소 간격 하드**(0=해제, 실효는 4 부터). INFEASIBLE 시 호출부가
+            #   0 으로 내려 재생성한다 — `same_shift_hard_k`·`isolated_work_hard` 와 같은 규약.
+            # ★ 기본이 0(해제)이라 `or 0` 이 안전하다. 컬럼이 NULL 로 추가돼도 0 = 해제로
+            #   의도와 일치한다(기본값이 10 인 `n_to_n_interval_target` 은 같은 패턴이면
+            #   NULL 을 0 으로 읽어 패스가 통째로 꺼지는 함정이 있다 — 혼동하지 말 것).
+            n2n_min_gap=int(config_data.get("n2n_min_gap", 0) or 0),
             # 분배 정책 모드/월단위 선호 가중치
             distribution_mode=str(config_data.get("distribution_mode", "hybrid") or "hybrid"),
             monthly_preference_weight=int(config_data.get("monthly_preference_weight", 60) or 0),
@@ -3849,6 +3855,16 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
             if mid is not None:
                 m.Add(X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
+            if w_idx is not None:
+                # 메인코드 없는 근무(W)에도 `E→` · `N→` 금지를 건다. 위 전이 금지는
+                #   day 인덱스만 봐서 W 로 접힌 주간 근무(`DD` 등)가 통과했다.
+                #   lex 쪽(fallback_lex) 과 같은 규약 — 상세 주석은 그쪽에 있다.
+                if getattr(cfg, "ban_e_to_d", True):
+                    if not (fixed.get((n, d - 1)) == eve and fixed.get((n, d)) == w_idx):
+                        m.Add(X(n, d - 1, eve) + X(n, d, w_idx) <= 1)
+                if getattr(cfg, "ban_n_to_d", True):
+                    if not (fixed.get((n, d - 1)) == night and fixed.get((n, d)) == w_idx):
+                        m.Add(X(n, d - 1, night) + X(n, d, w_idx) <= 1)
             # if getattr(cfg, "ban_d_to_n", True):
             #     m.Add(X(n,d,night)+X(n,d-1,day)<=1)
 

@@ -6854,6 +6854,83 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 config_dict["isolated_work_hard"] = False
                 config_dict["_isolated_work_soft_retry_attempted"] = True
 
+    # ── 4차 완화: n2n 최소 간격 하드 해제 ─────────────────────────────────
+    # ★★ 이 블록은 아래 `if validation_error:` 사다리(team_min → same_shift →
+    #   isolated_work) **밖**에 있고, 그보다 **먼저** 돈다. 둘 다 이유가 있다.
+    #
+    #   (1) 밖에 있는 이유 — n2n 하드가 과하면 stage2 가 UNKNOWN 으로 끝나는데, 그러면
+    #     엔진이 보존해 둔 stage1 해로 복원해 **근무표는 정상 산출된다**. 즉
+    #     `validation_error` 가 None 이라 그 사다리에는 **영원히 도달하지 못한다.**
+    #     실측(2026-09-18 · `n2n_min_gap=15`): 폴백 로그 0줄 · 하드는 조용히 무시
+    #     (gap<15 위반 30건) · 게다가 lex 최적화가 통째로 무효가 되어 간격중앙이
+    #     10~11 → **7** 로 **오히려 나빠졌다**. 제약을 걸고도 품질만 잃는 최악의 조합이다.
+    #     그래서 트리거를 `_infeasible_empty` 가 아니라 `fallback_lex` 가 세우는
+    #     `roster_system._n2n_min_gap_stage2_failed` 로 잡는다.
+    #
+    #   (2) 1~3차 **뒤**에 있어야 하는 이유 — 실측(2026-09-18)에서 성남 중환자실-RN 은
+    #     **첫 생성의 stage1 이 원래 INFEASIBLE** 이라(hard·broad_soft 둘 다) 1차 완화
+    #     team_min 이 재생성을 돌린다. 하드가 실제로 stage2 에 걸리는 것은 **그 재생성**
+    #     이고, 플래그도 그때 세워진다. 1~3차 앞에 두면 아직 None 인 플래그를 읽어
+    #     영원히 발화하지 않는다(실측: DBG 421행 vs 하드 등록 676행).
+    _mg_on = int(config_dict.get("n2n_min_gap", 0) or 0)
+    _mg_failed = bool(getattr(roster_system, "_n2n_min_gap_stage2_failed", False))
+    if (_mg_failed and _mg_on >= 4
+            and not bool(config_dict.get("_n2n_min_gap_retry_attempted"))):
+        print(f"[N2NMinGapFallback] stage2 실패 감지 → n2n_min_gap {_mg_on}→0 해제로 1회 재시도")
+        _mg_cfg = dict(config_dict)
+        _mg_cfg["n2n_min_gap"] = 0
+        _mg_cfg["_n2n_min_gap_retry_attempted"] = True
+        try:
+            _mg_generated, _, _mg_rs = _run_cp_sat_basic(
+                db, current_user, nurses_for_engine, preferences, latest_config, req,
+                shift_manage_data,
+                fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
+                config_override=_mg_cfg,
+                _assignments=_assignments,
+                _inbound_assignments=_inbound_assignments,
+                _outbound_assignments=_outbound_assignments,
+            )
+            if isinstance(_mg_generated, dict):
+                _mg_generated.update(fixed_roster)
+            else:
+                _mg_generated = fixed_roster
+            if _alloff_roster:
+                if isinstance(_mg_generated, dict):
+                    _mg_generated.update(_alloff_roster)
+                else:
+                    _mg_generated = dict(_alloff_roster)
+            _mg_err = _validate_generated_roster(
+                _mg_generated, _mg_rs,
+                nurses_context=list(nurses_for_engine or []),
+                config_context=_mg_cfg,
+                grade_config_context=_fetch_grade_config_dict(
+                    db, current_user.office_id, current_user.group_id),
+            )
+        except Exception as _mg_exc:
+            _mg_err = f"n2n_min_gap 해제 재시도 예외: {type(_mg_exc).__name__}: {_mg_exc}"
+            _mg_generated = _mg_rs = None
+        if not _mg_err:
+            generated = _mg_generated
+            roster_system = _mg_rs
+            applied_relaxations.append("n2n_min_gap_released")
+            if _ctx is not None:
+                _ctx["relaxed"] = True
+            weekly_off_warnings.append({
+                "type": "n2n_min_gap_released_applied",
+                "detail": ("나이트 블록 간 최소 간격 제한이 infeasible 로 자동 해제되어 "
+                           "재생성됐습니다. 회복 휴무 직후 다시 나이트가 배정될 수 있습니다."),
+            })
+            print("[N2NMinGapFallback][AUTO-RELEASE][success] n2n_min_gap 해제로 근무표 생성. "
+                  "applied_relaxations=['n2n_min_gap_released']")
+            validation_error = None
+        else:
+            print(f"[N2NMinGapFallback][AUTO-RELEASE][fail] 재시도 실패: {_mg_err}")
+            config_dict["n2n_min_gap"] = 0
+            config_dict["_n2n_min_gap_retry_attempted"] = True
+
+
+
     if validation_error:
         print(f"[RosterGenerate][UNRECOVERABLE] {validation_error}")
         print(f"[RosterGenerate][UNRECOVERABLE] applied_relaxations={applied_relaxations}")

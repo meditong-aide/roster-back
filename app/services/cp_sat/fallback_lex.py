@@ -2114,6 +2114,25 @@ def optimize_fallback_lex_hard_first(
                     #   ★ 고정 셀로 `M→D` 가 명시된 자리는 면제한다(ND/ED/NE 와 같은 규약).
                     if not (fixed.get((n, d - 1)) == mid_idx and fixed.get((n, d)) == day_idx):
                         m.Add(X(n, d - 1, mid_idx) + X(n, d, day_idx) <= 1)
+                if w_idx is not None:
+                    # ── 메인코드 없는 근무(W)에도 `E→` · `N→` 금지를 건다 ──
+                    #   `shift_normalizer` 는 shift_gb·default_shift 가 없는 type='근무' 를
+                    #   전부 가상코드 **W** 로 접는다(`DD` Day 08:30~17:30 등). 그런데 위
+                    #   전이 금지는 `day_idx` **한 인덱스만** 봐서 W 로 접힌 주간 근무가
+                    #   그대로 통과했다 — 실측 성남 61병동-RN 2026-10: 김진아 26일 E → 27일 DD.
+                    #   ★ `N→W` 가 더 나쁘다. N 은 07:00 에 끝나는데 DD 는 08:30 에 시작해
+                    #     휴식이 **1.5시간**이다(`E→D` 의 7.5시간보다 짧다).
+                    #   ★ W 셀은 **고정셀로만 존재**한다(솔버는 W 를 배정하지 않는다). 그래서
+                    #     이 식은 선행 자유셀 한 칸만 묶고, 수용량 손실이 사실상 없다 —
+                    #     실측(61병동-RN 2026-10): 흩어진 DD 허용 8건으로 **수정 전과 동일**.
+                    #     같은 목적을 `DD→M` 매핑으로 우회하면 MID 선행 규칙에 걸려 3건으로 준다.
+                    #   ★ 양쪽이 모두 고정이면 면제한다 — ND/ED/NE 와 같은 규약.
+                    if getattr(cfg, "ban_e_to_d", True):
+                        if not (fixed.get((n, d - 1)) == eve_idx and fixed.get((n, d)) == w_idx):
+                            m.Add(X(n, d - 1, eve_idx) + X(n, d, w_idx) <= 1)
+                    if getattr(cfg, "ban_n_to_d", True):
+                        if not (fixed.get((n, d - 1)) == night_idx and fixed.get((n, d)) == w_idx):
+                            m.Add(X(n, d - 1, night_idx) + X(n, d, w_idx) <= 1)
                 # if getattr(cfg, "ban_d_to_n", True):
                 #     xd_prev = X(n, d - 1, day_idx)
                 #     m.Add(xd_prev + xn <= 1)
@@ -2895,6 +2914,63 @@ def optimize_fallback_lex_hard_first(
                     m.Add(
                         X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
                     ).OnlyEnforceIf([xn_prev, xn_curr, end_block])
+
+        # ── N 블록 간 최소 간격 하드 — "회복 OFF 직후 재-N" 차단 ──
+        # ★★ 이 바닥은 목적식으로 안 올라간다. 실측(성남 중환자실-RN 2026-10 · 동일조건 10판)에서
+        #   최소 간격이 **10판 전부 정확히 3** 이었다 — 실제 패턴은 `N N O O N N` 이다.
+        #   2N/3N 후 2OFF 하드가 `N O O N`(gap 3)을 바닥으로 만들고, `n2n` 은 lex 5번째 패스라
+        #   앞 패스(off_range·grade·team·n_range)가 굳혀 놓은 뒤에는 그 바닥을 못 민다.
+        #   목적식 축으로는 여섯 번 시도해 여섯 번 다 기각됐다(`n_to_n_interval_target` 을 낮추는
+        #   것은 오히려 **역효과** — 벌점이 `target−gap` 한쪽이라 target 이 곧 압력의 도달 거리다).
+        # ★ 가벼운 제약이다. 같은 10판에서 3블록 간격 중앙이 8 이고 gap3 은 전체 간격의 **10%**,
+        #   판당 평균 2.3명뿐이라 하한을 걸어도 그 10% 만 밀어내면 된다.
+        # ★ 양끝이 **둘 다** `fixed` 로 못 박힌 경우만 건너뛴다(MID 제약과 같은 선례).
+        #   한쪽만 고정이면 반대쪽을 밀어내면 되므로 제약을 유지한다.
+        # ★ 게이트 `AIDE_N2N_MIN_GAP` — 미설정(0)이면 **동작 불변**. 3 이하는 2OFF 하드가
+        #   이미 보장하므로 무의미해서 4 부터만 건다.
+        # ★★ **stage1 에는 걸지 않는다.** stage1 의 커버리지 부족은 하드가 아니라 **최소화
+        #   대상**이고(`m.Minimize(FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms) + …)`),
+        #   stage2 가 그 값을 `m.Add(sum(short_terms) == coverage_eq)` 로 **등식으로** 물려받는다.
+        #   그래서 stage1 에 이 하드를 걸면 커버리지와 충돌할 때 INFEASIBLE 이 아니라
+        #   **`best_short` 가 올라간 채 정상 종료**한다 — 운영자는 "간격은 벌어졌는데 사람이
+        #   모자란 근무표" 를 받는다. 완화 사다리(`roster_create_service` 의 `_trigger_soft`)는
+        #   `work_cells == 0` 에서만 발화하므로 이 부분 부족을 **전혀 못 잡는다.**
+        #   stage2 부터 걸면 커버리지가 이미 등식으로 고정된 뒤라, 충돌은 **명시적 INFEASIBLE**
+        #   로 드러난다. 조용한 열화보다 낫다.
+        # 설정(`roster_config.n2n_min_gap`) 이 정본이고, env 는 A/B 주입구다(env 가 이긴다).
+        _n2n_env = _os_lex.environ.get("AIDE_N2N_MIN_GAP")
+        _n2n_min_gap = (int(_n2n_env) if _n2n_env not in (None, "")
+                        else int(getattr(cfg, "n2n_min_gap", 0) or 0))
+        # 모델에 실어 보낸다 — solve 쪽은 이 함수의 지역변수를 못 본다(`_grade_cell_spec` 규약).
+        m._n2n_min_gap = _n2n_min_gap        # type: ignore[attr-defined]
+        if _n2n_min_gap >= 4 and stage >= 2:
+            _mg_cnt = 0
+            _mg_use_mid = bool(getattr(cfg, "use_mid", False))
+            for n in range(N):
+                # ★ N전담(N-only)은 야간이 강제라 간격 하한을 걸면 즉시 INFEASIBLE 이다.
+                #   `_prep_n2n` 이 같은 이유로 제외하는 것과 같은 규약.
+                if is_n_only_profile(
+                    getattr(roster_system.nurses[n], "allowed_shifts", None),
+                    use_mid=_mg_use_mid,
+                ):
+                    continue
+                T0, T1 = join[n], leave[n]
+                for d in range(T0, T1):
+                    # d 가 N 블록의 마지막 날 = `X(d)=1 AND X(d+1)=0`.
+                    #   그때 d+2 … d+(gap-1) 에 N 을 금지하면 다음 블록은 d+gap 이후로 밀린다.
+                    #   (d+1 은 블록 끝 정의상 이미 0 이라 뺀다)
+                    _mg_end = [X(n, d, night_idx), X(n, d + 1, night_idx).Not()]
+                    for _k in range(2, _n2n_min_gap):
+                        _dk = d + _k
+                        if _dk > T1:
+                            break
+                        if fixed.get((n, d)) == night_idx and fixed.get((n, _dk)) == night_idx:
+                            continue
+                        m.Add(X(n, _dk, night_idx) == 0).OnlyEnforceIf(_mg_end)
+                        _mg_cnt += 1
+            if stage == 2:
+                print(f"{logger_prefix} [N2N-MinGap] gap>={_n2n_min_gap} 하드 {_mg_cnt}건 "
+                      f"(stage1 제외 — 커버리지 우선)")
 
         # 금지 패턴 N-O-D/E
         if getattr(cfg, "nod_noe", True):
@@ -4069,6 +4145,25 @@ def optimize_fallback_lex_hard_first(
             except Exception as _mus_exc:
                 print(f"[FallbackLex][stage2] MUS 추출 실패(무시): {_mus_exc}")
         print(f"{logger_prefix} 폴백2 결과: status={_cp_sat_status_to_text(st2)}")
+        # ★★ stage2 가 못 풀렸는데 n2n 최소간격 하드가 켜져 있으면 **호출부에 알린다.**
+        #   실측(2026-09-18 · `n2n_min_gap=15`): stage2 가 UNKNOWN 으로 끝나면 엔진은
+        #   보존해 둔 stage1 해로 복원하고 근무표는 **정상 산출된다**. 그래서
+        #   `validation_error` 가 안 뜨고, 완화 사다리는 `work_cells == 0` 에서만 발화하므로
+        #   **아무도 이 상태를 못 잡는다.** 결과는 최악의 조합이다 —
+        #     · 간격 하한은 안 지켜지고(그 판 실측: 최소 3 · gap<15 위반 30건)
+        #     · lex 최적화가 **통째로 무효**가 되어 품질이 오히려 나빠진다
+        #       (간격중앙 7 · 정상 판은 10~11).
+        #   정상 범위(4~5)에서는 80런 동안 한 번도 안 났지만, 설정값을 잘못 넣으면
+        #   경고 한 줄 없이 이 상태가 된다. 호출부가 하드를 내리고 재시도하게 한다.
+        _mg_on2 = int(getattr(m2, "_n2n_min_gap", 0) or 0)
+        if (st2 not in (cp_model.OPTIMAL, cp_model.FEASIBLE)) and _mg_on2 >= 4:
+            try:
+                roster_system._n2n_min_gap_stage2_failed = True    # type: ignore[attr-defined]
+            except Exception:
+                pass
+            print(f"{logger_prefix} [N2N-MinGap][WARN] stage2 {_cp_sat_status_to_text(st2)} — "
+                  f"간격 하한(gap>={_mg_on2})이 반영되지 않았고 lex 최적화도 무효다. "
+                  f"호출부에 해제 재시도를 요청한다.")
         if st2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             _log_off_slack_used("stage2", s2, m2)
             # H1: Stage2 lex 3-pass — safety_sum → OFF range → N range 순차 minimize.
@@ -4083,6 +4178,11 @@ def optimize_fallback_lex_hard_first(
             # 6-pass(grade 재배치)가 달성한 미달 칸 수. stage3 가 이 값을 상한으로
             #   물려받아 재배치 결과를 지킨다(아래 '폴백3 grade 동결' 참조).
             lex_grade_short: Optional[int] = None
+            # ※ n2n 을 grade 처럼 stage3 에 동결하는 것은 **기각**했다(2026-09-18).
+            #   구현해 24런 교차한 결과 기여가 0 이었다 — 기준선을 보정하면
+            #   A gap<5 3.0 → 동결+하드 2.0 (개선 1.0) vs A 2.0 → 하드단독 1.0 (개선 1.0) 로
+            #   개선폭이 같고, 오히려 하드 단독이 2블록 17.0 대 13.5 로 더 좋았다.
+            #   간격은 목적식/동결이 아니라 **하한 하드**(`AIDE_N2N_MIN_GAP`)로만 움직인다.
 
             def _capture_lex_solution() -> None:
                 for _n in range(N):
@@ -4434,6 +4534,10 @@ def optimize_fallback_lex_hard_first(
                         if _tgt < 2:
                             return None
                         _terms = []
+                        # 아래 월경계 기존 경로가 루프 밖에서 이 둘을 참조한다(결함 보존 분기).
+                        # N==0 이거나 전원 continue 될 때 NameError 가 나지 않도록 초기화한다.
+                        _n = -1
+                        _aset: set = set()
                         for _n in range(N):
                             if leave[_n] < join[_n]:
                                 continue
@@ -4470,25 +4574,52 @@ def optimize_fallback_lex_hard_first(
                         #   전월 꼬리는 확정 상수라 "현월 d 일이 첫 N 이고 그 앞은 전부 N 아님"만
                         #     변수로 세우면 된다. gap = d - (전월 마지막 N 날짜) 인데, 전월
                         #     마지막 날을 0 으로 두면 현월 d(1-based)의 gap 은 그대로 d 다.
-                        _n_tail = int((getattr(roster_system, "prev_month_n_tail_by_idx", {})
-                                       or {}).get(_n, 0) or 0)
-                        if _n_tail >= 1:
-                            _days_sorted = sorted(_aset)
+                        # ★★ 결함(2026-09-17 발견): 이 블록이 위 `for _n in range(N)` 루프 **밖**에
+                        #   있었다 — 들여쓰기가 24칸으로 루프와 같은 레벨이다. 그래서 전월 꼬리
+                        #   벌점이 **마지막 간호사 한 명에게만**, 그것도 그 사람의 `_aset` 으로
+                        #   생성됐다. 배선은 있는데 실질적으로 안 걸려 있었던 셈이다.
+                        #   ★ 게이트 `AIDE_N2N_CROSS_FIX=1` 로 전원 적용을 켠다. 기본 off 는
+                        #     **기존 동작 그대로** — 실측으로 확인하기 전에는 동작을 바꾸지 않는다.
+                        #   ※ 과거 기각된 "월경계 gap 보정"(개선 11 vs 악화 10)은 `_gap_x` 계산에
+                        #     `offs_after` 를 반영하는 **다른 축**이었다. 이건 스코프 결함이다.
+                        def _add_cross(_cn, _caset):
+                            _n_tail = int((getattr(roster_system, "prev_month_n_tail_by_idx", {})
+                                           or {}).get(_cn, 0) or 0)
+                            if _n_tail < 1:
+                                return
+                            _days_sorted = sorted(_caset)
                             for _d in _days_sorted:
                                 _gap_x = _d + 1        # 전월 마지막 N=0일, 현월 인덱스 d → gap
                                 if _gap_x >= _tgt:
                                     break              # 이후는 전부 무벌점
                                 _before = [_b for _b in _days_sorted if _b < _d]
-                                _pair_x = m2.NewBoolVar(f"lex_n2n_cross_{_n}_{_d}")
-                                m2.Add(_pair_x <= X2(_n, _d, night_idx_h1))
+                                _pair_x = m2.NewBoolVar(f"lex_n2n_cross_{_cn}_{_d}")
+                                m2.Add(_pair_x <= X2(_cn, _d, night_idx_h1))
                                 for _b in _before:
-                                    m2.Add(_pair_x <= 1 - X2(_n, _b, night_idx_h1))
-                                _bsum = sum(X2(_n, _b, night_idx_h1) for _b in _before)
-                                m2.Add(_pair_x >= X2(_n, _d, night_idx_h1) - _bsum)
+                                    m2.Add(_pair_x <= 1 - X2(_cn, _b, night_idx_h1))
+                                _bsum = sum(X2(_cn, _b, night_idx_h1) for _b in _before)
+                                m2.Add(_pair_x >= X2(_cn, _d, night_idx_h1) - _bsum)
                                 _terms.append((_tgt - _gap_x) * _pair_x)
+
+                        if _os_lex.environ.get("AIDE_N2N_CROSS_FIX") == "1":
+                            for _cn in range(N):
+                                if leave[_cn] < join[_cn]:
+                                    continue
+                                if is_n_only_profile(
+                                    getattr(roster_system.nurses[_cn], "allowed_shifts", None),
+                                    use_mid=use_mid_h1,
+                                ):
+                                    continue
+                                _add_cross(
+                                    _cn,
+                                    set(iter_nurse_days(_cn, join, leave, blocked_by_nurse)),
+                                )
+                        else:
+                            _add_cross(_n, _aset)   # 기존 동작(결함) 보존 — 루프 마지막 값
                         if not _terms:
                             return None
                         _frac = float(_os_lex.getenv("N2N_LEX_TIME_FRAC", "0.5"))
+
                         return (sum(_terms), lambda v: m2.Add(sum(_terms) <= v), 8.0, _frac)
 
                     def _prep_de():
@@ -4944,6 +5075,11 @@ def optimize_fallback_lex_hard_first(
             m3.Add(sum(_g3_shorts) <= int(lex_grade_short))
             print(f"{logger_prefix} 폴백3 grade 동결: short <= {lex_grade_short} "
                   f"(cells={len(_g3_shorts)})")
+        # ※ n2n 동결은 여기 있었는데 **기각**했다(2026-09-18 · 24런 교차). grade 와 같은
+        #   규약으로 구현해 봤으나 기여가 0 이었다 — 기준선을 보정하면 개선폭이
+        #   하드 단독과 같고(각 1.0), 2블록은 하드 단독이 오히려 나았다(17.0 대 13.5).
+        #   `n2n` soft 값 자체가 회차마다 1~96 으로 흔들려 "달성치를 지킨다" 가
+        #   나쁜 회차의 나쁜 값을 지키는 것으로도 작동한다. 간격은 **하한 하드**로만 움직인다.
         for n in range(N):
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 for s in range(S):
