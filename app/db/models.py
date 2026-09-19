@@ -708,8 +708,17 @@ class ShiftManage(Base):
     year = Column(SMALLINT, nullable=True)
     month = Column(INTEGER, nullable=True)
     config_version = Column(VARCHAR(20), nullable=True)
-    created_at = Column(DATETIME, nullable=True)
-    updated_at = Column(DATETIME, nullable=True)
+    # ★★ `default` 가 **반드시** 있어야 한다. 없으면 SQLAlchemy 가 이 컬럼을 INSERT 문에
+    #   포함시키고 값이 없으니 **명시적 NULL** 을 보낸다(실측 2026-09-19:
+    #   `INSERT INTO shift_manage (..., created_at, updated_at) VALUES (..., NULL, NULL)`).
+    #   `shift_manage.created_at` 은 **dev 는 nullable, 운영은 NOT NULL** 이라
+    #   dev 에서만 통과하고 **운영에서는 IntegrityError** 가 난다.
+    #   그 예외를 `ensure_default_shift_manage` 가 로그 없이 삼켜서, 신규 병동의
+    #   기본 슬롯이 **운영에서만 한 번도 안 만들어졌다**(동탄시티병원 8병동·모니터링 실사례.
+    #   `GET /shifts` 는 "근무코드 설정을 준비하지 못했습니다" 로 500).
+    #   이 모델만 default 가 빠져 있었다 — 다른 테이블은 전부 `default=func.now()` 다.
+    created_at = Column(DATETIME, nullable=True, default=func.now())
+    updated_at = Column(DATETIME, nullable=True, default=func.now(), onupdate=func.now())
 
     __table_args__ = (
         UniqueConstraint(

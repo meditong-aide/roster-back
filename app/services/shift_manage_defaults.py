@@ -53,7 +53,29 @@ def ensure_default_shift_manage(
         )
     try:
         db.commit()
-    except IntegrityError:
+    except IntegrityError as exc:
         # 다른 요청이 먼저 동일 슬롯 생성(UNIQUE 충돌) → 롤백 후 재조회로 수렴.
+        # ★★ **반드시 남긴다.** 종전엔 로그 한 줄 없이 삼키고 `True` 를 돌려줬다.
+        #   UNIQUE 경쟁이면 정상이지만 FK·NOT NULL·스키마 불일치·CHECK 도 같은
+        #   `IntegrityError` 라, 슬롯이 안 생긴 채 호출측이 "성공" 으로 읽고 넘어간다.
+        #   그러면 `GET /shifts` 는 "근무코드 설정을 준비하지 못했습니다" 로 500 을 내는데
+        #   **무엇이 위반이었는지 어디에도 안 남아** 원인 추적이 불가능하다
+        #   (2026-09-19 동탄시티병원 8병동 실사례 — UNIQUE·FK·NOT NULL·스키마를 전부
+        #    정상 확인하고도 실패 원인을 못 좁혔다).
         db.rollback()
+        print(
+            f"[ensure_default_shift_manage][WARN] 기본 슬롯 seeding 실패(IntegrityError) — "
+            f"office={office_id} group={group_id} class={nurse_class} :: {exc}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        # ★ IntegrityError 가 아닌 실패(연결·타입·드라이버)는 종전에 **전파**돼
+        #   라우터 catch-all 이 원문을 응답에 실어 보냈다. 로그로 남기고 같은 계약을
+        #   유지하되(재전파), 최소한 서버 로그에서 원인을 볼 수 있게 한다.
+        db.rollback()
+        print(
+            f"[ensure_default_shift_manage][ERROR] 기본 슬롯 seeding 예외 — "
+            f"office={office_id} group={group_id} class={nurse_class} :: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        raise
     return True
