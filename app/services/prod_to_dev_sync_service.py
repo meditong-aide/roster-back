@@ -25,6 +25,12 @@ EXPLICIT_PKS = {
     "nurse_pair_requests": ["nurse_id", "request_id", "month"],
     "issued_roster": ["office_id", "group_id", "version"],
     "wanted": ["group_id", "year", "month"],
+    # ★ prod 에는 PK(pk_banned_wanted_entries, id)가 있는데 dev 테이블에만 없어
+    #   `_merge_upsert` 의 pk 가드에서 skipped="no_pk" 로 **조용히 복사에서 빠졌다**
+    #   (실측 2026-09-21 전체 sync: prod 4행 / dev 28행 stale). upsert 대상 중 dev PK 가
+    #   없으면서 여기 미등록이던 유일한 테이블이었다. dev DDL 로 PK 를 붙여 드리프트를
+    #   없앴지만, 같은 일이 다른 환경에서 또 나지 않도록 여기에도 못 박아 둔다.
+    "banned_wanted_entries": ["id"],
     # attribute period SSOT (id identity PK — _wipe_by_parent_fk 의 pk 가드 통과용)
     "nurse_preceptee_period": ["id"],
     "nurse_allowed_shift_period": ["id"],
