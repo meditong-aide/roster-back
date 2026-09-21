@@ -1307,9 +1307,15 @@ def export_schedule_excel_bytes(
     alias_map.setdefault('O', 'O')
 
     def to_base(code: str) -> str:
-        if not code:
+        # ★ 정규화는 **여기 한 곳에서만** 한다(strip + upper). 예전엔 strip 이 없어
+        #   `' - '` 처럼 공백이 붙은 값이 base 로 그대로 남았다. 그러면 하단 집계
+        #   (`footer_labels`)는 strip 후 sentinel 로 걸러 내는데 우측 요약 열
+        #   (`used_codes`)은 못 걸러, **하단엔 없는 하이픈 열이 우측에만 생긴다.**
+        #   실데이터는 dev·prod 모두 0건이지만, 두 축이 같은 함수를 쓰는 이상
+        #   정규화가 한 곳에 모여 있어야 어긋나지 않는다.
+        u = str(code or "").strip().upper()
+        if not u:
             return '-'
-        u = code.upper()
         if u in alias_map:
             return alias_map[u]
         if u.startswith('D'): return 'D'
@@ -1331,6 +1337,27 @@ def export_schedule_excel_bytes(
     tail_labels = core_codes + extra_codes
     summary_cols = len(tail_labels)
 
+    # ───────── 2-a) 하단 「일일 근무 현황」용 — **세부 코드 그대로** ─────────
+    #   우측 요약 열(`tail_labels`)은 base 로 접어 1인당 D/E/N/O 합을 보여주는 자리라
+    #   그대로 둔다. 반면 하단 일일 집계는 병동이 **그 날 어떤 코드가 몇 개 나갔는지**를
+    #   보는 곳이라, `D2`·`D1` 같은 하위코드가 `D` 로 접히면 쓸 수가 없다(병동 요청).
+    #   ★ 코드 마스터 전체가 아니라 **그 근무표에 실제로 발생한 코드만** 행이 된다 —
+    #     안 쓴 코드까지 깔면 0 행이 수십 줄 생긴다.
+    #   ★ 정렬은 base 묶음 순(D 계열 → E → N → O → 그 외)이라 D 하위코드가 붙어 보인다.
+    #   ★ **미배정 sentinel `-` 를 뺀다.** 위 base 수집이 `base != '-'` 로 거르는 것과
+    #     같은 규약이다. `shifts` 마스터에 없는 값인데 `schedule_entries` 에는 실제로
+    #     저장돼 있어(운영·dev 양쪽 실측: `29dba53a16a1` 2026-03), 안 거르면 하단에
+    #     `-` 행이 생겨 **미배정 칸이 근무 인원으로 읽힌다**.
+    used_raw_codes = {
+        _c for _c in (str(e.shift_id or "").strip() for e in entries)
+        if _c and to_base(_c) != "-"
+    }
+    _base_rank = {c: i for i, c in enumerate(core_codes)}
+    footer_labels = sorted(
+        used_raw_codes,
+        key=lambda c: (_base_rank.get(to_base(c), len(core_codes)), to_base(c), c),
+    )
+
     # nurse별 매핑
     by_nurse: dict[str, dict[int, str]] = {}
     for e in entries:
@@ -1349,14 +1376,17 @@ def export_schedule_excel_bytes(
         .all()
     )
     code_bg: Dict[str, str] = {}
-    #: 배정 영역에서 **배경을 칠할** 코드 — 셋이다:
+    #: 배정 영역에서 **배경을 칠할** 코드 — 둘이다:
     #:   ① 3교대 대표(`default_shift ∈ D,E,N`)
-    #:   ② OFF 교환 대상(`off_swap_target`)
-    #:   ③ **연차 계열(`annual_leave_unit IS NOT NULL`)** — `Y`(1.0)·`Y1`/`Y2`(0.5)·
-    #:      `Y3`(0.25) 처럼 연차 일수로 환산되는 코드. `off_swap_target` 은 병동마다
-    #:      설정이 엇갈려(같은 `Y` 가 어느 병동은 켜져 있고 어느 병동은 아님) 연차 배경이
-    #:      들쭉날쭉했는데, 이 컬럼은 연차 정산에 쓰이므로 채워져 있어야만 하는 값이라
-    #:      기준으로 삼기에 안정적이다.
+    #:   ② **연차 계열(`annual_leave_unit IS NOT NULL`)** — `Y`(1.0)·`Y1`/`Y2`(0.5)·
+    #:      `Y3`(0.25) 처럼 연차 일수로 환산되는 코드. 이 컬럼은 연차 정산에 쓰이므로
+    #:      채워져 있어야만 하는 값이라 기준으로 삼기에 안정적이다.
+    #: ★★ `off_swap_target` 은 **여기 넣지 않는다**(병동 요청으로 OFF 축 배경을 걷어낼 때
+    #:   같이 정리). 그 플래그는 `off_axis_codes`(=빨간 글자 대상)에도 들어가므로,
+    #:   `fill_codes` 에까지 넣으면 **OFF 축인데 배경이 칠해지는** 코드가 생긴다.
+    #:   실측(2026-09-21 운영): `FB`(9병동·중환자실1/2·중환자실1/2-NA/LP)·`T`(4병동)·
+    #:   `연`(3병동-RN) 7건이 `annual_leave_unit` 없이 색만 있어 정확히 그 상태였다.
+    #:   연차인 `Y`·`Y4` 는 `leave_unit_codes` 로 걸려 배경이 그대로 유지된다.
     #: 나머지 고정근무·특수코드까지 칠하면 표가 얼룩덜룩해 글자색 표시가 묻힌다.
     #: 범례·집계는 이 제한을 받지 않는다.
     fill_codes: set = set()
@@ -1418,7 +1448,9 @@ def export_schedule_excel_bytes(
             off_axis_codes.add(_code)
         if getattr(_s, "annual_leave_unit", None) is not None:
             leave_unit_codes.add(_code)
-        if _axis in ("D", "E", "N") or _swap or _code in leave_unit_codes:
+        # ★ `_swap` 을 조건에서 뺐다 — 위 `code_bg` 주석 참조. OFF 축과 배경이 한 코드에
+        #   겹치지 않게 한다. 연차는 `leave_unit_codes` 로 남는다.
+        if _axis in ("D", "E", "N") or _code in leave_unit_codes:
             fill_codes.add(_code)
 
     # 고정근무 — **그 사람의 그 칸은 배경을 칠하지 않는다.** 상시 근무라 한 줄이 통째로
@@ -1765,7 +1797,10 @@ def export_schedule_excel_bytes(
 
     # ───────── 6) 본문 ─────────
     start_row = header_row + 1
-    daily_counts = {d: {code: 0 for code in tail_labels} for d in range(1, days_in_month + 1)}
+    # 하단 일일 집계는 **세부 코드** 축(`footer_labels`)이다. 우측 요약 열의 base 축
+    #   (`row_counts` / `tail_labels`)과 축이 다르므로 같은 dict 를 쓰면 안 된다.
+    daily_counts = {d: {code: 0 for code in footer_labels}
+                    for d in range(1, days_in_month + 1)}
 
     def write_nurse_row(n, r: int, idx: int):
         """간호사 1명을 r 행에 작성하고 daily_counts 를 누적한다."""
@@ -1844,21 +1879,10 @@ def export_schedule_excel_bytes(
                 _code in off_axis_codes or _code in leave_unit_codes
             ):
                 cell.font = Font(color=_C_WANTED)
-                # ★ **빨강 OFF 칸에만 배경을 칠한다**(2026-09-21 병동 요청).
-                #   연차 계열은 `fill_codes` 에 들어 있어 이미 배경이 있는데 OFF 축만
-                #   비어 있어서, 같은 "신청해서 받은 쉬는 날" 인데 한쪽만 밋밋했다.
-                #   색은 `shifts.color` 를 그대로 쓴다 — 연차와 같은 방식이고 병원이
-                #   정한 OFF 색이다(성남 중환자실-RN `#FF99CC`).
-                #   ★ 조건이 **빨강일 때뿐**이라 일반 OFF 는 배경이 없다. 그래야
-                #     "신청분" 과 "솔버가 준 휴무" 가 눈으로 갈린다.
-                #   ★ 글자색은 위에서 이미 빨강으로 덮었으므로 여기선 배경만 손댄다
-                #     (`_readable_text_color` 를 다시 태우면 빨강이 지워진다).
-                #   ★ 본인 행 하이라이트(`highlight_fill`)보다 우선한다 — 색 규약이
-                #     하이라이트를 이긴다(연차·D/E/N 배경과 같은 취급).
-                if _code in off_axis_codes and not _bg:
-                    _off_bg = code_bg.get(_code)
-                    if _off_bg:
-                        cell.fill = PatternFill("solid", fgColor=_off_bg)
+                # ★ OFF 축은 **원티드 여부와 무관하게 배경을 칠하지 않는다**(병동 요청).
+                #   한때 "신청해서 받은 OFF" 에만 배경을 넣어 솔버가 준 휴무와 구분했으나,
+                #   병동이 OFF 칸은 전부 바탕 없이 보는 쪽을 택했다. 구분은 **글자색 빨강**
+                #   하나로 충분하다. 연차 계열은 `fill_codes` 라 여전히 배경이 있다.
             elif (
                 _code and _code != "-"
                 and _code not in den_codes
@@ -1871,10 +1895,14 @@ def export_schedule_excel_bytes(
             ):
                 cell.font = Font(color=_C_SPECIAL)
 
+            # 우측 요약 열은 base 축, 하단 일일 집계는 세부 코드 축 — 따로 센다.
             base = to_base(shift_code)
             if base in row_counts:
                 row_counts[base] += 1
-                daily_counts[d][base] += 1
+            #   `footer_labels` 와 **같은 정규화**를 써야 키가 어긋나지 않는다(양쪽 strip).
+            _raw = str(shift_code or "").strip()
+            if _raw in daily_counts[d]:
+                daily_counts[d][_raw] += 1
 
         # 요약 열: 0도 그대로 표시 (빈칸 → 0)
         for i, lab in enumerate(tail_labels):
@@ -1964,14 +1992,16 @@ def export_schedule_excel_bytes(
             col = static_cols + days_in_month + 1 + i
             ws.cell(row=row_idx, column=col).border = border_all
 
-    for i, lab in enumerate(tail_labels):
+    for i, lab in enumerate(footer_labels):
         row_idx = footer_start + 1 + i
         vals = [daily_counts[d][lab] for d in range(1, days_in_month + 1)]
         write_footer_row(lab, vals, row_idx)
 
     # ───────── 8) 테두리 보정 ─────────
+    #   가로 끝은 우측 요약 열 기준(`tail_labels`), 세로 끝은 하단 집계 행 수
+    #   기준(`footer_labels`)이다 — 축이 서로 다르다.
     max_col = tail_start_col + len(tail_labels) + leave_cols - 1
-    for row in ws.iter_rows(min_row=wd_row, max_row=footer_start + len(tail_labels) + 1,
+    for row in ws.iter_rows(min_row=wd_row, max_row=footer_start + len(footer_labels) + 1,
                             min_col=1, max_col=max_col):
         for cell in row:
             if cell.value is not None and (cell.border is None or cell.border.left.style is None):
