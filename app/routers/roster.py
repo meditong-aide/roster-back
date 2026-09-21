@@ -689,6 +689,14 @@ async def get_issued_roster_snapshot(
             current_user=current_user,
             db=db,
             target_group_id=target_group_id,
+            # ★★ `_expand_target_rosters=False` — 기본값(True)은 관련 병동 스냅샷을
+            #   **재귀로 전부** 끌어와 `target_rosters` 필드를 채운다. 그런데 그 필드를
+            #   읽는 곳이 프론트에도 이 라우터에도 **한 곳도 없다**(생성만 하고 버린다).
+            #   아래에서 파견 셀에 필요한 대상 병동 스냅샷은 `_load_target_snapshot` 이
+            #   **필요한 병동만 캐시해** 따로 읽는다. 실측 1병동 31→25 쿼리.
+            #   ※ 발행 뒤 파견으로 행을 지어내면 읽는 병동 수가 늘 수 있어, 이 절감이
+            #     그 증가분을 상쇄한다.
+            _expand_target_rosters=False,
         )
         # ★ 발행본이 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 의 404 를
         #   `index.html` **200(text/html)** 으로 바꿔 보내고, 그 HTML 을 **URL 단위로
@@ -808,6 +816,53 @@ async def get_issued_roster_snapshot(
                 _other_tgt_rosters[_tgid] = _map
                 return _map
 
+            # ── 발행 뒤에 파견이 잡힌 사람을 행으로 만든다 ─────────────────────
+            # ★★ 발행본의 `nurses` 는 **발행 시점 명단**이다. 그 뒤에 이 병동으로
+            #   파견이 잡히면 배치는 `_assignments` 에 있는데 행이 없어, 받는 병동
+            #   전체표에서 그 사람이 **통째로 안 보인다**. 운영자는 누가 와 있는지를
+            #   근무표에서 확인할 수 없다. 급한 파견은 발행 뒤에 잡히는 일이 흔하다.
+            # ★ 근무는 비어 있다(이 병동 근무표에 배정이 없으므로). 그래도 행이
+            #   있어야 기간 띠가 그려지고, 그 띠 자체가 "이 기간 우리 병동에 있다"
+            #   는 정보다.
+            _existing_nids = {
+                str(_n.get("nurse_id", "")) for _n in (_roster.get("nurses") or [])
+            }
+            _synth_nids: set[str] = set()
+            _missing_inbound = [
+                str(_anid) for _anid, _al in _assignments.items()
+                if str(_anid) not in _existing_nids
+                and any(_a0.get("is_inbound") for _a0 in _al)
+            ]
+            if _missing_inbound:
+                _nrows = (
+                    db.query(Nurse)
+                    .filter(Nurse.nurse_id.in_(_missing_inbound))
+                    .all()
+                )
+                _nmap = {str(_nr.nurse_id): _nr for _nr in _nrows}
+                _nurses_list = _roster.setdefault("nurses", [])
+                # ★ **맨 뒤에** 붙인다. 발행본의 기존 순서는 그대로 둬야 화면이
+                #   이전 발행본과 같은 줄 배치를 유지한다. 뒤에 붙으면 새로 온
+                #   사람이라는 것도 자연히 드러난다.
+                for _mnid in _missing_inbound:
+                    _nr = _nmap.get(_mnid)
+                    if _nr is None:
+                        # 간호사 마스터에 없는 배치 — 행을 지어내지 않는다.
+                        continue
+                    _nurses_list.append({
+                        "nurse_id": _mnid,
+                        "name": _nr.name or "",
+                        "experience": _nr.experience or 0,
+                        "schedule": [
+                            {"code": "", "color": ""} for _ in range(_days)
+                        ],
+                        "schedule_ids": [None] * _days,
+                        # 빈 dict 로 둬야 `recount_roster_counts` 가 색표 기준으로
+                        # 0 을 채운다(키 자체가 없으면 건너뛴다).
+                        "counts": {},
+                    })
+                    _synth_nids.add(_mnid)
+
             for _nurse in (_roster.get("nurses") or []):
                 _nid = str(_nurse.get("nurse_id", ""))
                 _a_list = _assignments.get(_nid)
@@ -853,7 +908,13 @@ async def get_issued_roster_snapshot(
                     #   늘 확정이다. 코드도 이 스냅샷 값이 정답이라 `_put_cell` 이
                     #   비우면 안 된다 — 그래서 여기서 `confirmed` 로 끊는다.
                     if _asg.get("is_inbound"):
-                        return "confirmed"
+                        # ★★ 이 병동 발행본에 그 사람 행이 **있을 때만** 확정이다.
+                        #   발행 뒤에 파견이 잡혀 위에서 행을 지어낸 경우는 근무가
+                        #   비는데, 그걸 `confirmed` 로 두면 "근무 없음이 확정"
+                        #   (= 휴직·퇴사) 과 구분되지 않는다. 사실은 대상 병동이
+                        #   발행했는데 그 사람 행이 없는 것이라 `target_no_row` 다
+                        #   (outbound 쪽에서 같은 상황에 쓰는 값과 같다).
+                        return "target_no_row" if _nid in _synth_nids else "confirmed"
                     # ★★ 휴직·퇴사는 **대상 병동이 없다**(`target_group_id` 가 비어
                     #   `target_status` 도 안 붙는다). 이걸 '상태 정보 없음' 으로 읽어
                     #   `confirmed` 로 돌리면 그 기간의 원 소속 코드가 남은 채
