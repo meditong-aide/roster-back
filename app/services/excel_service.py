@@ -1010,6 +1010,45 @@ def _kr_holidays_in_month(year: int, month: int) -> set:
         return set()
 
 
+def _tenure_text(joining_date, year: int, month: int) -> str:
+    """현재 병원 **근속**을 'N년 M개월' 로. 값이 없거나 미래 입사면 빈 문자열.
+
+    ★ 기준일은 `date.today()` 가 아니라 **그 근무표 월의 말일**이다.
+      마이페이지(`routers/nurses.py:950-961`)는 "오늘 기준 재직기간" 이 맞지만,
+      근무표 엑셀은 과거 달을 다시 받는 일이 흔해 오늘로 잡으면 **같은 파일이
+      받을 때마다 다른 값**으로 나온다. 월 말일로 고정해야 재현된다.
+    ★ `experience`(이직 전 경력 합산)를 대체한다 — 같은 병동 안에서 누가 오래
+      일했는지를 나타내려면 현재 병원 근속이어야 한다(2026-09-21 병동 요청).
+    """
+    if not joining_date:
+        return ""
+    try:
+        from calendar import monthrange
+        from datetime import date as _date
+        from dateutil.relativedelta import relativedelta
+
+        jd = joining_date.date() if hasattr(joining_date, "date") else joining_date
+        base = _date(year, month, monthrange(year, month)[1])
+        if jd > base:
+            return ""
+        delta = relativedelta(base, jd)
+        return f"{delta.years}년 {delta.months}개월"
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Excel] 근속 계산 실패 — 빈 칸으로 둔다: {exc}")
+        return ""
+
+
+def _join_date_text(joining_date) -> str:
+    """입사일 'YYYY-MM-DD'. 값이 없으면 빈 문자열."""
+    if not joining_date:
+        return ""
+    try:
+        jd = joining_date.date() if hasattr(joining_date, "date") else joining_date
+        return jd.isoformat()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _day_font_color(year: int, month: int, day: int, holidays: set):
     """일자/요일 헤더의 글자색. 해당 없으면 None(기본 검정)."""
     import calendar as _cal
@@ -1130,7 +1169,7 @@ def export_schedule_excel_bytes(
     days_in_month = calendar.monthrange(year, month)[1]
 
     nurses = db.query(
-        Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role,
+        Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.joining_date, Nurse.sequence, Nurse.role,
         Nurse.hn_auth,
     ).filter(
         Nurse.group_id == target_group_id
@@ -1150,7 +1189,7 @@ def export_schedule_excel_bytes(
     _inbound_ids = _entry_nurse_ids - _home_nurse_ids
     if _inbound_ids:
         inbound_nurses = db.query(
-            Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role,
+            Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.joining_date, Nurse.sequence, Nurse.role,
             Nurse.hn_auth,
         ).filter(
             Nurse.nurse_id.in_(_inbound_ids)
@@ -1454,13 +1493,46 @@ def export_schedule_excel_bytes(
     holidays = _kr_holidays_in_month(year, month)
 
     # ───────── 2-c) 확정 원티드 ─────────
-    #   **확정 원티드(`fixed_wanted_entries`, `is_applied=True`)에 있는 칸 = 빨간 글자.**
-    #   ★★ **제출 테이블(`wanted_requests`·`nurse_shift_requests`)과 대조하지 않는다.**
-    #     예전엔 '간호사 제출본에도 같은 코드가 있는가' 를 빨강 조건으로 걸었는데,
-    #     **운영에서 빨강이 한 칸도 안 나왔다** — 수간호사가 종이 휴가계획서를 받아
-    #     확정 원티드에 직접 넣는 운용이 흔해서 제출본이 통째로 비어 있기 때문이다
-    #     (실측 2026-09-16 운영 성남시의료원 5개 병동 2026-10: 제출본 **0건** ·
-    #      확정원티드 **249건**). 확정에 올라간 것 자체가 '반영된 원티드' 다.
+    #   **확정 원티드(`fixed_wanted_entries`, `is_applied=True`) ∩ 간호사 제출본에
+    #     같은 (간호사, 날짜)가 있는 칸 = 빨간 글자.**
+    #   ★★ **2026-09-21 방침 변경 — 제출본 대조를 다시 건다.**
+    #     색의 의미를 "확정 원티드에 올라갔다" 가 아니라 **"간호사가 낸 신청이
+    #     반영됐다"** 로 좁힌다(병동 요청). 수간호사가 종이 휴가계획서를 보고 직접
+    #     넣은 칸은 간호사 신청이 아니므로 **바탕색 없이 검정**으로 둔다.
+    #     예) 성남 중환자실-RN 홍난희 10/1·10/2 OF 는 `reason='10월 원티드 9.17 수정본'`
+    #         이지만 제출본에 없어 수간호사 입력이다 → 검정.
+    #   ★★ 예전에 같은 대조를 걸었다가 "빨강이 한 칸도 안 나온다" 고 되돌린 적이 있다.
+    #     그 현상 자체는 지금도 같다 — 실측 2026-10 제출본/확정원티드:
+    #         성남 중환자실-RN 0/225 · 동탄 7B-RN 0/95 · 8병동 0/37 · 6B-RN 0/35
+    #         성남 61병동-RN 64/112 · 61병동-AN 6/7
+    #     즉 **성남 61병동 말고는 색이 사라진다**. 그때는 버그였지만 이번엔 그게
+    #     의도한 결과다(신청하지 않은 칸을 신청분처럼 보이게 하지 않는다).
+    #   ★ 대조 대상은 `nurse_shift_requests` 다. `wanted_requests` 는 (간호사,월) 헤더라
+    #     날짜가 없어 칸 단위 판정에 못 쓴다.
+    #   ★ 판정은 **(간호사, 날짜)** 로만 한다 — 코드 일치까지 요구하지 않는다.
+    #     수간호사가 제출을 보고 코드를 조정하는 일이 흔한데(희망 OF → 확정 Y 등),
+    #     그것도 신청이 반영된 것이다.
+    submitted_days: set = set()       # (간호사, 일) — 간호사가 실제로 제출한 칸
+    try:
+        from db.models import NurseShiftRequest
+
+        for _s in (
+            db.query(NurseShiftRequest.nurse_id, NurseShiftRequest.shift_date)
+            .filter(
+                NurseShiftRequest.group_id == target_group_id,
+                NurseShiftRequest.shift_date >= date(year, month, 1),
+                NurseShiftRequest.shift_date < (
+                    date(year, month, 1) + timedelta(days=days_in_month)
+                ),
+            )
+            .all()
+        ):
+            if _s.shift_date:
+                submitted_days.add((str(_s.nurse_id), _s.shift_date.day))
+    except Exception as _sub_exc:
+        # 실패하면 **아무 칸도 빨강이 아니게** 된다. 조용히 넘기면 "원래 신청이 없는
+        #   병동" 과 구분이 안 되므로 사유를 남긴다.
+        print(f"[Excel] 제출 원티드 조회 실패 — 빨강 판정 전부 꺼진다: {_sub_exc}")
     #   ★★ `year`·`month` 필터를 반드시 건다. `request_id` 가 (간호사,월) 스코프로 1부터
     #     재채번돼, 월 필터 없는 조회가 다른 달 셀을 **일(day)만 떼어** 같은 날짜로 반영한
     #     사고가 있었다(운영 전사 236건). 날짜 범위도 함께 걸어 이중으로 막는다.
@@ -1487,8 +1559,13 @@ def export_schedule_excel_bytes(
             .all()
         ):
             _wc = str(_w.shift_id or "").strip()
-            if _w.shift_date and _wc:
-                wanted_req[(str(_w.nurse_id), _w.shift_date.day)] = _wc
+            if not (_w.shift_date and _wc):
+                continue
+            _key = (str(_w.nurse_id), _w.shift_date.day)
+            # ★ 제출본에 없는 칸 = 수간호사 직접 입력 → 색을 주지 않는다(검정).
+            if _key not in submitted_days:
+                continue
+            wanted_req[_key] = _wc
     except Exception as _w_exc:
         print(f"[Excel] 확정 원티드 조회 실패: {_w_exc}")
 
@@ -1558,14 +1635,23 @@ def export_schedule_excel_bytes(
 
     # ───────── 4) 제목 영역 ─────────
     title = f"{year}년 {month}월 근무표"
-    # 팀별보기면 맨 앞(컬럼1)에 팀 컬럼 1개 추가 → static_cols 4→5.
-    # 배치: 팀(1) · 번호(2) · 이름(3) · 구분(4) · 경력(5). 기본: 번호(1) · 이름(2) · 구분(3) · 경력(4).
+    # 팀별보기면 맨 앞(컬럼1)에 팀 컬럼 1개 추가 → static_cols 5→6.
+    # 배치: 팀(1) · 번호(2) · 이름(3) · 구분(4) · 근속(5) · 입사일(6).
+    #       기본: 번호(1) · 이름(2) · 구분(3) · 근속(4) · 입사일(5).
     # 날짜 시작열·spacer·요약열은 static_cols 에서 파생되므로 자동 보정.
-    static_cols = 5 if team_view else 4
+    #
+    # ★ '경력'(`nurses.experience`) 대신 **현재 병원 근속**(`joining_date` 기준)을 낸다
+    #   (2026-09-21 병동 요청). experience 는 이직 전 경력까지 합산된 값이라 같은 병동
+    #   안에서 누가 오래 일했는지를 나타내지 못한다. 근속 계산은 마이페이지가 쓰는
+    #   `routers/nurses.py:950-961` 과 같은 식(relativedelta)을 쓰되, 기준일만
+    #   **그 근무표 월의 말일**로 바꾼다 — `date.today()` 로 잡으면 과거 근무표를 다시
+    #   받을 때마다 값이 커져 같은 파일이 다르게 나온다.
+    static_cols = 6 if team_view else 5
     idx_col  = 2 if team_view else 1  # 번호 컬럼
     name_col = 3 if team_view else 2  # 이름 컬럼
     role_col = name_col + 1           # 구분
-    exp_col  = name_col + 2           # 경력
+    exp_col  = name_col + 2           # 근속(현재 병원)
+    join_col = name_col + 3           # 입사일
     spacer_cols = 2
     leave_cols = len(leave_labels)
     total_cols = static_cols + days_in_month + spacer_cols + summary_cols + leave_cols
@@ -1583,7 +1669,8 @@ def export_schedule_excel_bytes(
         ws.cell(row=header_row, column=1, value="번호").font = header_font
     ws.cell(row=header_row, column=name_col, value="이름").font = header_font
     ws.cell(row=header_row, column=role_col, value="구분").font = header_font
-    ws.cell(row=header_row, column=exp_col, value="경력").font = header_font
+    ws.cell(row=header_row, column=exp_col, value="근속").font = header_font
+    ws.cell(row=header_row, column=join_col, value="입사일").font = header_font
 
     for c in range(1, static_cols + 1):
         cell = ws.cell(row=header_row, column=c)
@@ -1664,7 +1751,8 @@ def export_schedule_excel_bytes(
         ws.column_dimensions['A'].width = 5  # 번호
     ws.column_dimensions[get_column_letter(name_col)].width = 12  # 이름
     ws.column_dimensions[get_column_letter(role_col)].width = 6   # 구분
-    ws.column_dimensions[get_column_letter(exp_col)].width = 6    # 경력
+    ws.column_dimensions[get_column_letter(exp_col)].width = 11   # 근속 (N년 M개월)
+    ws.column_dimensions[get_column_letter(join_col)].width = 11  # 입사일 (YYYY-MM-DD)
     for d in range(1, days_in_month + 1):
         ws.column_dimensions[get_column_letter(static_cols + d)].width = 4
     for s in range(spacer_cols):
@@ -1686,7 +1774,10 @@ def export_schedule_excel_bytes(
         ws.cell(row=r, column=idx_col, value=idx)
         ws.cell(row=r, column=name_col, value=n.name)
         ws.cell(row=r, column=role_col, value=n.role)
-        ws.cell(row=r, column=exp_col, value=n.experience)
+        ws.cell(row=r, column=exp_col, value=_tenure_text(
+            getattr(n, "joining_date", None), year, month))
+        ws.cell(row=r, column=join_col, value=_join_date_text(
+            getattr(n, "joining_date", None)))
         # 팀 컬럼(col1)은 본문 작성 후 팀 그룹 경계로 세로병합하므로 여기선 비워둔다.
 
         for c in range(1, static_cols + 1):
@@ -1753,6 +1844,21 @@ def export_schedule_excel_bytes(
                 _code in off_axis_codes or _code in leave_unit_codes
             ):
                 cell.font = Font(color=_C_WANTED)
+                # ★ **빨강 OFF 칸에만 배경을 칠한다**(2026-09-21 병동 요청).
+                #   연차 계열은 `fill_codes` 에 들어 있어 이미 배경이 있는데 OFF 축만
+                #   비어 있어서, 같은 "신청해서 받은 쉬는 날" 인데 한쪽만 밋밋했다.
+                #   색은 `shifts.color` 를 그대로 쓴다 — 연차와 같은 방식이고 병원이
+                #   정한 OFF 색이다(성남 중환자실-RN `#FF99CC`).
+                #   ★ 조건이 **빨강일 때뿐**이라 일반 OFF 는 배경이 없다. 그래야
+                #     "신청분" 과 "솔버가 준 휴무" 가 눈으로 갈린다.
+                #   ★ 글자색은 위에서 이미 빨강으로 덮었으므로 여기선 배경만 손댄다
+                #     (`_readable_text_color` 를 다시 태우면 빨강이 지워진다).
+                #   ★ 본인 행 하이라이트(`highlight_fill`)보다 우선한다 — 색 규약이
+                #     하이라이트를 이긴다(연차·D/E/N 배경과 같은 취급).
+                if _code in off_axis_codes and not _bg:
+                    _off_bg = code_bg.get(_code)
+                    if _off_bg:
+                        cell.fill = PatternFill("solid", fgColor=_off_bg)
             elif (
                 _code and _code != "-"
                 and _code not in den_codes
