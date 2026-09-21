@@ -2494,6 +2494,16 @@ def get_roster_assignments(
             "is_inbound": _is_inbound,
             "source_group_id": a.source_group_id or "",
             "source_group_name": gname_map.get(a.source_group_id, "") if a.source_group_id else "",
+            # ★ 이 조회는 **끝난 배치(completed)도 포함**한다
+            #   (`get_active_assignments_for_month` 가 `status.in_(["active","completed"])`).
+            #   그 달에 유효했던 기간은 이미 종료됐어도 근무표에 그려져야 하기 때문이다 —
+            #   빼면 그 기간 셀에 원 소속 코드가 되살아나 "파견 나간 사람이 원 병동에서
+            #   근무한 것" 으로 보인다.
+            #   다만 화면은 진행 중인 파견과 끝난 파견을 **구분해 그려야** 하므로 그대로 싣는다.
+            #   ★ 판정에는 쓰지 않는다 — `_cell_status_for`·`_put_cell`·`_active_by_day` 는
+            #     이 두 키를 읽지 않으므로 서버 동작은 불변이다.
+            "id": a.id,
+            "status": a.status,
         }
         if _is_inbound:
             # 대상 병동 = 지금 조회 중인 이 병동. 그 발행본을 보고 있으므로 늘 발행·행 존재다
@@ -2519,6 +2529,10 @@ def get_roster_assignments(
             "target_group_name": "",
             "start_date": str(n.resignation_date),
             "end_date": None,
+            # ★ synthetic entry 라 실제 assignment 행이 없다. 그래도 **키는 항상 둔다** —
+            #   소비자가 `status === "completed"` 를 안전하게 쓰려면 키 유무가 갈리면 안 된다.
+            "id": None,
+            "status": None,
         })
     return result
 

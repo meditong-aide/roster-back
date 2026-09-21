@@ -1329,6 +1329,11 @@ def get_my_issued_roster_service(
             "reason": None,
             # 원 소속 발행본의 값이므로 확정이다. 파견 구간은 아래에서 덮인다.
             "status": CELL_CONFIRMED,
+            # ★ 전체표 셀과 **같은 키 집합**을 유지한다. 파견이 아닌 날은 대상 병동이
+            #   없으므로 None 이다(전체표의 평범한 셀과 같다). 화면이 두 API 를
+            #   한 코드로 그릴 수 있게 하려는 것이라, 값이 비어도 키는 있어야 한다.
+            "target_group_id": None,
+            "target_group_name": None,
         })
 
     # 파견/병동이동: target 근무표 overlay (복수 assignment 지원)
@@ -1636,7 +1641,9 @@ def get_my_issued_roster_service(
                     CELL_ASSIGNMENT_CONFLICT if _own.get("conflict")
                     else CELL_CONFIRMED
                 ),
-                "target_status": _d_status,
+                # 전체표 셀과 같은 키 — 그 날 근무한 대상 병동.
+                "target_group_id": _gid,
+                "target_group_name": _gname,
             })
         else:
             # ★★ 대상 근무를 확인할 수 없는 구간. **원 소속 코드를 반드시 지운다.**
@@ -1651,15 +1658,16 @@ def get_my_issued_roster_service(
                 "group_name": _gname,
                 "is_source": False,
                 "reason": _own["reason"],
-                # ★ 파견이 겹친다는 사실이 **발행 지연보다 근본 원인**이다. 발행본이
-                #   없다고 `target_not_issued` 로 덮으면 화면은 단순 발행 대기로 오인한다.
-                #   두 조건을 잃지 않도록 `target_status` 를 함께 내린다.
+                # ★ 파견이 겹친다는 사실이 **발행 지연보다 근본 원인**이라 충돌을 먼저
+                #   본다. 발행본이 없다고 `target_not_issued` 로 덮으면 화면은 단순
+                #   발행 대기로 오인한다. 세 경우가 이 한 축에 모두 들어간다.
                 "status": (
                     CELL_ASSIGNMENT_CONFLICT if _own.get("conflict")
                     else CELL_TARGET_NO_ROW if _d_status == TARGET_NO_ROW
                     else CELL_TARGET_NOT_ISSUED
                 ),
-                "target_status": _d_status,
+                "target_group_id": _gid,
+                "target_group_name": _gname,
             })
 
     # ── transfers: 실제로 적용된 연속 구간 단위로 조립 ───────────────────────
@@ -1873,6 +1881,11 @@ def get_my_issued_week_service(
             #   **파견지가 아직 발행을 안 해 모르는 것**. 대시보드가 둘을 같은
             #   '미배정' 으로 그리지 않도록 월간 조회가 판정한 셀 상태를 그대로 싣는다.
             "status": (cell or {}).get("status") or CELL_CONFIRMED,
+            # ★ 사유도 함께 싣는다. `group_name` 만으로는 **왜** 다른 병동인지
+            #   (파견인지 병동이동인지) 알 수 없어, 같은 대시보드의 `/me/today` 가
+            #   최상위 `reason` 을 주는 것과 비대칭이었다. 주간 카드만 사유를 모르면
+            #   화면이 배지를 그리려고 월간 조회를 따로 한 번 더 불러야 한다.
+            "reason": (cell or {}).get("reason"),
         })
 
     today_cell = next((c for c in days_out if c["is_today"]), None)

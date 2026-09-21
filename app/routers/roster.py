@@ -574,6 +574,85 @@ async def get_issued_schedules(
         )
 
 
+# ── 근무표 셀 계약 ────────────────────────────────────────────────────────────
+# ★★ 전체표·개인표의 모든 셀은 **같은 키 집합**을 갖는다. 종전에는 파견/병동이동이
+#   걸린 셀에만 `status`·`reason` 이 붙고 평범한 셀은 `{code, color}` 2키뿐이라,
+#   화면이 셀마다 "이 키가 있나" 를 먼저 묻고 없으면 `assignments[]` 를 날짜로 되짚어
+#   상태를 **추론**해야 했다. 추론이 갈리면 같은 날이 화면마다 다르게 그려진다.
+#   키가 늘 있으면 화면은 셀 하나만 읽으면 된다.
+# ★ `schedule_id` 는 `schedule_ids[]` 배열에도 그대로 남긴다 — 기존 소비처가 있다.
+ROSTER_CELL_KEYS = (
+    "code",
+    "color",
+    "schedule_id",
+    "status",
+    "reason",
+    "target_group_id",
+    "target_group_name",
+)
+
+
+def normalize_roster_cells(roster: dict | None) -> None:
+    """roster["nurses"][*]["schedule"] 의 전 셀을 셀 계약 7키로 맞춘다(in-place).
+
+    - 문자열 셀(`"D"`)도 dict 로 승격한다.
+    - `schedule_id` 는 같은 인덱스의 `schedule_ids[]` 에서 끌어온다.
+    - 배치가 없는 평범한 날은 `status="confirmed"` · `reason=None` 이다.
+    - 이미 채워진 값은 **덮지 않는다**(파견 overlay 가 먼저 돌았을 수 있다).
+    """
+    for _n in ((roster or {}).get("nurses") or []):
+        _sched = _n.get("schedule") or []
+        _sids = _n.get("schedule_ids") or []
+        for _i, _cell in enumerate(_sched):
+            _c = dict(_cell) if isinstance(_cell, dict) else {"code": _cell or ""}
+            _c.setdefault("code", "")
+            _c.setdefault("color", "")
+            _c.setdefault("status", "confirmed")
+            _c.setdefault("reason", None)
+            _c.setdefault("target_group_id", None)
+            _c.setdefault("target_group_name", None)
+            if _c.get("schedule_id") is None:
+                _c["schedule_id"] = _sids[_i] if _i < len(_sids) else None
+            _sched[_i] = _c
+
+
+def recount_roster_counts(roster: dict | None) -> None:
+    """overlay 가 끝난 **셀 기준**으로 `counts` 를 다시 센다(in-place).
+
+    ★★ 스냅샷의 `counts` 는 **발행 시점 값**이다. 파견/병동이동 overlay 로 셀이
+      바뀌어도 그대로라, 파견 나간 날의 원 소속 코드가 계속 세어졌다
+      (실측 2026-09 1병동: 전도연 `D` counts 9 ↔ 실제 셀 5 · 대상 병동 근무
+      `Dㅇ` 은 0 으로 누락). 근무 횟수는 공정성 판단의 입력이라 조용히 틀리면
+      안 된다. 개인표(`get_my_issued_roster_service`)는 이미 재계산한다.
+    ★ 세는 대상은 `shift_colors` 에 있는 코드뿐이다 — `-`(미배정)는 근무가 아니다.
+    ★ 확정할 수 없는 날(`assignment_conflict`)은 `provisional_counts` 로 뺀다.
+      어느 병동 근무인지 못 정하는 날을 확정 근무로 세면 값이 흔들린다.
+    """
+    _r = roster or {}
+    _codes = list((_r.get("shift_colors") or {}).keys())
+    if not _codes:
+        return
+    for _n in (_r.get("nurses") or []):
+        if "counts" not in _n:
+            continue
+        _counts = {_c: 0 for _c in _codes}
+        _prov: dict[str, int] = {}
+        for _cell in (_n.get("schedule") or []):
+            _code = (
+                str(_cell.get("code") or "") if isinstance(_cell, dict)
+                else str(_cell or "")
+            )
+            if not _code or _code not in _counts:
+                continue
+            if isinstance(_cell, dict) and _cell.get("status") == "assignment_conflict":
+                _prov[_code] = _prov.get(_code, 0) + 1
+            else:
+                _counts[_code] += 1
+        _n["counts"] = _counts
+        if _prov:
+            _n["provisional_counts"] = _prov
+
+
 @router.get("/issued_roster")
 async def get_issued_roster_snapshot(
     year: int,
@@ -644,20 +723,11 @@ async def get_issued_roster_snapshot(
                 return _date.fromisoformat(str(v)[:10])
             _roster = snapshot.get("roster") or {}
             _s_colors = _roster.get("shift_colors")
-            # 본인이 파견/병동이동 대상자일 때 target 스냅샷 조회
-            _my_nid = getattr(current_user, "nurse_id", None)
-            _my_a_list = _assignments.get(_my_nid, []) if _my_nid else []
-            _my_tgt_roster = {}
-            # ★ 본인 행의 target 스냅샷 병합은 **outbound 일 때만** 의미가 있다.
-            #   inbound 는 대상 병동이 지금 보고 있는 이 병동이라, 여기서 잡으면
-            #   같은 스냅샷을 target 이라며 다시 읽어 제 값으로 덮어쓴다.
-            _my_tgt_a = next(
-                (a for a in _my_a_list
-                 if a["reason"] in ("파견", "병동이동")
-                 and a.get("target_group_id")
-                 and not a.get("is_inbound")),
-                None,
-            )
+            # ★★ 본인 행 전용 분기는 **없다.** 종전엔 로그인한 간호사 행만 따로
+            #   `_my_tgt_a`(배치 목록의 **첫** outbound 하나)로 target 을 병합해,
+            #   ① 배치가 둘 이상인 달에는 뒤의 배치가 엉뚱한 병동 근무를 보고
+            #   ② 같은 사람의 같은 날이 **누가 조회하느냐에 따라 다르게** 그려졌다.
+            #   지금은 모든 행이 배치마다 제 대상 병동을 보는 한 경로만 탄다.
             # target_group_id → group_name 맵 (inbound 배지 표시용, batch 1회 조회)
             _tgt_gids = {
                 _a.get("target_group_id")
@@ -710,20 +780,33 @@ async def get_issued_roster_snapshot(
                         _sids_local = _tn.get("schedule_ids") or []
                         _daymap: dict[int, tuple] = {}
                         for _i, _item in enumerate(_sched_local):
+                            # ★ `_item` 은 코드 문자열이 아니라 **셀 dict 통째**다
+                            #   (`{code, color, …}` — 발행 스냅샷이 병동별 색표로
+                            #   이미 색을 박아 저장한다). `_put_cell` 이 이걸 그대로
+                            #   복사하므로 overlay 된 파견 셀은 **대상 병동 색**을
+                            #   달고 나간다. 아래 색표 `setdefault` 가 조회 병동
+                            #   범례를 지키면서도 셀 색이 안 틀리는 이유가 이것이다.
+                            #   (실측 2026-09: 2병동 셀 600개 전부 dict, 색이 빈
+                            #    146개는 모두 `-` 미배정 — 색표에 없는 코드라 무해)
                             _daymap[_i + 1] = (
                                 _item,
                                 _sids_local[_i] if _i < len(_sids_local) else None,
                             )
                         _map[_tnid] = _daymap
+                    # ★★ 대상 병동 색은 **조회 병동에 없는 코드만** 채운다.
+                    #   `update()` 는 같은 코드명(`Day`·`N` …)의 색을 대상 병동 값으로
+                    #   덮어써, 파견 한 건 때문에 **화면 전체 범례가 남의 병동 색**이 된다
+                    #   (실측 2026-09: 1병동 `Day`=#028835 ↔ 2병동 `Day`=#b49c7f).
+                    #   파견 셀은 위 `_daymap` 이 담아 온 **셀 dict 자체**에 색이 들어
+                    #   있어 범례를 덮을 이유가 없다. 조회 병동에 아예 없는 코드
+                    #   (`Dㅇ` 등)만 여기서 범례에 보태면 폴백까지 정확해진다.
+                    #   개인표(`roster_service.py`)는 같은 자리를 이미 `setdefault` 로 짜 뒀다.
                     _t_colors_local = _t_roster_local.get("shift_colors") or {}
                     if _s_colors is not None:
-                        _s_colors.update(_t_colors_local)
+                        for _ck, _cv in _t_colors_local.items():
+                            _s_colors.setdefault(_ck, _cv)
                 _other_tgt_rosters[_tgid] = _map
                 return _map
-
-            if _my_tgt_a:
-                _my_map = _load_target_snapshot(_my_tgt_a["target_group_id"])
-                _my_tgt_roster = dict(_my_map.get(str(_my_nid), {}))
 
             for _nurse in (_roster.get("nurses") or []):
                 _nid = str(_nurse.get("nurse_id", ""))
@@ -753,18 +836,24 @@ async def get_issued_roster_snapshot(
                         _active_by_day.setdefault(_d0.day, []).append(_a0)
                         _d0 += _timedelta(days=1)
 
-                def _cell_status_for(_day: int, _asg: dict) -> tuple[str, str | None]:
-                    """(셀 status, 대상 병동 발행 상태). 개인 API 계약과 같은 값."""
+                def _cell_status_for(_day: int, _asg: dict) -> str:
+                    """셀 status. 개인 API 계약과 같은 값.
+
+                    ★ `target_status` 는 **셀 밖으로 내보내지 않는다.** 대상 병동의
+                      발행 여부는 이미 이 status 안에 접혀 있고(`target_no_row` ·
+                      `target_not_issued`), 두 축을 같이 내보내면 화면이 어느 쪽을
+                      믿을지 정해야 한다. 내부 판정 입력으로만 쓴다.
+                    """
                     _ts = _asg.get("target_status")
                     if len(_active_by_day.get(_day, [])) > 1:
-                        return "assignment_conflict", _ts
+                        return "assignment_conflict"
                     # ★★ inbound(이 병동이 파견을 **받는** 쪽)는 판정 방향이 반대다.
                     #   outbound 는 "저쪽 병동이 발행했나" 를 물어야 하지만, inbound 의
                     #   대상 병동은 **지금 보고 있는 이 병동**이고 그 발행본을 읽는 중이라
                     #   늘 확정이다. 코드도 이 스냅샷 값이 정답이라 `_put_cell` 이
                     #   비우면 안 된다 — 그래서 여기서 `confirmed` 로 끊는다.
                     if _asg.get("is_inbound"):
-                        return "confirmed", "issued"
+                        return "confirmed"
                     # ★★ 휴직·퇴사는 **대상 병동이 없다**(`target_group_id` 가 비어
                     #   `target_status` 도 안 붙는다). 이걸 '상태 정보 없음' 으로 읽어
                     #   `confirmed` 로 돌리면 그 기간의 원 소속 코드가 남은 채
@@ -772,21 +861,26 @@ async def get_issued_roster_snapshot(
                     #   코드는 비우되(`_put_cell`) 상태는 확정으로 둔다 —
                     #   빈 코드 + `confirmed` = 미배정, 사유는 `reason` 이 말한다.
                     if not (_asg.get("target_group_id") or "").strip():
-                        return "confirmed", None
+                        return "confirmed"
                     if _ts == "no_row":
-                        return "target_no_row", _ts
+                        return "target_no_row"
                     if _ts == "not_issued":
-                        return "target_not_issued", _ts
-                    return "confirmed", _ts
+                        return "target_not_issued"
+                    return "confirmed"
 
-                def _put_cell(_idx: int, _code, _reason: str, _day: int, _asg: dict):
-                    """셀에 코드·사유·상태를 함께 싣는다.
+                def _put_cell(
+                    _idx: int, _code, _reason: str, _day: int, _asg: dict, _sid=None
+                ):
+                    """셀에 7키(code·color·schedule_id·status·reason·target_group_*)를 싣는다.
 
                     ★ 확정이 아닌 날은 **코드를 비운다.** 예전에는 원 소속 코드나
                       사유 문자열('파견')이 코드 자리에 남아, 파견 나간 사람의 옛 병동
                       근무가 확정 근무처럼 그려졌다(개인 API 에서 먼저 고친 문제).
+                    ★★ `schedule_id` 를 **셀 안에도** 싣고 `schedule_ids[]` 배열도 같은
+                      자리에서 갱신한다. 종전엔 셀과 배열을 호출부마다 따로 건드려,
+                      네 갈래 중 하나만 어긋나도 셀과 id 가 말없이 엇갈렸다.
                     """
-                    _st, _ts = _cell_status_for(_day, _asg)
+                    _st = _cell_status_for(_day, _asg)
                     # 대상 병동이 없는 배치(휴직·퇴사)는 그 기간에 이 병동 근무가 없다.
                     # 상태가 `confirmed` 여도 **코드는 비워야** 원 소속 근무가 안 남는다.
                     _no_ward = not (_asg.get("target_group_id") or "").strip()
@@ -797,9 +891,16 @@ async def get_issued_roster_snapshot(
                         _base["color"] = ""
                     _base["reason"] = _reason
                     _base["status"] = _st
-                    if _ts:
-                        _base["target_status"] = _ts
+                    _base.pop("target_status", None)
+                    _cell_tgid = (_asg.get("target_group_id") or "").strip() or None
+                    _base["target_group_id"] = _cell_tgid
+                    _base["target_group_name"] = (
+                        _tgid_to_name.get(_cell_tgid) if _cell_tgid else None
+                    )
+                    _base["schedule_id"] = _sid
                     _sched[_idx] = _base
+                    if _idx < len(_sids):
+                        _sids[_idx] = _sid
 
                 _nurse["inbound"] = [
                     {
@@ -817,6 +918,11 @@ async def get_issued_roster_snapshot(
                         "is_inbound": bool(_a.get("is_inbound")),
                         "source_group_id": _a.get("source_group_id") or "",
                         "source_group_name": _a.get("source_group_name") or "",
+                        # ★ 이 배열에는 **끝난 배치(completed)도 들어온다**(그 달에 유효했던
+                        #   기간은 근무표에 그려져야 하므로). 화면이 진행 중인 것과 구분해
+                        #   그릴 수 있게 원본 상태를 그대로 전달한다.
+                        "id": _a.get("id"),
+                        "status": _a.get("status"),
                     }
                     for _a in _a_list
                 ]
@@ -848,8 +954,10 @@ async def get_issued_roster_snapshot(
                             #   판정해 넣어 준 값을 그대로 전달한다. 여기서 `Schedule` 행
                             #   유무로 다시 계산하면, 스냅샷은 있는데 issued Schedule 행이
                             #   없는(또는 그 반대) 상태에서 **같은 병동·월에 대해 응답마다
-                            #   `target_issued` 가 달라진다.** `target_status` 도 함께 넘겨야
-                            #   프론트가 '발행됐지만 내 행 없음' 을 구분할 수 있다.
+                            #   `target_issued` 가 달라진다.**
+                            #   ★ '발행됐지만 내 행 없음' 은 셀 `status` 의
+                            #   `target_no_row` / `target_not_issued` 로 읽는다 —
+                            #   `target_status` 는 같은 사실의 둘째 표현이라 내보내지 않는다.
                             "target_issued": _a.get(
                                 "target_issued",
                                 bool(_tgid and _tgid_issued.get(_tgid)),
@@ -858,58 +966,59 @@ async def get_issued_roster_snapshot(
                             "is_inbound": bool(_a.get("is_inbound")),
                             "source_group_id": _a.get("source_group_id") or "",
                             "source_group_name": _a.get("source_group_name") or "",
-                            **({"target_status": _a["target_status"]}
-                               if _a.get("target_status") else {}),
+                            # 끝난 배치(completed)도 들어오므로 화면이 구분해 그릴 수 있게 한다.
+                            "id": _a.get("id"),
+                            "status": _a.get("status"),
                         }
                     )
 
                     if not _in_month:
                         continue
 
-                    # 본인 행: target shift 병합 + reason 필드
-                    if _nid == _my_nid and _my_tgt_roster:
-                        for d in range(_p_start, _p_end + 1):
-                            idx = d - 1
-                            tgt = _my_tgt_roster.get(d)
-                            if tgt and idx < len(_sched):
-                                _put_cell(idx, tgt[0], _a["reason"], d, _a)
-                                if idx < len(_sids):
-                                    _sids[idx] = tgt[1]
-                            elif idx < len(_sched):
-                                # 대상 근무를 못 찾은 날 — 사유를 코드 자리에 넣지 않는다.
-                                _put_cell(idx, "", _a["reason"], d, _a)
-                                if idx < len(_sids):
-                                    _sids[idx] = None
-                    else:
-                        # 타인 행: 아웃바운드면 target 스냅샷 overlay, 없으면 기존 셀에 reason만 부가
-                        _a_tgid = _a.get("target_group_id")
-                        _tgt_map = (
-                            _load_target_snapshot(_a_tgid).get(_nid, {})
-                            if _a_tgid and _a["reason"] in ("파견", "병동이동")
-                            and _a_tgid != target_group_id
-                            else {}
-                        )
-                        for d in range(_p_start, _p_end + 1):
-                            idx = d - 1
-                            tgt = _tgt_map.get(d)
-                            if tgt and idx < len(_sched):
-                                _put_cell(idx, tgt[0], _a["reason"], d, _a)
-                                if idx < len(_sids):
-                                    _sids[idx] = tgt[1]
-                                continue
-                            if idx < len(_sched):
-                                # ★ 기존 셀(= 원 소속 코드)에 사유만 붙이던 자리.
-                                #   확정이 아니면 `_put_cell` 이 코드를 비운다.
-                                # ★★ inbound 는 여기서 **이 병동 스냅샷 코드를 그대로 두고**
-                                #   status·target_status 만 얹는다(`_cell_status_for` 가
-                                #   `confirmed` 를 돌려주므로 `_put_cell` 이 안 지운다).
-                                _put_cell(idx, _sched[idx], _a["reason"], d, _a)
-                            # ★ outbound 는 이 병동 근무가 없으니 schedule_id 를 비운다.
-                            #   inbound 는 근무가 **실재**하므로 비우면 셀과 id 가 어긋난다.
-                            if idx < len(_sids) and not _a.get("is_inbound"):
-                                _sids[idx] = None
+                    # ── 모든 행이 같은 경로를 탄다(본인 예외 없음) ──────────────
+                    _is_in = bool(_a.get("is_inbound"))
+                    # outbound(파견/병동이동) 일 때만 **저쪽 병동** 스냅샷을 읽는다.
+                    # inbound 의 대상 병동은 지금 보고 있는 이 병동이라 다시 읽으면
+                    # 같은 스냅샷을 target 이라며 제 값으로 덮어쓴다.
+                    _tgt_map = (
+                        _load_target_snapshot(_tgid).get(_nid, {})
+                        if _tgid
+                        and _a["reason"] in ("파견", "병동이동")
+                        and not _is_in
+                        and _tgid != target_group_id
+                        else {}
+                    )
+                    for d in range(_p_start, _p_end + 1):
+                        idx = d - 1
+                        if idx >= len(_sched):
+                            continue
+                        tgt = _tgt_map.get(d)
+                        if tgt:
+                            # 저쪽 병동의 그 날 근무를 그대로 가져온다.
+                            _put_cell(idx, tgt[0], _a["reason"], d, _a, tgt[1])
+                        elif _is_in:
+                            # ★ inbound — 이 병동 근무가 **실재**한다. 코드도 id 도 그대로
+                            #   두고 status·reason 만 얹는다(`_cell_status_for` 가
+                            #   `confirmed` 를 돌려주므로 `_put_cell` 이 안 지운다).
+                            _put_cell(
+                                idx, _sched[idx], _a["reason"], d, _a,
+                                _sids[idx] if idx < len(_sids) else None,
+                            )
+                        else:
+                            # ★★ outbound·휴직·퇴사 — 이 병동 근무가 없다. 대상 근무까지
+                            #   못 찾았으면 **원 소속 코드를 남기지 않는다.** 종전 타인 행
+                            #   경로는 여기서 기존 셀을 그대로 넘겨, 대상 병동이 발행됐는데
+                            #   그 사람 행만 없는 날에 `confirmed` + 옛 병동 코드가 남아
+                            #   **파견 나간 사람이 원 병동에서 근무한 것처럼** 그려졌다.
+                            _put_cell(idx, "", _a["reason"], d, _a, None)
 
                 _nurse["assignments"] = _assignments_out
+
+        # ★ overlay 가 끝난 **뒤** 전 셀을 계약에 맞추고, 그 셀로 counts 를 다시 센다.
+        #   `setdefault` 라 위에서 `_put_cell` 이 채운 값은 그대로 두고, 배치가 없는
+        #   평범한 셀만 채운다.
+        normalize_roster_cells(snapshot.get("roster"))
+        recount_roster_counts(snapshot.get("roster"))
         return snapshot
     except HTTPException:
         raise
@@ -1411,6 +1520,9 @@ async def get_roster_by_schedule_id(
             sched_ids = nurse_entry.get("schedule_ids")
 
             # 프론트 전달용 inbound/assignments 메타 (기간바·배지용)
+            # ★ 키 구성을 `/roster/issued_roster` 의 `inbound[]` 와 **같게** 유지한다.
+            #   같은 이름의 배열이 라우트마다 다른 키를 담으면, 화면은 어느 경로로
+            #   받았는지 먼저 알아내야 배지를 그릴 수 있다.
             nurse_entry["inbound"] = [
                 {
                     "startDate": _a["start_date"],
@@ -1420,6 +1532,11 @@ async def get_roster_by_schedule_id(
                     "target_group_name": _tgid_to_name.get(
                         _a.get("target_group_id")
                     ),
+                    "is_inbound": bool(_a.get("is_inbound")),
+                    "source_group_id": _a.get("source_group_id") or "",
+                    "source_group_name": _a.get("source_group_name") or "",
+                    "id": _a.get("id"),
+                    "status": _a.get("status"),
                 }
                 for _a in _a_list
             ]
@@ -1458,8 +1575,14 @@ async def get_roster_by_schedule_id(
                             "target_issued",
                             bool(_tgid and _tgid_issued.get(_tgid)),
                         ),
-                        **({"target_status": _a["target_status"]}
-                           if _a.get("target_status") else {}),
+                        # ★ 이 라우트의 `assignments[]` 는 종전에 방향·상태를 안 실어
+                        #   `/roster/issued_roster` 쪽과 **계약이 갈려 있었다.** 소비자가
+                        #   어느 경로로 받았는지에 따라 다르게 추론해야 했으므로 맞춘다.
+                        "is_inbound": bool(_a.get("is_inbound")),
+                        "source_group_id": _a.get("source_group_id") or "",
+                        "source_group_name": _a.get("source_group_name") or "",
+                        "id": _a.get("id"),
+                        "status": _a.get("status"),
                     }
                 )
             nurse_entry["assignments"] = _assignments_out
@@ -1954,103 +2077,6 @@ async def unpublish_roster(
         "schedule_id": schedule_id,
         "new_status": "draft",
     }
-
-
-# [Roster] - 특정 월의 근무표 조회
-@router.get("/{year: int}/{month: int}")
-async def get_roster_for_month(
-    year: int,
-    month: int,
-    group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
-    db: Session = Depends(get_db),
-):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    # 관리자(HN/ADM)만. 토큰 group_id 대신 nurse_id→DB + groups.hn_id 로 해석.
-    if not (
-        caller_is_head_nurse(db, current_user)
-        or getattr(current_user, "is_master_admin", False)
-    ):
-        raise HTTPException(status_code=403, detail="Permission denied")
-    target_group_id = resolve_effective_group(db, current_user, group_id)
-
-    # Get latest issued schedule for the month
-    schedule_info = (
-        db.query(Schedule)
-        .filter(
-            Schedule.group_id == target_group_id,
-            Schedule.year == year,
-            Schedule.month == month,
-            Schedule.status == "issued",
-        )
-        .order_by(Schedule.version.desc())
-        .first()
-    )
-
-    if not schedule_info:
-        raise HTTPException(
-            status_code=404, detail="No issued roster found for this month."
-        )
-
-    # Get all nurses in the group
-    nurses_in_group = (
-        db.query(Nurse.nurse_id, Nurse.name, Nurse.experience)
-        .filter(Nurse.group_id == target_group_id)
-        .order_by(Nurse.experience.desc(), Nurse.nurse_id.asc())
-        .all()
-    )
-
-    # Get shift colors
-    shifts_db = db.query(Shift).all()
-    shift_colors = {s.shift_id: s.color for s in shifts_db}
-
-    # Get schedule entries
-    entries = (
-        db.query(ScheduleEntry)
-        .filter(ScheduleEntry.schedule_id == schedule_info.schedule_id)
-        .all()
-    )
-
-    roster_data = {
-        "year": year,
-        "month": month,
-        "days_in_month": get_days_in_month(year, month),
-        "shift_colors": shift_colors,
-        "nurses": [],
-    }
-
-    # Structure data by nurse
-    entries_by_nurse = {}
-    for entry in entries:
-        if entry.nurse_id not in entries_by_nurse:
-            entries_by_nurse[entry.nurse_id] = {}
-        entries_by_nurse[entry.nurse_id][entry.work_date.day] = entry.shift_id
-
-    # 저장된 위반사항 사용 (RosterSystem 생성하지 않음)
-    violations = []  # 임시로 빈 리스트 반환 - DB 스키마 업데이트 후 위반사항 기능 복구 예정
-
-    for nurse in nurses_in_group:
-        nurse_schedule = [
-            entries_by_nurse.get(nurse.nurse_id, {}).get(d, "-")
-            for d in range(1, roster_data["days_in_month"] + 1)
-        ]
-
-        counts = {shift: nurse_schedule.count(shift) for shift in shift_colors.keys()}
-
-        roster_data["nurses"].append(
-            {
-                "id": nurse.nurse_id,
-                "name": nurse.name,
-                "experience": nurse.experience or 0,
-                "schedule": nurse_schedule,
-                "counts": counts,
-            }
-        )
-    roster_data["violations"] = violations
-
-    return roster_data
 
 
 # [Roster] - 근무표 저장
