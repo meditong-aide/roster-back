@@ -585,15 +585,46 @@ ROSTER_CELL_KEYS = (
     "code",
     "color",
     "schedule_id",
+    "is_issued",
     "status",
     "reason",
+    "is_inbound",
+    "source_group_id",
+    "source_group_name",
     "target_group_id",
     "target_group_name",
 )
 
+# ★★ **방향이 셀에 있어야 한다.** `target_group_*` 만으로는 파견 **받는** 병동에서
+#   그 값이 곧 조회 병동 자신이라 "어디서 왔는지" 를 알 수 없다. 화면이 출발 병동을
+#   그리려면 `assignments[]` 를 날짜로 되짚어야 하는데, 그 재매칭을 없애는 것이
+#   셀 계약의 목적이다. 모바일 셀 스키마(`services/roster/snapshot.ts`)는 이미
+#   `is_inbound`·`source_group_*` 를 셀에서 기대하고 있고, `optional` 이라
+#   **파싱은 통과하면서 정보만 조용히 빠지고 있었다**(병동 스위칭 시 출발 병동 누락).
 
-def normalize_roster_cells(roster: dict | None) -> None:
-    """roster["nurses"][*]["schedule"] 의 전 셀을 셀 계약 7키로 맞춘다(in-place).
+# ★★ `is_issued` 는 화면이 읽는 **한 축**이다 — "이 셀에 그릴 근무가 확정돼 있나".
+#   `status` 는 **왜 비었는지**를 남기는 진단 축이라 둘은 대체 관계가 아니다.
+#   화면은 boolean 하나만 보면 되고(프론트 요청), 미발행·행누락·배치충돌을 갈라
+#   봐야 할 때만 `status` 를 읽으면 된다. `status` 를 없애면 "대상 병동이 발행했는데
+#   그 사람 행만 없다"(= 누락이라 문의가 필요하다)가 단순 미발행과 구분되지 않는다.
+# ★ 정의는 **코드를 그릴 수 있는가**다. `target_no_row` 는 대상 병동이 발행되긴
+#   했지만 그릴 코드가 없으므로 `false` 다 — 이름만 보고 "발행 여부" 로 읽으면
+#   어긋나는 유일한 자리라 여기 적어 둔다.
+
+
+def normalize_roster_cells(
+    roster: dict | None, view_gid: str | None = None, view_gname: str | None = None
+) -> None:
+    """roster["nurses"][*]["schedule"] 의 전 셀을 셀 계약 키로 맞춘다(in-place).
+
+    ★★ `view_gid`/`view_gname` 은 **조회 병동**이다. 배치가 없는 평범한 날도
+      `source`/`target` 을 이 병동으로 채운다 — 비워 두면 화면이 "비어 있으면
+      조회 병동" 이라는 규칙을 따로 알아야 하고, 같은 날이 어느 병동에서 보느냐에
+      따라 어떤 때는 값이 있고 어떤 때는 `null` 이 된다(파견 받는 병동에서는
+      원 소속이 채워지는데 원 소속 병동에서는 비어 있었다).
+      **모든 셀이 "그 날 어느 병동 근무인가" 를 스스로 말한다.**
+    ★ 배치 유무의 진실원천은 `reason` 이다 — `source == target` 이면 이동이 없는
+      날이고, `reason` 이 있으면 파견·이동·휴직 구간이다.
 
     - 문자열 셀(`"D"`)도 dict 로 승격한다.
     - `schedule_id` 는 같은 인덱스의 `schedule_ids[]` 에서 끌어온다.
@@ -608,9 +639,17 @@ def normalize_roster_cells(roster: dict | None) -> None:
             _c.setdefault("code", "")
             _c.setdefault("color", "")
             _c.setdefault("status", "confirmed")
+            # ★ overlay 셀과 **같은 규칙**(그릴 코드가 있는가)으로 채운다.
+            #   무조건 True 로 두면 발행본의 빈 셀이 확정 근무로 읽힌다.
+            #   미배정 `-` 는 코드가 있는 것으로 본다 — 발행된 근무표의 정상 값이다.
+            if "is_issued" not in _c:
+                _c["is_issued"] = bool(_c.get("code"))
             _c.setdefault("reason", None)
-            _c.setdefault("target_group_id", None)
-            _c.setdefault("target_group_name", None)
+            _c.setdefault("is_inbound", False)
+            _c.setdefault("source_group_id", view_gid or None)
+            _c.setdefault("source_group_name", view_gname or None)
+            _c.setdefault("target_group_id", view_gid or None)
+            _c.setdefault("target_group_name", view_gname or None)
             if _c.get("schedule_id") is None:
                 _c["schedule_id"] = _sids[_i] if _i < len(_sids) else None
             _sched[_i] = _c
@@ -952,12 +991,50 @@ async def get_issued_roster_snapshot(
                         _base["color"] = ""
                     _base["reason"] = _reason
                     _base["status"] = _st
-                    _base.pop("target_status", None)
+                    # ★★ 화면용 단일 축 — **그릴 코드가 실제로 남았는가**로 정한다.
+                    #   `status == "confirmed"` 로 잡으면 안 된다. 휴직·퇴사는 대상
+                    #   병동이 없어 코드를 비우면서도 status 는 의도적으로
+                    #   `confirmed` 로 남기기 때문에(근무가 없는 것이 확정이다),
+                    #   그리면 안 되는 셀이 `is_issued=true` 로 나간다.
+                    #   코드 유무로 보면 미발행·행누락·충돌·휴직이 한 번에 걸린다.
+                    _base["is_issued"] = bool(_base.get("code"))
+                    # ★★ 방향과 출발 병동을 **셀에** 싣는다. inbound 셀에서는
+                    #   `target_group_*` 가 조회 병동 자신이라 아무 것도 말해 주지
+                    #   않는다 — 필요한 건 "어디서 왔나" 다.
+                    _base["is_inbound"] = bool(_asg.get("is_inbound"))
+                    _base["source_group_id"] = (
+                        (_asg.get("source_group_id") or "").strip() or None
+                    )
+                    _base["source_group_name"] = (
+                        (_asg.get("source_group_name") or "").strip() or None
+                    )
                     _cell_tgid = (_asg.get("target_group_id") or "").strip() or None
                     _base["target_group_id"] = _cell_tgid
                     _base["target_group_name"] = (
                         _tgid_to_name.get(_cell_tgid) if _cell_tgid else None
                     )
+                    # ★ `target_status` 는 모바일이 아직 읽는다(셀·transfers 양쪽).
+                    #   `is_issued` 로 갈음할 수 있지만 전환은 프론트와 맞춰야 하므로
+                    #   당분간 함께 내린다. 대상 병동이 없는 배치(휴직·퇴사)는 원래
+                    #   붙지 않았고 그 계약을 지킨다.
+                    #   ★★ **방향이 아니라 `status` 에서 유도한다.** inbound 라고
+                    #   무조건 `issued` 로 두면, 발행 뒤에 파견이 잡혀 행을 지어낸
+                    #   셀(`target_no_row`)까지 "발행됨" 으로 나가 모바일이 그 날을
+                    #   확실한 근무로 읽는다. 두 축이 한 셀 안에서 서로 다른 말을
+                    #   하게 두면 안 된다.
+                    _base.pop("target_status", None)
+                    if not _no_ward:
+                        if _st == "target_no_row":
+                            _ts_out = "no_row"
+                        elif _st == "target_not_issued":
+                            _ts_out = "not_issued"
+                        elif _st == "confirmed" and _asg.get("is_inbound"):
+                            # 이 병동 발행본에 행이 있는 inbound — 곧 발행된 것이다.
+                            _ts_out = "issued"
+                        else:
+                            _ts_out = _asg.get("target_status")
+                        if _ts_out:
+                            _base["target_status"] = _ts_out
                     _base["schedule_id"] = _sid
                     _sched[_idx] = _base
                     if _idx < len(_sids):
@@ -1030,6 +1107,10 @@ async def get_issued_roster_snapshot(
                             # 끝난 배치(completed)도 들어오므로 화면이 구분해 그릴 수 있게 한다.
                             "id": _a.get("id"),
                             "status": _a.get("status"),
+                            # ★ 모바일이 아직 읽는다(`fullRosterAssignments.ts`).
+                            #   `is_issued` 로 갈음 가능하나 전환은 프론트와 맞춘다.
+                            **({"target_status": _a["target_status"]}
+                               if _a.get("target_status") else {}),
                         }
                     )
 
@@ -1073,12 +1154,70 @@ async def get_issued_roster_snapshot(
                             #   **파견 나간 사람이 원 병동에서 근무한 것처럼** 그려졌다.
                             _put_cell(idx, "", _a["reason"], d, _a, None)
 
+                # ── 파견 온 간호사: 배치가 없는 날을 **원 소속 근무**로 채운다 ──
+                # ★★ 받는 병동 발행본에서 그 사람의 파견 기간 밖은 `-`(미배정)다.
+                #   그 병동 관점에서는 맞는 값이지만, 화면은 **한 사람의 한 달**을
+                #   보여 주므로 어느 병동에서 열든 같은 판이 나와야 한다. 종전에는
+                #   원 소속 병동에서 열면 파견 구간에 대상 병동 근무가 얹히는데,
+                #   반대로 받는 병동에서 열면 나머지가 통째로 비어 **한쪽만 반쪽**
+                #   이었다(2026-09 실측: 2병동에서 본 전도연이 9/1~25 전부 `-`).
+                # ★ 배치가 있는 날(`_active_by_day`)은 위 overlay 가 이미 정했으므로
+                #   건드리지 않는다 — 그래야 파견 구간이 되돌려지지 않는다.
+                _home_a = next(
+                    (
+                        _a0 for _a0 in _a_list
+                        if _a0.get("is_inbound")
+                        and (_a0.get("source_group_id") or "").strip()
+                    ),
+                    None,
+                )
+                _home_gid = (
+                    (_home_a.get("source_group_id") or "").strip() if _home_a else ""
+                )
+                if _home_gid and _home_gid != target_group_id:
+                    _home_map = _load_target_snapshot(_home_gid).get(_nid, {})
+                    # ★ 이름은 배치가 이미 싣고 온 값을 쓴다 — `_tgid_to_name` 은
+                    #   target 만 모아서 출발 병동이 들어 있지 않다(쿼리도 아낀다).
+                    _home_name = (
+                        (_home_a.get("source_group_name") or "").strip()
+                        or _tgid_to_name.get(_home_gid, "")
+                    )
+                    for _hd in range(1, _days + 1):
+                        if _hd in _active_by_day:
+                            continue
+                        _hit = _home_map.get(_hd)
+                        _hidx = _hd - 1
+                        if not _hit or _hidx >= len(_sched):
+                            continue
+                        _hcell = (
+                            dict(_hit[0]) if isinstance(_hit[0], dict)
+                            else {"code": _hit[0] or ""}
+                        )
+                        _hcell["reason"] = None
+                        _hcell["status"] = "confirmed"
+                        _hcell["is_issued"] = bool(_hcell.get("code"))
+                        _hcell["is_inbound"] = False
+                        _hcell["source_group_id"] = _home_gid
+                        _hcell["source_group_name"] = _home_name or None
+                        # 그 날 실제로 근무한 병동 = 원 소속.
+                        _hcell["target_group_id"] = _home_gid
+                        _hcell["target_group_name"] = _home_name or None
+                        _hcell.pop("target_status", None)
+                        _hcell["schedule_id"] = _hit[1]
+                        _sched[_hidx] = _hcell
+                        if _hidx < len(_sids):
+                            _sids[_hidx] = _hit[1]
+
                 _nurse["assignments"] = _assignments_out
 
         # ★ overlay 가 끝난 **뒤** 전 셀을 계약에 맞추고, 그 셀로 counts 를 다시 센다.
         #   `setdefault` 라 위에서 `_put_cell` 이 채운 값은 그대로 두고, 배치가 없는
         #   평범한 셀만 채운다.
-        normalize_roster_cells(snapshot.get("roster"))
+        normalize_roster_cells(
+            snapshot.get("roster"),
+            view_gid=target_group_id,
+            view_gname=snapshot.get("group_name"),
+        )
         recount_roster_counts(snapshot.get("roster"))
         return snapshot
     except HTTPException:
@@ -1644,6 +1783,9 @@ async def get_roster_by_schedule_id(
                         "source_group_name": _a.get("source_group_name") or "",
                         "id": _a.get("id"),
                         "status": _a.get("status"),
+                        # ★ 모바일이 아직 읽는다. 위 라우트와 같은 계약을 유지한다.
+                        **({"target_status": _a["target_status"]}
+                           if _a.get("target_status") else {}),
                     }
                 )
             nurse_entry["assignments"] = _assignments_out

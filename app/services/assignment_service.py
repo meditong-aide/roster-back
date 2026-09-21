@@ -2429,6 +2429,39 @@ def get_roster_assignments(
         )
     ]
 
+    # ★★ 파견을 **받는** 간호사는 그 사람의 **다른 병동 배치까지** 함께 싣는다.
+    #   위 필터는 `group_id in (source, target)` 이라, 파견 받는 병동에서 조회하면
+    #   그 간호사가 같은 달에 **또 다른 병동으로** 나간 배치가 통째로 빠진다.
+    #   그러면 받는 병동 화면에서 그 기간이 원 소속 근무처럼 남아, 같은 사람의 같은
+    #   날이 **어느 병동에서 보느냐에 따라 다르게** 그려진다(1병동에서는 비어 있고
+    #   2병동에서는 1병동 코드가 보인다). 한 사람의 월 전체가 어디서 보든 같아야 한다.
+    # ★ 쿼리는 **간호사 묶음 1회**다 — 인원마다 돌지 않는다.
+    _inbound_nids = {
+        a.nurse_id for a in eligible
+        if a.reason in _BIDIR_REASONS
+        and a.target_group_id == group_id
+        and a.source_group_id != group_id
+    }
+    if _inbound_nids:
+        from sqlalchemy import case as _sa_case
+        _eff_end = _sa_case(
+            (NurseAssignment.end_date.isnot(None), NurseAssignment.end_date),
+            else_=NurseAssignment.expected_end_date,
+        )
+        _extra = (
+            db.query(NurseAssignment)
+            .filter(
+                NurseAssignment.nurse_id.in_(list(_inbound_nids)),
+                NurseAssignment.status.in_(["active", "completed"]),
+                NurseAssignment.reason.in_(_BIDIR_REASONS),
+                NurseAssignment.start_date <= _m_end,
+                or_(_eff_end.is_(None), _eff_end >= _m_start),
+            )
+            .all()
+        )
+        _seen_ids = {a.id for a in eligible}
+        eligible.extend(a for a in _extra if a.id not in _seen_ids)
+
     # 해당 월 퇴사자 (nurses.resignation_date 기반 synthetic entry)
     _resigning_all = (
         db.query(NurseModel)

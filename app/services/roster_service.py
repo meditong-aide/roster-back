@@ -1329,11 +1329,20 @@ def get_my_issued_roster_service(
             "reason": None,
             # 원 소속 발행본의 값이므로 확정이다. 파견 구간은 아래에서 덮인다.
             "status": CELL_CONFIRMED,
-            # ★ 전체표 셀과 **같은 키 집합**을 유지한다. 파견이 아닌 날은 대상 병동이
-            #   없으므로 None 이다(전체표의 평범한 셀과 같다). 화면이 두 API 를
-            #   한 코드로 그릴 수 있게 하려는 것이라, 값이 비어도 키는 있어야 한다.
-            "target_group_id": None,
-            "target_group_name": None,
+            # ★ 화면용 단일 축 — "이 셀에 그릴 근무가 확정돼 있나".
+            #   전체표 셀과 같은 키·같은 규칙이다(`routers/roster.py:ROSTER_CELL_KEYS`).
+            #   무조건 True 로 두면 발행본의 빈 셀이 확정 근무로 읽힌다.
+            "is_issued": bool(_code),
+            # ★ 전체표 셀과 같은 키. 개인표는 본인 기준이라 inbound 가 없고,
+            #   출발 병동은 언제나 원 소속이다.
+            "is_inbound": False,
+            "source_group_id": src_gid,
+            "source_group_name": src_group_name,
+            # ★ 그 날 실제 근무 병동 = 원 소속. 전체표가 배치 없는 날에
+            #   조회 병동을 채우는 것과 같은 규칙이다(비워 두면 화면이
+            #   "null 이면 원 소속" 을 따로 알아야 한다).
+            "target_group_id": src_gid,
+            "target_group_name": src_group_name,
         })
 
     # 파견/병동이동: target 근무표 overlay (복수 assignment 지원)
@@ -1621,6 +1630,12 @@ def get_my_issued_roster_service(
             #   병동의 근무가 `confirmed` 로 나간다(코드는 원 소속 값이라 그럴듯하다).
             if _own.get("conflict"):
                 schedule_days[_i]["status"] = CELL_ASSIGNMENT_CONFLICT
+                # ★★ `is_issued` 도 함께 내린다. 이 분기는 **코드를 일부러 남기므로**
+                #   (원 소속 값이라 화면에 참고로 보인다) 초기화 때 넣은
+                #   `bool(_code)` 가 True 로 남아, 확정할 수 없는 날이 확정 근무로
+                #   그려진다. 전체표는 충돌 시 코드를 비워 자동으로 거짓이 되는데
+                #   여기만 규칙이 갈렸다.
+                schedule_days[_i]["is_issued"] = False
             continue
         _d_roster, _d_status = _load_group_roster(_gid)
         _gname = gid_to_name.get(_gid, "")
@@ -1641,9 +1656,17 @@ def get_my_issued_roster_service(
                     CELL_ASSIGNMENT_CONFLICT if _own.get("conflict")
                     else CELL_CONFIRMED
                 ),
+                # ★ 전체표와 같은 규칙 — 그릴 코드가 남았는가. 충돌이면 어느 병동
+                #   근무인지 확정할 수 없어 그리면 안 된다.
+                "is_issued": bool(_code) and not _own.get("conflict"),
+                "is_inbound": False,
+                "source_group_id": src_gid,
+                "source_group_name": src_group_name,
                 # 전체표 셀과 같은 키 — 그 날 근무한 대상 병동.
                 "target_group_id": _gid,
                 "target_group_name": _gname,
+                # ★ 모바일이 아직 읽는다(`myIssuedRosterToRoster.ts`).
+                "target_status": _d_status,
             })
         else:
             # ★★ 대상 근무를 확인할 수 없는 구간. **원 소속 코드를 반드시 지운다.**
@@ -1666,8 +1689,14 @@ def get_my_issued_roster_service(
                     else CELL_TARGET_NO_ROW if _d_status == TARGET_NO_ROW
                     else CELL_TARGET_NOT_ISSUED
                 ),
+                # 코드를 비운 셀이라 그릴 근무가 없다.
+                "is_issued": False,
+                "is_inbound": False,
+                "source_group_id": src_gid,
+                "source_group_name": src_group_name,
                 "target_group_id": _gid,
                 "target_group_name": _gname,
+                "target_status": _d_status,
             })
 
     # ── transfers: 실제로 적용된 연속 구간 단위로 조립 ───────────────────────
