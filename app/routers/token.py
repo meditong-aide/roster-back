@@ -93,7 +93,13 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
     - account_id: 조회할 계정 ID
 
     반환
-    - {'office_id', 'account_id', 'is_head_nurse', 'group_id'} 중 존재하는 값만 담은 dict
+    - {'office_id', 'account_id', 'is_head_nurse', 'group_id', 'hn_auth'} 중
+      존재하는 값만 담은 dict
+
+    ★★ `auth.py` 에 **같은 이름의 함수가 따로** 있다. 그쪽에 `hn_auth` 가 추가될 때
+      이 복사본이 같이 안 고쳐져, SSO 로 들어온 그룹 관리자는 토큰에 권한이 안 실려
+      PC 웹에서 **병동 전환 자체가 안 보였다**(DB 는 `hn_auth='HN'` 로 정상).
+      한쪽을 고치면 다른 쪽도 함께 본다.
     """
     try:
         nurse = db.query(Nurse).filter(Nurse.account_id == account_id).first()
@@ -104,6 +110,7 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
             "account_id": getattr(nurse, "account_id", None),
             "is_head_nurse": bool(getattr(nurse, "is_head_nurse", False)),
             "group_id": getattr(nurse, "group_id", None),
+            "hn_auth": getattr(nurse, "hn_auth", None),
         }
         # group_id 기준으로 groups 테이블에서 group_name 조회
         if result["group_id"]:
@@ -325,6 +332,9 @@ def login_for_access_token(response: Response,
             mb_part_name = extra_data.get("group_name") or mb_part_name
             if "is_head_nurse" in extra_data:
                 is_head_nurse = extra_data["is_head_nurse"]
+            # ★ 그룹 관리자 권한. 화면은 이 값 하나로 병동 전환 노출을 정한다
+            #   (`hn_auth === "HN"`). 토큰에 안 실으면 DB 가 맞아도 전환이 안 보인다.
+            hn_auth = extra_data.get("hn_auth")
 
             access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
             access_token = create_login_token(
@@ -344,6 +354,7 @@ def login_for_access_token(response: Response,
                     "gw_useYN": gw_useYN,
                     "qpis_useYN": qpis_useYN,
                     "official_title_name": official_title_name,  # 추가 필드
+                    "hn_auth": hn_auth,  # 그룹 관리자 권한
                     "original_group_id": group_id,  # 로그인 시 DB 기준 원래 소속 그룹
                 },
                 expires_delta=access_token_expires,
@@ -373,6 +384,8 @@ def login_for_access_token(response: Response,
                 gw_useYN=gw_useYN,
                 qpis_useYN=qpis_useYN,
                 official_title_name=official_title_name,  # 추가 필드
+                hn_auth=hn_auth,  # 그룹 관리자 권한
+                original_group_id=group_id,  # 토큰과 같은 값을 응답에도 싣는다
             )
 
             # return {"result": "succeed", "message": "Login successful", "account_id": MemberID}
