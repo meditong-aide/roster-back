@@ -1242,7 +1242,10 @@ def get_my_issued_roster(
 ):
     try:
         result = get_my_issued_roster_service(
-            year=year, month=month, current_user=current_user, db=db
+            year=year, month=month, current_user=current_user, db=db,
+            # ★ 월간 조회에서만 날짜별 동료를 싣는다 — 파생 엔드포인트
+            #   (/me/today · /me/week)는 쓰지 않으므로 기본 꺼짐이다.
+            include_coworkers=True
         )
         # ★ 발행본이 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 의 404 를
         #   `index.html` **200** 으로 바꿔 보내기 때문이다(CustomErrorResponses 는 배포

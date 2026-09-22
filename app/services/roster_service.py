@@ -1246,12 +1246,17 @@ CELL_TARGET_NO_ROW = "target_no_row"          # 파견지 발행됐으나 내 �
 #: 근무는 정해진 규칙(가장 늦게 시작한 배치)으로 채우되 확정으로 보이면 안 된다.
 CELL_ASSIGNMENT_CONFLICT = "assignment_conflict"
 
+#: 범례·요약의 근무코드 표시 순서. 프론트 범례(`ShiftSummaryUI`)와 같은 관례다.
+#: `ward_counts[].shifts[]` 는 화면이 배열 순서 그대로 그리므로 서버가 이 순서로 낸다.
+_SUMMARY_CATEGORY_ORDER = ("D", "E", "N", "O", "M")
+
 
 def get_my_issued_roster_service(
     year: int,
     month: int,
     current_user,
     db: Session,
+    include_coworkers: bool = False,
 ) -> dict | None:
     """
     로그인 사용자 본인의 발행된 근무표만 조회합니다.
@@ -1598,6 +1603,17 @@ def get_my_issued_roster_service(
                     "schedule": _t_my.get("schedule") or [],
                     "schedule_ids": _t_my.get("schedule_ids") or [],
                     "shift_colors": _t_roster.get("shift_colors") or {},
+                    # ★★ 동료 계산에 쓴다 — 종전에는 이 둘을 버려서, 파견 구간의
+                    #   동료를 **화면이 원 소속 명단으로만** 찾아야 했다. 그러면
+                    #   대상 병동 사람이 그 목록에 없어 "근무 유형은 보이는데 같이
+                    #   일하는 사람이 없는" 상태가 된다(모바일 제보).
+                    #   추가 조회는 없다 — 이미 읽은 스냅샷에서 꺼내 둘 뿐이다.
+                    "nurses": _t_nurses,
+                    "shifts": _snap.get("shifts") or [],
+                    # ★ 스냅샷 **최상위** `nurses` 는 근무 행이 아니라 프로필이다
+                    #   (`_nurse_profiles` 가 이걸 읽는다). 빼면 파견 구간 동료의
+                    #   경력·직군·정렬 순서가 통째로 빈다.
+                    "profiles": _snap.get("nurses") or [],
                 }
         _snap_cache[_gid] = (_out, _status)
         return _out, _status
@@ -1614,10 +1630,26 @@ def get_my_issued_roster_service(
         return str((_palette or {}).get(_code, "") or "")
 
     # 응답의 통합 `shift_colors` 는 범례/폴백용이다. 셀 색은 위에서 병동별로 정한다.
+    # ★★ 통합본은 **같은 코드가 병동마다 다르면 구분이 안 된다** — `setdefault` 라
+    #   먼저 온 병동 값이 이긴다(1병동 `Day`=#028835 ↔ 2병동 #b49c7f). 그래서
+    #   `ward_counts` 는 아래 병동별 값을 쓴다. 통합본은 기존 소비처용으로 유지.
+    # ★ 추가 조회는 없다 — 아래 루프가 어차피 각 병동 스냅샷을 읽는다(캐시됨).
+
+    # 병동별 근무코드 정의(발행 스냅샷 원본)와 색표. `ward_counts` 가 이름·색·
+    # `schedule_id` 를 여기서 가져간다 — 카탈로그가 없으면 이름이 코드로, 색이
+    # 회색 폴백으로 나간다(실측: 조회 병동 카탈로그에 `Dㅇ` 가 없어 `Dㅇ Dㅇ 1회`).
+    # 색표는 카탈로그에 코드가 없을 때의 폴백이다.
+    _colors_by_group: dict[str, dict] = {src_gid: dict(shift_colors)} if src_gid else {}
+    _shifts_by_group: dict[str, list[dict]] = (
+        {src_gid: list(snapshot_data.get("shifts") or [])} if src_gid else {}
+    )
     for _gid in sorted(_other_gids):
         _d_roster, _ = _load_group_roster(_gid)
         if _d_roster:
-            for _c, _v in (_d_roster.get("shift_colors") or {}).items():
+            _gcolors = _d_roster.get("shift_colors") or {}
+            _colors_by_group[_gid] = dict(_gcolors)
+            _shifts_by_group[_gid] = list(_d_roster.get("shifts") or [])
+            for _c, _v in _gcolors.items():
                 shift_colors.setdefault(_c, _v)
 
     # ── 날짜별 overlay ───────────────────────────────────────────────────────
@@ -1777,6 +1809,14 @@ def get_my_issued_roster_service(
     #   사용자는 흔들리는 값을 사실로 받는다. 대신 `provisional_counts` 로 따로 알린다.
     counts: dict[str, int] = {code: 0 for code in shift_colors}
     provisional_counts: dict[str, int] = {}
+    # ★★ 병동 축(`ward_counts` 재료). 통합 `counts` 만으로는 화면이 **"어느 병동에서
+    #   몇 번"** 을 말할 수 없다 — 같은 코드를 두 병동이 쓰면 한 숫자로 합쳐지고
+    #   (`E 7회` = 본 5 + 파견 2), 파견 전용 코드는 어느 병동 것인지 표시가 없다.
+    # ★ 확정 셀만 담는다(`counts` 와 같은 규칙) — 충돌 셀은 병동 자체가 미확정이라
+    #   병동별로 세면 그 임시 후보를 사실로 굳히게 된다.
+    # ★ `counts` 처럼 0 으로 초기화하지 않는다. 병동 축은 "일어난 것" 만 담아야
+    #   범례가 근무 없는 병동을 이름만 띄우지 않는다.
+    _counts_by_group: dict[str, dict[str, int]] = {}
     for _d in schedule_days:
         _c = _d["code"]
         if not _c:
@@ -1785,6 +1825,10 @@ def get_my_issued_roster_service(
             provisional_counts[_c] = provisional_counts.get(_c, 0) + 1
         else:
             counts[_c] = counts.get(_c, 0) + 1
+            _bucket = _counts_by_group.setdefault(
+                str(_d.get("group_id") or src_gid or ""), {}
+            )
+            _bucket[_c] = _bucket.get(_c, 0) + 1
 
     # 관련 병동(group) 목록: 본인 소속 + 파견/이동 target 전체
     _groups_map: dict[str, str] = {}
@@ -1794,9 +1838,139 @@ def get_my_issued_roster_service(
         _tgid = _t.get("target_group_id")
         if _tgid and _tgid not in _groups_map:
             _groups_map[_tgid] = _t.get("target_group_name") or ""
+    # ── 날짜별 동료 ─────────────────────────────────────────────────────────
+    # ★★ 파견 구간의 동료를 화면이 **원 소속 명단으로만** 찾을 수 없다. 그 병동
+    #   사람이 목록에 없어 "근무 유형은 보이는데 같이 일하는 사람이 없는" 상태가
+    #   된다(모바일 제보). 그 날 실제 근무 병동 스냅샷에서 서버가 찾아 싣는다.
+    # ★ 조회는 늘지 않는다 — `_load_group_roster` 가 이미 캐시한 스냅샷을 쓴다.
+    # ★ 판정은 `/me/today` 와 **같은 함수**(`_coworkers_of_day`)다. 근무면 같은
+    #   시간대(`default_shift`), 비근무면 그 날 쉬는 사람 전부 — 두 화면이 갈리지 않는다.
+    # ★ 확정할 수 없는 날(대상 미발행·행 없음·배치 충돌)은 **빈 목록**이다.
+    #   본인 근무를 모르는데 동료를 단정할 수 없다(같은 함수의 규약).
+    # ★★ **기본 꺼짐**이다. 이 함수는 `/me/today`(모바일 대시보드 최상단 — 폴링된다)
+    #   와 `/me/week`(달 경계면 두 달) 가 재사용하는데, 그쪽은 `coworkers` 를 쓰지도
+    #   않는다(today 는 그 날 것만 따로 계산한다). 무조건 월 전체를 돌면 폴링되는
+    #   화면에 월 스캔 + 병동별 프로필 조회가 얹힌다. 월간 조회 라우트만 켠다.
+    _src_meta = _shift_meta_by_code(snapshot_data) if include_coworkers else {}
+    # ★★ 프로필은 **병동당 한 번만** 만든다. `_coworkers_of_day` 안에서 부르면
+    #   `_nurse_profiles` 의 라이브 `IN` 조회가 **날짜마다** 돌아 한 달 요청이
+    #   최대 31회 늘어난다(실측 21회). 캐시해서 넘긴다.
+    _prof_cache: dict[str, dict] = {}
+
+    def _profiles_for(_g: str, _snap_like: dict) -> dict:
+        if _g not in _prof_cache:
+            _prof_cache[_g] = _nurse_profiles(db, _snap_like)
+        return _prof_cache[_g]
+
+    for _i, _d in enumerate(schedule_days if include_coworkers else []):
+        _d["coworkers"] = []
+        if not _d.get("is_issued") or not _d.get("code"):
+            continue
+        _dg = _d.get("group_id")
+        if _dg == src_gid:
+            _snap_for_day, _meta_for_day = snapshot_data, _src_meta
+        else:
+            _dr, _ = _load_group_roster(_dg)
+            if not _dr:
+                continue
+            # `_load_group_roster` 가 담아 둔 그 병동 명단·코드 정의로 본다.
+            _snap_for_day = {
+                "roster": {"nurses": _dr.get("nurses") or []},
+                "shifts": _dr.get("shifts") or [],
+                "nurses": _dr.get("profiles") or [],   # 최상위 = 프로필
+            }
+            _meta_for_day = _shift_meta_by_code(_snap_for_day)
+        _d["coworkers"] = _coworkers_of_day(
+            db, _snap_for_day, _meta_for_day, str(nurse_id), _i + 1, _d["code"],
+            profiles=_profiles_for(_dg or "", _snap_for_day),
+        )
+
     groups_out = [
         {"group_id": _gid, "group_name": _gname}
         for _gid, _gname in _groups_map.items()
+    ]
+
+    # ── 병동별 통계 `ward_counts` ────────────────────────────────────────────
+    # ★★ 통합 `counts` 는 **근무코드 단위**라 파견을 다녀오면 같은 이름의 근무가
+    #   나란히 뜬다(1병동 `D Day 5회` · 2병동 `Dㅇ Day 1회`). 사용자는 왜 Day 가
+    #   둘인지 알 수 없고, 같은 코드라도 병동마다 색·근무명이 달라 칩 색조차 어긋난다.
+    # ★★ 화면이 `schedule[]` 을 월 단위로 **다시 집계하는 길로 가지 않는다** —
+    #   소비처마다 결과가 갈리고 책임 범위가 흐려진다. 서버가 병동 단위로 낸다.
+    # ★ 이름·색·`schedule_id` 는 모두 **그 병동 발행 스냅샷**의 값이다.
+    #   `schedule_id` = 그 병동 스냅샷 `shifts` 행의 `id`(근무 정의 식별자).
+    # ★ 근무가 하나 이상인 병동만 담는다. 원 소속/파견 여부는 담지 않는다
+    #   (구분이 필요하면 최상위 `source_group_id` 와 비교하면 된다).
+    def _repr_by_code(_rows: list[dict]) -> dict[str, dict]:
+        """코드 → 대표 행. 같은 `shift_id` 가 여러 행인 데이터가 실재하므로
+        `(sequence, id)` 최소값으로 **결정적으로** 고른다. 먼저 온 행이 이기게
+        두면 같은 근무표가 호출마다 다른 색·이름을 낼 수 있다.
+        ★ 셀에는 어느 행인지가 실려 있지 않아 행 단위로 더 쪼갤 수는 없다.
+        """
+        _by: dict[str, dict] = {}
+        for _r in sorted(
+            _rows, key=lambda r: (r.get("sequence") or 0, r.get("id") or 0)
+        ):
+            _by.setdefault(str(_r.get("shift_id") or "").strip(), _r)
+        return _by
+
+    def _code_rank(_code: str, _repr: dict[str, dict]) -> tuple:
+        """★ 화면이 **배열 순서 그대로** 그리므로 서버가 순서를 정한다.
+        기준은 기존 범례와 같은 D·E·N·O·M 관례다 — 병동 `sequence` 로 내면
+        `O` 가 맨 앞에 오는 병동이 있어(실측 1병동 seq: O1·D2·E3·N4) 같은
+        화면에서 코드 순서가 병동마다 뒤바뀐다.
+        ★ `_repr` 을 **인자로 받는다** — 루프 안에서 클로저로 잡으면 루프 변수를
+          바인딩하지 않아(ruff B023) 정렬을 뒤로 미루는 순간 다른 병동 카탈로그로
+          순서를 재는 버그가 된다.
+        """
+        _row = _repr.get(_code) or {}
+        _cat = str(_row.get("default_shift") or _code).strip().upper()[:1]
+        _order = _SUMMARY_CATEGORY_ORDER
+        return (
+            _order.index(_cat) if _cat in _order else len(_order),
+            _row.get("sequence") or 0,
+            _row.get("id") or 0,
+            _code,
+        )
+
+    def _ward_shift_rows(_gid: str, _wcodes: dict[str, int]) -> list[dict]:
+        """그 병동 칩 목록. 이름·색·`schedule_id` 는 그 병동 스냅샷 값이다."""
+        _repr = _repr_by_code(_shifts_by_group.get(_gid) or [])
+        _fallback = _colors_by_group.get(_gid) or {}
+        _rows = []
+        for _c, _n in sorted(
+            _wcodes.items(), key=lambda kv: _code_rank(kv[0], _repr)
+        ):
+            _row = _repr.get(_c) or {}
+            _rows.append({
+                "code": _c,
+                "name": _row.get("name") or _c,
+                "color": _row.get("color") or _fallback.get(_c) or "",
+                "schedule_id": _row.get("id"),
+                "count": _n,
+                # ★ 요청 외 2필드. 근무/휴일 총계를 **첫 글자 추측 없이** 세게
+                #   한다 — 지금 화면은 조회 병동 카탈로그에 없는 코드를
+                #   `Dㅇ`→`D` 처럼 첫 글자로 맞추므로, 첫 글자가 D·E·N·O·M 이
+                #   아닌 대상 병동 코드는 근무도 휴일도 아닌 것이 되어 총계에서
+                #   통째로 빠진다. 쓰지 않아도 무해하다.
+                "type": _row.get("type"),
+                "default_shift": _row.get("default_shift"),
+            })
+        return _rows
+
+    # ★ 순서 = 원 소속 먼저, 그 다음 관련 병동. 마지막 항은 **누락 방지 안전망**이다
+    #   — `_groups_map` 에 없는 병동에 근무가 잡히면 그 통계가 조용히 사라져
+    #   `ward_counts` 합계가 `counts` 와 어긋난다(합계 불일치는 화면에서 안 보인다).
+    _ward_order = [src_gid] + [g for g in _groups_map if g != src_gid]
+    _ward_order += [g for g in _counts_by_group if g not in _ward_order]
+    ward_counts = [
+        {
+            "group_id": _gid,
+            "group_name": _groups_map.get(_gid) or "",
+            "counts": dict(_counts_by_group[_gid]),
+            "shifts": _ward_shift_rows(_gid, _counts_by_group[_gid]),
+        }
+        for _gid in _ward_order
+        if _counts_by_group.get(_gid)
     ]
 
     return {
@@ -1809,7 +1983,10 @@ def get_my_issued_roster_service(
         "issued_at": snapshot_data.get("created_at"),
         "shift_colors": shift_colors,
         "schedule": schedule_days,
+        # ★ 통합 `counts` 는 **그대로 유지**한다(기존 소비처·근무일/휴일 총계).
+        #   병동별 칩은 아래 `ward_counts` 만 본다.
         "counts": counts,
+        "ward_counts": ward_counts,
         # 겹친 파견 구간의 **임시** 근무 횟수. 확정 `counts` 와 분리해 내려,
         # 화면이 "확인 필요" 로 구분해 보여줄 수 있게 한다(비어 있으면 충돌 없음).
         "provisional_counts": provisional_counts,
@@ -2385,8 +2562,13 @@ def _coworkers_of_day(
     my_nurse_id: str,
     day: int,
     my_code: str,
+    profiles: dict[str, dict] | None = None,
 ) -> list[dict]:
     """같은 날 **같은 상태**인 동료. 본인 제외.
+
+    ★ `profiles` 를 넘기면 그걸 쓴다 — 월 전체를 도는 호출부가 날짜마다
+      `_nurse_profiles` 의 라이브 조회를 반복하지 않게 하려는 것이다.
+      안 넘기면 종전대로 여기서 만든다(`/me/today` 는 하루라 그대로).
 
     · 본인이 근무면 → 같은 시간대(`default_shift`) 근무자
     · 본인이 비근무면 → 그 날 **근무하지 않는 사람 전부**(OFF·주휴·휴가·공가)
@@ -2407,7 +2589,7 @@ def _coworkers_of_day(
     my_is_work = bool(my_meta.get("is_work"))
     my_slot = (my_meta.get("default_shift") or my_code) if my_is_work else None
 
-    profiles = _nurse_profiles(db, snapshot)
+    profiles = profiles if profiles is not None else _nurse_profiles(db, snapshot)
     out: list[dict] = []
     for row in ((snapshot or {}).get("roster") or {}).get("nurses") or []:
         nurse_id = str(row.get("nurse_id") or "")
