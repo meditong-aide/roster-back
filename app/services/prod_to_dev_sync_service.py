@@ -236,6 +236,30 @@ def _group_filter_clause(
 OFFICE_SKIP_TABLES = {"notices", "sticker", "shift_transfer_logs"}
 
 
+def _office_scope_col(db: Session, table: str) -> Optional[str]:
+    """office 스코프를 잡을 컬럼을 **prod·dev 양쪽에 다 있는 것 중에서** 고른다.
+
+    ★★ 한쪽에만 있는 컬럼을 쓰면 dev DELETE 와 prod→dev INSERT 가 **서로 다른 집합**을
+      가리켜 중복이 쌓인다. 실측(2026-09-22 office 102243 sync):
+          nurse_shift_requests · wanted_requests 는 **dev 에만 `office_id` 가 있고**
+          그 값이 **전 행 NULL** 이다. 그래서
+              DELETE ... WHERE office_id IN ('102243')        → 0행
+              INSERT ... SELECT ... WHERE group_id IN (...)   → 3209행
+          이 되어 dev 가 정확히 2배(6415, 중복 키 2742, 최대 6배)로 불었다.
+          PK 제약이 있는 `nurse_pair_requests` 는 같은 이유로 PK 충돌 에러가 났고,
+          PK 가 없는 `nurse_shift_requests` 는 **조용히** 중복이 누적됐다.
+      이전 주석은 "양쪽이 다른 컬럼으로 같은 office 스코프를 잡는다" 고 했는데,
+      그 전제는 **양쪽 컬럼이 같은 집합을 가리킬 때만** 성립한다. 값이 비어 있으면 깨진다.
+      그래서 여기서는 **공통 컬럼만** 쓰고, 없으면 스코프 불가로 보고 skip 한다.
+    """
+    for col in ("office_id", "group_id", "nurse_id"):
+        if _table_has_column(db, PROD_DB, table, col) and _table_has_column(
+            db, DEV_DB, table, col
+        ):
+            return col
+    return None
+
+
 def _office_where(
     db: Session,
     db_name: str,
@@ -245,16 +269,16 @@ def _office_where(
 ) -> tuple:
     """office_ids 기준 해당 테이블의 WHERE 절 + params 반환 (office 마이그용).
 
-    **컬럼은 db_name(dev/prod) 별로 확인** — prod/dev 스키마 drift 에 견고.
-    (예: nurse_shift_requests 등은 dev=office_id, prod=nurse_id 라 양쪽이 다른 컬럼으로
-     같은 office 스코프를 잡음.)
+    **스코프 컬럼은 prod·dev 공통인 것만 쓴다**(`_office_scope_col`). db_name 은 서브쿼리가
+    바라볼 DB(dev wipe 면 dev, prod copy 면 prod)를 고르는 데만 쓴다 — 기준 컬럼 자체는
+    양쪽이 같아야 DELETE 와 INSERT 가 같은 행 집합을 가리킨다.
 
     분기 우선순위:
     1. OFFICE_SKIP_TABLES → (None, None) → skip (notices/sticker/shift_transfer_logs)
-    2. office_id O → office_id IN (...)
-    3. group_id O → group_id IN (SELECT group_id FROM <db>.groups WHERE office_id IN (...))
+    2. 공통 office_id → office_id IN (...)
+    3. 공통 group_id → group_id IN (SELECT group_id FROM <db>.groups WHERE office_id IN (...))
     4. schedule_entries → schedule_id IN (SELECT ... FROM <db>.schedules WHERE office_id IN (...))
-    5. nurse_id O → nurse_id IN (SELECT nurse_id FROM <db>.nurses WHERE office_id IN (...))
+    5. 공통 nurse_id → nurse_id IN (SELECT nurse_id FROM <db>.nurses WHERE office_id IN (...))
        (prod 에 office_id/group_id 가 없는 request 계열 테이블 fallback)
     6. 그 외 → (None, None) → skip
     """
@@ -263,11 +287,12 @@ def _office_where(
     prefix = f"{alias}." if alias else ""
     ph = ", ".join(f":of{i}" for i in range(len(office_ids)))
     params = {f"of{i}": o for i, o in enumerate(office_ids)}
-    if _table_has_column(db, db_name, table, "office_id"):
+    col = _office_scope_col(db, table)
+    if col == "office_id":
         return f" WHERE {prefix}office_id IN ({ph})", params
     # 서브쿼리 비교는 COLLATE DATABASE_DEFAULT 로 collation 충돌 방지
     # (같은 DB 내 컬럼 간 collation 이 달라도 안전 — 기존 MERGE 와 동일 정책).
-    if _table_has_column(db, db_name, table, "group_id"):
+    if col == "group_id":
         sub = (
             f"SELECT group_id COLLATE DATABASE_DEFAULT FROM {db_name}.dbo.[groups] "
             f"WHERE office_id IN ({ph})"
@@ -279,7 +304,7 @@ def _office_where(
             f"WHERE office_id IN ({ph})"
         )
         return f" WHERE {prefix}schedule_id COLLATE DATABASE_DEFAULT IN ({sub})", params
-    if _table_has_column(db, db_name, table, "nurse_id"):
+    if col == "nurse_id":
         sub = (
             f"SELECT nurse_id COLLATE DATABASE_DEFAULT FROM {db_name}.dbo.[nurses] "
             f"WHERE office_id IN ({ph})"
