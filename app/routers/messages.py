@@ -17,27 +17,72 @@ from services import message_service
 router = APIRouter(prefix="/message", tags=["message"])
 
 
-@router.get("/groups", summary="메시지 수신자 그룹 목록 (office 내 전체)")
+@router.get("/groups", summary="메시지 수신자 병동 목록 (보낼 수 있는 범위)")
 def get_message_groups(
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
-    return message_service.get_available_groups(db, current_user.office_id)
+    """보낼 수 있는 병동만. 그룹관리자는 관리 병동 전부, 일반 근무자는 자기 병동 하나.
+
+    ★ 종전에는 office 전체를 돌려줬다. 고를 수 없는 병동까지 뜨고, 그 자체가
+      병원 조직도를 흘린다.
+    """
+    return message_service.get_available_groups(
+        db, message_service.resolve_recipient_group_ids(db, current_user)
+    )
 
 
 @router.get("/memberlist", summary="메시지 수신자 목록", response_model=List[MessageMemberItem])
 def get_member_list(
-    extra_group_ids: Optional[str] = None,  # 콤마 구분 "groupA,groupB"
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
-    extra = [g.strip() for g in extra_group_ids.split(",")] if extra_group_ids else None
+    """수신자 전량. 범위는 **호출자에게서 유도한다**(그룹관리자=관리 병동 전부,
+    일반 근무자=자기 병동).
+
+    ★★ `extra_group_ids` 파라미터를 없앴다. 서버가 "같은 office 인가" 만 보고
+      "이 사람이 그 병동을 볼 수 있는가" 는 안 봐서, 일반 근무자도 파라미터 하나로
+      병원 전 병동 명단을 훑을 수 있었다. 호출하던 곳은 없다(모바일은 늘 생략).
+    ★ 응답은 **배열 그대로** 둔다. 배포된 모바일이 이 형태를 읽는다 — 페이지가
+      필요하면 아래 `/memberlist/page` 를 쓴다.
+    """
     return message_service.get_member_list(
-        db,
-        office_id=current_user.office_id,
-        group_id=current_user.group_id,
-        extra_group_ids=extra,
+        db, message_service.resolve_recipient_group_ids(db, current_user)
     )
+
+
+@router.get("/memberlist/page", summary="메시지 수신자 목록 (커서)")
+def get_member_list_page(
+    limit: int = 20,
+    cursor: Optional[str] = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """수신자 한 페이지. 받은함과 **같은 계약** — `{items, nextCursor, total}`.
+
+    * 호출방식 : /message/memberlist/page?limit=30 · ...&cursor=...
+    * 리턴값 : `{"result": {"items": [...], "nextCursor": str|null, "total": int}}`
+    * 범위는 호출자에게서 유도한다 — 그룹관리자는 관리 병동 전부, 일반 근무자는
+      자기 병동. 병동을 나누지 않고 **한 줄로** 이어 내려준다(각 행에 `group_name`
+      이 실려 있어 화면이 소속을 그대로 보여줄 수 있다).
+    * `limit` 은 프론트가 정하고 상한 200 으로 자른다 — 범위가 가장 큰 병원이
+      262명이라, 상한이 없으면 한 번에 전량을 끌어오는 호출과 구분되지 않는다.
+
+    ★ 정렬은 `(병동이름, sequence, nurse_id)` 다. 같은 병동 사람이 붙어 나오고,
+      `sequence` 는 병동 안에서만 유일하므로 `nurse_id` 를 보조키로 둔다 — 없으면
+      같은 값에서 건너뛰거나 되풀이된다.
+    ★ `result` 래퍼는 받은함·보낸함과 같은 모양을 지키기 위해서다.
+    """
+    if limit < 1:
+        raise HTTPException(status_code=400, detail="limit 은 1 이상이어야 합니다.")
+    return {
+        "result": message_service.get_member_page(
+            db,
+            message_service.resolve_recipient_group_ids(db, current_user),
+            limit=min(limit, 200),
+            cursor=cursor,
+        )
+    }
 
 
 @router.post("/write", summary="메시지 전송")
@@ -51,14 +96,24 @@ def write_message(
     if not body.message and not body.message_img:
         raise HTTPException(status_code=400, detail="메시지 내용을 입력해주세요.")
 
-    count = message_service.create_message(
-        db,
-        office_id=current_user.office_id,
-        sender_nurse_id=current_user.nurse_id,
-        receiver_nurse_ids=body.receiver_nurse_ids,
-        message=body.message,
-        message_img=body.message_img,
-    )
+    try:
+        count = message_service.create_message(
+            db,
+            office_id=current_user.office_id,
+            sender_nurse_id=current_user.nurse_id,
+            receiver_nurse_ids=body.receiver_nurse_ids,
+            message=body.message,
+            message_img=body.message_img,
+            # ★ 목록과 같은 범위로 검사한다. 목록에 뜬 사람은 반드시 보낼 수 있고,
+            #   안 뜬 사람에게는 못 보낸다.
+            allowed_group_ids=message_service.resolve_recipient_group_ids(
+                db, current_user
+            ),
+        )
+    except ValueError as exc:
+        # 수신자 스코프 위반. 403 이 아니라 400 으로 답한다 — 403 은 "그 대상은
+        # 실재하는데 권한이 없다" 로 읽혀 존재 여부를 흘린다.
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"result": "success", "sent_count": count}
 
 
