@@ -25,15 +25,84 @@ from services.preferences_service import (
     get_monthly_memo_service,
     save_monthly_memo_service,
     list_group_monthly_memos_service,
+    _resolve_write_group_id,
+    assert_writable,
 )
 from pydantic import BaseModel, Field
 from typing import Optional
 
 
-def _with_analysis(result, analysis: Optional[dict]):
-    """응답에 자연어 분석 상태를 얹는다. 성공(None)이면 그대로 둔다."""
-    if analysis and isinstance(result, dict):
+def _summarize_rejections(rejections) -> Optional[str]:
+    """미반영 통지를 토스트 한 줄로 요약한다. 보여줄 게 없으면 None.
+
+    ★ `blocking=False` 는 **저장은 된** 정보성 통지라 뺀다(선호 신청으로 기피가
+      자동 해제된 경우 등). 토스트로 띄우면 정상 동작마다 경고가 뜬다.
+    ★ 분석 실패는 `analysis.message` 로 이미 나가므로 중복해서 싣지 않는다.
+    """
+    from services.wanted_service import REJECT_ANALYSIS_FAILED
+
+    _msgs: list[str] = []
+    for _r in (rejections or []):
+        if not isinstance(_r, dict) or not _r.get("blocking"):
+            continue
+        if _r.get("code") == REJECT_ANALYSIS_FAILED:
+            continue
+        _reason = str(_r.get("reason") or "").strip()
+        if _reason and _reason not in _msgs:
+            _msgs.append(_reason)
+    if not _msgs:
+        return None
+    if len(_msgs) <= 2:
+        return " ".join(_msgs)
+    return f"{_msgs[0]} {_msgs[1]} 외 {len(_msgs) - 2}건이 반영되지 않았습니다."
+
+
+def _finalize_save_response(result, analysis: Optional[dict]):
+    """저장 응답을 마무리한다 — `save_status` 한 축 + 표시용 `analysis.message`.
+
+    ★★ 미반영 통지(`rejections`)가 있으면 그 요약을 `analysis.message` **에도**
+      싣는다. `rejections` 가 본 계약이지만, 화면이 그것을 읽기 전까지는 사용자가
+      아무것도 못 보기 때문이다. 특히 휴무/휴가 한도 초과는 종전에 **422 로 거절**
+      돼 에러 토스트가 떴는데, 지금은 초과분만 잘라내고 200 으로 나간다. 화면이
+      `rejections` 를 모르면 **일부가 잘린 채 "저장 완료" 로만 보인다.**
+      화면이 `rejections` 를 제대로 읽게 되면 이 합성은 걷어낸다.
+    ★ `rejections` 자체는 손대지 않는다 — 합성은 표시용 사본일 뿐이다.
+    """
+    from services.wanted_service import (
+        SAVE_OK, SAVE_WITH_REJECTIONS, SAVE_SNAPSHOT_UNAVAILABLE,
+    )
+
+    if not isinstance(result, dict):
+        return result
+    if analysis:
         result["analysis"] = analysis
+    _summary = _summarize_rejections(result.get("rejections"))
+    if _summary:
+        _base = result.get("analysis") or {"ok": True, "code": "partially_rejected"}
+        _prev = str(_base.get("message") or "").strip()
+        result["analysis"] = {
+            **_base,
+            "message": f"{_prev} {_summary}".strip() if _prev else _summary,
+        }
+    # ★ 저장 결과 단일 축. 스냅샷을 못 만든 쪽이 더 급하다 — 화면이 낡은 캐시를
+    #   그대로 두면 미반영 통지를 띄워도 무엇이 빠졌는지 확인할 수가 없다.
+    #   세부 사유는 `rejections[]` 에 그대로 있으므로 이 값이 하나여도 정보는
+    #   잃지 않는다.
+    # ★★ 판정은 `_summary`(표시용)가 **아니라** blocking 통지의 존재로 한다.
+    #   `_summary` 는 토스트 중복을 피하려고 분석 실패를 빼는데, 그 필터를 판정에
+    #   그대로 쓰면 **문장이 통째로 반영 안 된 경우가 `saved` 로 나간다.**
+    #   정보성(blocking=False)만 있을 때는 `saved` 다 — 정상 동작마다 부분 실패로
+    #   읽히지 않게 한다.
+    _has_blocking = any(
+        isinstance(_r, dict) and _r.get("blocking")
+        for _r in (result.get("rejections") or [])
+    )
+    if result.get("snapshot_unavailable"):
+        result["save_status"] = SAVE_SNAPSHOT_UNAVAILABLE
+    elif _has_blocking:
+        result["save_status"] = SAVE_WITH_REJECTIONS
+    else:
+        result["save_status"] = SAVE_OK
     return result
 
 router = APIRouter(
@@ -47,23 +116,38 @@ def _raise_domain_error(exc: Exception) -> None:
 
     - 403: 역할/그룹 불일치
     - 409: 마감 또는 이미 제출됨
-    - 422: 날짜 중복 · 유효하지 않은 shift_id · 미지원 intent · 한도 초과
+    - 422: 날짜 중복 · 유효하지 않은 shift_id · 미지원 intent
+      (휴무/휴가 한도 초과는 **거절하지 않는다** — 초과분만 잘라내고 200 +
+       응답 `rejections` 로 알린다. `/wanted/invoke` 와 같은 정책.)
     매핑 대상이 아니면 그대로 재전파해 호출부가 500 으로 처리하게 둔다.
     """
-    if isinstance(exc, PreferenceForbiddenError):
-        raise HTTPException(status_code=403, detail=str(exc))
-    if isinstance(exc, PreferenceConflictError):
-        raise HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, PreferenceValidationError):
-        body = {"code": exc.code, "message": str(exc)}
-        # 화면이 어느 날짜를 짚어 줄지 알 수 있게 부가 정보를 함께 내린다.
-        if getattr(exc, "detail", None):
-            body["detail"] = exc.detail
-        raise HTTPException(status_code=422, detail=body)
+    # ★★ 세 예외 모두 `detail` 을 **같은 모양의 객체**로 내린다.
+    #   종전에는 422 만 `{code, message}` 였고 403·409 는 문자열이라, 화면이 같은
+    #   저장 실패를 어떤 건 코드로 어떤 건 문구로 갈라 봐야 했다. 문구는 바뀌면
+    #   분기가 조용히 깨진다.
+    #   ※ 프론트 `config/axios.ts` 는 객체 `detail` 에서 `message` 를 꺼내 쓰므로
+    #     (422 를 그렇게 처리해 왔다) 문자열을 기대하던 화면도 그대로 동작한다.
+    _pairs = (
+        (PreferenceForbiddenError, 403, "forbidden"),
+        (PreferenceConflictError, 409, "conflict"),
+        (PreferenceValidationError, 422, "invalid_entry"),
+    )
+    for _cls, _status, _default_code in _pairs:
+        if isinstance(exc, _cls):
+            body = {
+                "code": getattr(exc, "code", None) or _default_code,
+                "message": str(exc),
+            }
+            # 화면이 어느 날짜를 짚어 줄지 알 수 있게 부가 정보를 함께 내린다.
+            if getattr(exc, "detail", None):
+                body["detail"] = exc.detail
+            raise HTTPException(status_code=_status, detail=body)
     raise exc
 
 
-async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Optional[dict]:
+async def _merge_analyzed_request(
+    req: PreferenceData, current_user, db, rejections: list
+) -> Optional[dict]:
     """`req.request`(자연어)가 있으면 분석해 `req.wanted_entries` 에 병합한다.
 
     프론트가 `/wanted/invoke` → `/preferences` → `/preferences/submit` 로 나눠 부르던
@@ -83,26 +167,48 @@ async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Opti
     분석이 실패하면 저장은 그대로 진행하되 **상태를 돌려준다**(호출자가 응답에 실어
     화면이 "문장 해석에 실패했습니다" 를 띄우게). 조용히 넘기면 사용자는 저장된 줄
     안다. 성공이면 None.
+
+    해석은 됐지만 반영하지 못한 항목은 `rejections` 에 담는다 — 분석 자체가
+    실패한 것(위 반환값)과, 일부만 못 들어간 것은 사용자에게 다르게 보여야 한다.
     """
+    from services.wanted_service import (
+        make_rejection, REJECT_ANALYSIS_FAILED, REJECT_OVERRIDDEN_BY_CALENDAR,
+        REJECT_NOTHING_TO_APPLY,
+    )
     text = (getattr(req, "request", None) or "").strip()
     if not text:
         return
-    group_id = req.group_id or getattr(current_user, "group_id", None)
-    if not group_id:
-        return
+    # ★★ **인가를 분석보다 먼저** 한다. 예전에는 `req.group_id` 를 그대로 믿고
+    #   분석부터 돌렸는데, 분석은 그 그룹의 시프트와 **간호사 전원의 id·이름**을
+    #   읽어 외부 LLM 으로 보낸다(`analyze_wanted_text` 의 `schema`).
+    #   저장 단계에서 `_resolve_write_group_id` 가 403 을 내더라도 그때는 이미
+    #   남의 병동 명단이 조회돼 밖으로 나간 뒤다. 저장이 쓰는 것과 **같은 해석기**로
+    #   먼저 그룹을 확정해, 분석과 저장이 언제나 같은 그룹을 보게 한다.
+    group_id = _resolve_write_group_id(db, current_user, req.group_id)
     try:
         analyzed = await analyze_wanted_text(
             db, getattr(current_user, "nurse_id", None), group_id, text,
-            req.year, req.month,
+            req.year, req.month, rejections=rejections,
         )
     except WantedAnalysisError as exc:
         print(f"[preferences] 자연어 분석 실패 — 저장은 계속: {exc}")
-        return {
-            "ok": False,
-            "code": "analysis_failed",
-            "message": "문장을 해석하지 못했습니다. 달력에서 직접 선택하거나 다시 시도해 주세요.",
-        }
+        _msg = ("문장을 해석하지 못했습니다. 달력에서 직접 선택하거나 "
+                "다시 시도해 주세요.")
+        rejections.append(make_rejection(REJECT_ANALYSIS_FAILED, _msg))
+        return {"ok": False, "code": "analysis_failed", "message": _msg}
     if not analyzed:
+        # ★★ 문장은 왔는데 반영할 게 한 건도 없다 = **변경 없음**이다.
+        #   종전에는 그냥 `None`(성공)을 돌려줘 `wanted_entries` 가 None 으로 남았고,
+        #   호출자가 레거시 `data` 경로로 빠져 **스냅샷 없는 `{message}` 응답**을
+        #   내보냈다. 화면이 그걸 캐시에 얹으면 찍어 둔 달력이 사라진다
+        #   (`useSaveWantedRequest` 주석의 그 현상). 게다가 아무것도 저장하지
+        #   않았는데 `save_status` 는 `saved` 로 나갔다.
+        #   호출자가 **저장을 건너뛰고 현재 상태를 돌려주도록** 신호를 준다.
+        _msg = "문장에서 반영할 내용을 찾지 못했습니다. 달력에서 직접 선택해 주세요."
+        if req.wanted_entries is None:
+            rejections.append(make_rejection(REJECT_NOTHING_TO_APPLY, _msg))
+            return {"ok": False, "code": REJECT_NOTHING_TO_APPLY, "message": _msg}
+        # 달력 상태가 함께 왔다면 그것만으로 저장할 것이 있다 — 정식 경로 그대로.
         return None
     picked = list(req.wanted_entries or [])
 
@@ -120,13 +226,52 @@ async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Opti
             # 요청↔금지가 뒤집힌 경우 — 방금 한 말이 이전 저장분보다 최신 의사다.
             by_date[item["date"]] = WantedEntryItem(**item)
             flipped += 1
-        # 같은 극성이면 캘린더(직접 선택) 우선 — 기존 규칙 유지.
+        elif getattr(existing, "shift_id", None) != item.get("shift_id"):
+            # 같은 극성이면 캘린더(직접 선택) 우선 — 기존 규칙 유지.
+            # ★ 다만 **코드가 다르면** 문장이 통째로 무시된 것처럼 보인다.
+            #   버리는 건 유지하되 무엇이 밀렸는지는 알린다.
+            rejections.append(make_rejection(
+                REJECT_OVERRIDDEN_BY_CALENDAR,
+                f"{item['date']} 은 달력에서 고른 "
+                f"'{getattr(existing, 'shift_id', '')}' 을 그대로 두어 문장의 "
+                f"'{item.get('shift_id')}' 은 반영하지 않았습니다.",
+                date=item["date"], shift_id=item.get("shift_id"),
+                intent=item.get("intent", "wanted"),
+            ))
 
     req.wanted_entries = [by_date[k] for k in sorted(by_date)]
     print(f"[preferences] 자연어 분석 병합: {len(analyzed)}건 중 "
           f"신규 {added}건 · 극성전환 {flipped}건 반영 "
           f"(캘린더 {len(picked)}건 중 {len(picked) - flipped}건 유지)")
     return None
+
+
+def _is_nothing_to_apply(analysis) -> bool:
+    """문장만 왔는데 반영할 내용이 없어 **저장을 건너뛰어야 하는** 경우."""
+    from services.wanted_service import REJECT_NOTHING_TO_APPLY
+
+    return bool(analysis) and analysis.get("code") == REJECT_NOTHING_TO_APPLY
+
+
+def _skip_save_and_return_current(req, current_user, db, analysis, rejections):
+    """저장을 건너뛰고 **현재 상태 스냅샷**을 돌려준다.
+
+    ★ 문장만 왔는데 반영할 게 한 건도 없는 경우다. 변경이 없으므로 쓰지 않는다 —
+      같은 값을 다시 저장하면 자연어 저장으로 취급돼 쓸데없는 draft 가 쌓인다
+      (`save_wanted_entries_service` 가 발화 1건마다 새 request_id 를 남긴다).
+    ★ 응답 모양은 정상 저장과 **같아야** 한다. 화면이 이 응답을 캐시에 얹기 때문에,
+      스냅샷 없는 `{message}` 를 주면 찍어 둔 달력이 사라진다.
+    """
+    result = get_latest_preference_service(
+        year=req.year, month=req.month, current_user=current_user, db=db,
+        override_group_id=req.group_id,
+    )
+    # ★ 조회 응답에는 `rejections` 가 없다. 저장 경로와 **같은 자리**에 실어야
+    #   `_finalize_save_response` 가 save_status 를 제대로 매긴다 — 안 실으면
+    #   아무것도 반영 못 했는데 `saved` 로 나간다(고치려던 바로 그 증상).
+    if isinstance(result, dict):
+        result["rejections"] = list(rejections or [])
+    return _finalize_save_response(result, analysis)
 
 
 @router.post("")
@@ -142,9 +287,18 @@ async def save_preference_draft(
     snapshot 을 반환한다(/wanted/invoke 불필요).
     """
     try:
-        analysis = await _merge_analyzed_request(req, current_user, db)
-        result = submit_preferences_service(req, current_user, db, is_draft=True)
-        return _with_analysis(result, analysis)
+        rejections: list = []
+        analysis = await _merge_analyzed_request(req, current_user, db, rejections)
+        if _is_nothing_to_apply(analysis):
+            # 제출과 같은 게이트를 탄다 — 정상 경로도 임시저장에서 마감을 막는다.
+            assert_writable(req, current_user, db)
+            return _skip_save_and_return_current(
+                req, current_user, db, analysis, rejections
+            )
+        result = submit_preferences_service(
+            req, current_user, db, is_draft=True, rejections=rejections
+        )
+        return _finalize_save_response(result, analysis)
     except HTTPException:
         raise
     except (PreferenceForbiddenError, PreferenceConflictError, PreferenceValidationError) as e:
@@ -169,7 +323,8 @@ async def submit_preferences(
     """
     try:
         # 자연어가 함께 오면 분석해 병합한다 — 이 호출 하나로 분석·저장·제출이 끝난다.
-        analysis = await _merge_analyzed_request(req, current_user, db)
+        rejections: list = []
+        analysis = await _merge_analyzed_request(req, current_user, db, rejections)
         # 허용 근무코드 검증 (기존 data 기반 경로 전용).
         # wanted_entries 경로는 서비스에서 422 로 검증한다.
         preferences = (
@@ -190,8 +345,19 @@ async def submit_preferences(
                     detail=f"허용되지 않은 근무코드: {', '.join(set(invalid_shifts))}"
                 )
 
-        result = submit_preferences_service(req, current_user, db, is_draft=False)
-        return _with_analysis(result, analysis)
+        if _is_nothing_to_apply(analysis):
+            # ★★ 쓸 내용이 없어 저장은 건너뛰더라도 **마감·중복제출 게이트는
+            #   반드시 태운다.** 안 그러면 마감된 달에 눌러도 200 이 나가 처리된
+            #   줄 안다. 응답의 `is_submitted` 가 false 로 남고 `rejections` 에
+            #   사유가 실려 "제출 안 됨" 이 드러난다.
+            assert_writable(req, current_user, db)
+            return _skip_save_and_return_current(
+                req, current_user, db, analysis, rejections
+            )
+        result = submit_preferences_service(
+            req, current_user, db, is_draft=False, rejections=rejections
+        )
+        return _finalize_save_response(result, analysis)
     except HTTPException:
         raise
     except (PreferenceForbiddenError, PreferenceConflictError, PreferenceValidationError) as e:

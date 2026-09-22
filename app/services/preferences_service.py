@@ -18,11 +18,26 @@ from datetime import datetime, timezone, timedelta, date
 # ──────────────────────────── 도메인 예외 ────────────────────────────
 # 라우터에서 HTTP 상태로 매핑한다(403/409/422). 그 외 예외는 기존대로 500.
 class PreferenceForbiddenError(Exception):
-    """역할 또는 그룹 불일치 (403)."""
+    """역할 또는 그룹 불일치 (403). code 로 사유를 구분한다.
+
+    ★ `PreferenceValidationError`(422) 만 `code` 를 갖고 403·409 는 문자열뿐이라,
+      화면이 같은 저장 실패를 **어떤 건 코드로, 어떤 건 문구로** 갈라 봐야 했다.
+      문구는 바뀌면 분기가 조용히 깨진다. 세 예외의 계약을 같게 맞춘다.
+    """
+
+    def __init__(self, message: str, code: str = "forbidden", detail=None):
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
 
 
 class PreferenceConflictError(Exception):
-    """마감되었거나 이미 제출된 원티드 (409)."""
+    """마감되었거나 이미 제출된 원티드 (409). code 로 사유를 구분한다."""
+
+    def __init__(self, message: str, code: str = "conflict", detail=None):
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
 
 
 class PreferenceValidationError(Exception):
@@ -118,9 +133,13 @@ def _resolve_write_group_id(db: Session, current_user: UserSchema, requested_gro
     """저장·제출 대상 그룹. 본인 원티드이므로 home group 이 유일한 정답이다."""
     home_gid = resolve_home_group_id(db, current_user)
     if not home_gid:
-        raise PreferenceForbiddenError("소속 그룹을 확인할 수 없습니다.")
+        raise PreferenceForbiddenError(
+            "소속 그룹을 확인할 수 없습니다.", code="no_home_group"
+        )
     if requested_group_id and str(requested_group_id) != str(home_gid):
-        raise PreferenceForbiddenError("본인 소속 그룹의 원티드만 저장할 수 있습니다.")
+        raise PreferenceForbiddenError(
+            "본인 소속 그룹의 원티드만 저장할 수 있습니다.", code="not_own_group"
+        )
     return str(home_gid)
 
 
@@ -137,7 +156,9 @@ def _resolve_read_group_id(db: Session, current_user: UserSchema, requested_grou
         assert_caller_can_access_group(db, current_user, str(requested_group_id))
     home_gid = resolve_home_group_id(db, current_user)
     if not home_gid:
-        raise PreferenceForbiddenError("소속 그룹을 확인할 수 없습니다.")
+        raise PreferenceForbiddenError(
+            "소속 그룹을 확인할 수 없습니다.", code="no_home_group"
+        )
     return str(home_gid)
 
 
@@ -177,14 +198,37 @@ def _assert_wanted_writable(wanted, year: int, month: int, submitted_wr) -> None
     """마감·중복제출 게이트. 위반 시 409."""
     if wanted is None:
         raise PreferenceConflictError(
-            f"{year}년 {month}월 원티드 요청이 아직 생성되지 않았습니다."
+            f"{year}년 {month}월 원티드 요청이 아직 생성되지 않았습니다.",
+            code="wanted_not_open",
         )
     if _is_wanted_closed(wanted):
-        raise PreferenceConflictError(f"{year}년 {month}월 원티드가 마감되었습니다.")
+        raise PreferenceConflictError(
+            f"{year}년 {month}월 원티드가 마감되었습니다.", code="wanted_closed"
+        )
     if submitted_wr is not None:
         raise PreferenceConflictError(
-            "이미 제출된 원티드입니다. 제출을 철회한 뒤 다시 저장해주세요."
+            "이미 제출된 원티드입니다. 제출을 철회한 뒤 다시 저장해주세요.",
+            code="already_submitted",
         )
+
+
+def assert_writable(req, current_user: UserSchema, db: Session) -> None:
+    """**저장 없이** 쓰기 가능 여부만 검사한다(그룹·마감·중복제출).
+
+    ★ 자연어만 왔는데 해석이 0건이면 쓸 내용이 없어 저장을 건너뛰는데, 그때도
+      **게이트는 그대로 태워야** 한다. 안 그러면 마감된 달이나 이미 제출한 달에
+      저장·제출을 눌러도 200 이 나가 사용자가 처리된 줄 읽는다.
+    ★ 임시저장과 제출 **양쪽 모두** 같은 게이트를 탄다 — 정상 경로
+      (`save_wanted_entries_service`)가 이미 그렇게 동작하므로 여기만 느슨하면
+      "문장만 보내면 마감을 통과" 하는 샛길이 생긴다.
+    """
+    group_id = _resolve_write_group_id(db, current_user, req.group_id)
+    wanted = _load_wanted_window(db, group_id, req.year, req.month)
+    month_str = f"{req.year}-{req.month:02d}"
+    submitted = _latest_submitted_request(
+        db, getattr(current_user, "nurse_id", None), month_str
+    )
+    _assert_wanted_writable(wanted, req.year, req.month, submitted)
 
 
 def _normalize_wanted_entries(entries, year: int, month: int, allowed_shift_ids: set) -> list[dict]:
@@ -492,16 +536,47 @@ def _load_nurse_avoid_entries(
     return entries
 
 
-def _assert_off_limit(entries: list[dict], off_shift_ids: set, max_requests) -> None:
-    """휴무/휴가 요청 개수 상한 검증. 초과 시 422(잘라내지 않고 거절)."""
+def _trim_off_limit(
+    entries: list[dict], off_shift_ids: set, max_requests, rejections: list
+) -> list[dict]:
+    """휴무/휴가 요청 개수 상한을 적용한다. **초과분만 잘라내고 통지한다.**
+
+    ★ 예전에는 422 로 저장 전체를 거절했는데, 같은 상황에서 `/wanted/invoke` 는
+      초과분만 잘라내고 200 을 돌려줬다. 같은 문장이 어느 경로로 들어오느냐에 따라
+      "일부 제외" 와 "통째 실패" 로 갈렸다. 잘라내는 쪽으로 통일한다 —
+      LLM 이 한도를 모르고 뽑아 오는 경로가 정상 흐름이라, 통째 거절은
+      사용자가 무엇을 지워야 할지 모른 채 막히는 것으로 나타난다.
+
+    자르는 순서는 invoke 와 같다 — **날짜 오름차순으로 한도까지 채우고 뒤를 버린다.**
+    선호가 아닌 항목(근무 요청)은 한도와 무관하므로 그대로 둔다.
+
+    Returns:
+        한도를 적용한 entries(원래 순서 유지).
+    """
+    from services.wanted_service import REJECT_OFF_LIMIT, make_rejection
+
     if max_requests is None:
-        return
-    off_used = sum(1 for e in entries if e["shift_id"] in off_shift_ids)
-    if off_used > max_requests:
-        raise PreferenceValidationError(
-            f"휴무/휴가 요청 가능 수({max_requests}개)를 초과했습니다. 요청 {off_used}개.",
-            code="off_limit_exceeded",
-        )
+        return entries
+    off_entries = [e for e in entries if e["shift_id"] in off_shift_ids]
+    if len(off_entries) <= max_requests:
+        return entries
+
+    kept_dates = {
+        e["date"] for e in sorted(off_entries, key=lambda x: x["date"])[:max_requests]
+    }
+    dropped = [e for e in off_entries if e["date"] not in kept_dates]
+    for e in dropped:
+        rejections.append(make_rejection(
+            REJECT_OFF_LIMIT,
+            f"휴무/휴가 신청 가능 수({max_requests}개)를 넘어 "
+            f"{e['date'].month}/{e['date'].day}({e['shift_id']}) 을 "
+            f"반영하지 못했습니다.",
+            date=e["date"].isoformat(), shift_id=e["shift_id"], intent="wanted",
+        ))
+    print(f"[wanted_entries] 휴무/휴가 한도 {max_requests} 초과 — "
+          f"{len(dropped)}건 제외: {[str(e['date']) for e in dropped]}")
+    dropped_dates = {e["date"] for e in dropped}
+    return [e for e in entries if e["date"] not in dropped_dates]
 
 
 #: (간호사, 월) 당 보관할 미제출 draft 수. 초과분은 오래된 것부터 지운다.
@@ -655,13 +730,23 @@ def save_wanted_entries_service(
     db: Session,
     *,
     is_draft: bool,
+    rejections: list | None = None,
 ):
     """wanted_entries 를 단일 원본으로 저장한다. is_draft=False 면 제출까지 원자 처리.
 
     Returns:
         canonical wanted snapshot (get_latest_preference_service 와 동일 형태).
     """
-    from services.wanted_service import _compute_weekly_off_days, _get_off_shift_ids
+    from services.wanted_service import (
+        _compute_weekly_off_days, _get_off_shift_ids, make_rejection,
+        REJECT_WEEKLY_OFF, REJECT_AVOID_BLOCKED_BY_HN, REJECT_AVOID_CLEARED,
+        REJECT_WANTED_BLOCKED_BY_HN,
+    )
+
+    # 미반영 통지 수집기. 프론트가 읽는 단일 창구(`result["rejections"]`)로 나간다.
+    # ★ 호출자(`/preferences` 라우터)가 문장 해석 단계에서 걸러낸 것을 미리 담아
+    #   넘겨주므로, 여기서 새로 만들지 않고 이어 쓴다.
+    rejections = list(rejections or [])
 
     year, month = req.year, req.month
     month_str = f"{year}-{month:02d}"
@@ -681,12 +766,21 @@ def save_wanted_entries_service(
     }
     normalized = _normalize_wanted_entries(req.wanted_entries, year, month, allowed_shift_ids)
 
-    # 주휴일은 원티드 대상이 아니다 — 기존 /wanted/invoke 와 동일하게 조용히 제외.
+    # 주휴일은 원티드 대상이 아니라 제외한다. ★ 조용히 버리지 않고 통지한다 —
+    # 사용자는 그 날짜도 신청된 줄 알고 있었다.
     weekly_off_days = _compute_weekly_off_days(db, nurse_id, group_id, year, month)
     if weekly_off_days:
-        dropped = [e["date"].day for e in normalized if e["date"].day in weekly_off_days]
+        dropped = [e for e in normalized if e["date"].day in weekly_off_days]
         if dropped:
-            print(f"[wanted_entries] 주휴일 엔트리 제외: {sorted(dropped)}")
+            print(f"[wanted_entries] 주휴일 엔트리 제외: "
+                  f"{sorted(e['date'].day for e in dropped)}")
+        for e in dropped:
+            rejections.append(make_rejection(
+                REJECT_WEEKLY_OFF,
+                f"{month}/{e['date'].day} 은 주휴일이라 원티드 신청 대상이 아닙니다.",
+                date=e["date"].isoformat(), shift_id=e["shift_id"],
+                intent=e["intent"],
+            ))
         normalized = [e for e in normalized if e["date"].day not in weekly_off_days]
 
     # 선호(wanted)는 nurse_shift_requests, 기피(avoid)는 banned_wanted_entries 로 갈린다.
@@ -696,10 +790,11 @@ def save_wanted_entries_service(
     )
 
     nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
-    _assert_off_limit(
+    entries = _trim_off_limit(
         entries,
         set(_get_off_shift_ids(db, group_id)),
         nurse_row.wanted_max_requests if nurse_row else None,
+        rejections,
     )
 
     # 기피근무 저장소(banned_wanted_entries)가 없으면 — 기피가 없을 땐 그냥 건너뛰고,
@@ -769,30 +864,83 @@ def save_wanted_entries_service(
         f"선호 {len(entries)}건 · 기피 {len(avoid)}건"
         + ("" if manages_avoid else " (기피 미관리)")
     )
-    result = get_latest_preference_service(
-        year, month, current_user, db, override_group_id=group_id
-    )
-    if avoid_blocked and isinstance(result, dict):
+    # ── 통지 조립은 **DB 조회보다 먼저** 끝낸다 ────────────────────────────────
+    # 통지의 재료(`avoid_blocked`·`conflict_resolved`)는 이미 메모리에 있어 조회가
+    # 필요 없다. 아래 `get_latest_preference_service` 뒤에 두면, 그 조회가 실패했을 때
+    # **커밋은 이미 끝났는데 무엇이 빠졌는지 알릴 방법이 사라진다.**
+    notices: dict = {}
+    if avoid_blocked:
         # 조용히 버리면 사용자는 반영된 줄 안다.
-        result["avoid_blocked"] = {
+        notices["avoid_blocked"] = {
             "dates": [d.isoformat() for d in avoid_blocked],
             "message": "수간호사가 이미 지정한 날짜라 피하고 싶은 근무로 반영하지 "
                        "못했습니다.",
         }
+        for d in avoid_blocked:
+            rejections.append(make_rejection(
+                REJECT_AVOID_BLOCKED_BY_HN,
+                "수간호사가 이미 지정한 날짜라 피하고 싶은 근무로 반영하지 "
+                "못했습니다.",
+                date=d.isoformat(), intent="avoid",
+            ))
     # 같은 날짜 상충 해소 결과 — 같은 이유로 조용히 넘기지 않는다.
-    if isinstance(result, dict) and conflict_resolved["cleared"]:
-        result["avoid_cleared"] = {
+    if conflict_resolved["cleared"]:
+        notices["avoid_cleared"] = {
             "dates": [c["date"] for c in conflict_resolved["cleared"]],
             "message": "같은 날짜에 희망 근무를 신청해, 기존에 피하고 싶던 근무를 "
                        "해제했습니다.",
         }
-    if isinstance(result, dict) and conflict_resolved["blocked_by_hn"]:
+        for c in conflict_resolved["cleared"]:
+            rejections.append(make_rejection(
+                REJECT_AVOID_CLEARED,
+                "같은 날짜에 희망 근무를 신청해, 기존에 피하고 싶던 근무를 "
+                "해제했습니다.",
+                date=c["date"], shift_id=c.get("shift"), intent="avoid",
+                blocking=False,
+            ))
+    if conflict_resolved["blocked_by_hn"]:
         # 선호는 저장된다. 다만 수간호사 확정 기피가 하드 제약이라 근무표에는 안 걸린다.
-        result["wanted_blocked_by_hn"] = {
+        notices["wanted_blocked_by_hn"] = {
             "dates": [c["date"] for c in conflict_resolved["blocked_by_hn"]],
             "message": "수간호사가 피하고 싶은 근무로 확정한 날짜입니다. 신청은 "
                        "저장했지만 근무표에는 반영되지 않습니다.",
         }
+        for c in conflict_resolved["blocked_by_hn"]:
+            rejections.append(make_rejection(
+                REJECT_WANTED_BLOCKED_BY_HN,
+                "수간호사가 피하고 싶은 근무로 확정한 날짜입니다. 신청은 저장했지만 "
+                "근무표에는 반영되지 않습니다.",
+                date=c["date"], shift_id=c.get("shift"), intent="wanted",
+                blocking=False,
+            ))
+
+    try:
+        result = get_latest_preference_service(
+            year, month, current_user, db, override_group_id=group_id
+        )
+    except Exception as exc:  # noqa: BLE001 — 커밋 이후라 삼키는 것이 맞다
+        # ★★ 여기서 예외를 올리면 **저장은 확정됐는데 사용자는 실패로 읽는다.**
+        #   제출이었다면 재시도는 `_assert_wanted_writable` 의 '이미 제출됨' 409 에
+        #   막혀 복구도 안 된다. 게다가 부분 수락 정책에서는 이 응답이 무엇이 빠졌는지
+        #   알릴 유일한 통로라 통지까지 함께 잃는다.
+        #   화면용 스냅샷을 못 만든 것뿐이므로, 저장 결과와 통지는 돌려주고
+        #   `snapshot_unavailable` 로 "이 응답을 캐시에 덮어쓰지 말고 다시 받아라" 를 알린다.
+        print(f"[wanted_entries] 저장은 완료했으나 응답 스냅샷 조회 실패: "
+              f"{type(exc).__name__}: {exc}")
+        return {
+            "year": year, "month": month,
+            "saved": True, "is_submitted": not is_draft,
+            "snapshot_unavailable": True,
+            "message": "저장은 완료했습니다. 화면을 새로 불러와 주세요.",
+            "rejections": rejections,
+            **notices,
+        }
+
+    # ★ 미반영 통지 단일 창구. 위 개별 키는 기존 소비자를 위해 남겨 두되,
+    #   화면은 이 배열 하나만 읽으면 사유를 빠짐없이 볼 수 있다.
+    if isinstance(result, dict):
+        result.update(notices)
+        result["rejections"] = rejections
     return result
 
 
@@ -800,16 +948,22 @@ def submit_preferences_service(
     req: PreferenceData,
     current_user: UserSchema,
     db: Session,
-    is_draft: bool = False
+    is_draft: bool = False,
+    rejections: list | None = None,
 ):
     """
     희망근무 저장/제출 통합 서비스
 
     req.wanted_entries 가 오면 단일 원본 경로로 위임한다(신규 계약).
     없으면 기존 data 기반 경로로 동작한다(AIDE·모바일 하위호환).
+
+    `rejections` 는 호출자가 문장 해석 단계에서 이미 걸러낸 미반영 항목이다.
+    저장 단계에서 걸러낸 것과 합쳐 응답의 `rejections` 로 나간다.
     """
     if req.wanted_entries is not None:
-        return save_wanted_entries_service(req, current_user, db, is_draft=is_draft)
+        return save_wanted_entries_service(
+            req, current_user, db, is_draft=is_draft, rejections=rejections
+        )
 
     month_str = f"{req.year}-{req.month:02d}"
 
@@ -1092,8 +1246,13 @@ def submit_preferences_service(
 
     db.commit()
 
+    # ★ legacy(`data`) 경로도 통지를 실어 보낸다. 자연어만 보내고 캘린더를 안 실은
+    #   요청은 분석이 전부 걸러지면 `wanted_entries` 가 None 인 채 이 분기로 오는데,
+    #   여기서 빠뜨리면 "저장은 200 인데 왜 안 들어갔는지 알 수 없는" 상태가
+    #   그대로 남는다(신규 경로만 고쳐서는 구멍이 메워지지 않는다).
     return {
-        "message": "임시 저장되었습니다." if is_draft else "제출이 완료되었습니다."
+        "message": "임시 저장되었습니다." if is_draft else "제출이 완료되었습니다.",
+        "rejections": list(rejections or []),
     }
 
 
@@ -1490,7 +1649,9 @@ def _memo_scope(current_user: UserSchema, db: Session, override_group_id=None):
         raise PreferenceForbiddenError("간호사 계정이 아닙니다.")
     home_gid = resolve_home_group_id(db, current_user)
     if not home_gid:
-        raise PreferenceForbiddenError("소속 그룹을 확인할 수 없습니다.")
+        raise PreferenceForbiddenError(
+            "소속 그룹을 확인할 수 없습니다.", code="no_home_group"
+        )
     if override_group_id and str(override_group_id) != str(home_gid):
         raise PreferenceForbiddenError("본인 소속 그룹의 메모만 다룰 수 있습니다.")
     return nurse_id, str(home_gid)

@@ -64,6 +64,91 @@ from services.weekly_off_service import (
 from utils.utils import send_wanted_request_push
 
 
+# ── 원티드 미반영 통지 ─────────────────────────────────────────────────────
+# 저장은 200 으로 성공하는데 **일부가 반영되지 않는** 자리가 여럿이다(한도 초과,
+# 주휴일, 달력 우선, 병동에 없는 코드 …). 예전에는 전부 `print` 로만 남아
+# 사용자는 낸 그대로 저장된 줄 알았다. 응답에 `rejections` 로 실어 화면이
+# "무엇이 왜 빠졌는지" 를 말할 수 있게 한다.
+#
+# ★ 코드는 프론트가 문구·아이콘을 갈라 쓰는 키다. 값을 바꾸면 화면이 같이 바뀐다.
+REJECT_OFF_LIMIT = "off_limit_exceeded"            # 휴무/휴가 한도 초과분
+REJECT_WEEKLY_OFF = "weekly_off_day"               # 주휴일은 신청 대상 아님
+REJECT_OVERRIDDEN_BY_CALENDAR = "overridden_by_calendar"  # 달력 직접선택이 우선
+REJECT_ANALYSIS_FAILED = "analysis_failed"         # 문장 해석 자체가 실패
+REJECT_SHIFT_NOT_IN_WARD = "shift_not_in_ward"     # 병동에 없는 근무코드
+REJECT_SHIFT_NOT_IN_PREFERENCE = "shift_not_in_preference"  # 원티드 미노출 코드
+REJECT_AVOID_DROPPED_BY_WANTED = "avoid_dropped_by_wanted"  # 같은 날 선호 우선
+REJECT_AVOID_BLOCKED_BY_HN = "avoid_blocked_by_hn"  # 수간호사 확정 셀
+REJECT_AVOID_CLEARED = "avoid_cleared_by_wanted"    # 선호 신청으로 기피 자동 해제
+REJECT_WANTED_BLOCKED_BY_HN = "wanted_blocked_by_hn"  # 저장은 됐으나 생성 미반영
+REJECT_INVALID_DATE = "invalid_date"               # 그 달에 없는 날짜
+REJECT_NOTHING_TO_APPLY = "nothing_to_apply"       # 문장에서 반영할 내용을 못 찾음
+
+
+# ── 저장 결과 단일 축 ──────────────────────────────────────────────────────
+# ★★ 저장이 온전히 끝났는지를 **한 값**으로 말한다. 종전에는 화면이 네 곳을 봐야
+#   알 수 있었다 — HTTP status, `detail.code`(422 만 있었다), `rejections[]`,
+#   그리고 `snapshot_unavailable` 같은 최상위 플래그. 어느 하나라도 빠뜨리면
+#   "저장 완료" 로 읽힌다.
+#   실패(4xx/5xx)는 `detail.code` 한 축으로 모았고, 성공(200)은 이 값 한 축이다.
+# ★ 세부 사유는 그대로 `rejections[]` 에 있다. 이 값은 **어느 갈래인지**만 말한다.
+SAVE_OK = "saved"                                   # 전부 반영됨
+SAVE_WITH_REJECTIONS = "saved_with_rejections"      # 저장됐으나 일부 미반영
+SAVE_SNAPSHOT_UNAVAILABLE = "saved_snapshot_unavailable"  # 저장됐으나 화면 갱신 필요
+
+
+def make_rejection(
+    code: str,
+    reason: str,
+    *,
+    date: Optional[str] = None,
+    shift_id: Optional[str] = None,
+    intent: Optional[str] = None,
+    blocking: bool = True,
+) -> Dict[str, Any]:
+    """미반영 통지 한 건.
+
+    Args:
+        code: `REJECT_*` 중 하나. 프론트 분기 키다.
+        reason: 사용자에게 그대로 보여 줄 한 문장.
+        date: 관련 날짜(`YYYY-MM-DD`). 특정 날짜가 없으면 None.
+        shift_id: 관련 근무코드.
+        intent: 'wanted' 또는 'avoid'.
+        blocking: True 면 **반영되지 않았다**, False 면 저장은 됐지만
+            그대로는 근무표에 안 걸리거나 자동으로 바뀌었다(정보성).
+    """
+    return {
+        "code": code,
+        "reason": reason,
+        "date": date,
+        "shift_id": shift_id,
+        "intent": intent,
+        "blocking": blocking,
+    }
+
+
+def _add_rejection(
+    sink: Optional[List[Dict[str, Any]]], code: str, reason: str, **kwargs
+) -> None:
+    """`sink` 가 있을 때만 통지를 담는다(수집기를 안 넘긴 호출부는 그대로 동작).
+
+    똑같은 통지는 한 번만 담는다 — 분석 결과가 중첩 리스트라 같은 항목이 여러 번
+    걸러질 수 있는데, 화면에 같은 문장이 여러 줄 뜨면 안 된다.
+
+    ★ 판정에 **`reason` 을 반드시 넣는다.** (code, date, shift_id) 만으로 보면
+      날짜를 특정할 수 없는 통지들(date=None)이 서로를 잡아먹는다 — 실측: 한
+      근무코드에 잘못된 날짜가 둘 오면 둘 다 date=None 이라 뒤엣것이 사라졌다.
+      구체값은 `reason` 문장에 들어 있으므로 이것까지 봐야 실제 중복만 걸러진다.
+    """
+    if sink is None:
+        return
+    item = make_rejection(code, reason, **kwargs)
+    key = (item["code"], item["date"], item["shift_id"], item["reason"])
+    if any((r["code"], r["date"], r["shift_id"], r["reason"]) == key for r in sink):
+        return
+    sink.append(item)
+
+
 def _yyyymm(year: int, month: int) -> str:
     """연/월을 'YYYY-MM' 문자열로 변환합니다.
 
@@ -798,6 +883,7 @@ def _parse_avoid_results(
     allowed_shift_map: Dict[str, str],
     wanted_days: Optional[Set[int]] = None,
     ward_mains: Optional[Set[str]] = None,
+    rejections: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """기피 분석 결과를 wanted_entries 의 avoid 엔트리 형태로 변환한다.
 
@@ -813,6 +899,9 @@ def _parse_avoid_results(
 
     반환: [{"date": "YYYY-MM-DD", "shift_id": "E", "intent": "avoid", "comment": "부담이 됩니다"}]
       `comment` 는 AIDE 가 문장에서 뽑은 **사유**다. 없으면 빈 문자열(선호 경로와 같은 계약).
+
+    `rejections` 리스트를 넘기면 여기서 걸러낸 항목을 사유와 함께 담는다 —
+    조용히 버리면 사용자는 문장이 반영된 줄 안다.
     """
     if not isinstance(avoid_results, list):
         return []
@@ -824,6 +913,12 @@ def _parse_avoid_results(
         entries = sublist if isinstance(sublist, list) else [sublist]
         for entry in entries:
             if not isinstance(entry, dict):
+                _add_rejection(
+                    rejections, REJECT_ANALYSIS_FAILED,
+                    "문장에서 읽어낸 '피하고 싶은 근무' 일부가 형식에 맞지 않아 "
+                    "반영하지 못했습니다.",
+                    intent="avoid",
+                )
                 continue
             for sr in (entry.get("shift_result") or []):
                 code = str(sr.get("shift") or "").strip().upper()
@@ -832,9 +927,22 @@ def _parse_avoid_results(
                 # 아래 allowed_shift_map(원티드 노출 코드) 필터에만 맡긴다.
                 if ward_mains is not None and code not in ward_mains:
                     print(f"[avoid 파싱] 병동에 없는 근무코드 → 제외: {code}")
+                    _add_rejection(
+                        rejections, REJECT_SHIFT_NOT_IN_WARD,
+                        f"'{code}' 는 이 병동에 없는 근무코드라 피하고 싶은 근무로 "
+                        f"반영하지 못했습니다.",
+                        shift_id=code, intent="avoid",
+                    )
                     continue
-                if allowed_shift_map and code not in allowed_shift_map:
+                # ★ 선호 경로와 같은 규칙 — 맵이 비어 있어도 거른다(빈 맵을
+                #   "검사 생략" 으로 읽으면 저장에서 422 로 통째 실패한다).
+                if code not in allowed_shift_map:
                     print(f"[avoid 파싱] 원티드 미노출 코드 → 제외: {code}")
+                    _add_rejection(
+                        rejections, REJECT_SHIFT_NOT_IN_PREFERENCE,
+                        f"'{code}' 는 원티드로 신청할 수 없는 근무코드입니다.",
+                        shift_id=code, intent="avoid",
+                    )
                     continue
                 # 사유는 `date` 와 같은 길이의 리스트로 온다(선호 쪽 `_parse_shift_results` 와 같은 규약).
                 # 예전에는 여기서 무조건 "" 로 눌러 버려서, 간호사가 쓴 기피 사유가
@@ -844,14 +952,41 @@ def _parse_avoid_results(
                     try:
                         day = int(raw_day)
                     except (ValueError, TypeError):
+                        _add_rejection(
+                            rejections, REJECT_INVALID_DATE,
+                            f"날짜로 읽을 수 없는 값({raw_day})이라 반영하지 "
+                            f"못했습니다.",
+                            shift_id=code, intent="avoid",
+                        )
                         continue
                     if not 1 <= day <= days_in_month:
+                        _add_rejection(
+                            rejections, REJECT_INVALID_DATE,
+                            f"{month}월에 없는 날짜({raw_day})라 반영하지 못했습니다.",
+                            shift_id=code, intent="avoid",
+                        )
                         continue
                     if day in wanted_days:
                         print(f"[avoid 파싱] {day}일은 선호가 이미 있어 기피 제외(선호 우선)")
+                        _add_rejection(
+                            rejections, REJECT_AVOID_DROPPED_BY_WANTED,
+                            f"{month}/{day} 은 희망 근무를 신청해 피하고 싶은 근무를 "
+                            f"함께 두지 않았습니다.",
+                            date=f"{year}-{month:02d}-{day:02d}",
+                            shift_id=code, intent="avoid", blocking=False,
+                        )
                         continue
                     date_str = f"{year}-{month:02d}-{day:02d}"
                     if date_str in by_date:
+                        # 한 날짜엔 기피 1건만 남는다(먼저 나온 것 우선). 같은 날
+                        # 다른 코드를 함께 피하고 싶다고 말해도 뒤엣것은 사라지므로
+                        # 알린다 — 저장 규칙이 날짜당 1건이라 구조적 제약이다.
+                        _add_rejection(
+                            rejections, REJECT_AVOID_DROPPED_BY_WANTED,
+                            f"{month}/{day} 은 피하고 싶은 근무를 하루에 하나만 "
+                            f"신청할 수 있어 '{code}' 는 반영하지 못했습니다.",
+                            date=date_str, shift_id=code, intent="avoid",
+                        )
                         continue
                     _c = sr_comments[idx] if idx < len(sr_comments) else None
                     by_date[date_str] = {
@@ -883,6 +1018,7 @@ async def analyze_wanted_text(
     request: str,
     year: int,
     month: int,
+    rejections: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """자연어 원티드 문장 → `wanted_entries` 목록. **저장은 하지 않는다.**
 
@@ -897,6 +1033,9 @@ async def analyze_wanted_text(
     그대로 진행하되 응답에 실패를 표시해야 한다 — 저장을 막아서도 안 되고,
     조용히 넘겨서도 안 된다(사용자가 저장된 줄 안다).
     뽑을 게 없어 비는 것(잡담 등)은 실패가 아니라 **빈 목록**이다.
+
+    `rejections` 리스트를 넘기면 해석은 됐지만 반영하지 못한 항목을 사유와 함께
+    담는다(그 달에 없는 날짜, 병동에 없는 코드 등).
     """
     text = (request or "").strip()
     if not text:
@@ -935,12 +1074,34 @@ async def analyze_wanted_text(
         raise WantedAnalysisError("분석 결과 형식이 올바르지 않습니다")
 
     out: List[Dict[str, Any]] = []
-    shift_parsed = _parse_shift_results(raw[:2])
+    shift_parsed = _parse_shift_results(raw[:2], rejections)
     for code, per_day in (shift_parsed or {}).items():
+        # ★★ 선호 코드도 **여기서** 걸러야 한다. 안 거르면 LLM 이 없는 코드를
+        #   하나만 뱉어도 `_normalize_wanted_entries` 가 invalid_shift_id 로 422 를
+        #   내어, 달력에서 직접 찍은 멀쩡한 항목까지 **저장이 통째로 실패**한다.
+        #   기피(avoid)는 이미 같은 검사를 하고 있었는데 선호만 빠져 있었다.
+        #   판정 기준은 422 를 내는 쪽과 같은 축(`show_in_preference=True`)이라야
+        #   정확히 막힌다.
+        # ★ `allowed_shift_map` 이 **비어 있어도** 거른다. "비면 검사 생략" 으로
+        #   두면 원티드 노출 시프트가 0개인 병동에서 모든 코드가 통과해 저장에서
+        #   422 가 나고, 달력으로 찍은 멀쩡한 항목까지 같이 죽는다.
+        if code not in allowed_shift_map:
+            _add_rejection(
+                rejections, REJECT_SHIFT_NOT_IN_PREFERENCE,
+                f"'{code}' 는 원티드로 신청할 수 없는 근무코드라 반영하지 "
+                f"못했습니다.",
+                shift_id=code, intent="wanted",
+            )
+            continue
         for day, meta in (per_day or {}).items():
             try:
                 d = date(year, month, int(day))
             except (TypeError, ValueError):
+                _add_rejection(
+                    rejections, REJECT_INVALID_DATE,
+                    f"{month}월에 없는 날짜({day})라 반영하지 못했습니다.",
+                    shift_id=code, intent="wanted",
+                )
                 continue
             # ★ `comment` 는 AIDE 가 뽑아낸 **사유**다. `request` 는 그 사유를 뽑아낸
             #   문장(=사용자가 친 프롬프트를 쪼갠 조각) 이라 여기에 실으면 안 된다.
@@ -956,12 +1117,14 @@ async def analyze_wanted_text(
         out += _parse_avoid_results(
             raw[2], year, month, allowed_shift_map,
             wanted_days=wanted_days, ward_mains=ward_mains,
+            rejections=rejections,
         )
     return out
 
 
 def _parse_shift_results(
-    response: List[List[Dict[str, Any]]]
+    response: List[List[Dict[str, Any]]],
+    rejections: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[int, Dict[str, Any]]]:
     """
     그래프 결과에서 shift_result를 {shift: {day: {score, request}}} 형태로 정리
@@ -976,11 +1139,26 @@ def _parse_shift_results(
             shift_results = entry.get("shift_result", [])
             for sr in shift_results:
                 record = sr.get("result", sr) if isinstance(sr, dict) else sr
+                # 분석기가 형식을 어겼거나 근무코드를 비워 보낸 경우. 문장에서 무언가를
+                # 읽어내려다 실패한 것이므로 흔적을 남긴다 — 여기서 버리면 사용자는
+                # 말한 내용이 왜 안 들어갔는지 알 길이 없다.
                 if not isinstance(record, dict) or "shift" not in record:
+                    _add_rejection(
+                        rejections, REJECT_ANALYSIS_FAILED,
+                        "문장에서 읽어낸 내용 일부가 형식에 맞지 않아 반영하지 "
+                        "못했습니다.",
+                        intent="wanted",
+                    )
                     continue
 
                 shift = str(record.get("shift", "")).strip()
                 if not shift:
+                    _add_rejection(
+                        rejections, REJECT_ANALYSIS_FAILED,
+                        "문장에서 근무코드를 찾지 못한 요청이 있어 반영하지 "
+                        "못했습니다.",
+                        intent="wanted",
+                    )
                     continue
 
                 dates = record.get("date", [])
@@ -989,11 +1167,21 @@ def _parse_shift_results(
                 comments = record.get("comment", [None] * len(dates))
 
                 for i, day_str in enumerate(dates):
+                    # ★ 일(day) 로 읽을 수 없는 값은 여기서 탈락한다. 월별 실제
+                    #   일수 검사는 호출자가 하지만(그쪽이 year/month 를 안다),
+                    #   32 처럼 아예 일이 될 수 없는 값은 이 자리가 마지막이라
+                    #   여기서 알리지 않으면 흔적 없이 사라진다.
                     try:
                         day = int(day_str)
                         if not 1 <= day <= 31:
-                            continue
-                    except:
+                            raise ValueError(day_str)
+                    except (ValueError, TypeError):
+                        _add_rejection(
+                            rejections, REJECT_INVALID_DATE,
+                            f"날짜로 읽을 수 없는 값({day_str})이라 반영하지 "
+                            f"못했습니다.",
+                            shift_id=shift, intent="wanted",
+                        )
                         continue
 
                     if shift in seen_per_day.get(day, set()):
@@ -1360,6 +1548,9 @@ async def invoke_and_persist_wanted_service(
     ).all()
     allowed_shift_map = {row.shift_id: row.name for row in allowed_shifts_query}
 
+    # 미반영 통지 수집기. 이 함수 안에서 "걸러냈다" 고 판단하는 자리마다 담는다.
+    rejections: List[Dict[str, Any]] = []
+
     # ★★★ 핵심: case 정규화를 함수 초반으로 이동 ★★★
     normalized_case, ignored_case = _normalize_case_items(
         case_raw=req.case,
@@ -1368,6 +1559,16 @@ async def invoke_and_persist_wanted_service(
         allowed_shift_map=allowed_shift_map,
     )
     has_case = bool(normalized_case)
+    # 정규화가 버린 항목 — 예전에는 사유까지 만들어 놓고 변수만 받고 버렸다.
+    for _ig in ignored_case:
+        _item = _ig.get("item")
+        _add_rejection(
+            rejections, REJECT_INVALID_DATE if "날짜" in _ig.get("reason", "")
+            else REJECT_SHIFT_NOT_IN_PREFERENCE,
+            f"달력에서 보낸 항목을 반영하지 못했습니다({_ig.get('reason')}).",
+            date=(_item or {}).get("date") if isinstance(_item, dict) else None,
+            shift_id=(_item or {}).get("shift") if isinstance(_item, dict) else None,
+        )
 
     # # 3. NURSE_LIMIT 검증 (간호사별 월단위 요청 개수 제한) - 프론트에서 검증, nurses 테이블로 이동됨
     # nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
@@ -1504,7 +1705,7 @@ async def invoke_and_persist_wanted_service(
             # [0]=shift, [1]=preference, [2]=avoid(기피). 예전 2개 반환도 계속 받는다.
             if isinstance(raw_response, list) and len(raw_response) >= 2:
                 response = raw_response[:2]
-                shift_parsed = _parse_shift_results(response)
+                shift_parsed = _parse_shift_results(response, rejections)
                 pref_parsed = _parse_preferences(response, req.schema)
                 if len(raw_response) >= 3:
                     _wanted_days = {
@@ -1513,7 +1714,7 @@ async def invoke_and_persist_wanted_service(
                     }
                     avoid_parsed = _parse_avoid_results(
                         raw_response[2], req.year, req.month, allowed_shift_map,
-                        wanted_days=_wanted_days,
+                        wanted_days=_wanted_days, rejections=rejections,
                     )
                 if not shift_parsed and not pref_parsed and not avoid_parsed:
                     aide_status = {"code": "no_output", "ok": False}
@@ -1529,6 +1730,12 @@ async def invoke_and_persist_wanted_service(
                 "detail": str(e),
                 "error_type": type(e).__name__,
             }
+
+    if not aide_status.get("ok", True):
+        _add_rejection(
+            rejections, REJECT_ANALYSIS_FAILED,
+            "문장을 해석하지 못했습니다. 달력에서 직접 선택하거나 다시 시도해 주세요.",
+        )
 
     # 새 request_id 생성
     new_request_id = _persist_wanted_request(db, nurse_id, month_str, req.request, group_id=group_id)
@@ -1783,6 +1990,9 @@ async def invoke_and_persist_wanted_service(
         "avoid_blocked_by_hn": avoid_cleanup["blocked_by_hn"],
         "warning": None,
         "aide_status": aide_status,
+        # 미반영 통지 단일 창구. 위 `warning`·`avoid_*` 는 기존 소비자를 위해
+        # 남겨 두되, 새 화면은 이 배열 하나만 읽으면 된다.
+        "rejections": rejections,
     }
 
     if excluded_off_dates:
@@ -1796,6 +2006,30 @@ async def invoke_and_persist_wanted_service(
             "excluded_count": len(excluded_items),
             "limit": max_requests
         }
+        for exc_day, exc_shift in excluded_items:
+            _add_rejection(
+                rejections, REJECT_OFF_LIMIT,
+                f"휴무/휴가 신청 가능 수({max_requests}개)를 넘어 "
+                f"{req.month}/{exc_day}({exc_shift}) 을 반영하지 못했습니다.",
+                date=f"{req.year}-{req.month:02d}-{exc_day:02d}",
+                shift_id=exc_shift, intent="wanted",
+            )
+
+    for _c in avoid_cleanup["blocked_by_hn"]:
+        _add_rejection(
+            rejections, REJECT_WANTED_BLOCKED_BY_HN,
+            "수간호사가 피하고 싶은 근무로 확정한 날짜입니다. 신청은 저장했지만 "
+            "근무표에는 반영되지 않습니다.",
+            date=_c.get("date"), shift_id=_c.get("shift"), intent="wanted",
+            blocking=False,
+        )
+    for _c in avoid_cleanup["cleared"]:
+        _add_rejection(
+            rejections, REJECT_AVOID_CLEARED,
+            "같은 날짜에 희망 근무를 신청해, 기존에 피하고 싶던 근무를 해제했습니다.",
+            date=_c.get("date"), shift_id=_c.get("shift"), intent="avoid",
+            blocking=False,
+        )
 
     return result
 
