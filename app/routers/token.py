@@ -28,7 +28,15 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1 day
 #   (`/login`)에서 믿으면 안 된다 — 두 요청은 독립이고 폼 값은 조작 가능하다.
 _DEMO_OFFICE_CODE = "100723"
 _DEMO_ROLE_ACCOUNTS = {
-    "admin": "yadmin",    # 통합관리자   — EmpAuthGbn='ADM' (nurses 미등록이지만 ADM 은 게이트 면제)
+    # ★★ 종전에는 `yadmin`(EmpAuthGbn='ADM')이었다. ADM 은 `is_master_admin` 이라
+    #   office 안을 무조건 다 보고 **관리 기능까지 열린다** — 시연은 "전 병동을
+    #   둘러보는" 것이 목적이라 권한이 과했다. 같은 범위를 그룹관리자(HN)로도
+    #   만들 수 있다: `resolve_managed_group_ids` 가 HN 에게 `groups.hn_id` 에
+    #   자기 nurse_id 가 든 병동을 모두 돌려주므로, 전 병동에 등록해 두면 된다.
+    # ★ 그래서 이 계정은 **nurses 에 있어야** 한다(ADM 과 달리 501 게이트 면제가
+    #   없다). `hn_auth='HN'` 과 각 `groups.hn_id` 등록이 전제다 — 둘 중 하나라도
+    #   빠지면 조용히 home 병동 하나만 보인다.
+    "admin": "yss0101",   # 모니터링     — nurses.hn_auth='HN' · 전 병동 groups.hn_id 등록
     "hn": "yss0401",      # 근무표관리자 — nurses.is_head_nurse=1 · hn_auth='HN'
     "nurse": "yss0414",   # 근무자       — nurses 일반
 }
