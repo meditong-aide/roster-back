@@ -31,13 +31,41 @@ def resolve_recipient_group_ids(db: Session, current_user: UserSchema) -> List[s
     return [home] if home else []
 
 
-def _member_rows_query(db: Session, group_ids: List[str]):
-    """수신자 후보 기본 질의. 목록·페이지·발송 가드가 **모두 이 축을 쓴다.**"""
-    return (
+#: `LIKE` 에서 뜻을 가지는 문자. 사용자가 친 그대로 찾게 하려면 탈출시켜야 한다.
+#: `%` 하나만 쳐도 전원이 걸리고, `[` 는 문자 집합으로 읽혀 엉뚱한 결과가 나온다.
+_LIKE_ESCAPE = "\\"
+
+
+def _like_contains(term: str) -> str:
+    """부분일치용 패턴. 특수문자를 탈출시켜 **친 글자 그대로** 찾는다."""
+    for ch in (_LIKE_ESCAPE, "%", "_", "["):
+        term = term.replace(ch, _LIKE_ESCAPE + ch)
+    return f"%{term}%"
+
+
+def _member_rows_query(db: Session, group_ids: List[str], q: Optional[str] = None):
+    """수신자 후보 기본 질의. 목록·페이지·발송 가드가 **모두 이 축을 쓴다.**
+
+    ★ `q` 는 이름·직급·병동 이름 부분일치다 — 화면이 하던 것과 **같은 세 필드**다.
+      세 컬럼 모두 `Korean_Wansung_CI_AS` 라 대소문자는 이미 무시된다. `lower()` 를
+      씌우면 계산식이 되어 collation 이점만 잃는다.
+    ★ 파라미터가 아니라 **컬럼의 collation 이 이긴다**(collation 우선순위). 그래서
+      Latin1 이 기본인 이 DB 에서도 한글 비교가 어긋나거나 468 로 터지지 않는다.
+    """
+    query = (
         db.query(Nurse, Group.group_name)
         .join(Group, Nurse.group_id == Group.group_id)
         .filter(Nurse.group_id.in_(group_ids), Nurse.active == 1)
     )
+    term = (q or "").strip()
+    if term:
+        pattern = _like_contains(term)
+        query = query.filter(
+            Nurse.name.like(pattern, escape=_LIKE_ESCAPE)
+            | Nurse.role.like(pattern, escape=_LIKE_ESCAPE)
+            | Group.group_name.like(pattern, escape=_LIKE_ESCAPE)
+        )
+    return query
 
 
 def _member_item(n: Nurse, group_name: str) -> dict:
@@ -66,9 +94,20 @@ def get_member_list(db: Session, group_ids: List[str]) -> List[dict]:
 
 
 def get_member_page(
-    db: Session, group_ids: List[str], limit: int = 20, cursor: Optional[str] = None
+    db: Session,
+    group_ids: List[str],
+    limit: int = 20,
+    cursor: Optional[str] = None,
+    q: Optional[str] = None,
 ) -> dict:
     """수신자 한 페이지. `{items, nextCursor, total}` — 받은함과 같은 계약.
+
+    ★★ `q` 는 **서버에서** 거른다. 화면이 받은 만큼만 거르면 아직 안 받은 사람이
+      "검색 결과 없음" 으로 나와, 사용자는 그 사람이 없다고 믿는다. 검색을 서버로
+      올리면 화면이 전량을 들고 있지 않아도 결과가 정확하다.
+    ★ `total` 도 **거른 뒤 수**다. 검색 중에 "131명 중" 같은 숫자가 뜨면 안 된다.
+    ★ 커서는 `q` 가 같을 때만 유효하다. 정렬이 같아 이어받기는 성립하지만,
+      검색어를 바꾸면 화면이 커서를 버리고 처음부터 받아야 한다.
 
     ★ 정렬은 `(병동이름, sequence, nurse_id)` 다. `sequence` 는 병동 안에서만 유일해
       보조키 없이 커서를 만들면 같은 값에서 **건너뛰거나 되풀이**된다.
@@ -87,14 +126,14 @@ def get_member_page(
         .all()
     }
 
-    q = _member_rows_query(db, group_ids)
+    rows_q = _member_rows_query(db, group_ids, q)
     key = _decode_cursor(cursor, 3)
     if key is not None:
         last_gid, last_seq, last_nid = key[0], key[1], key[2]
         last_name = names.get(last_gid)
         if last_name is not None:
             # (이름, sequence, nurse_id) 사전식 비교로 이어 받는다.
-            q = q.filter(
+            rows_q = rows_q.filter(
                 (Group.group_name > last_name)
                 | (
                     (Group.group_name == last_name)
@@ -106,7 +145,7 @@ def get_member_page(
             )
 
     rows = (
-        q.order_by(Group.group_name, Nurse.sequence, Nurse.nurse_id)
+        rows_q.order_by(Group.group_name, Nurse.sequence, Nurse.nurse_id)
         .limit(limit + 1)             # 한 건 더 떠서 다음 페이지 유무를 판정
         .all()
     )
@@ -123,8 +162,9 @@ def get_member_page(
     return {
         "items": [_member_item(n, group_name) for n, group_name in rows],
         "nextCursor": next_cursor,
-        # ★ 페이지가 아니라 **범위 전체 인원**이다. 마지막 페이지에서도 같은 값이다.
-        "total": _member_rows_query(db, group_ids).count(),
+        # ★ 페이지가 아니라 **조건에 맞는 전체 인원**이다(검색 중이면 거른 뒤 수).
+        #   마지막 페이지에서도 같은 값이다.
+        "total": _member_rows_query(db, group_ids, q).count(),
     }
 
 

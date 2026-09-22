@@ -55,6 +55,7 @@ def get_member_list(
 def get_member_list_page(
     limit: int = 20,
     cursor: Optional[str] = None,
+    q: Optional[str] = None,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
@@ -67,6 +68,12 @@ def get_member_list_page(
       이 실려 있어 화면이 소속을 그대로 보여줄 수 있다).
     * `limit` 은 프론트가 정하고 상한 200 으로 자른다 — 범위가 가장 큰 병원이
       262명이라, 상한이 없으면 한 번에 전량을 끌어오는 호출과 구분되지 않는다.
+    * `q` 는 이름·직급·병동 이름 부분일치다(생략 가능). **검색을 서버가 하므로**
+      화면이 전량을 들고 있지 않아도 결과가 정확하다 — 받은 만큼만 거르면 아직
+      안 받은 사람이 "검색 결과 없음" 으로 나와, 사용자는 없다고 믿게 된다.
+      `total` 도 거른 뒤 수다.
+    ★ 커서는 **같은 `q` 안에서만** 유효하다. 검색어를 바꾸면 커서를 버리고 처음부터
+      받아야 한다(정렬은 같아 이어받기 자체는 성립하지만 모수가 달라진다).
 
     ★ 정렬은 `(병동이름, sequence, nurse_id)` 다. 같은 병동 사람이 붙어 나오고,
       `sequence` 는 병동 안에서만 유일하므로 `nurse_id` 를 보조키로 둔다 — 없으면
@@ -81,6 +88,7 @@ def get_member_list_page(
             message_service.resolve_recipient_group_ids(db, current_user),
             limit=min(limit, 200),
             cursor=cursor,
+            q=q,
         )
     }
 
