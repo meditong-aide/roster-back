@@ -25,7 +25,7 @@ router = APIRouter(
 )
 
 @router.get("/settings", response_model=WeeklyOffSettingResponse)
-async def get_weekly_off_settings(
+def get_weekly_off_settings(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -36,7 +36,7 @@ async def get_weekly_off_settings(
     return get_weekly_off_settings_service(current_user, db, group_id)
 
 @router.put("/settings", response_model=WeeklyOffSettingResponse)
-async def update_weekly_off_settings(
+def update_weekly_off_settings(
     payload: WeeklyOffSettingUpdate,
     group_id: Optional[str] = Query(None),
     current_user: UserSchema = Depends(get_current_user_from_cookie),

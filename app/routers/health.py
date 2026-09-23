@@ -76,7 +76,7 @@ def health_check():
 
 
 @router.get("/alb")
-async def alb_health_check(db: Session = Depends(get_db)):
+def alb_health_check(db: Session = Depends(get_db)):
     """
     ALB 상태검사를 위한 통합 헬스체크 엔드포인트
     - 간단하고 빠른 응답으로 ALB에서 사용
@@ -104,7 +104,7 @@ async def alb_health_check(db: Session = Depends(get_db)):
 
 
 @router.get("/simple")
-async def simple_health_check():
+def simple_health_check():
     """
     간단한 헬스체크 엔드포인트
     - DB 연결 없이 기본적인 서비스 상태만 확인
@@ -123,7 +123,7 @@ async def simple_health_check():
 
 
 @router.get("/database")
-async def database_health_check(db: Session = Depends(get_db)):
+def database_health_check(db: Session = Depends(get_db)):
     """
     데이터베이스 연결 상태 체크 엔드포인트
     """
@@ -142,7 +142,7 @@ async def database_health_check(db: Session = Depends(get_db)):
 
 
 @router.get("/system")
-async def system_health_check():
+def system_health_check():
     """
     시스템 리소스 상태 체크 엔드포인트
     """
@@ -161,7 +161,7 @@ async def system_health_check():
 
 
 @router.get("/dependencies")
-async def dependencies_health_check():
+def dependencies_health_check():
     """
     서비스 의존성 체크 엔드포인트
     """
@@ -180,7 +180,7 @@ async def dependencies_health_check():
 
 
 @router.get("/comprehensive")
-async def comprehensive_health_check(db: Session = Depends(get_db)):
+def comprehensive_health_check(db: Session = Depends(get_db)):
     """
     종합 헬스체크 엔드포인트
     - 데이터베이스, 시스템, 의존성 모든 상태를 한번에 체크
@@ -200,7 +200,7 @@ async def comprehensive_health_check(db: Session = Depends(get_db)):
 
 
 @router.get("/ready")
-async def readiness_check(db: Session = Depends(get_db)):
+def readiness_check(db: Session = Depends(get_db)):
     """
     서비스 준비 상태 체크 엔드포인트
     - 로드밸런서나 쿠버네티스에서 사용
@@ -224,7 +224,7 @@ async def readiness_check(db: Session = Depends(get_db)):
 
 
 @router.get("/live")
-async def liveness_check():
+def liveness_check():
     """
     서비스 생존 상태 체크 엔드포인트
     - 로드밸런서나 쿠버네티스에서 사용

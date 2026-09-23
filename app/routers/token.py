@@ -122,7 +122,7 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
         return {}
 
 @router.post("/", summary="Token 생성")
-async def get_token(response: Response,
+def get_token(response: Response,
                     clientId: str = Form(...),
                     clientSecret: str = Form(...)):
     """
@@ -139,7 +139,7 @@ async def get_token(response: Response,
     return {"token" : token}
 
 @router.post("/sso-mode", summary="SSO 진입 모드 — 시연 역할 선택이 필요한 계정인지")
-async def get_sso_mode(token: str = Form(...), MemberID: str = Form(...)):
+def get_sso_mode(token: str = Form(...), MemberID: str = Form(...)):
     """SSO 진입 직후 프론트가 역할 선택 모달을 띄울지 판단하기 위한 조회.
 
     반환

@@ -121,7 +121,7 @@ def _resolve_managed_target(
 
 
 @router.get("", response_model=list[TeamWithMembers])
-async def get_teams(
+def get_teams(
     current_user: UserSchema = Depends(require_current_user),
     group_id: str | None = None,
     year: int | None = None,
@@ -148,7 +148,7 @@ async def get_teams(
 
 
 @router.put("", response_model=list[TeamWithMembers])
-async def put_teams(
+def put_teams(
     body: TeamBulkOpsRequest,
     current_user: UserSchema = Depends(require_current_user),
     group_id: str | None = None,
@@ -185,7 +185,7 @@ async def put_teams(
 
 
 @router.post("/classify/preview")
-async def classify_preview(
+def classify_preview(
     body: TeamClassifyPreviewRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -203,7 +203,7 @@ async def classify_preview(
 
 
 @router.post("/classify/apply")
-async def classify_apply(
+def classify_apply(
     body: TeamClassifyApplyRequest,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
@@ -226,7 +226,7 @@ async def classify_apply(
 
 
 @router.post("/redistribute/preview")
-async def redistribute_preview(
+def redistribute_preview(
     body: WardRedistributePreviewRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -254,7 +254,7 @@ async def redistribute_preview(
 
 
 @router.post("/redistribute/apply")
-async def redistribute_apply(
+def redistribute_apply(
     body: WardRedistributeApplyRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),

@@ -96,7 +96,7 @@ def get_shifts(
 
 
 @router.get("/shifts/paged")
-async def get_shifts_paged(
+def get_shifts_paged(
     group_id: str,
     cursor: Optional[str] = None,
     limit: int = 20,
@@ -161,7 +161,7 @@ def _is_weekly_off_slot(slot_data: dict[str, Any]) -> bool:
 VALID_NURSE_CLASSES = {"RN", "AN", "보조"}
 
 @router.post("/shifts/add")
-async def add_shift(
+def add_shift(
     req: ShiftAddRequest,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -184,7 +184,7 @@ async def add_shift(
         raise HTTPException(status_code=500, detail=f"근무코드 추가 실패: {str(e)}")
 
 @router.post("/shifts/update")
-async def update_shift(
+def update_shift(
     req: ShiftUpdateRequest,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -207,7 +207,7 @@ async def update_shift(
         print('error', e)
         raise HTTPException(status_code=500, detail=f"근무코드 수정 실패: {str(e)}")
 @router.post("/shifts/remove")
-async def remove_shift(
+def remove_shift(
     req: RemoveShiftRequest,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -221,7 +221,7 @@ async def remove_shift(
         raise HTTPException(status_code=500, detail=f"근무코드 삭제 실패: {str(e)}")
 
 @router.post("/shifts/move")
-async def move_shift(
+def move_shift(
     req: MoveShiftRequest,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -238,7 +238,7 @@ async def move_shift(
 
 # [Shifts] - 엑셀 일괄 업로드
 @router.get("/shifts/template-download")
-async def download_shift_template(
+def download_shift_template(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
 ):
     """근무코드 엑셀 업로드 템플릿 다운로드"""
@@ -286,7 +286,7 @@ async def shift_upload_validate_endpoint(
 
 
 @router.post("/shifts/upload-confirm")
-async def shift_upload_confirm_endpoint(
+def shift_upload_confirm_endpoint(
     payload: ShiftUploadConfirmRequest,
     group_id: str = Query(..., description="대상 병동 group_id (필수)"),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -324,7 +324,7 @@ async def shift_upload_confirm_endpoint(
 
 # [Shifts] - 타 병동 근무코드 가져오기
 @router.get("/shifts/available-imports")
-async def get_available_shift_imports(
+def get_available_shift_imports(
     group_id: str = Query(..., description="현재 선택된 병동 그룹 ID"),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -351,7 +351,7 @@ async def get_available_shift_imports(
 
 
 @router.post("/shifts/import-to-group")
-async def import_shifts_to_group_endpoint(
+def import_shifts_to_group_endpoint(
     payload: ShiftImportRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -390,7 +390,7 @@ async def import_shifts_to_group_endpoint(
 
 # [Shift Management] - 시프트 관리 데이터 조회
 @router.get("/shift-manage/{class_name}")
-async def get_shift_manage(
+def get_shift_manage(
     class_name: Optional[str] = None,
     # config_version: Optional[str] = None,
     group_id: Optional[str] = None,
@@ -518,7 +518,7 @@ def _upsert_shift_manage_slots(
 
 
 @router.post("/shift-manage/save")
-async def save_shift_manage(
+def save_shift_manage(
     req: ShiftManageSaveRequest,
     # config_version: Optional[str] = None,
     group_id: Optional[str] = None,

@@ -19,7 +19,7 @@ router = APIRouter(
 
 
 @router.get("")
-async def list_groups(
+def list_groups(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
@@ -48,7 +48,7 @@ async def list_groups(
 
 
 @router.post("")
-async def create_group(
+def create_group(
     payload: dict,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -75,7 +75,7 @@ async def create_group(
 
 # 그룹 명 수정
 @router.patch("/{group_id}")
-async def update_group_name(
+def update_group_name(
     group_id: str,
     payload: dict,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -152,7 +152,7 @@ async def update_group_name(
 
 
 @router.get("/by-office")
-async def list_groups_by_office(
+def list_groups_by_office(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):
@@ -195,7 +195,7 @@ async def list_groups_by_office(
 
 
 @router.put("/hn-admin")
-async def update_hn_admin(
+def update_hn_admin(
     payload: dict,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -257,7 +257,7 @@ async def update_hn_admin(
 
 
 @router.get("/my-admin-groups")
-async def get_my_admin_groups(
+def get_my_admin_groups(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
 ):

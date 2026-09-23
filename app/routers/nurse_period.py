@@ -83,7 +83,7 @@ class BackfillResult(BaseModel):
 
 
 @router.post("/backfill", response_model=BackfillResult)
-async def backfill_nurse_periods(
+def backfill_nurse_periods(
     payload: BackfillRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -149,7 +149,7 @@ class ChangeResult(BaseModel):
 
 
 @router.post("/change", response_model=ChangeResult)
-async def change_nurse_period(
+def change_nurse_period(
     payload: ChangeRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -218,7 +218,7 @@ class RollResult(BaseModel):
 
 
 @router.post("/roll", response_model=RollResult)
-async def roll_nurse_cache(
+def roll_nurse_cache(
     payload: RollRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -293,7 +293,7 @@ class LeaveFlagsResult(BaseModel):
 
 
 @router.get("/leave-flags", response_model=LeaveFlagsResult)
-async def get_leave_flags(
+def get_leave_flags(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -338,7 +338,7 @@ class LeaveFlagUpdate(BaseModel):
 
 
 @router.post("/leave-flags", response_model=LeaveFlagRow)
-async def update_leave_flags(
+def update_leave_flags(
     payload: LeaveFlagUpdate,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -418,7 +418,7 @@ class NightCycleResult(BaseModel):
 
 
 @router.get("/night-cycle", response_model=NightCycleResult)
-async def get_night_cycle(
+def get_night_cycle(
     year: int,
     month: int,
     group_id: Optional[str] = None,

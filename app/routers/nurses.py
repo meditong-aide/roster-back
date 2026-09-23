@@ -101,7 +101,7 @@ router = APIRouter(prefix="/nurses", tags=["nurses"])
 
 
 @router.get("/managed-groups/summary")
-async def get_managed_groups_summary(
+def get_managed_groups_summary(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -195,7 +195,7 @@ async def get_managed_groups_summary(
 
 
 @router.get("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
-async def get_monthly_limits(
+def get_monthly_limits(
     group_id: str,
     nurse_id: str,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -211,7 +211,7 @@ async def get_monthly_limits(
 
 
 @router.put("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
-async def put_monthly_limits(
+def put_monthly_limits(
     body: NurseMonthlyLimitBulkUpsertRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -228,7 +228,7 @@ async def put_monthly_limits(
 
 
 @router.post("/monthly-limits/night-bulk", response_model=NurseMonthlyLimitListResponse)
-async def night_bulk_apply(
+def night_bulk_apply(
     body: NightBulkApplyRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -286,7 +286,7 @@ def _ensure_office_exists(
 
 
 @router.get("/members")
-async def get_group_members_in_month(
+def get_group_members_in_month(
     group_id: str,
     year: int,
     month: int,
@@ -309,7 +309,7 @@ async def get_group_members_in_month(
 
 
 @router.get("/preceptee-periods")
-async def get_preceptee_periods(
+def get_preceptee_periods(
     group_id: str,
     year: int,
     month: int,
@@ -338,7 +338,7 @@ async def get_preceptee_periods(
 
 
 @router.get("", response_model=List[NurseProfile])
-async def get_nurses_in_group(
+def get_nurses_in_group(
     office_id: Optional[str] = None,
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,  # 신규 파라미터
@@ -424,7 +424,7 @@ async def get_nurses_in_group(
 
 
 @router.post("/sequence/save")
-async def save_nurse_sequence(
+def save_nurse_sequence(
     req: NurseSequenceUpdate,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -446,7 +446,7 @@ async def save_nurse_sequence(
 
 
 @router.post("/sequence/reorder")
-async def reorder_nurses(
+def reorder_nurses(
     payload: ReorderPayload,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -469,7 +469,7 @@ async def reorder_nurses(
 
 
 @router.post("/bulk-update")
-async def bulk_update_nurses(
+def bulk_update_nurses(
     nurses_data: List[NurseProfile],
     group_id: Optional[str] = None,
     year: Optional[int] = None,
@@ -495,7 +495,7 @@ async def bulk_update_nurses(
 
 
 @router.get("/template-download")
-async def download_template(
+def download_template(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -516,7 +516,7 @@ async def download_template(
 
 
 @router.get("/template2-download")
-async def download_template2(
+def download_template2(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
 ):
     """신규 엑셀 템플릿2 (계정ID/이름만) 다운로드 - ADM 전용"""
@@ -612,7 +612,7 @@ async def upload2_validate_endpoint(
 
 
 @router.post("/upload2-confirm")
-async def upload2_confirm_endpoint(
+def upload2_confirm_endpoint(
     payload: Upload2ConfirmRequest,
     group_id: str = Query(
         ..., description="대상 병동 group_id (필수)"
@@ -658,7 +658,7 @@ async def upload2_confirm_endpoint(
 
 
 @router.get("/available-members")
-async def get_available_members(
+def get_available_members(
     group_id: str = Query(..., description="현재 선택된 병동 그룹 ID"),
     pagination: Optional[str] = Query(None, description="Use cursor pagination"),
     q: Optional[str] = Query(None, description="Name search query"),
@@ -722,7 +722,7 @@ async def get_available_members(
 
 
 @router.post("/add-to-group")
-async def add_nurses_to_group(
+def add_nurses_to_group(
     payload: AddToGroupRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -758,7 +758,7 @@ async def add_nurses_to_group(
 
 
 @router.get("/export-members")
-async def export_members(
+def export_members(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
 ):
     """ADM 전용: 현재 오피스 전체 인원 정보를 엑셀로 내려받기."""
@@ -797,7 +797,7 @@ async def export_members(
 
 
 @router.post("/validate-excel")
-async def validate_excel_data_endpoint(
+def validate_excel_data_endpoint(
     request: ExcelValidationRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -815,7 +815,7 @@ async def validate_excel_data_endpoint(
 
 
 @router.post("/confirm-upload")
-async def confirm_upload(
+def confirm_upload(
     request: ExcelConfirmRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -843,7 +843,7 @@ async def confirm_upload(
 
 
 @router.post("/integrated-register")
-async def integrated_register(
+def integrated_register(
     payload: IntegratedRegisterRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -1024,7 +1024,7 @@ def get_personnel_basic_info(
 
 
 @router.patch("/personnel-basic-info")
-async def partial_update_personnel_basic_info(
+def partial_update_personnel_basic_info(
     update_data: PersonnelUpdate,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
@@ -1062,7 +1062,7 @@ async def partial_update_personnel_basic_info(
 
 
 @router.post("/profile-image")
-async def upload_profile_image(
+def upload_profile_image(
     file: UploadFile = File(...),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -1081,7 +1081,7 @@ async def upload_profile_image(
 
 
 @router.get("/profile-image")
-async def get_profile_image(
+def get_profile_image(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -1096,7 +1096,7 @@ async def get_profile_image(
 
 
 @router.delete("/profile-image")
-async def delete_profile_image(
+def delete_profile_image(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
@@ -1111,7 +1111,7 @@ async def delete_profile_image(
 
 
 @router.put("/change-password")
-async def change_password(
+def change_password(
     payload: PasswordChangeRequest,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
@@ -1160,7 +1160,7 @@ async def change_password(
 
 
 @router.post("/change-phone/send-code")
-async def send_phone_verification_code(
+def send_phone_verification_code(
     payload: PhoneChangeRequest,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
@@ -1204,7 +1204,7 @@ async def send_phone_verification_code(
 
 
 @router.put("/change-phone/verify")
-async def verify_and_update_phone(
+def verify_and_update_phone(
     payload: PhoneChangeRequest,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
@@ -1245,7 +1245,7 @@ async def verify_and_update_phone(
     response_model=NurseAssignmentResponse,
     deprecated=True,
 )
-async def create_nurse_assignment(
+def create_nurse_assignment(
     req: NurseAssignmentCreate,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -1259,7 +1259,7 @@ async def create_nurse_assignment(
 
 
 @router.get("/assignments", response_model=NurseAssignmentListResponse)
-async def get_nurse_assignments(
+def get_nurse_assignments(
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,
     status: Optional[str] = "active",
@@ -1307,7 +1307,7 @@ class AssignmentPreviewRequest(BaseModel):
 
 
 @router.post("/assignments/preview")
-async def preview_nurse_assignment(
+def preview_nurse_assignment(
     req: AssignmentPreviewRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -1339,7 +1339,7 @@ async def preview_nurse_assignment(
     response_model=NurseAssignmentResponse,
     deprecated=True,
 )
-async def update_nurse_assignment(
+def update_nurse_assignment(
     assignment_id: int,
     req: NurseAssignmentUpdate,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -1357,7 +1357,7 @@ async def update_nurse_assignment(
     response_model=NurseAssignmentResponse,
     deprecated=True,
 )
-async def delete_nurse_assignment(
+def delete_nurse_assignment(
     assignment_id: int,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -1370,7 +1370,7 @@ async def delete_nurse_assignment(
 
 
 @router.get("/{nurse_id}", response_model=NurseProfile)
-async def get_nurse_by_id(
+def get_nurse_by_id(
     nurse_id: str,
     group_id: Optional[str] = None,
     year: Optional[int] = None,
@@ -1459,7 +1459,7 @@ async def get_nurse_by_id(
 
 
 @router.patch("/{nurse_id}")
-async def update_nurse_profile(
+def update_nurse_profile(
     nurse_id: str,
     update_data: NurseProfileUpdate,
     group_id: Optional[str] = None,
@@ -1486,7 +1486,7 @@ async def update_nurse_profile(
 
 
 @router.delete("/{nurse_id}")
-async def delete_nurse(
+def delete_nurse(
     nurse_id: str,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),

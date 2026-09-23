@@ -289,7 +289,7 @@ async def roster_create_async(
 
 # [Roster] - 근무표 생성
 @router.post("/roster_create/generate")
-async def generate_roster_endpoint(
+def generate_roster_endpoint(
     req: RosterRequest,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
@@ -353,7 +353,7 @@ class ApplyResolutionRequest(BaseModel):
 
 
 @router.post("/roster_create/apply-resolution")
-async def apply_resolution_endpoint(
+def apply_resolution_endpoint(
     req: ApplyResolutionRequest,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
@@ -470,7 +470,7 @@ async def apply_resolution_endpoint(
 
     # [Schedules] - 수간호사가 근무표 생성 요청
 @router.post("/roster/request")
-async def request_schedule(
+def request_schedule(
     req: RosterRequest,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
@@ -499,7 +499,7 @@ async def request_schedule(
 
 # [Roster] - 고정된 셀을 반영한 근무표 생성
 @router.post("/roster_create/hold_generate")
-async def hold_generate_roster_endpoint(
+def hold_generate_roster_endpoint(
     req: HoldGenerateRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)

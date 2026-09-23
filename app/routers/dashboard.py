@@ -20,7 +20,7 @@ from typing import Optional
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 @router.get("/summary")
-async def get_dashboard_summary(
+def get_dashboard_summary(
     year: Optional[int] = Query(None, description="조회할 년도"),
     month: Optional[int] = Query(None, description="조회할 월"),
     current_user: User = Depends(get_current_user_from_cookie),
@@ -46,7 +46,7 @@ async def get_dashboard_summary(
         raise HTTPException(status_code=500, detail=f"대시보드 요약 데이터 조회 실패: {str(e)}")
 
 @router.get("/individual")
-async def get_individual_dashboard(
+def get_individual_dashboard(
     year: Optional[int] = Query(None, description="조회할 년도"),
     month: Optional[int] = Query(None, description="조회할 월"),
     current_user: User = Depends(get_current_user_from_cookie),
@@ -72,7 +72,7 @@ async def get_individual_dashboard(
         raise HTTPException(status_code=500, detail=f"개인별 분석 데이터 조회 실패: {str(e)}")
 
 @router.get("/trends")
-async def get_monthly_trend(
+def get_monthly_trend(
     months: int = Query(6, description="조회할 월 수", ge=1, le=12),
     current_user: User = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -96,7 +96,7 @@ async def get_monthly_trend(
         raise HTTPException(status_code=500, detail=f"월별 트렌드 조회 실패: {str(e)}")
 
 @router.get("/request-details/{analytics_id}")
-async def get_request_details_by_analytics(
+def get_request_details_by_analytics(
     analytics_id: int,
     current_user: User = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)

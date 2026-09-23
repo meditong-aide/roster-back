@@ -71,7 +71,7 @@ templates = Jinja2Templates(directory="app/templates")
 
 # [Wanted] - Wanted 작성 요청 생성 (수간호사용)
 @router.post("/request")
-async def request_wanted_shifts(
+def request_wanted_shifts(
     payload: WantedDeadlineRequest,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -97,7 +97,7 @@ async def request_wanted_shifts(
 
 # [Wanted] - 특정 그룹의 Wanted 상태 조회
 @router.get("/status")
-async def get_wanted_status(
+def get_wanted_status(
     year: int, month: int,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -204,7 +204,7 @@ def get_my_wanted_reflection(
 
 # [Wanted] - 특정 스케줄의 모든 간호사 제출 현황 확인
 @router.get("/{year}/{month}/submissions")
-async def get_submission_statuses(
+def get_submission_statuses(
     year: int, month: int,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -299,7 +299,7 @@ def get_all_wanted(
 
 # [Wanted] - Wanted 상태를 closed로 변경
 @router.patch("/close")
-async def close_wanted_request(
+def close_wanted_request(
     year: int, month: int,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -341,7 +341,7 @@ async def close_wanted_request(
 
 # [Wanted] - Wanted 마감일 변경
 @router.patch("/deadline")
-async def update_wanted_deadline(
+def update_wanted_deadline(
     req: WantedDeadlineRequest,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -716,7 +716,7 @@ def delete_wanted_config_endpoint(
 
 
 @router.delete("/config/toggle")
-async def delete_wanted_config_by_month_endpoint(
+def delete_wanted_config_by_month_endpoint(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -751,7 +751,7 @@ async def delete_wanted_config_by_month_endpoint(
 
 
 @router.post("/validate-limits")
-async def validate_wanted_limits_endpoint(
+def validate_wanted_limits_endpoint(
     nurse_id: str,
     year: int,
     month: int,
@@ -790,7 +790,7 @@ async def validate_wanted_limits_endpoint(
 
 # 간호사 원티드 개수 제한 초과분인 경우에 대한 조회 및 무조건적인 삭제 기능 서비스 함수
 @router.get("/over-limit-nurses")
-async def get_over_limit_nurses_api(
+def get_over_limit_nurses_api(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -806,7 +806,7 @@ async def get_over_limit_nurses_api(
 
 
 @router.post("/delete-excess-off/{nurse_id}")
-async def delete_excess_off_api(
+def delete_excess_off_api(
     nurse_id: str,
     year: int,
     month: int,
@@ -830,7 +830,7 @@ async def delete_excess_off_api(
 
 # Fixed Wanted 관련 엔드포인트
 @router.get("/adjustment/{year}/{month}", response_model=AdjustmentResponse)
-async def get_wanted_adjustment(
+def get_wanted_adjustment(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -863,7 +863,7 @@ async def get_wanted_adjustment(
 
 
 @router.post("/adjustment", response_model=FixedWantedListResponse)
-async def save_fixed_wanted(
+def save_fixed_wanted(
     req: FixedWantedCreate,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -928,7 +928,7 @@ async def save_fixed_wanted(
 
 
 @router.patch("/adjustment/entry/{entry_id}/toggle", response_model=ToggleEntryResponse)
-async def toggle_fixed_wanted_entry(
+def toggle_fixed_wanted_entry(
     entry_id: int,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -965,7 +965,7 @@ async def toggle_fixed_wanted_entry(
 
 
 @router.patch("/adjustment/banned/entry/{entry_id}/toggle", response_model=ToggleEntryResponse)
-async def toggle_banned_wanted_entry(
+def toggle_banned_wanted_entry(
     entry_id: int,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -1002,7 +1002,7 @@ async def toggle_banned_wanted_entry(
 
 
 @router.post("/adjustment/{year}/{month}/reset", response_model=AdjustmentResponse)
-async def reset_fixed_wanted(
+def reset_fixed_wanted(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -1034,7 +1034,7 @@ async def reset_fixed_wanted(
 
 
 @router.post("/adjustment/{year}/{month}/apply-all", response_model=AdjustmentResponse)
-async def set_adjustment_applied(
+def set_adjustment_applied(
     year: int,
     month: int,
     req: AdjustmentApplyAllRequest,
@@ -1075,7 +1075,7 @@ async def set_adjustment_applied(
 
 
 @router.get("/fixed/{year}/{month}")
-async def get_fixed_wanted(
+def get_fixed_wanted(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -1123,7 +1123,7 @@ async def get_fixed_wanted(
 
 # [Wanted] - 전체 원티드 제출 현황 + shift 내역 일괄 조회
 @router.get("/{year:int}/{month:int}/shift-requests")
-async def get_all_shift_requests(
+def get_all_shift_requests(
     year: int,
     month: int,
     group_id: Optional[str] = None,

@@ -204,7 +204,7 @@ async def submit_preferences(
 
 # [Preferences] - 빈 선호도 최종 제출
 @router.post("/submit/empty")
-async def submit_empty_preferences(
+def submit_empty_preferences(
     req: PreferenceSubmit,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -218,7 +218,7 @@ async def submit_empty_preferences(
 
 # [Preferences] - 최종 제출 철회 (수정)
 @router.post("/retract")
-async def retract_submission(
+def retract_submission(
     req: PreferenceSubmit,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -295,7 +295,7 @@ class MonthlyMemoUpdate(BaseModel):
 
 
 @router.get("/monthly-memo")
-async def get_monthly_memo(
+def get_monthly_memo(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -317,7 +317,7 @@ async def get_monthly_memo(
 
 
 @router.patch("/monthly-memo")
-async def patch_monthly_memo(
+def patch_monthly_memo(
     req: MonthlyMemoUpdate,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -348,7 +348,7 @@ async def patch_monthly_memo(
 
 
 @router.get("/monthly-memo/group")
-async def list_group_monthly_memos(
+def list_group_monthly_memos(
     year: int,
     month: int,
     group_id: Optional[str] = None,

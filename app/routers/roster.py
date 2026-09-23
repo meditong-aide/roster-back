@@ -168,7 +168,7 @@ def _roster_config_to_dict(config) -> dict:
 
 
 @router.post("/config/save")
-async def save_roster_config(
+def save_roster_config(
     config_data: RosterConfigCreate,
     group_id: Optional[str] = None,
     user: User = Depends(get_current_user_from_cookie),
@@ -218,7 +218,7 @@ async def save_roster_config(
 
 
 @router.delete("/config/{config_id}")
-async def unsave_roster_config(
+def unsave_roster_config(
     config_id: int,
     group_id: Optional[str] = None,
     user: User = Depends(get_current_user_from_cookie),
@@ -369,7 +369,7 @@ def get_config_versions(
 
 
 @router.get("/config/version/{config_version}")
-async def get_config_by_version(
+def get_config_by_version(
     config_version: str,
     group_id: Optional[str] = None,
     schedule_id: Optional[str] = None,
@@ -549,7 +549,7 @@ def get_latest_schedule(
 
 # [Schedules] - 발행된(issued) 모든 스케줄 조회
 @router.get("/issued")
-async def get_issued_schedules(
+def get_issued_schedules(
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -694,7 +694,7 @@ def recount_roster_counts(roster: dict | None) -> None:
 
 
 @router.get("/issued_roster")
-async def get_issued_roster_snapshot(
+def get_issued_roster_snapshot(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -1390,7 +1390,7 @@ def get_my_today(
 
 # [Schedules] - 현재 그룹의 특정 월에 대한 스케줄 상태 확인
 @router.get("/status")
-async def get_schedule_status(
+def get_schedule_status(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -1440,7 +1440,7 @@ def _load_schedule_for_caller(
 
 # 삭제(드롭) 엔드포인트: schedule.dropped=1로 마킹
 @router.delete("/{schedule_id}")
-async def drop_schedule(
+def drop_schedule(
     schedule_id: str,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -1501,7 +1501,7 @@ async def drop_schedule(
 
 # [Roster] - 특정 schedule_id의 근무표 조회
 @router.get("/schedule/{schedule_id}")
-async def get_roster_by_schedule_id(
+def get_roster_by_schedule_id(
     schedule_id: str,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -1869,7 +1869,7 @@ def get_schedule_versions(
 
 # [Roster] - 특정 월의 근무표 조회
 @router.get("/{year:int}/{month:int}")
-async def get_roster_for_month(
+def get_roster_for_month(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -1967,7 +1967,7 @@ async def get_roster_for_month(
 
 # [Roster] - 전월 근무표 tail N일 데이터 조회 (원티드 관리보드 / 생성된 근무표용)
 @router.get("/{year:int}/{month:int}/prev-tail")
-async def get_prev_month_tail(
+def get_prev_month_tail(
     year: int,
     month: int,
     schedule_id: Optional[str] = None,
@@ -2009,7 +2009,7 @@ async def get_prev_month_tail(
 
 # [Roster] - 근무표 발행
 @router.post("/publish")
-async def publish_roster(
+def publish_roster(
     req: PublishRequest,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -2207,7 +2207,7 @@ async def publish_roster(
 
 # [Roster] - 근무표 발행 취소 (마감 철회)
 @router.post("/unpublish")
-async def unpublish_roster(
+def unpublish_roster(
     schedule_id: str,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -2299,7 +2299,7 @@ async def unpublish_roster(
 #     운영은 uvicorn 워커 1개(EC2 단일 프로세스, ECS 는 미사용)라 호출자 5곳이 전부
 #     async 인 동안에는 루프 하나에서 직렬화돼 이 결함에 도달하지 않는다.
 #     성능 때문에 def 로 돌리려면 **먼저** 5곳 전부에 그룹 단위 잠금을 넣어야 한다.
-async def save_roster(
+def save_roster(
     roster_data: dict,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -2564,7 +2564,7 @@ def get_schedule_history(
 
 # [Schedules] - 특정 스케줄의 모든 간호사 원티드 제출 현황 확인
 @router.get("/{year:int}/{month:int}/submissions")
-async def get_submission_statuses(
+def get_submission_statuses(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -2609,7 +2609,7 @@ async def get_submission_statuses(
 
 # [Schedules] - 현재 그룹의 특정 월에 대한 스케줄 상태 확인
 @router.get("/status")
-async def get_schedule_status(
+def get_schedule_status(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -2713,7 +2713,7 @@ async def get_schedule_status(
 
 
 @router.post("/validate")
-async def validate_roster(
+def validate_roster(
     roster_data: dict,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -3010,7 +3010,7 @@ async def validate_roster(
 
 # [Roster] - 스케줄 이름 업데이트
 @router.patch("/{schedule_id}/name")
-async def update_schedule_name(
+def update_schedule_name(
     schedule_id: str,
     name_data: dict,
     group_id: Optional[str] = None,
@@ -3052,7 +3052,7 @@ async def update_schedule_name(
 
 
 @router.get("/schedule/{schedule_id}/export", response_class=FileResponse)
-async def export_schedule_excel(
+def export_schedule_excel(
     schedule_id: str,
     group_id: Optional[str] = None,
     group_by_team: bool = False,
@@ -3147,7 +3147,7 @@ def _get_next_version(db: Session, group_id: str, year: int, month: int) -> int:
 
 
 @router.post("/copy/{source_schedule_id}")
-async def copy_schedule_to_new_version(
+def copy_schedule_to_new_version(
     source_schedule_id: str,
     request: dict = Body({}),
     group_id: Optional[str] = None,
@@ -3260,7 +3260,7 @@ async def copy_schedule_to_new_version(
 
 
 @router.post("/create-empty")
-async def create_empty_roster(
+def create_empty_roster(
     year: int = Query(..., description="생성할 연도 (현재 탭 연도)"),
     month: int = Query(..., description="생성할 월 (현재 탭 월)"),
     name: Optional[str] = Query(None, description="새 버전 이름 (생략 시 자동 생성)"),
@@ -3341,7 +3341,7 @@ async def create_empty_roster(
 
 
 @router.post("/create-with-weekly-off")
-async def create_roster_with_weekly_off(
+def create_roster_with_weekly_off(
     year: int = Query(..., description="생성할 연도 (현재 탭 연도)"),
     month: int = Query(..., description="생성할 월 (현재 탭 월)"),
     name: Optional[str] = Query(None, description="새 버전 이름 (생략 시 자동 생성)"),
@@ -3551,7 +3551,7 @@ def recommend_replacements(
         raise HTTPException(status_code=500, detail=f"replacement recommendation failed: {e}")
 
 @router.post("/shares/schedules/{schedule_id}")
-async def create_schedule_share_link(
+def create_schedule_share_link(
     schedule_id: str,
     payload: ScheduleShareCreateRequest = Body(...),
     request: Request = None,
@@ -3604,7 +3604,7 @@ async def create_schedule_share_link(
 
 
 @router.post("/shares/schedules/{schedule_id}/upload")
-async def create_schedule_share_link_with_upload(
+def create_schedule_share_link_with_upload(
     schedule_id: str,
     image_file: UploadFile = File(...),
     title: Optional[str] = Form("근무표 공유"),
@@ -3652,7 +3652,7 @@ async def create_schedule_share_link_with_upload(
 
 
 @router.post("/shares/schedules/{schedule_id}/auto")
-async def create_schedule_share_link_auto(
+def create_schedule_share_link_auto(
     schedule_id: str,
     payload: ScheduleShareAutoCreateRequest = Body(...),
     request: Request = None,
@@ -3700,7 +3700,7 @@ async def create_schedule_share_link_auto(
 
 
 @router.post("/shares/schedules/{schedule_id}/capture")
-async def create_schedule_share_link_capture(
+def create_schedule_share_link_capture(
     schedule_id: str,
     payload: ScheduleShareCaptureCreateRequest = Body(...),
     request: Request = None,
@@ -3750,7 +3750,7 @@ async def create_schedule_share_link_capture(
 
 
 @router.delete("/shares/{share_token}")
-async def revoke_schedule_share_link(
+def revoke_schedule_share_link(
     share_token: str,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -3775,7 +3775,7 @@ async def revoke_schedule_share_link(
 
 
 @router.get("/s/{token}", response_class=HTMLResponse)
-async def render_schedule_share_page(
+def render_schedule_share_page(
     token: str, request: Request, db: Session = Depends(get_db)
 ):
     import html
@@ -3874,7 +3874,7 @@ async def render_schedule_share_page(
 
 
 @router.get("/s/{token}/image", name="render_schedule_share_image")
-async def render_schedule_share_image(token: str, db: Session = Depends(get_db)):
+def render_schedule_share_image(token: str, db: Session = Depends(get_db)):
     import io
     from services.roster_service import get_public_share_image_service
 

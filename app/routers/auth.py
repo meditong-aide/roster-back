@@ -373,7 +373,7 @@ def read_users_me(current_user: UserSchema = Depends(get_current_user_from_cooki
 
 
 @router.post("/switch-group")
-async def switch_group(
+def switch_group(
     payload: dict,
     response: Response,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -463,7 +463,7 @@ async def switch_group(
 
 
 @router.post("/find_id")
-async def handle_find_id_request(
+def handle_find_id_request(
         # 필수 공통 필드
         auth_method: str = Form(...),
         EmployeeName: str = Form(...),
@@ -500,7 +500,7 @@ async def handle_find_id_request(
     raise HTTPException(status_code=500, detail="일치하는 회원정보가 없습니다.")
 
 @router.post("/find_pw")
-async def handle_find_pw_request(
+def handle_find_pw_request(
         background_tasks: BackgroundTasks,
         # 필수 공통 필드
         auth_method: str = Form(...),
