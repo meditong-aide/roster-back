@@ -90,7 +90,7 @@ def message_view(
             (재직 1,796명 중 NULL 1,792). 그룹웨어 직위(`T_Part`)도 후보였으나,
             직함을 우리가 직접 고칠 수 있는 roster 컬럼으로 가기로 했다.
       - Message: 푸시 메세지
-      - regdate: 등록일 ex) 2025-11-06
+      - regdate: 등록일시(KST) ex) 2025-11-06 14:03 — `YYYY-MM-DD HH:mm` 고정 16자, 초·오프셋 없음
       - ReadYN : 읽음 여부 (Y,N)
     """
     OfficeCode = current_user.office_id

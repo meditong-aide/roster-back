@@ -203,6 +203,11 @@ class Common:
         # ★ 값이 없으면 **빈 문자열이 아니라 null** 로 내려보낸다(프론트 계약).
         # ★ DB명은 `roster_db()` 로 호출 시점에 주입한다(모듈 상수면 import 순서에 취약).
         # ★ `nurses.nurse_id` 는 중복이 없어(실측) 조인으로 행이 늘지 않는다.
+        # ★ regdate 는 **`YYYY-MM-DD HH:mm`(VarChar(16), KST)** 다. 날짜만(VarChar(10)) 주면
+        #   모바일이 그 날 00:00 으로 읽어 오늘 온 알림이 전부 "14시간 전" 처럼 보였다
+        #   (2026-09-28 실측). 모바일 `formatRelativeTime` 은 정확히 이 16자 형식에만
+        #   `+09:00` 을 붙이므로 초를 붙이면(19자) 오프셋 없이 기기 시간대로 읽혀 틀린다.
+        #   `/push/inbox`(`_push_inbox_cte`) 도 같은 형식이어야 한다.
         linked_filter = (
             "\n               And (NULLIF(LinkCode, '') IS NOT NULL "
             "Or CHARINDEX(':', DerivedLinkCode) > 0)"
@@ -213,7 +218,7 @@ class Common:
                    a.Idx, a.pushcode, a.pushsubcode, a.officecode,
                    a.EmpSeqNo as senderEmpSeqNo, c.EmployeeName as sendername,
                    NULLIF(d.level_, '') as senderduty,
-                   a.Message, Convert(VarChar(10), b.RegDate, 120) as regdate,
+                   a.Message, Convert(VarChar(16), b.RegDate, 120) as regdate,
                    b.ReadYN, b.Fk_Idx,
                    ISNULL(a.LinkUrl, '') as LinkUrl,
                    ISNULL(a.LinkCode, '') as LinkCode
@@ -297,7 +302,7 @@ class Common:
         `rn = 1` 과 scope 필터는 **소비처가 건다** — 그 자리가 곧 건수를 세는 자리라
         여기서 걸어 버리면 소비처가 세는 집합을 못 고른다.
         `get_push_list` 와 같은 파생·중복제거 규칙을 쓴다. 규칙이 갈리면 목록과 건수가
-        서로 다른 집합을 세게 된다.
+        서로 다른 집합을 세게 된다. regdate 형식(`YYYY-MM-DD HH:mm`)도 그쪽과 같아야 한다.
         """
         return f"""
         WITH Base AS (
@@ -305,7 +310,7 @@ class Common:
                    a.Idx, a.pushcode, a.pushsubcode, a.officecode,
                    a.EmpSeqNo as senderEmpSeqNo, c.EmployeeName as sendername,
                    NULLIF(d.level_, '') as senderduty,
-                   a.Message, Convert(VarChar(10), b.RegDate, 120) as regdate,
+                   a.Message, Convert(VarChar(16), b.RegDate, 120) as regdate,
                    b.ReadYN, b.Fk_Idx,
                    ISNULL(a.LinkUrl, '') as LinkUrl,
                    ISNULL(a.LinkCode, '') as LinkCode
