@@ -3435,7 +3435,14 @@ def optimize_fallback_lex_hard_first(
             _allow_soft_fb = True
             if isinstance(_gc_fb, dict):
                 _allow_soft_fb = bool(_gc_fb.get("allow_soft_fallback", False))
-            if isinstance(_gc_fb, dict) and not _allow_soft_fb:
+            # ★★ soft fallback 그룹도 여기서 건다(2026-09-28). soft 면 하한(cascade short)·상한(slack)이
+            #   **둘 다 soft** 라 풀림 여부는 안 바뀌는데, 안 걸면 `_grade_off0_shorts`·`_grade_cell_spec`
+            #   가 비어 stage2 목적의 등급 항이 없고 lex grade 패스가 `대상 없음 — 건너뜀` 이 된다 →
+            #   등급은 stage3 가중치로만 다뤄진다(여수 6병동 운영 grade_min 14). 등급 설정이 **없는**
+            #   병동도 기본값이 soft(`_fetch_grade_config_dict._default`)라 같은 구멍에 빠진다.
+            #   `AIDE_GRADE_SOFT_STAGE12=0` 이면 예전처럼 hard 그룹만 건다(A/B·긴급 원복용).
+            _grade_soft_stage12 = _os_lex.environ.get("AIDE_GRADE_SOFT_STAGE12", "1") != "0"
+            if isinstance(_gc_fb, dict) and (not _allow_soft_fb or _grade_soft_stage12):
                 # ★★ 반환값(목적항)을 **버리지 않고 모델에 보관**한다.
                 #   stage3 objective 경로가 목적항이 필요해 같은 함수를 다시 부르는데,
                 #   그러면 제약과 side-channel(`_grade_cell_spec`)이 **두 벌** 쌓인다.

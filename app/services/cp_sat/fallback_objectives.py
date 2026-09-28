@@ -656,8 +656,9 @@ def build_fallback_stage3_objective_terms(
     #   실측: stage2 cells=93 / stage3 cells=186 이었고, stage3 가 11곳 중 6곳에서
     #   INFEASIBLE 이었다(`short <= 0` 인 병동만 멀쩡했다 — 0 은 두 벌로 세도 0).
     #   보관분은 목적항이므로 그대로 쓰면 된다 — 제약은 이미 모델에 들어가 있다.
-    # ★ `allow_soft_fallback=True` 인 그룹은 build_model 이 grade 를 건너뛰므로
-    #   보관분이 없다. 그때는 여기서 처음 건다(두 경로 모두 살아 있어야 한다).
+    # ★ `allow_soft_fallback=True` 인 그룹도 이제 build_model 이 건다(2026-09-28). 다만
+    #   `AIDE_GRADE_SOFT_STAGE12=0` 이면 예전처럼 건너뛰어 보관분이 없고, 그때는 여기서
+    #   처음 건다(두 경로 모두 살아 있어야 한다).
     #   판정(2026-09-09): stage3 실패 **6곳 → 0곳**(11곳 1회, FEASIBLE 8 · OPTIMAL 2).
     #   safety 는 건드리지 않는다 — 중환자실2 16회에서 최종값이 stage2 와 **전부 일치**했다
     #   (S4-2 동결이 상한을 지킨다). 한때 A/B 5회에서 악화로 보였으나 그 병동의
