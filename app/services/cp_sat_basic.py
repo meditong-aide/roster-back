@@ -4026,7 +4026,15 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         continue
                     if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night:
                         continue  # 1N day0 N 고정(경계) 시 해당일 1N 제약 스킵
-                    if d == 0 and getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0) > 0:
+                    # ★★ 전월 N 꼬리가 있어도 **그 뒤에 OFF 가 이미 붙었으면** 블록은 끊긴 것이라
+                    #   10/1 의 N 은 새 블록의 첫날이다 → 1N 금지를 그대로 적용해야 한다.
+                    #   `consecutive_night_tail` 은 꼬리 OFF 를 건너뛴 뒤의 N 개수라
+                    #   `N N N O O` 도 3 이 나온다. 이 값만 보고 면제하면 단독 N 이 통과한다.
+                    #   (동탄 8병동 실측: 박서이 9/26~28 N · 9/29~30 O 인데 10/1 단독 N 이 배정됐다.
+                    #    연속N·2N2OFF·3N2OFF 는 이미 `prev_month_n_offs_after_by_idx` 를 함께 보는데
+                    #    1N 금지만 빠져 있었다 — line 4148·4504·4655 참조.)
+                    if d == 0 and getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0) > 0 \
+                            and (getattr(rs, "prev_month_n_offs_after_by_idx", {}) or {}).get(n, 0) == 0:
                         continue
                     neighbors = []
                     if d - 1 >= T0:
