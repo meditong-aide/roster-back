@@ -99,14 +99,22 @@ def _pick_schedule(db: Session, group_id: str, year: int, month: int):
         Schedule.dropped == False).all()  # noqa: E712
     if not rows:
         return None
-    issued = [r for r in rows if str(r.status or "").strip() == "issued"]
-    pool = issued or rows
-    pool = sorted(pool, key=lambda r: (r.created_at or date.min), reverse=True)
-    for r in pool:
-        if db.query(ScheduleEntry).filter(
-                ScheduleEntry.schedule_id == r.schedule_id).first() is not None:
-            return r.schedule_id
-    return None
+    # ★★ 발행본 우선은 **셀이 있는 것들 사이에서** 따져야 한다. `issued or rows` 로
+    #   먼저 좁히면 **빈 발행본 하나가 draft 전체를 가린다** — 아래 루프는 그 좁혀진
+    #   pool 안에서만 셀을 확인하므로, 셀이 든 draft 는 후보에 오르지도 못한다.
+    #   실측(인천 수술실 2026-09): v3 이 `issued` 인데 셀 0 이고, 콜이 든 v5(600셀)는
+    #   draft 라 통째로 빠졌다. 그래서 10월 생성이 "직전 달 콜 배정이 없어 시작 팀을
+    #   역산할 수 없습니다" 로 콜을 건너뛰었다.
+    def _has_entry(r) -> bool:
+        return db.query(ScheduleEntry).filter(
+            ScheduleEntry.schedule_id == r.schedule_id).first() is not None
+
+    alive = [r for r in rows if _has_entry(r)]
+    if not alive:
+        return None
+    issued = [r for r in alive if str(r.status or "").strip() == "issued"]
+    pool = sorted(issued or alive, key=lambda r: (r.created_at or date.min), reverse=True)
+    return pool[0].schedule_id
 
 
 def _resolve_start_team(
