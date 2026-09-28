@@ -6633,7 +6633,11 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             # 차감 실패는 생성을 막지 않는다(기존 동작으로 진행). 다만 초과가 남을 수 있다.
             print(f"[FixedShiftCoverage] 차감 실패(무시): {type(_fx_exc).__name__}: {_fx_exc}")
 
+    # UNDIAGNOSED 탐색 기준의 대체값(첫 시도 스냅샷이 없을 때). 아래 완화 사다리가 config_dict 의
+    # 최상위 키를 누적 갱신(same_shift·isolated_work·n2n_min_gap)하므로 첫 시도 직전 값을 떠 둔다.
+    _first_attempt_cfg: dict | None = None
     if nurses_for_engine:
+        _first_attempt_cfg = {k: v for k, v in config_dict.items() if not str(k).startswith("_sa_")}
         # _debug_log(
         #     "cp_sat_start",
         #     {
@@ -7057,11 +7061,24 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     if validation_error:
         print(f"[RosterGenerate][UNRECOVERABLE] {validation_error}")
         print(f"[RosterGenerate][UNRECOVERABLE] applied_relaxations={applied_relaxations}")
+        # ★★ 이 커밋이 간호사 ORM 을 **만료시키면 안 된다.** 등급·주말휴무·고정근무(월 as-of)와
+        #   팀은 `__dict__` 오버레이로만 들어가 있어(DB 컬럼은 캐시·NULL), 만료되면 아래 해결책
+        #   탐색·MUS·개별 지목 재계산이 **DB 원래 값으로** 돈다. 실측(2026-09-28 여수 6병동 dev):
+        #   첫 시도 `by_grade {1:[0..5],…}` → 탐색 `by_grade {1:[],2:[],3:[]}` 로 등급이 통째로
+        #   사라져 등급 1/1/1 하드가 무의미해지고, 무엇을 바꿔도 '풀림' → "+1 이면 된다" 헛답.
+        _eoc = db.expire_on_commit
+        db.expire_on_commit = False
+        _overlay_lost = False
         try:
             db.delete(schedule)
             db.commit()
         except Exception:
             db.rollback()
+            # rollback 은 expire_on_commit 과 무관하게 ORM 을 만료시킨다 → 오버레이 소실.
+            #   아래 재계산 진단(해결책 탐색)은 틀린 값으로 돌게 되므로 건너뛴다.
+            _overlay_lost = True
+        finally:
+            db.expire_on_commit = _eoc
         try:
             from services.precheck import build_unrecoverable_payload
             try:
@@ -7193,7 +7210,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 ]
                 _has_actionable = bool(_ui_options_pre) or bool(_ui_causes_fix)
                 _is_undiag = ("UNDIAGNOSED" in _codes_pre) or not _has_actionable
-                if _is_undiag and _os_undiag.getenv("UNDIAG_PROBE_DISABLE") != "1":
+                if _is_undiag and _overlay_lost:
+                    print("[UndiagProbe] 간호사 오버레이 소실(삭제 커밋 rollback) → 재계산 진단 생략")
+                if _is_undiag and not _overlay_lost and _os_undiag.getenv("UNDIAG_PROBE_DISABLE") != "1":
                     from services.cp_sat.undiagnosed_probe import probe_relaxations, to_resolution_options
 
                     _probe_cnt = [0]
@@ -7226,10 +7245,13 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
 
                     # probe base: solve 시점에 박아둔 유효 config 스냅샷(하드규칙+조립분 포함, 충실).
                     # 실패 시점 메모리(config_dict)는 ORM 만료·stale 라 부정확하므로 스냅샷 우선.
+                    #   ★ 스냅샷이 없을 때 지금의 config_dict 를 쓰면 안 된다 — 완화 사다리가 누적
+                    #     갱신한 값이라, 그 위에서 찾은 '해결책' 은 실제 재생성의 첫 시도와 조건이 다르다.
                     _probe_base = getattr(roster_system, "_effective_config_snapshot", None)
+                    print(f"[UndiagProbe] 기준={'첫 시도 스냅샷' if _probe_base else '첫 시도 직전 설정 사본'}")
                     if not _probe_base:
-                        _probe_base = {k: v for k, v in dict(config_dict).items()
-                                       if not str(k).startswith("_sa_")}
+                        _probe_base = _first_attempt_cfg or {
+                            k: v for k, v in dict(config_dict).items() if not str(k).startswith("_sa_")}
                     _probe_base = dict(_probe_base)
                     # 금지근무(banned)×강제OFF 개인모순 진단이 initial_constraints 를 봐야 하므로
                     # 스냅샷에 없으면 merged config 에서 승계(금지·강제OFF 합집합 맵).
@@ -7414,7 +7436,11 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                     except NameError:
                         _wk_flags = []
                     _wk_feasible = any(f.get("type") == "weekend_off_load" for f in _wk_flags)
-                    if _wk_feasible:
+                    # 기준 설정이 탐색 재계산에서 풀리면(실패 재현 불가) 1명씩 해제해 봐도 전부 '풀림'
+                    # 이라 지목이 무의미하다. 탐색이 시간 상한에 걸렸으면 여기서 재계산을 더 돌리면
+                    # 상한을 둔 의미가 없다(묶음 1회 + 최대 6명 × 20초). 둘 다 건너뛴다.
+                    _pn_allowed = not (_probe_res.get("baseline_feasible") or _probe_res.get("timed_out"))
+                    if _wk_feasible and _pn_allowed:
                         try:
                             from services.nurse_period_resolver import weekend_off_ids_asof as _wo_ids
                             _wk_cands = sorted(_wo_ids(
@@ -7592,7 +7618,7 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                         o.get("verified") and (o.get("apply") or {}).get("max_nig_per_month") is not None
                         for o in _probe_opts
                     )
-                    if _nc_feasible:
+                    if _nc_feasible and _pn_allowed:
                         try:
                             _cfg_mn = int(_probe_base.get("max_nig_per_month") or 0)
                             # 후보: n_exact 또는 n_max 가 config 야간 상한보다 큰 간호사(그 값을 상한
@@ -7709,7 +7735,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                     _combo = _probe_res.get("combo")
                     print(f"[UndiagProbe] found={_probe_res.get('found')} "
                           f"resolutions={[r['id'] for r in _probe_res.get('resolutions', [])]} "
-                          f"combo={_combo.get('id') if _combo else None}")
+                          f"combo={_combo.get('id') if _combo else None} "
+                          f"baseline_feasible={_probe_res.get('baseline_feasible')} "
+                          f"timed_out={_probe_res.get('timed_out')} solves={_probe_cnt[0]}")
             except Exception as _undiag_exc:
                 print(f"[UndiagProbe] failed (ignore): {_undiag_exc}")
             # (ontology treatment → resolution_options 는 build_unrecoverable_payload 에서 처리됨)

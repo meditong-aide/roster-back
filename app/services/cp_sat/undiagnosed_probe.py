@@ -15,6 +15,7 @@ UNDIAGNOSED(원인 미식별)가 난다. 이 모듈은 assumption 의존 없이 
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Callable
 
 from services.cp_sat.fix_location import attach_fix_to_options
@@ -477,6 +478,7 @@ def _find_combo(
     logger: Callable[[str], None],
     priority_families: list[str] | None = None,
     first_hit: bool = True,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]] | None:
     """단일완화로 못 풀 때: 크기 2부터 max_size 까지 조합 탐색.
     단일이 모두 실패했으므로, 가장 작은 크기에서 feasible 한 조합은 자동으로 irreducible
@@ -499,6 +501,9 @@ def _find_combo(
     for size in range(2, max(2, max_size) + 1):
         feasible_combos: list[tuple[int, tuple]] = []
         for combo in itertools.combinations(cands, size):
+            if should_stop and should_stop():
+                logger(f"[UndiagProbe][combo-{size}] 탐색 시간 상한 도달 → 조합 탐색 중단")
+                return None
             ok, _ = resolve_fn(_apply_set(base, list(combo)))
             logger(f"[UndiagProbe][combo-{size}] {[c['id'] for c in combo]} feasible={ok}")
             if ok:
@@ -572,6 +577,62 @@ def _search_boundary(
         return lo, solves                   # 최소 침습(최대) feasible 값
 
 
+def _probe_budget_sec() -> float:
+    """탐색 전체(기준 확인 포함) 시간 상한(초). 기본 90. AIDE_PROBE_BUDGET_SEC 로 조절, 0 이하는 무제한.
+
+    ★ 재계산 1회 상한(AIDE_PROBE_TIME_LIMIT 20초)만으로는 횟수가 늘면 끝이 없다 —
+      원인 미상 실패 응답을 병원 사용자가 5분 기다렸다(2026-09-28 여수 6병동 11:16→11:21).
+    """
+    try:
+        return float(os.getenv("AIDE_PROBE_BUDGET_SEC", "90"))
+    except ValueError:
+        return 90.0
+
+
+def _budgeted(
+    resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
+    budget_sec: float,
+) -> tuple[Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]], Callable[[], bool]]:
+    """resolve_fn 을 시간 상한으로 감싼다. 넘기면 재계산 없이 (False, skipped) 를 돌린다.
+
+    over() 는 상한 도달 여부(한 번 넘으면 계속 True) — 호출부 루프가 이걸 보고 멈추고,
+    반환값 timed_out 도 이걸로 정한다(마지막 재계산이 상한을 넘겨 끝난 경우까지 잡는다).
+    """
+    t0 = time.monotonic()
+    hit = [False]
+
+    def over() -> bool:
+        if not hit[0] and budget_sec and budget_sec > 0 and time.monotonic() - t0 >= budget_sec:
+            hit[0] = True
+        return hit[0]
+
+    def wrapped(cfg: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        if over():
+            return False, {"skipped": "budget"}
+        return resolve_fn(cfg)
+
+    return wrapped, over
+
+
+def _baseline_reproduces(
+    base_config: dict[str, Any],
+    resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
+    logger: Callable[[str], None],
+) -> bool:
+    """기준 설정을 **그대로** 한 번 푼다. 탐색 재계산에서 풀리면 실패를 재현하지 못한 것이다.
+
+    ★ 이게 없으면 탐색 재계산이 실제 생성보다 느슨할 때(검증 모드·짧은 제한시간 등) 기준값이
+      이미 풀리는데도 `_search_boundary` 가 cur+1 부터 보므로 **무엇이든 '+1 이면 된다'** 가 된다
+      (2026-09-28 여수 6병동: 월 야간 상한 8→9→10→11 을 연달아 '가능', 실제 생성은 전부 실패).
+    """
+    try:
+        ok, info = resolve_fn(dict(base_config))
+    except Exception as exc:
+        ok, info = False, {"error": str(exc)[:120]}
+    logger(f"[UndiagProbe] 기준 설정 그대로 재계산 feasible={ok} {info}")
+    return not ok
+
+
 def probe_relaxations(
     base_config: dict[str, Any],
     resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
@@ -584,9 +645,14 @@ def probe_relaxations(
     priority_families: list[str] | None = None,
     stop_after: int | None = None,
     hard_filter: bool = False,
+    baseline_check: bool = True,
+    budget_sec: float | None = None,
     logger: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """결합제약을 하나씩 완화해 resolve_fn 으로 feasible 여부를 실측.
+
+    baseline_check: 먼저 기준 설정 그대로 풀어 실패가 재현되는지 본다. 풀리면 해결책을 내지 않는다.
+    budget_sec: 탐색 전체 시간 상한(None 이면 AIDE_PROBE_BUDGET_SEC). 넘기면 모은 데까지만 돌린다.
 
     Returns:
         {
@@ -594,8 +660,11 @@ def probe_relaxations(
           "resolutions": [ {id,family,label_ko,delta,info} ... ],  # 푸는 완화들(=원인+해결책)
           "all_probed": [ {..., feasible} ... ],
           "probed_count": int,
+          "baseline_feasible": bool,     # 기준 설정이 탐색 재계산에서 풀림(=실패 재현 불가)
+          "timed_out": bool,             # 시간 상한 도달(기준 확인 1회만으로 넘긴 경우 포함)
         }
     """
+    resolve_fn, _over = _budgeted(resolve_fn, _probe_budget_sec() if budget_sec is None else budget_sec)
     cat = catalog if catalog is not None else RELAX_CATALOG
     # ── 온톨로지 소프트정렬 ──
     #   presolve(max-flow) 가 지목한 병목 완화군(priority_families)을 앞으로 당겨 먼저 검증하고,
@@ -620,7 +689,17 @@ def probe_relaxations(
     _remaining = int(search_budget)
     _hard_combo_done = False
     try:
+        if baseline_check:
+            # 기준 확인도 재계산 1회다 — search_budget(재계산 상한)에서 뺀다.
+            _remaining -= 1
+            if not _baseline_reproduces(base_config, resolve_fn, logger):
+                logger("[UndiagProbe] 기준 설정이 탐색 재계산에서는 풀림 → 실패를 재현하지 못해 해결책 제시 생략")
+                return {"found": False, "resolutions": [], "combo": None, "all_probed": [],
+                        "probed_count": 0, "baseline_feasible": True, "timed_out": _over()}
         for _idx, item in enumerate(cat):
+            if _over():
+                logger(f"[UndiagProbe] 탐색 시간 상한 도달 → 남은 {len(cat) - _idx}개 완화 생략")
+                break
             _feas_so_far = sum(1 for r in all_probed if r.get("feasible"))
             # stop_after: 검증된 해결책이 목표치만큼 모이면 즉시 종료(필요한 만큼만 probe).
             if stop_after and _feas_so_far >= stop_after:
@@ -641,7 +720,8 @@ def probe_relaxations(
                     _hard_combo_done = True
                     _pm = _find_combo(
                         base_config, resolve_fn, cat[:_n_prio], max_size=max_combo,
-                        logger=logger, priority_families=priority_families, first_hit=True)
+                        logger=logger, priority_families=priority_families, first_hit=True,
+                        should_stop=_over)
                     if _pm:
                         combo = _mk_combo(_pm, base_config)
                         logger("[UndiagProbe] 압박군 콤보로 해결 "
@@ -705,10 +785,10 @@ def probe_relaxations(
         ]
         # 단일완화로 못 풀면 최소조합(black-box MCS) 탐색.
         # combo 가 이미 있으면(hard-filter 우선군 콤보로 해결) 재탐색 생략.
-        if not resolutions and try_combo and combo is None:
+        if not resolutions and try_combo and combo is None and not _over():
             members = _find_combo(
                 base_config, resolve_fn, cat, max_size=max_combo, logger=logger,
-                priority_families=priority_families, first_hit=True,
+                priority_families=priority_families, first_hit=True, should_stop=_over,
             )
             if members:
                 combo = _mk_combo(members, base_config)
@@ -724,4 +804,6 @@ def probe_relaxations(
         "combo": combo,
         "all_probed": all_probed,
         "probed_count": len(all_probed),
+        "baseline_feasible": False,
+        "timed_out": _over(),
     }

@@ -56,10 +56,11 @@ def test_fallback_when_priority_fails():
 
 def test_stop_after_halts_once_enough_found():
     # 전부 풀리는 상황: stop_after=1 이면 첫 feasible 후 즉시 종료(나머지 미검증).
+    # 기준 설정부터 풀리는 합성 resolve 라 기준 확인을 끈다(켜면 탐색 전에 종료 — 그 동작은 별도 확인).
     res = probe_relaxations(
         {}, lambda cfg: (True, {}),
         catalog=CAT, verify=False, try_combo=False,
-        stop_after=1,
+        stop_after=1, baseline_check=False,
     )
     assert len(res["all_probed"]) == 1  # 첫 항목만 검증하고 종료
     assert res["found"] is True
@@ -70,7 +71,7 @@ def test_stop_after_with_priority_targets_bottleneck_first():
     res = probe_relaxations(
         {}, lambda cfg: (True, {}),
         catalog=CAT, verify=False, try_combo=False,
-        priority_families=["off_budget"], stop_after=1,
+        priority_families=["off_budget"], stop_after=1, baseline_check=False,
     )
     assert [p["id"] for p in res["all_probed"]] == ["b_off"]
 
@@ -97,8 +98,8 @@ def test_combo_first_hit_stops_early():
     )
     assert res["combo"] is not None
     assert {m["id"] for m in res["combo"]["members"]} == {"a_night", "b_off"}
-    # 단일 3회 + 콤보 첫 hit 1회 = 4 (전수면 6). (b_off,c_team)·(a_night,c_team) 미검증.
-    assert len(calls) == 4
+    # 기준 확인 1회 + 단일 3회 + 콤보 첫 hit 1회 = 5 (전수면 7). (b_off,c_team)·(a_night,c_team) 미검증.
+    assert len(calls) == 5
 
 
 def test_hard_filter_probes_only_pressure_then_combo():
@@ -114,10 +115,10 @@ def test_hard_filter_probes_only_pressure_then_combo():
     )
     assert res["combo"] is not None
     assert {m["id"] for m in res["combo"]["members"]} == {"a_night", "b_off"}
-    # 압박군 단일 2(a_night,b_off) + 압박군 콤보 1 = 3. c_team 단일은 미검증.
+    # 기준 확인 1 + 압박군 단일 2(a_night,b_off) + 압박군 콤보 1 = 4. c_team 단일은 미검증.
     probed_single_ids = [p["id"] for p in res["all_probed"]]
     assert "c_team" not in probed_single_ids
-    assert len(calls) == 3
+    assert len(calls) == 4
 
 
 def test_hard_filter_falls_back_to_full_when_pressure_wrong():
