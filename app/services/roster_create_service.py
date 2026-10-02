@@ -8156,6 +8156,10 @@ def request_schedule_service(req: RosterRequest, current_user, db: Session):
         # raise Exception("설정값을 입력해주세요")
     if not latest_config or latest_config == None:
         return "noConfigId"
+    # ★ 번호를 읽기 전에 그룹·달 잠금 — 새 버전 저장·복사와 동시에 같은 VER 를 만들지 않게.
+    #   생성 작업은 30초까지 기다린다(409 면 워커가 실패 알림·재시도로 번진다).
+    from services.schedule_versioning import lock_version_numbering
+    lock_version_numbering(db, current_user.group_id, req.year, req.month, timeout_ms=30000)
     latest_version = db.query(func.max(Schedule.version)).filter(
         Schedule.group_id == current_user.group_id,
         Schedule.year == req.year,

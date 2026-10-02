@@ -133,9 +133,10 @@ def list_schedule_history(
         if latest_only:
             _cq = _cq.filter(ScheduleEntryLog.is_latest == True)  # noqa: E712
         _total = int(_cq.scalar() or 0)
-    # 이름은 화면 표시용 — 이력에 등장한 간호사만 모아 한 번에 읽는다.
+    # 이름은 화면 표시용 — 이력에 등장한 간호사와 **수정한 사람**을 모아 한 번에 읽는다.
+    #   `changed_by` 는 수정자 nurse_id 다. ADM 은 nurses 행이 없어 이름이 null 로 남는다.
     from db.models import Nurse
-    nurse_ids = {r.nurse_id for r in rows}
+    nurse_ids = {r.nurse_id for r in rows} | {r.changed_by for r in rows if r.changed_by}
     names: dict[str, str] = {}
     if nurse_ids:
         names = {
@@ -183,6 +184,9 @@ def list_schedule_history(
             # ★ 로그의 after 가 아니라 근무표의 현재값. 재생성 등으로 달라졌을 수 있다.
             "current": {"shift_id": cur_shift, "id": cur_id} if cur_shift else None,
             "changed_by": r.changed_by,
+            "changed_by_name": names.get(str(r.changed_by)) if r.changed_by else None,
+            # 'manual'(화면 저장) | 'save_as'(새 버전으로 저장 — 원본 대비 바뀐 칸)
+            "source": r.source,
             "changed_at": r.changed_at.isoformat() if r.changed_at else None,
             "is_latest": bool(r.is_latest),
         })
@@ -196,6 +200,25 @@ def list_schedule_history(
     }
 
 
+def _reset_latest(db: Session, schedule_id: str, changed: list[tuple[str, date]]) -> None:
+    """같은 칸의 직전 최신 기록을 꺾는다. 칸당 is_latest 는 항상 하나여야 한다.
+
+    ★★ nurse_id.in_(...) 와 work_date.in_(...) 를 **따로** 걸면 안 된다 — 카테시안이라
+       (n1,d1)·(n2,d2) 만 바뀌어도 (n1,d2)·(n2,d1) 까지 꺾인다. 칸을 쌍으로 묶어야 한다.
+       MSSQL 은 (a,b) IN ((..),(..)) 을 지원하지 않으므로 OR 로 편다.
+    """
+    db.query(ScheduleEntryLog).filter(
+        ScheduleEntryLog.schedule_id == schedule_id,
+        # ★ MSSQL 은 `IS TRUE` 를 모른다 — SQLAlchemy 의 `.is_(True)` 는 `IS 1` 로 나가
+        #   구문 오류가 된다(sqlite 로는 통과해서 더 늦게 드러난다). bit 는 `== True` 로 비교한다.
+        ScheduleEntryLog.is_latest == True,  # noqa: E712
+        or_(*[
+            and_(ScheduleEntryLog.nurse_id == n, ScheduleEntryLog.work_date == d)
+            for n, d in changed
+        ]),
+    ).update({"is_latest": False}, synchronize_session=False)
+
+
 def log_manual_changes(
     db: Session,
     *,
@@ -204,8 +227,14 @@ def log_manual_changes(
     before: CellMap,
     after: CellMap,
     changed_by: Optional[str],
+    source: str = "manual",
+    reset_latest: bool = True,
 ) -> int:
     """`before` → `after` 로 바뀐 칸을 로그에 적재하고 건수를 돌려준다.
+
+    Args:
+        source: 'manual'(화면 저장) | 'save_as'(새 버전으로 저장 — before 는 원본 버전의 칸).
+        reset_latest: False 면 같은 칸의 직전 최신 기록을 꺾지 않는다 — 이력이 아직 없는 새 버전에서만.
 
     ★ commit 은 하지 않는다. 호출부(저장 트랜잭션)와 **같은 커밋에 묶여야** 근무표와
       이력이 어긋나지 않는다.
@@ -221,20 +250,8 @@ def log_manual_changes(
     seqs = _next_seq_map(db, schedule_id, changed)
     now = datetime.now()
 
-    # ★ 같은 칸의 직전 최신 기록을 먼저 꺾는다. 칸당 is_latest 는 항상 하나여야 한다.
-    #   ★★ nurse_id.in_(...) 와 work_date.in_(...) 를 **따로** 걸면 안 된다 — 카테시안이라
-    #      (n1,d1)·(n2,d2) 만 바뀌어도 (n1,d2)·(n2,d1) 까지 꺾인다. 칸을 쌍으로 묶어야 한다.
-    #      MSSQL 은 (a,b) IN ((..),(..)) 을 지원하지 않으므로 OR 로 편다.
-    db.query(ScheduleEntryLog).filter(
-        ScheduleEntryLog.schedule_id == schedule_id,
-        # ★ MSSQL 은 `IS TRUE` 를 모른다 — SQLAlchemy 의 `.is_(True)` 는 `IS 1` 로 나가
-        #   구문 오류가 된다(sqlite 로는 통과해서 더 늦게 드러난다). bit 는 `== True` 로 비교한다.
-        ScheduleEntryLog.is_latest == True,  # noqa: E712
-        or_(*[
-            and_(ScheduleEntryLog.nurse_id == n, ScheduleEntryLog.work_date == d)
-            for n, d in changed
-        ]),
-    ).update({"is_latest": False}, synchronize_session=False)
+    if reset_latest:
+        _reset_latest(db, schedule_id, changed)
 
     for cell in changed:
         nurse_id, work_date = cell
@@ -259,7 +276,7 @@ def log_manual_changes(
             after_color=colors.get(a_shift) if a_shift else None,
             group_id=group_id,
             action=action,
-            source="manual",
+            source=source,
             changed_by=str(changed_by) if changed_by else None,
             changed_at=now,
         ))

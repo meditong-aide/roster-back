@@ -612,7 +612,8 @@ class PushOutbox(Base):
 class ScheduleEntryLog(Base):
     """근무표 셀 **수동 수정** 이력. `schedule_entries` 는 현재 상태만 유지하고 이력은 여기 쌓인다.
 
-    ★ 대상은 `/roster/save`(사람이 화면에서 고친 것)뿐이다. 생성·재생성은 남기지 않는다 —
+    ★ 대상은 사람이 화면에서 고친 것 — `/roster/save`(source='manual')와 `/roster/save-as`
+      (source='save_as', 원본 버전 대비 바뀐 칸)뿐이다. 생성·재생성은 남기지 않는다 —
       한 번에 수백 행이 바뀌어 로그가 금세 커지고, 사용자가 보려는 "내가 고친 이력"과 성격이 다르다.
       나중에 방침이 바뀌어도 `source` 로 구분만 하면 되도록 컬럼은 미리 뒀다.
 
@@ -643,13 +644,35 @@ class ScheduleEntryLog(Base):
 
     group_id = Column(VARCHAR(50), nullable=True)       # (group_id, shifts.id) 라야 shift 가 유일
     action = Column(VARCHAR(10), nullable=False)        # 'update' | 'insert' | 'delete'
-    source = Column(VARCHAR(10), nullable=False)        # 'manual' | 'generate'
+    source = Column(VARCHAR(10), nullable=False)        # 'manual' | 'save_as' ('generate' 는 예약)
     changed_by = Column(VARCHAR(50), nullable=True)
     changed_at = Column(DATETIME, nullable=False)
     #: 그 셀의 **마지막 변경 기록**인가. 셀당 1행만 True 여야 한다.
     #: ★ "현재값" 과 다르다 — 재생성되면 근무표는 바뀌지만 이 로그는 그대로다.
     #:   현재값의 정본은 언제나 `schedule_entries` 다.
     is_latest = Column(BOOLEAN, nullable=False, default=True)
+
+
+class ScheduleLineage(Base):
+    """근무표 버전 출처 — [새 버전으로 저장]으로 만든 버전 1개 = 1행.
+
+    ★ `schedules` 에 컬럼을 더하지 않고 따로 둔다. 모델 컬럼이면 모든 근무표 조회가 읽어서
+      DDL 없이 배포되면 근무표 화면 전체가 멈춘다(`migrations/2026_10_02_add_schedule_lineage.sql`).
+    ★ 원본 대비 바뀐 칸 자체는 `schedule_entry_log`(source='save_as')에 있다. 여기는 요약만.
+    """
+
+    __tablename__ = "schedule_lineage"
+
+    schedule_id = Column(VARCHAR(50), primary_key=True)        # 새로 만든 버전
+    source_schedule_id = Column(VARCHAR(50), nullable=False)   # 원본 버전
+    source_version = Column(BIGINT, nullable=True)             # 저장 시점 원본 VER
+    kind = Column(VARCHAR(10), nullable=False)                 # 'save_as'
+    # 원본 대비 요약 — `/roster/compare` 의 summary 와 같은 기준(근무코드·명단 분리)
+    changed_cells = Column(INTEGER, nullable=False)            # 양쪽 명단에 다 있는 간호사의 바뀐 칸 수
+    added_nurses = Column(INTEGER, nullable=False)             # 새 버전에만 있는 간호사 수
+    removed_nurses = Column(INTEGER, nullable=False)           # 원본에만 있던 간호사 수
+    created_by = Column(VARCHAR(50), nullable=True)            # 저장한 사람 account_id(`schedules.created_by` 와 같은 기준)
+    created_at = Column(DATETIME, nullable=False)
 
 
 class Shift(Base):
