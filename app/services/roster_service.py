@@ -2837,10 +2837,11 @@ def create_issued_roster_snapshot(
     DB 세션에는 추가만 수행하고, 커밋은 호출자가 직접 처리하도록 합니다.
     """
     # 동일 그룹/연월의 기존 발행 스냅샷 is_active_issued 플래그 비활성화
+    #   ★ office_id 는 걸지 않는다 — group_id 가 병원을 확정한다. 호출자 병원이 다르면(타 병원 그룹 마감)
+    #     예전 스냅샷이 비활성화되지 않아 활성 마감본·재마감 변경 알림이 둘 남았다(Codex 2026-10-02).
     (
         db.query(IssuedRosterSnapshot)
         .filter(
-            IssuedRosterSnapshot.office_id == office_id,
             IssuedRosterSnapshot.group_id == group_id,
             IssuedRosterSnapshot.year == schedule.year,
             IssuedRosterSnapshot.month == schedule.month,

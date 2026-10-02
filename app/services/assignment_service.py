@@ -476,9 +476,14 @@ def create_assignment(
         target_fixed_shift=req.target_fixed_shift,
         target_wanted_max_requests=req.target_wanted_max_requests,
     )
+    # ★ 이벤트와 target 팀·속성 구간을 **한 커밋**으로 남긴다. 예전엔 이벤트를 먼저 커밋해서, 뒤의 팀 구간
+    #   저장이 간호사 잠금 시간 초과(409) 등으로 실패하면 이동 이벤트만 남고 재시도는 기간 겹침으로 막혔다
+    #   (Codex 2026-10-02). 간호사 잠금도 이벤트를 넣기 **전에** 잡는다.
+    if req.reason == "병동이동" and req.target_team_id is not None:
+        from services.team_period import _lock_team_period
+        _lock_team_period(db, req.nurse_id)
     db.add(row)
-    db.commit()
-    db.refresh(row)
+    db.flush()
 
     # [팀 SSOT] 병동이동의 target 팀을 nurse_team_period(target_group)에 일원화 기록.
     #   수동 병동이동(프로필 패널 _dispatch_assignment_payload 등)은 외부 set_team_period 가
@@ -490,7 +495,7 @@ def create_assignment(
         set_team_period(
             db, nurse_id=req.nurse_id, group_id=req.target_group_id,
             valid_from=req.start_date, team_id=req.target_team_id,
-            source="transfer", note=req.note,
+            source="transfer", note=req.note, commit=False,
         )
 
     # [속성 SSOT] 병동이동의 target grade/allowed/fixed 도 period(target_group)에 일원화 기록.
@@ -510,7 +515,8 @@ def create_assignment(
             upsert_period(db, NurseAllowedShiftPeriod, req.nurse_id, req.start_date,
                           "fixed_shift", req.target_fixed_shift, source="transfer",
                           carry_attrs=["allowed_shifts"])
-        db.commit()
+    db.commit()       # 이벤트 + 팀·속성 구간을 한 번에
+    db.refresh(row)
 
     logger.info(
         "배정 등록: nurse_id=%s, reason=%s, start=%s",
@@ -1831,9 +1837,14 @@ def create_permanent_change(
         payload=payload,
         note=note,
     )
+    # ★ 이벤트와 팀·등급·근무유형 구간을 **한 커밋**으로 남긴다. 예전엔 이벤트를 먼저 커밋해서, 뒤의 팀 구간
+    #   저장이 간호사 잠금 시간 초과(409) 등으로 실패하면 이벤트만 남고 재시도 때 같은 이벤트가 또 생겼다
+    #   (Codex 2026-10-02). 간호사 잠금도 이벤트를 넣기 **전에** 잡는다.
+    if new_team_id is not None:
+        from services.team_period import _lock_team_period
+        _lock_team_period(db, nurse_id)
     db.add(row)
-    db.commit()
-    db.refresh(row)
+    db.flush()
 
     # [팀 SSOT] 속성변경의 팀 변경을 nurse_team_period 에 일원화 기록(발효 전이어도 resolve_team/
     #   생성기가 즉시 반영). 외부 호출자(team_classify/ward_redistribute)도 동일 호출을 하지만
@@ -1842,7 +1853,7 @@ def create_permanent_change(
         from services.team_period import set_team_period
         set_team_period(
             db, nurse_id=nurse_id, group_id=group_id, valid_from=start_date,
-            team_id=new_team_id, source="permanent_change", note=note,
+            team_id=new_team_id, source="permanent_change", note=note, commit=False,
         )
 
     # [속성 SSOT] grade/allowed_shifts 도 period 에 일원화(team 과 동일). 캐시 투영은 발효 flush 가.

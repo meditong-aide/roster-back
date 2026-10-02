@@ -280,6 +280,29 @@ def _mid_month_teams(db: Session, group_id: str, nurse_ids: list[str], year: int
     return out
 
 
+def _lock_team_period(db: Session, nurse_id: str) -> None:
+    """간호사 단위로 팀 구간 쓰기를 트랜잭션 끝까지 직렬화한다(`sp_getapplock`, 트랜잭션 소유).
+
+    ★ 아래 "같은 시작일 조회 → 덮는 구간 조회 → INSERT" 는 한 세션 안의 중복만 막는다. 같은 간호사·
+      시작일로 두 요청이 동시에 들어오면 RCSI 가 꺼진 READ COMMITTED 에서 둘 다 "기존 구간 없음" 으로
+      보고 같은 행을 각각 넣는다(Codex 1회차 MEDIUM). 기존 행이 없어 행 잠금으로는 못 막는다.
+    ★ 키에 병동을 넣지 않는다 — 한 간호사의 모든 병동 구간 쓰기를 줄 세운다(Codex 2회차 MEDIUM).
+    ★ 여러 간호사를 한 트랜잭션에서 고치는 곳은 `lock_team_periods` 로 **nurse_id 순서대로 먼저** 잡는다
+      (순서가 엇갈리면 교착). 같은 트랜잭션에서 다시 잡아도 괜찮다(앱 잠금은 재진입된다).
+    ★ 시간 초과(-1)는 409, 그 밖 음수는 500 + 로그. MSSQL 에서만(테스트용 SQLite 제외).
+    """
+    from services.schedule_versioning import _applock
+
+    _applock(db, f"team_period:{nurse_id}", 10000,
+             "같은 간호사의 팀 변경이 진행 중입니다. 잠시 후 다시 시도해 주세요.")
+
+
+def lock_team_periods(db: Session, nurse_ids) -> None:
+    """여러 간호사의 팀 구간 쓰기를 nurse_id 순서대로 미리 잠근다(교착 방지)."""
+    for nid in sorted({str(n) for n in nurse_ids if n}):
+        _lock_team_period(db, nid)
+
+
 def set_team_period(
     db: Session,
     *,
@@ -301,6 +324,9 @@ def set_team_period(
     #   SessionLocal(autoflush=False)에서 apply_team_ops 가 한 nurse 를 두 번 처리하면
     #   (payload 중복 item / 이동을 두 op 로 표현 등) 두 번째 호출의 same 쿼리가 첫 INSERT 를
     #   못 봐서 동일행을 또 INSERT → 완전중복 행. upsert_period 와 동일하게 flush 로 차단.
+    # ★ 간호사 잠금은 flush **보다 먼저** — 호출부가 바꿔 둔 nurses 행이 flush 로 먼저 잠기면, 팀 잠금을 쥔 채
+    #   nurses 를 읽는 다른 요청(팀 설정 apply_team_ops)과 서로 기다린다(Codex 17회차). 순서: 잠금 → 행.
+    _lock_team_period(db, nurse_id)
     db.flush()
     base = db.query(NurseTeamPeriod).filter(
         NurseTeamPeriod.nurse_id == nurse_id,

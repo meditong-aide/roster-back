@@ -2098,7 +2098,26 @@ def publish_roster(
         not_found_detail="해당 스케줄을 찾을 수 없습니다.",
     )
     target_group_id = schedule.group_id
-    office_id = current_user.office_id
+    # ★ 병원은 호출자가 아니라 **대상 병동의 병원**이다 — 마감 기록·스냅샷·푸시(office_code)가 다 이 값을 쓴다.
+    #   호출자 값을 쓰면 타 병원 관리병동을 마감할 때 남의 병원으로 기록되고 푸시가 엉뚱한 병원으로 간다(Codex 2026-10-02).
+    office_id = (
+        db.query(Group.office_id).filter(Group.group_id == target_group_id).scalar()
+        or current_user.office_id
+    )
+    # ★ 병동·달 마감 잠금을 **아무것도 바꾸기 전에** 잡는다. 같은 달 두 마감(또는 마감·철회)이 동시에 오면
+    #   둘 다 같은 직전 스냅샷을 비교 기준으로 읽어 활성 마감본·변경 알림이 둘 생긴다(Codex 2회차 HIGH).
+    #   잡은 뒤 근무표를 다시 읽는다 — 기다리는 사이 앞 요청이 지웠거나 바꿨을 수 있다.
+    from services.schedule_versioning import lock_month_publish
+    lock_month_publish(db, target_group_id, schedule.year, schedule.month)
+    # ★ 마감할 근무표 행도 선점한다(UPDLOCK) — 칸을 읽어 스냅샷을 만드는 사이 `/roster/save` 가 칸을
+    #   전량 교체·커밋하면 마감본(issued)과 스냅샷·변경 알림이 서로 다른 근무표를 가리킨다(Codex 9회차).
+    #   저장이 먼저면 그 커밋을 기다렸다 읽고, 마감이 먼저면 저장이 기다렸다 마감본이라 409 를 받는다.
+    #   저장은 앱 잠금을 쓰지 않으므로 잠금 순서(마감 잠금 → 근무표 행)가 엇갈리지 않는다.
+    db.query(Schedule.schedule_id).with_hint(Schedule, "WITH (UPDLOCK, ROWLOCK)", "mssql").filter(
+        Schedule.schedule_id == schedule.schedule_id).one()
+    db.refresh(schedule)
+    if schedule.dropped:
+        raise HTTPException(status_code=404, detail="해당 스케줄을 찾을 수 없습니다.")
 
     # Check if this is the first publication
     #   ★ office_id 는 걸지 않는다 (2026-09-01 제거). group_id 가 office 를 확정하는데
@@ -2146,6 +2165,12 @@ def publish_roster(
         issue_cmmt=req.issue_comment if not is_first_issue else "첫 발행",
         schedule_id=req.schedule_id,
     )
+
+    # ② 재마감 변경 확인의 비교 기준 — 새 스냅샷을 넣기 **전에** 그 달 가장 최근 스냅샷을 잡는다
+    #   (철회돼 비활성이어도 간호사들이 마지막으로 본 마감본이다).
+    #   ★ 병동·달 마감 잠금은 함수 첫머리에서 잡았다(그 뒤에 읽어야 앞 마감이 커밋한 스냅샷이 기준).
+    from services.roster_change_notice_service import latest_snapshot_before
+    prev_snapshot = latest_snapshot_before(db, target_group_id, schedule.year, schedule.month)
 
     # 발행 시점 스냅샷 레코드 생성
     snapshot = create_issued_roster_snapshot(
@@ -2208,15 +2233,47 @@ def publish_roster(
             rebuild_leave_balance_from(db, target_group_id, schedule.year, schedule.month)
     except Exception as _lb_exc:
         print(f"[LeaveBalance] 발행 후 차감 실패(무시): {_lb_exc}")
+    # ── ② 재마감 변경 알림(바뀐 칸·확인 대상자) ──
+    #   ★ 직전 마감본 대비 바뀐 칸이 있으면 알림·칸·대상자를 남기고 문구를 바꾼 푸시를 보낸다.
+    #     바뀐 칸 0·첫 마감이면 None → 아래 기존 마감/재마감 푸시.
+    #   ★ 기록이 실패하면 **마감 전체를 되돌린다**(커밋하지 않고 500). 삼키고 마감만 살리면 바뀐 근무표는
+    #     나가는데 확인 대상·비교 기준이 영영 빠지고 다시 만들 길도 없다(Codex 1회차 HIGH). 테이블은
+    #     dev·운영에 미리 만들어 두었다(`migrations/2026_10_02_add_roster_change_ack.sql`).
+    from services.roster_change_notice_service import record_change_notice
+    try:
+        change_notice = record_change_notice(
+            db, group_id=target_group_id, year=schedule.year, month=schedule.month,
+            new_snapshot=snapshot, prev_snapshot=prev_snapshot,
+            publisher_id=getattr(current_user, "nurse_id", None),
+        )
+    except HTTPException:
+        raise
+    except Exception as _cn_exc:
+        _roster_logger.error("[ChangeNotice] 변경 알림 기록 실패 — 마감을 되돌림: %s", _cn_exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="변경 확인 기록을 남기지 못해 마감하지 않았습니다. 잠시 후 다시 시도해 주세요.",
+        ) from _cn_exc
     # NOTE: ShiftTransferLog 기반 전달은 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ★ 알림은 커밋 **전에** 발송 대기열(push_outbox)에 넣는다 — 마감 저장과 한 트랜잭션이라
     #   저장은 됐는데 알림만 빠지는 일이 없다. 실제 발송·재시도는 서버 안 발송기가 한다.
-    nurses_in_group = (
-        db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
-    )
-    receive_emp_seq_no = [nurse.nurse_id for nurse in nurses_in_group]
+    # ★ 수신자 = 그 달 소속(파견 들어온 사람 포함) − 휴직·퇴사(변경 확인 대상과 같은 기준, 설계 9-28).
+    #   예전엔 nurses.group_id 전원이라 비활성·퇴사자에게도 가고 파견 온 사람은 빠졌다.
+    from services.roster_change_notice_service import confirm_targets
+    receive_emp_seq_no = confirm_targets(db, target_group_id, schedule.year, schedule.month, None)
 
-    if is_republish:
+    if change_notice:
+        from utils.utils import send_roster_change_notice_push
+        send_roster_change_notice_push(
+            year=schedule.year,
+            month=schedule.month,
+            notice=change_notice,
+            office_code=office_id,
+            sender_emp_seq_no=current_user.nurse_id,
+            sender_member_id=current_user.account_id,
+            db=db,
+        )
+    elif is_republish:
         send_roster_republish_push(
             year=schedule.year,
             month=schedule.month,
@@ -2282,6 +2339,12 @@ def publish_roster(
         "message": "근무표가 성공적으로 발행되었습니다.",
         # "seq_no": issued_roster.seq_no,
         "is_first_issue": is_first_issue,
+        # 재마감으로 바뀐 칸이 있으면 변경 알림 요약(없으면 null)
+        "change_notice": {
+            k: change_notice[k] for k in (
+                "notice_id", "base_snapshot_id", "changed_cells", "affected_nurses", "added_nurses",
+                "removed_nurses", "target_count", "total_cells")
+        } if change_notice else None,
     }
 
 
@@ -2312,6 +2375,10 @@ def unpublish_roster(
         db, current_user, schedule_id,
         not_found_detail="해당 스케줄을 찾을 수 없습니다.",
     )
+    # ★ 마감과 같은 병동·달 잠금 — 마감과 겹친 철회가 반쯤 끝난 상태를 읽지 않게(재마감 변경 확인 기준).
+    from services.schedule_versioning import lock_month_publish
+    lock_month_publish(db, schedule.group_id, schedule.year, schedule.month)
+    db.refresh(schedule)
     target_group_id = schedule.group_id
 
     if schedule.status != "issued":
@@ -2713,6 +2780,15 @@ def save_roster_as_new_version(
 
     from services.schedule_history_service import snapshot_entries
 
+    # ★ 원본 행을 먼저 잠근다(UPDLOCK) — 원본 칸을 읽은 직후 다른 `/roster/save` 가 원본을 바꾸고 커밋하면,
+    #   출처의 바뀐 칸 수·save_as 이력은 옛 원본 기준인데 이후 `/roster/compare` 는 새 원본 기준이 된다
+    #   (Codex 1회차 MEDIUM). `/roster/save` 는 원본 행을 갱신(flush)해 잠그므로 둘이 차례로 선다.
+    db.query(Schedule.schedule_id).with_hint(Schedule, "WITH (UPDLOCK, ROWLOCK)", "mssql").filter(
+        Schedule.schedule_id == source.schedule_id).one()
+    # 잠금을 기다리는 사이 원본이 삭제됐을 수 있다 — 다시 읽어 확인한다(Codex 11회차).
+    db.refresh(source)
+    if source.dropped:
+        raise HTTPException(status_code=404, detail="원본 근무표를 찾을 수 없습니다.")
     # ★ 원본 읽기·칸 변환을 먼저 끝내고 버전 번호(그룹·달 잠금)는 마지막에 잡는다 — 잠금을 쥔 채
     #   원본 읽기에서 기다리면 같은 달의 복사·생성까지 줄줄이 기다린다.
     before = snapshot_entries(db, source.schedule_id)

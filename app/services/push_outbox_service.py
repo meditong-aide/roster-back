@@ -310,6 +310,17 @@ def _guard_holds(cursor, guard: str | None) -> bool:
         )
         found = cursor.fetchone()
         return bool(found) and found[0] == "closed"
+    if kind == "roster_snapshot_active":
+        # 재마감 변경 확인 알림 — 보내기 전에 그 마감 스냅샷이 아직 활성이어야 한다. 그 사이 철회되거나
+        #   다시 마감됐으면 "확인해 주세요" 를 눌러도 409 라 보낼 이유가 없다(Codex 11회차).
+        #   스냅샷 행을 UPDLOCK 으로 잡아 확인과 발송 사이에 철회·재마감이 끼어들지 못하게 한다.
+        cursor.execute(
+            f"SELECT is_active_issued FROM {_roster_table('issued_roster_snapshot')} WITH (UPDLOCK, ROWLOCK) "
+            f"WHERE snapshot_id = %s",
+            (int(rest),),
+        )
+        found = cursor.fetchone()
+        return bool(found) and bool(found[0])
     _logger.warning("[PushOutbox] 알 수 없는 guard 종류 — 막지 않음: %s", guard)
     return True
 

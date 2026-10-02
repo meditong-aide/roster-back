@@ -675,6 +675,24 @@ class ScheduleLineage(Base):
     created_at = Column(DATETIME, nullable=False)
 
 
+class RosterChangeAck(Base):
+    """재마감 변경 확인 — 확인 대상자 1명 = 1행(성남 ②). `migrations/2026_10_02_add_roster_change_ack.sql`.
+
+    ★ 알림 자체는 따로 두지 않는다. 알림 = 바뀐 칸이 있는 재마감의 **마감 스냅샷**이다
+      (`issued_roster_snapshot.meta_json.change` 에 비교 기준·요약). 바뀐 칸은 두 스냅샷을 비교해
+      그때그때 계산한다 — 스냅샷이 이미 남아 있어 같은 정보를 한 번 더 저장할 이유가 없다.
+    ★ 재마감 시점에 대상자 행을 미리 만든다 — "N명 중 M명" 과 미확인자 목록이 바로 나온다.
+    """
+
+    __tablename__ = "roster_change_ack"
+
+    snapshot_id = Column(INTEGER, primary_key=True)      # issued_roster_snapshot.snapshot_id (= 알림 번호)
+    nurse_id = Column(VARCHAR(50), primary_key=True)
+    my_changed_cells = Column(INTEGER, nullable=False)   # 이 사람 칸이 바뀐 수(명단 변경 포함)
+    acked_at = Column(DATETIME, nullable=True)           # 미확인이면 None
+    ack_via = Column(VARCHAR(10), nullable=True)         # app | web
+
+
 class Shift(Base):
     __tablename__ = "shifts"
     shift_id = Column(VARCHAR(10), primary_key=True)

@@ -146,6 +146,10 @@ def apply_team_ops(db: Session, office_id: str, group_id: str, payload: List[Dic
     if _period_from is not None:
         for _it in payload:
             _moved_in_ids.update(str(_x) for _x in (_it.get('add') or []))
+        # ★ 이 요청이 구간을 고칠 간호사를 nurse_id 순서로 **먼저** 잠근다 — `set_team_period` 가 한 명씩
+        #   잠그면 다른 일괄 요청과 순서가 엇갈려 교착할 수 있다(team_period._lock_team_period).
+        from services.team_period import lock_team_periods
+        lock_team_periods(db, [_x for _it in payload for _x in (_it.get('add') or []) + (_it.get('remove') or [])])
     # 1) 팀별 ops 처리
     for item in payload:
         team_id = item.get('team_id')

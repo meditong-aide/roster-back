@@ -618,6 +618,8 @@ app.include_router(auth.router)
 app.include_router(nurses.router)
 # app.include_router(schedules.router)
 app.include_router(roster.router)
+from routers import roster_change_notice  # noqa: E402
+app.include_router(roster_change_notice.router)
 app.include_router(dates.router) 
 app.include_router(wanted.router) 
 app.include_router(preferences.router) 

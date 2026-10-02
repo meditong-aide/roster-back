@@ -451,6 +451,40 @@ def send_roster_republish_push(
     )
 
 
+def send_roster_change_notice_push(
+    year: int,
+    month: int,
+    notice: dict,
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+    db=None,
+):
+    """재마감 변경 알림 (P30 / S04) — 확인 대상자에게, 내 칸이 바뀐 사람과 나머지 문구를 나눠 보낸다.
+
+    `notice` 는 `roster_change_notice_service.record_change_notice` 의 반환값.
+    연결 코드는 재마감과 같은 `ROSTER:연:월` — 앱이 이미 그 달 근무표로 보낸다. 앱은 홈 배너
+    (`/roster/change-notices/pending/me`)로 확인 화면을 띄운다(로그인 후 항상 홈으로 가기 때문).
+    """
+    by_message: dict[str, list[str]] = {}
+    for nurse_id in notice.get("targets") or []:
+        mine = int((notice.get("my_changed") or {}).get(nurse_id, 0))
+        message = (f"{month}월 근무표 변경 — 내 근무 {mine}건 변경, 확인해 주세요" if mine
+                   else f"{month}월 근무표 변경({notice.get('total_cells', 0)}건), 확인해 주세요")
+        by_message.setdefault(message, []).append(nurse_id)
+    results = []
+    for message, recipients in by_message.items():
+        results.append(_send_or_enqueue(
+            db, source="roster_change_notice", push_code="P30", push_sub_code="S04",
+            office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+            sender_member_id=sender_member_id, recipients=recipients, message=message,
+            link_code=f"ROSTER:{year}:{month:02d}",
+            # 보내기 전에 그 마감본이 아직 활성인지 확인 — 그 사이 철회·재마감됐으면 보내지 않는다.
+            guard=f"roster_snapshot_active:{notice['notice_id']}",
+        ))
+    return results
+
+
 # ── assignment 관련 알림 (S06~S12) ──
 
 _REASON_LABEL = {"파견": "파견", "병동이동": "병동이동", "휴직": "휴직", "프리셉티": "프리셉티"}
