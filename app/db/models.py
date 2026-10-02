@@ -571,6 +571,44 @@ class ScheduleEntry(Base):
     id = Column(INTEGER, nullable=True)  # shifts.id (stable key)
 
 
+class PushOutbox(Base):
+    """앱 알림 발송 대기열 — 업무 저장과 같은 트랜잭션에 '보낼 알림'을 남기고 발송기가 따로 보낸다.
+
+    ★ 예전엔 커밋 뒤 그룹웨어에 바로 썼다. 그 사이 프로세스가 죽거나 그룹웨어가 잠깐 느리면
+      알림이 영영 빠졌고 다시 보낼 근거도 없었다. 이제 이 행이 남으므로 재시도할 수 있다.
+    ★ 그룹웨어 쓰기와 'sent' 표시는 한 트랜잭션이다(`push_outbox_service._deliver`).
+    상태: pending → sending → sent | skipped(운영 외) | failed(재시도 소진·24시간 경과)
+          | cancelled(guard 불충족).
+    DDL: `migrations/2026_10_02_add_push_outbox.sql`.
+    """
+
+    __tablename__ = "push_outbox"
+
+    id = Column(BIGINT, primary_key=True, autoincrement=True)
+    source = Column(VARCHAR(50), nullable=False)
+    push_code = Column(VARCHAR(10), nullable=False)
+    push_sub_code = Column(VARCHAR(10), nullable=False)
+    office_code = Column(VARCHAR(50), nullable=False)
+    sender_emp_seq_no = Column(VARCHAR(50), nullable=False)
+    sender_member_id = Column(VARCHAR(100), nullable=False)
+    recipients = Column(TEXT, nullable=False)        # 콤마 구분 사번(varchar(max))
+    recipient_count = Column(INTEGER, nullable=False)
+    message = Column(NVARCHAR(1000), nullable=False)
+    org_message = Column(NVARCHAR(2000), nullable=False)
+    link_url = Column(NVARCHAR(500), nullable=False, default="")
+    link_code = Column(NVARCHAR(100), nullable=False, default="")
+    guard = Column(VARCHAR(200), nullable=True)
+    status = Column(NVARCHAR(20), nullable=False, default="pending")  # nvarchar 인 이유는 DDL 주석
+    attempts = Column(INTEGER, nullable=False, default=0)
+    next_attempt_at = Column(DATETIME, nullable=False)
+    claimed_at = Column(DATETIME, nullable=True)
+    master_idx = Column(BIGINT, nullable=True)
+    device_count = Column(INTEGER, nullable=True)
+    last_error = Column(NVARCHAR(1000), nullable=True)
+    created_at = Column(DATETIME, nullable=False)
+    sent_at = Column(DATETIME, nullable=True)
+
+
 class ScheduleEntryLog(Base):
     """근무표 셀 **수동 수정** 이력. `schedule_entries` 는 현재 상태만 유지하고 이력은 여기 쌓인다.
 

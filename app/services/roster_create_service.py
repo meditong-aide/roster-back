@@ -3714,6 +3714,46 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     return cp_sat_result, {}, None
 
 
+def _enqueue_assignment_created_push(db: Session, req, current_user, assignments, nurses_in_group) -> None:
+    """파견·병동이동 대상자에게 '근무표 생성' 알림(S09)을 발송 대기열에 넣는다. **커밋은 호출부**.
+
+    알림 준비가 실패해도 근무표 저장은 막지 않는다.
+    ★ 준비용 조회(병동 이름·간호사 이름)는 **별도 읽기 세션**에서 한다. 업무 세션에서 조회하다
+      DB 오류(시간 초과·교착)가 나면 세션이 실패 상태가 되어, 예외를 삼켜도 뒤이은 근무표 저장
+      commit 이 함께 실패한다(Codex 2026-10-02). 업무 세션에는 대기열 행 추가(`db.add`)만 한다.
+    ★ 저장 **전**에 부르므로 `nurses_in_group` 에 파견 들어온 간호사가 아직 없다(저장 뒤에 붙인다).
+      거기서 못 찾은 이름은 간호사 테이블에서 직접 읽는다 — 안 그러면 알림에 사번이 찍힌다.
+    """
+    try:
+        from db.client2 import SessionLocal
+        from services.assignment_service import _get_group_name
+        from utils.utils import send_assignment_roster_created_push
+        nurse_ids = {
+            str(a.nurse_id) for a in assignments
+            if a.reason in ("파견", "병동이동") and a.status != "cancelled"
+        }
+        if not nurse_ids:
+            return
+        names_by_id = {str(n.nurse_id): n.name for n in nurses_in_group}
+        ordered = [str(n.nurse_id) for n in nurses_in_group if str(n.nurse_id) in nurse_ids]
+        rest = sorted(nurse_ids - set(ordered))
+        with SessionLocal() as read_db:
+            group_name = _get_group_name(read_db, current_user.group_id) or str(current_user.group_id)
+            if rest:
+                names_by_id.update({
+                    str(nid): name
+                    for nid, name in read_db.query(Nurse.nurse_id, Nurse.name).filter(Nurse.nurse_id.in_(rest))
+                })
+        names = [names_by_id.get(nid) or nid for nid in ordered + rest]
+        send_assignment_roster_created_push(
+            nurse_name=", ".join(names), group_name=group_name, year=req.year, month=req.month,
+            recipients=list(nurse_ids), office_code=current_user.office_id,
+            sender_emp_seq_no=current_user.nurse_id, sender_member_id=current_user.account_id, db=db,
+        )
+    except Exception as e:
+        print(f"[RosterCreate] assignment 생성 알림 준비 실패: {e}")
+
+
 def _persist_entries(db: Session, schedule, generated, req):
     """생성된 근무표를 ScheduleEntry로 저장한다."""
     db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule.schedule_id).delete()
@@ -7868,6 +7908,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         )
     except Exception as _oncall_exc:
         print(f"[Oncall] 후처리 실패 — 콜 미부여 진행: {_oncall_exc}")
+    # ★ S09 알림은 근무표 저장과 **같은 커밋**에 남긴다(`_persist_entries` 끝의 commit).
+    #   저장 뒤 따로 넣으면 그 사이 죽었을 때 근무표는 있는데 알림 근거가 없다(Codex 2026-10-02).
+    _enqueue_assignment_created_push(db, req, current_user, _assignments, nurses_in_group)
     _persist_entries(db, schedule, generated, req)
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──
@@ -7979,32 +8022,6 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                       f"options={[o['option_id'] for o in (_inf_a1.get('resolution_options') or [])]}")
     except Exception as _a1_exc:
         print(f"[A1Probe] failed (ignore): {_a1_exc}")
-
-    # ── assignment 대상자 근무표 생성 알림 (S09) ──
-    try:
-        from utils.utils import send_assignment_roster_created_push
-        from services.assignment_service import _get_group_name
-        _assign_nurse_ids = set()
-        for _a in _assignments:
-            if _a.reason in ("파견", "병동이동") and _a.status != "cancelled":
-                _assign_nurse_ids.add(str(_a.nurse_id))
-        if _assign_nurse_ids:
-            _gname = _get_group_name(db, current_user.group_id) or str(current_user.group_id)
-            _nurse_names = [
-                n.name for n in nurses_in_group if str(n.nurse_id) in _assign_nurse_ids
-            ] or list(_assign_nurse_ids)
-            send_assignment_roster_created_push(
-                nurse_name=", ".join(_nurse_names),
-                group_name=_gname,
-                year=req.year,
-                month=req.month,
-                recipients=list(_assign_nurse_ids),
-                office_code=current_user.office_id,
-                sender_emp_seq_no=current_user.nurse_id,
-                sender_member_id=current_user.account_id,
-            )
-    except Exception as e:
-        print(f"[RosterCreate] assignment 생성 알림 실패: {e}")
 
     # 휴가 자동 부여 요약 — 화면이 생성 결과를 검토할 수 있게 싣는다.
     #   ★ 기능이 꺼져 있거나 대상 코드가 없으면 후처리가 stats 를 안 채우므로 키 자체가

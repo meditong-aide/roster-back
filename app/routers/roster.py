@@ -2135,11 +2135,11 @@ def publish_roster(
     except Exception as _lb_exc:
         print(f"[LeaveBalance] 발행 후 차감 실패(무시): {_lb_exc}")
     # NOTE: ShiftTransferLog 기반 전달은 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
-    db.commit()
+    # ★ 알림은 커밋 **전에** 발송 대기열(push_outbox)에 넣는다 — 마감 저장과 한 트랜잭션이라
+    #   저장은 됐는데 알림만 빠지는 일이 없다. 실제 발송·재시도는 서버 안 발송기가 한다.
     nurses_in_group = (
         db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
     )
-    print("[DEBUG] [roster.py - publish_roster] nurses_in_group", nurses_in_group)
     receive_emp_seq_no = [nurse.nurse_id for nurse in nurses_in_group]
 
     if is_republish:
@@ -2150,6 +2150,7 @@ def publish_roster(
             office_code=office_id,
             sender_emp_seq_no=current_user.nurse_id,
             sender_member_id=current_user.account_id,
+            db=db,
         )
     else:
         send_roster_publish_push(
@@ -2159,44 +2160,49 @@ def publish_roster(
             office_code=office_id,
             sender_emp_seq_no=current_user.nurse_id,
             sender_member_id=current_user.account_id,
+            db=db,
         )
 
     # ── assignment 대상자 + 상대 그룹 관리자 알림 (S11/S12) ──
+    #   ★ 부가 알림이라 실패해도 마감은 살린다 — SAVEPOINT 로 격리(실패 시 이 부분만 되돌림).
     try:
-        from services.assignment_service import get_active_assignments_for_month
-        from utils.utils import send_assignment_roster_published_push
-        _assigns = get_active_assignments_for_month(db, target_group_id, schedule.year, schedule.month)
-        _notified: set[str] = set()
-        for _a in _assigns:
-            if _a.reason not in ("파견", "병동이동"):
-                continue
-            if _a.status == "cancelled":
-                continue
-            _is_source = (_a.source_group_id == target_group_id)
-            _other_gid = _a.target_group_id if _is_source else _a.source_group_id
-            # 수신자: 대상 간호사 + 상대 그룹 관리자
-            _recip: set[str] = {str(_a.nurse_id)}
-            if _other_gid:
-                from services.assignment_service import _get_head_nurse_ids
-                for _hn in _get_head_nurse_ids(db, _other_gid):
-                    _recip.add(_hn)
-            _new = _recip - _notified
-            if _new:
-                from services.assignment_service import _get_group_name
-                _gname = _get_group_name(db, target_group_id) or str(target_group_id)
-                send_assignment_roster_published_push(
-                    group_name=_gname,
-                    year=schedule.year,
-                    month=schedule.month,
-                    recipients=list(_new),
-                    office_code=office_id,
-                    sender_emp_seq_no=current_user.nurse_id,
-                    sender_member_id=current_user.account_id,
-                    is_source=_is_source,
-                )
-                _notified.update(_new)
+        with db.begin_nested():
+            from services.assignment_service import get_active_assignments_for_month
+            from utils.utils import send_assignment_roster_published_push
+            _assigns = get_active_assignments_for_month(db, target_group_id, schedule.year, schedule.month)
+            _notified: set[str] = set()
+            for _a in _assigns:
+                if _a.reason not in ("파견", "병동이동"):
+                    continue
+                if _a.status == "cancelled":
+                    continue
+                _is_source = (_a.source_group_id == target_group_id)
+                _other_gid = _a.target_group_id if _is_source else _a.source_group_id
+                # 수신자: 대상 간호사 + 상대 그룹 관리자
+                _recip: set[str] = {str(_a.nurse_id)}
+                if _other_gid:
+                    from services.assignment_service import _get_head_nurse_ids
+                    for _hn in _get_head_nurse_ids(db, _other_gid):
+                        _recip.add(_hn)
+                _new = _recip - _notified
+                if _new:
+                    from services.assignment_service import _get_group_name
+                    _gname = _get_group_name(db, target_group_id) or str(target_group_id)
+                    send_assignment_roster_published_push(
+                        group_name=_gname,
+                        year=schedule.year,
+                        month=schedule.month,
+                        recipients=list(_new),
+                        office_code=office_id,
+                        sender_emp_seq_no=current_user.nurse_id,
+                        sender_member_id=current_user.account_id,
+                        is_source=_is_source,
+                        db=db,
+                    )
+                    _notified.update(_new)
     except Exception as e:
         print(f"[Publish] assignment 마감 알림 실패: {e}")
+    db.commit()
 
     return {
         "message": "근무표가 성공적으로 발행되었습니다.",

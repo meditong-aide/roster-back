@@ -24,7 +24,6 @@ from schemas.roster_schema import (
 from services.graph_service import graph_service
 from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse
 from routers.auth import get_current_user_from_cookie, require_current_user
-from utils.utils import send_wanted_close_push
 from db.client2 import get_db
 from db.models import (
     Wanted,
@@ -60,6 +59,7 @@ from services.wanted_service import (
     get_shift_requests_service,
     update_wanted_deadline_service,
     run_wanted_auto_close,
+    enqueue_wanted_close_push,
 )
 from services.roster_service import get_my_wanted_reflection_service
 
@@ -330,28 +330,16 @@ def close_wanted_request(
         Wanted.group_id == target_group_id, Wanted.year == year, Wanted.month == month,
         or_(Wanted.status.is_(None), Wanted.status != "closed"),
     ).update({Wanted.status: "closed"}, synchronize_session=False)
-    db.commit()
     if not changed:
+        db.rollback()
         return {"message": "이미 마감된 Wanted 요청입니다."}
-    # 보내기 직전에 상태를 다시 읽는다 — 그 사이 마감일 연장으로 다시 열렸으면 '마감' 알림을
-    # 보내지 않는다(자동 마감 `_notify_wanted_closed` 와 같은 방어). 컬럼 조회라 DB 값을 본다.
-    current = db.query(Wanted.status).filter(
-        Wanted.group_id == target_group_id, Wanted.year == year, Wanted.month == month,
-    ).scalar()
-    if current != "closed":
-        return {"message": "마감 직후 마감일 변경으로 다시 열려 마감 알림은 보내지 않았습니다."}
-
-    nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
-    recipients = [nurse.nurse_id for nurse in nurses_in_group]
-    send_wanted_close_push(
-        year=wanted.year,
-        month=wanted.month,
-        recipients=recipients,
-        office_code=current_user.office_id,
-        sender_emp_seq_no=current_user.nurse_id,
-        sender_member_id=current_user.account_id,
+    # 마감과 알림을 한 트랜잭션으로 — 알림은 발송 대기열에 들어가고 발송기가 보낸다.
+    # 보내기 직전에 다시 열렸는지는 발송기가 guard 로 확인한다(`enqueue_wanted_close_push`).
+    enqueue_wanted_close_push(
+        db, target_group_id, year, month, source="wanted_manual_close",
+        sender_emp_seq_no=current_user.nurse_id, sender_member_id=current_user.account_id,
     )
-
+    db.commit()
     return {"message": "Wanted 요청이 마감되었습니다."}
 
 

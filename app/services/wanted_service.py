@@ -64,7 +64,6 @@ from services.weekly_off_service import (
     calc_weekly_off_weekday_by_week,
 )
 from utils.utils import (
-    push_not_delivered_reason,
     send_wanted_close_push,
     send_wanted_deadline_update_push,
     send_wanted_request_push,
@@ -1847,30 +1846,22 @@ def request_wanted_shifts_service(
         status='requested'
     )
     db.add(new_wanted)
-    db.commit()
-    db.refresh(new_wanted)
 
-    # 푸시 알림
+    # 푸시 알림 — 커밋 **전에** 발송 대기열에 넣는다(요청 생성과 한 트랜잭션).
     group_row = db.query(Group).filter(Group.group_id == target_group_id).first()
     office_id = group_row.office_id if group_row and group_row.office_id else current_user.office_id
-    # 수신자 명단: nurses.group_id 캐시 대신 해당 월 실제 소속(group member 모듈).
-    #   → 비활성/퇴사 제외 + 전입(파견/병동이동 inbound) 포함. 전출/휴직/파견나감은 제외.
-    from services.assignment_service import group_members_in_month
-    _members = group_members_in_month(db, target_group_id, req.year, req.month)["members"]
-    nurse_ids = [
-        m["nurse_id"] for m in _members
-        if m["membership_status"] in ("active", "inbound")
-    ]
-
     send_wanted_request_push(
         year=req.year,
         month=req.month,
-        recipients=nurse_ids,
+        recipients=wanted_push_recipients(db, target_group_id, req.year, req.month),
         office_code=office_id,
         sender_emp_seq_no=current_user.nurse_id,
         sender_member_id=current_user.account_id,
         deadline=new_wanted.exp_date,
+        db=db,
     )
+    db.commit()
+    db.refresh(new_wanted)
     
     display_exp_date = "마감일 없음" if new_wanted.exp_date is None else new_wanted.exp_date.strftime("%Y-%m-%d")
     
@@ -1879,6 +1870,17 @@ def request_wanted_shifts_service(
         "current_exp_date": new_wanted.exp_date.isoformat() if new_wanted.exp_date else None,
         "display_exp_date": display_exp_date
     }
+
+
+def wanted_push_recipients(db: Session, group_id: str, year: int, month: int) -> list[str]:
+    """원티드 알림(요청·마감일 변경·마감) 수신자 — 그 달 **실제 소속**(재직 + 파견·병동이동 전입).
+
+    ★ `nurses.group_id` 캐시로 고르면 퇴사자(레코드 보존)가 들어가고 파견으로 들어온 간호사는
+      빠진다. 요청 알림이 이미 쓰던 `group_members_in_month` 기준으로 세 알림을 맞춘다.
+    """
+    from services.assignment_service import group_members_in_month
+    members = group_members_in_month(db, group_id, year, month)["members"]
+    return [m["nurse_id"] for m in members if m["membership_status"] in ("active", "inbound")]
 
 
 _KST = timezone(timedelta(hours=9))
@@ -1930,10 +1932,21 @@ def update_wanted_deadline_service(
         # 같은 값 재요청(재시도·더블클릭)은 아무것도 안 바꾸고 알림도 다시 보내지 않는다.
         return _deadline_response(wanted, "마감일이 이미 같은 값입니다.")
     _write_deadline(db, wanted, new_exp, reopens)
+    # 알림은 같은 트랜잭션으로 발송 대기열에 넣는다 — 저장은 됐는데 알림만 빠지는 일이 없다.
+    send_wanted_deadline_update_push(
+        year=wanted.year,
+        month=wanted.month,
+        recipients=wanted_push_recipients(db, group_id, wanted.year, wanted.month),
+        office_code=current_user.office_id,
+        sender_emp_seq_no=current_user.nurse_id,
+        sender_member_id=current_user.account_id,
+        deadline=new_exp,
+        db=db,
+    )
+    db.commit()
+    db.refresh(wanted)
     message = "마감일이 제거되었습니다. (마감일 없음)" if new_exp is None else "마감일이 성공적으로 변경되었습니다."
-    response = _deadline_response(wanted, message)
-    response["notify_failed"] = _notify_deadline_change(db, wanted, current_user, group_id)
-    return response
+    return _deadline_response(wanted, message)
 
 
 def _lock_wanted_row(db: Session, wanted: Wanted) -> None:
@@ -1962,7 +1975,7 @@ def _concurrent_change_response(wanted: Wanted, new_exp: datetime | None, reopen
 
 
 def _write_deadline(db: Session, wanted: Wanted, new_exp: datetime | None, reopens: bool) -> None:
-    """마감일(재오픈이면 상태도)을 쓴다. 행은 이미 잠겨 있다.
+    """마감일(재오픈이면 상태도)을 쓴다. 행은 이미 잠겨 있다. **커밋은 호출부**(알림과 함께).
 
     ★ 속성 대입이 아니라 UPDATE 로 **함께** 쓴다 — 읽은 값과 같은 status 대입은 SQLAlchemy 가
       '변경 없음'으로 빼먹는다. 재오픈이면 status 를 항상 명시한다.
@@ -1973,35 +1986,6 @@ def _write_deadline(db: Session, wanted: Wanted, new_exp: datetime | None, reope
     db.query(Wanted).filter(
         Wanted.group_id == wanted.group_id, Wanted.year == wanted.year, Wanted.month == wanted.month,
     ).update(values, synchronize_session=False)
-    db.commit()
-    db.refresh(wanted)
-
-
-def _notify_deadline_change(db: Session, wanted: Wanted, current_user, group_id: str) -> str | None:
-    """마감일 변경 알림. 단말까지 보냈으면 None, 아니면 사유.
-
-    ★ 변경은 이미 커밋됐다 — 알림 예외를 500 으로 올리면 '실패'로 보인 요청을 다시 보내
-      같은 알림이 두 번 간다. 예외는 기록하고 응답의 `notify_failed` 로만 알린다.
-    ★ 발송 함수는 실패를 대부분 예외 없이 결과로 돌려준다 → 결과로 판정한다.
-    """
-    try:
-        recipients = [n.nurse_id for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
-        result = send_wanted_deadline_update_push(
-            year=wanted.year,
-            month=wanted.month,
-            recipients=recipients,
-            office_code=current_user.office_id,
-            sender_emp_seq_no=current_user.nurse_id,
-            sender_member_id=current_user.account_id,
-            deadline=wanted.exp_date,
-        )
-        return push_not_delivered_reason(result)
-    except Exception:
-        logging.getLogger(__name__).error(
-            "원티드 마감일 변경 알림 실패 group=%s %s-%s", wanted.group_id, wanted.year, wanted.month,
-            exc_info=True,
-        )
-        return "발송 오류"
 
 
 # 마감 알림은 최근 만료분에만 보낸다. 운영엔 자동 마감이 한 번도 돌지 않아 만료된 채
@@ -2011,26 +1995,27 @@ CLOSE_NOTIFY_WINDOW = timedelta(hours=72)
 
 
 def run_wanted_auto_close(db: Session, office_id: str | None = None) -> dict:
-    """만료 원티드를 닫고 마감 알림을 보낸다. office_id 가 None 이면 전 병원.
+    """만료 원티드를 닫고 마감 알림을 발송 대기열에 넣는다. office_id 가 None 이면 전 병원.
 
     호출자: 서버 안 스케줄러(`main._daily_wanted_close_scheduler`, 전 병원) ·
     관리자 수동 `POST /wanted/close-expired`(자기 병원).
     ★ 닫기만 한다. 다시 여는 건 수간호사가 마감일을 바꿀 때뿐이다
       (`update_wanted_deadline_service`). 수동 마감(마감일 없이 closed)을 건드리지 않는다.
-    ★ **행마다 '닫기 → 커밋 → 알림'을 끝내고** 다음 행으로 간다. 한 행이 실패해도 그 행만
-      건너뛴다 — 닫기를 다 하고 알림을 몰아 보내면, 중간 행 오류에서 멈췄을 때 앞서 닫은
-      원티드의 알림이 영영 안 나간다(다음 실행에선 이미 closed 라 다시 안 잡힌다).
+    ★ 행마다 **'닫기 + 알림 대기열 넣기'를 한 트랜잭션으로 커밋**한다. 닫혔는데 알림만 빠지는
+      일이 없고, 실제 발송·재시도는 서버 발송기(push_outbox)가 한다. 한 행이 실패해도 그 행만
+      건너뛴다(`close_failed`, 다음 실행이 다시 잡는다).
     ★ 마감 알림은 `CLOSE_NOTIFY_WINDOW` 안에 만료된 것만. 그보다 오래된 것은 알림 없이
       닫고 `closed_silently` 로 돌려준다.
     """
     now_kst = _now_kst_naive()
     notify_from = now_kst - CLOSE_NOTIFY_WINDOW
     result = {"now_kst": now_kst.isoformat(), "scope": office_id or "all", "updated": 0,
-              "closed_silently": [], "close_failed": [], "notify_failed": []}
+              "queued": 0, "closed_silently": [], "close_failed": []}
     for gid, year, month, exp_date in _expired_wanted_candidates(db, office_id, now_kst):
         key = {"group_id": gid, "year": year, "month": month}
+        notify = exp_date >= notify_from
         try:
-            if not _close_one_wanted(db, gid, year, month, now_kst):
+            if not _close_one_wanted(db, gid, year, month, now_kst, notify=notify):
                 continue
         except Exception:
             db.rollback()
@@ -2040,12 +2025,10 @@ def run_wanted_auto_close(db: Session, office_id: str | None = None) -> dict:
             result["close_failed"].append(key)
             continue
         result["updated"] += 1
-        if exp_date < notify_from:
+        if notify:
+            result["queued"] += 1
+        else:
             result["closed_silently"].append(key)
-            continue
-        reason = _notify_closed_safely(db, gid, year, month)
-        if reason:
-            result["notify_failed"].append({**key, "reason": reason})
     return result
 
 
@@ -2078,11 +2061,13 @@ def _expired_wanted_candidates(db: Session, office_id: str | None, now_kst: date
     return query.all()
 
 
-def _close_one_wanted(db: Session, group_id: str, year: int, month: int, now_kst: datetime) -> bool:
-    """한 행을 닫고 커밋한다. 이번 호출이 직접 닫았으면 True.
+def _close_one_wanted(
+    db: Session, group_id: str, year: int, month: int, now_kst: datetime, *, notify: bool,
+) -> bool:
+    """한 행을 닫고(알림이 필요하면 대기열에도 넣고) 커밋한다. 이번 호출이 직접 닫았으면 True.
 
     ★ 조건부 UPDATE — 만료 조건을 UPDATE 에서 **다시** 건다. 동시에 두 실행이 같은 행을
-      읽어도 먼저 갱신한 쪽만 rowcount 1(같은 마감 알림이 두 번 가지 않는다). 후보 조회 뒤
+      읽어도 먼저 갱신한 쪽만 rowcount 1(같은 마감 알림이 두 번 들어가지 않는다). 후보 조회 뒤
       수간호사가 마감일을 연장했으면 0 이라 닫지 않는다.
     ★ `READPAST` — 그 사이 잠긴 행은 기다리지 않고 0 으로 지나간다(다음 실행이 잡는다).
     """
@@ -2097,69 +2082,36 @@ def _close_one_wanted(db: Session, group_id: str, year: int, month: int, now_kst
         .execution_options(synchronize_session=False)
     )
     changed = db.execute(stmt).rowcount
+    if changed and notify:
+        enqueue_wanted_close_push(db, group_id, year, month, source="wanted_auto_close")
     db.commit()
     return bool(changed)
 
 
-def _notify_closed_safely(db: Session, group_id: str, year: int, month: int) -> str | None:
-    """마감 알림 1건. 단말까지 가지 않았으면 사유. 예외는 기록하고 다음 행으로 넘어간다.
+def enqueue_wanted_close_push(
+    db: Session, group_id: str, year: int, month: int, *, source: str,
+    sender_emp_seq_no: str | None = None, sender_member_id: str | None = None,
+) -> None:
+    """원티드 마감 알림을 발송 대기열에 넣는다(커밋은 호출부). 발신자를 안 주면 그룹 첫 관리자.
 
-    ★ 마감은 이미 커밋됐다. 발신 관리자 미설정처럼 **조용히 건너뛰던 경우도 사유로** 남긴다.
+    ★ guard `wanted_closed:...` — 발송기가 보내기 직전에 다시 확인해, 그 사이 마감일 연장으로
+      다시 열렸으면 보내지 않는다(이미 열린 원티드에 '마감' 알림이 가지 않게).
+    ★ 발신자를 못 찾아도 넣는다 — 발송기가 failed(필수값 없음)로 남겨 대기열에서 원인이 보인다.
     """
-    try:
-        reason = _notify_wanted_closed(db, group_id, year, month)
-    except Exception:
-        logging.getLogger(__name__).error(
-            "원티드 마감 알림 실패 group=%s %s-%s", group_id, year, month, exc_info=True,
-        )
-        # DB 오류였으면 세션이 무효 트랜잭션에 남아 뒤 병동이 전부 실패한다 — 되돌리고 계속.
-        db.rollback()
-        reason = "발송 오류"
-    if reason:
-        # dev 는 발송이 늘 skipped(운영에서만 실제 발송) — 경고에 섞이지 않게 낮춘다.
-        level = logging.INFO if reason.startswith("skipped") else logging.WARNING
-        logging.getLogger(__name__).log(
-            level, "원티드 마감 알림 미발송 group=%s %s-%s 사유=%s", group_id, year, month, reason,
-        )
-    return reason
-
-
-def _notify_wanted_closed(db: Session, group_id: str, year: int, month: int) -> str | None:
-    """병동 전원에게 마감 푸시. 발신자는 그룹 첫 관리자. 못 보내면 사유를 돌려준다."""
-    # ★ 보내기 직전에 상태를 다시 읽는다. 닫아 커밋한 뒤 수간호사가 마감일을 연장해
-    #   다시 열었으면, 이미 열린 원티드에 '마감' 알림이 뒤늦게 나간다(마감일 변경 알림과 모순).
-    #   컬럼 조회라 세션 캐시가 아닌 DB 값을 본다. 확인~발송 사이 틈은 남는다(재시도 큐 범위).
-    current = db.query(Wanted.status).filter(
-        Wanted.group_id == group_id, Wanted.year == year, Wanted.month == month,
-    ).scalar()
-    if current != "closed":
-        logging.getLogger(__name__).info(
-            "원티드 마감 알림 생략 — 이미 다시 열림 group=%s %s-%s status=%s", group_id, year, month, current,
-        )
-        return None
-    recipients = [
-        n.nurse_id
-        for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()
-    ]
-    if not recipients:
-        return "수신자 없음"
     group = db.query(Group).filter(Group.group_id == group_id).first()
-    office_id = group.office_id if group else None
-    hn_id = (group.hn_id or [])[0] if group and group.hn_id else None
-    if not office_id or not hn_id:
-        return "발신 관리자 미설정"
-    hn = db.query(Nurse).filter(Nurse.nurse_id == hn_id).first()
-    if not hn:
-        return "발신 관리자 계정 없음"
-    result = send_wanted_close_push(
-        year=year,
-        month=month,
-        recipients=recipients,
-        office_code=office_id,
-        sender_emp_seq_no=hn.nurse_id,
-        sender_member_id=hn.account_id,
+    office_id = group.office_id if group else ""
+    if sender_emp_seq_no is None:
+        hn_id = (group.hn_id or [])[0] if group and group.hn_id else None
+        hn = db.query(Nurse).filter(Nurse.nurse_id == hn_id).first() if hn_id else None
+        sender_emp_seq_no = hn.nurse_id if hn else ""
+        sender_member_id = hn.account_id if hn else ""
+    send_wanted_close_push(
+        year=year, month=month,
+        recipients=wanted_push_recipients(db, group_id, year, month),
+        office_code=office_id, sender_emp_seq_no=sender_emp_seq_no,
+        sender_member_id=sender_member_id or "",
+        db=db, guard=f"wanted_closed:{group_id}:{year}:{month}", source=source,
     )
-    return push_not_delivered_reason(result)
 
 
 # WantedConfig 관련 서비스 함수

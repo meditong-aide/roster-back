@@ -249,14 +249,11 @@ def _run_wanted_auto_close():
         result = run_wanted_auto_close(db, office_id=None)
         # ★ 0건이어도 남긴다 — '닫을 게 없었다'와 '안 돌았다'를 로그로 구분하려고.
         _scheduler_logger.info(
-            "[Scheduler] 원티드 자동 마감 끝: 닫음 %d건 (알림 없이 %d건)",
-            result["updated"], len(result["closed_silently"]),
+            "[Scheduler] 원티드 자동 마감 끝: 닫음 %d건 (알림 대기열 %d건 · 알림 없이 %d건)",
+            result["updated"], result["queued"], len(result["closed_silently"]),
         )
         if result["close_failed"]:
             _scheduler_logger.warning("[Scheduler] 원티드 마감 실패(다음 실행에 재시도): %s", result["close_failed"])
-        real_failures = [f for f in result["notify_failed"] if not f["reason"].startswith("skipped")]
-        if real_failures:
-            _scheduler_logger.warning("[Scheduler] 원티드 마감 알림 미발송: %s", real_failures)
     except Exception as e:
         _scheduler_logger.error("[Scheduler] 원티드 자동 마감 실패: %s", e, exc_info=True)
     finally:
@@ -285,6 +282,33 @@ async def _daily_wanted_close_scheduler():
         _scheduler_logger.info("[Scheduler] 원티드 자동 마감 다음 실행: %s", target.isoformat())
         await asyncio.sleep((target - now).total_seconds())
         await asyncio.to_thread(_run_wanted_auto_close)
+
+
+def _run_push_dispatch():
+    """앱 알림 발송 대기열 1회 처리(동기). ★ 동기 DB·그룹웨어 쓰기라 `to_thread` 로 부를 것."""
+    from services.push_outbox_service import dispatch_due
+
+    db = SessionLocal()
+    try:
+        counts = dispatch_due(db)
+        if counts:
+            _scheduler_logger.info("[Scheduler] 알림 발송: %s", counts)
+    except Exception as e:
+        _scheduler_logger.error("[Scheduler] 알림 발송기 오류: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+async def _push_outbox_dispatcher():
+    """앱 알림 발송기 — 10초마다 보낼 차례인 알림을 보낸다(`services.push_outbox_service`).
+
+    ★ 업무 코드는 알림을 대기열에 넣기만 한다(업무 저장과 같은 트랜잭션). 실제 발송·재시도는
+      여기서 한다. 여러 프로세스가 돌아도 행을 `UPDLOCK, READPAST` 로 나눠 잡아 겹치지 않는다.
+    ★ 운영 외 환경(dev·로컬)에선 실제로 보내지 않고 skipped 로 접는다(`push_enabled`).
+    """
+    while True:
+        await asyncio.sleep(10)
+        await asyncio.to_thread(_run_push_dispatch)
 
 
 def _log_task_end(task: asyncio.Task) -> None:
@@ -316,10 +340,13 @@ async def lifespan(app):
     sync_task = asyncio.create_task(_daily_nurse_sync_scheduler())
     janitor_task = asyncio.create_task(_stale_jobs_janitor())
     wanted_close_task = _start_wanted_close_task()
+    push_task = asyncio.create_task(_push_outbox_dispatcher(), name="push_outbox_dispatcher")
+    push_task.add_done_callback(_log_task_end)
     yield
     flush_task.cancel()
     sync_task.cancel()
     janitor_task.cancel()
+    push_task.cancel()
     if wanted_close_task is not None:
         wanted_close_task.cancel()
 
