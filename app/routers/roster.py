@@ -2022,6 +2022,13 @@ def publish_roster(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    # ★ 관리자(수간호사·ADM)만 — `/unpublish` 와 같은 판정. 예전엔 같은 병동 소속이면 일반 간호사도
+    #   마감돼 병동 전원에게 마감 알림이 나갔다(2026-10-02 실측: 일반 간호사 호출 200).
+    if not (
+        caller_is_head_nurse(db, current_user)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
 
     # 그룹은 스케줄 행에서, 권한은 별도 검증(HN 비-home 관리병동 발행 404 방지).
     schedule = _load_schedule_for_caller(
