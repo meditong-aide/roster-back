@@ -999,6 +999,77 @@ def get_prev_month_tail_service(
     }
 
 
+def _attach_issued_teams(db: Session, snapshot: IssuedRosterSnapshot, nurses_json: list, roster: dict) -> tuple[list[dict], str]:
+    """마감본 응답에 팀을 싣는다(① 팀별 보기). 반환 `(팀 목록, 기준)` — 기준 `issued`|`legacy`.
+
+    ★ 팀은 **마감 시점 고정**(2026-10-02 결정). 새 마감본은 마감 때 박은 값(`meta.teams`·행별
+      `team_id`/`team_name`)을 그대로 쓴다 — 마감 뒤 팀을 바꾸거나 팀 이름을 고쳐도 그대로다.
+    ★ 옛 마감본(`meta.teams` 없음)은 마감 당시 팀을 알 수 없다 — 저장된 `team_id` 는 당시
+      `nurses.team_id` 캐시인데, 팀을 구간으로만 관리하는 병동은 캐시가 비어 있었다(실측 dev
+      성남 중환자실-RN 10월 마감본 27명 전원 NULL). 그래서 **조회 때 그 달 팀으로 계산**하되,
+      지금 PC 가 `/teams` 로 보던 것과 **같은 계산**(`resolve_teams_for_month`)을 쓴다 — 결과가
+      지금 화면과 같고 쿼리가 2문이다. 마감 쪽 `month_team_layout` 은 `group_members_in_month` 를
+      타서 간호사별 조회가 붙는다(실측 중환자실-RN 조회당 +32문). 다시 마감하면 고정된다.
+    행별 값은 `nurses`(프로필)와 `roster.nurses`(근무 행) 양쪽에 같은 값으로 싣는다.
+    """
+    from services.team_period import active_team_names, ordered_teams, resolve_teams_for_month
+
+    frozen = (snapshot.meta_json or {}).get("teams")
+    if isinstance(frozen, list):
+        teams = [
+            {"team_id": t.get("team_id"), "team_name": t.get("team_name")}
+            for t in frozen if isinstance(t, dict)
+        ]
+        basis = "issued"
+        team_by_nurse = {
+            str(n.get("nurse_id")): (n.get("team_id"), n.get("team_name"))
+            for n in nurses_json if isinstance(n, dict)
+        }
+    else:
+        # 명단(팀 배치)을 먼저, 팀 목록을 나중에 — `month_team_layout` 과 같은 이유.
+        team_of = resolve_teams_for_month(db, snapshot.group_id, date(snapshot.year, snapshot.month, 1))
+        names = active_team_names(db, snapshot.group_id)
+        teams, basis, team_by_nurse = ordered_teams(names), "legacy", {}
+        for n in nurses_json:
+            if not isinstance(n, dict):
+                continue
+            tid = team_of.get(str(n.get("nurse_id")))
+            tid = tid if tid in names else None          # 활성 팀만(PC `groupIssuedRosterTeams` 와 같음)
+            n["team_id"], n["team_name"] = tid, names.get(tid)
+            team_by_nurse[str(n.get("nurse_id"))] = (tid, names.get(tid))
+    for row in (roster or {}).get("nurses") or []:
+        if isinstance(row, dict):
+            row["team_id"], row["team_name"] = team_by_nurse.get(str(row.get("nurse_id")), (None, None))
+    return teams, basis
+
+
+def attach_team_to_synth_rows(db: Session, snapshot: dict, nurse_ids: set, year: int, month: int) -> None:
+    """마감 **뒤에** 파견이 잡혀 지어낸 행에 팀을 붙인다(마감 때 박은 값이 없으므로).
+
+    그 달 이 병동 팀 구간으로 계산한다. 월초를 덮는 구간이 있으면 **가장 늦게 시작한** 것(근무자관리
+    `as_of_team`·`get_team_period_on` 과 같은 선택), 없으면 그 달에 겹치는 구간(월중 합류).
+    ★ 월초 하루만 보면 월중에 파견 와서 그날부터 팀 구간이 시작된 사람을 놓친다 — 이 행이 바로
+      그런 사람이다(Codex 2026-10-02).
+    ★ `resolve_team_for_roster` 를 바로 쓰지 않는다 — 월초를 덮는 구간이 둘 이상 겹쳐 있으면
+      **가장 먼저 시작한** 것을 골라 화면과 다른 팀이 나온다(실측 운영 성남 61병동-RN 9/1·10/1 열린 구간
+      겹침 20쌍 · 팀이 다른 2명).
+    응답 팀 목록(`teams`)에 없는 팀이면 미등록(None).
+    """
+    from services.team_period import _coerce_team_int, get_team_period_on, resolve_team_for_roster
+
+    gid = snapshot.get("group_id")
+    names = {t.get("team_id"): t.get("team_name") for t in snapshot.get("teams") or [] if isinstance(t, dict)}
+    month_start = date(year, month, 1)
+    for row in (snapshot.get("roster") or {}).get("nurses") or []:
+        nid = str(row.get("nurse_id", ""))
+        if nid not in nurse_ids or not gid:
+            continue
+        covering = get_team_period_on(db, nid, gid, month_start)
+        tid = (_coerce_team_int(covering.team_id) if covering is not None
+               else resolve_team_for_roster(db, nid, gid, year, month))
+        row["team_id"], row["team_name"] = (tid, names[tid]) if tid in names else (None, None)
+
+
 def get_issued_roster_snapshot_service(
     year: int,
     month: int,
@@ -1006,6 +1077,7 @@ def get_issued_roster_snapshot_service(
     db: Session,
     target_group_id: str | None = None,
     _expand_target_rosters: bool = True,
+    with_teams: bool = False,
 ) -> dict | None:
     """
     특정 연월에 대해 활성 발행본(is_active_issued=True)의 근무표 스냅샷을 조회합니다.
@@ -1013,6 +1085,9 @@ def get_issued_roster_snapshot_service(
     관리자(ADM)는 `target_group_id`로 대상 그룹을 지정할 수 있습니다.
     `_expand_target_rosters=True`일 때 응답의 `target_rosters` 필드에 변경(파견/병동이동)
     병동의 동월 발행 스냅샷 body 를 동봉합니다 (재귀 차단을 위해 내부 호출은 False).
+    `with_teams=True` 면 팀별 보기 데이터(`teams`·`team_basis`·행별 팀)를 싣는다(`_attach_issued_teams`).
+    ★ 기본은 끈다 — 옛 마감본은 그 달 팀을 조회 때 계산(쿼리 10여 개)하므로, 팀을 안 쓰는
+      개인표·주간·오늘·대상 병동 로딩까지 그 비용을 물게 하지 않는다(Codex 2026-10-02).
     """
     if not current_user:
         raise Exception("Not authenticated")
@@ -1206,6 +1281,14 @@ def get_issued_roster_snapshot_service(
                 "roster": _t_snap.get("roster") or {},
             }
 
+    _roster_json = matched_snapshot.roster_json or {}
+    _team_out: dict = {}
+    if with_teams:
+        _teams, _team_basis = _attach_issued_teams(db, matched_snapshot, _nurses_json, _roster_json)
+        # 팀별 보기: 팀 목록(팀명순 · 미등록은 화면이 맨 뒤에 붙인다) + 행별 team_id/team_name.
+        #   team_basis: issued=마감 때 박은 값 · legacy=옛 마감본이라 조회 때 그 달 팀으로 계산
+        _team_out = {"teams": _teams, "team_basis": _team_basis}
+
     return {
         "snapshot_id": matched_snapshot.snapshot_id,
         "office_id": matched_snapshot.office_id,
@@ -1220,11 +1303,12 @@ def get_issued_roster_snapshot_service(
         "nurses": _nurses_json,
         "shifts": matched_snapshot.shifts_json or [],
         "shift_manage": matched_snapshot.shift_manage_json or [],
-        "roster": matched_snapshot.roster_json or {},
+        "roster": _roster_json,
         "violations": matched_snapshot.violations_json
         or {"messages": [], "details": []},
         "groups": groups_out,
         "target_rosters": target_rosters,
+        **_team_out,
     }
 
 
@@ -2911,6 +2995,19 @@ def create_issued_roster_snapshot(
     if group_id and group_id not in _nurse_group_name_map:
         _nurse_group_name_map[group_id] = _main_group_name
 
+    # ★ 팀은 **마감 시점 고정**(2026-10-02 결정) — 그 달 팀(근무자관리 화면 기준)을 지금 박아 둔다.
+    #   예전엔 `nurses.team_id`(현재값 캐시)를 그대로 넣어 그 달 팀과 어긋날 수 있었고 이름도 없었다.
+    #   조회(`_attach_issued_teams`)는 이 값을 그대로 쓰므로 마감 뒤 팀을 바꿔도 마감본은 그대로다.
+    from services.team_period import month_team_layout
+
+    _team_of, _teams = month_team_layout(db, group_id, schedule.year, schedule.month)
+    _team_names = {t["team_id"]: t["team_name"] for t in _teams}
+    meta_json["teams"] = _teams
+
+    def _team_fields(nurse_id) -> dict:
+        tid = _team_of.get(str(nurse_id))
+        return {"team_id": tid, "team_name": _team_names.get(tid)}
+
     nurses_json = []
     for n in nurses:
         _block = _inbound_blocks.get(n.nurse_id)
@@ -2939,7 +3036,7 @@ def create_issued_roster_snapshot(
                 else None,
                 "sequence": n.sequence,
                 "active": n.active,
-                "team_id": n.team_id,
+                **_team_fields(n.nurse_id),
                 "is_inbound": n.group_id != group_id,
                 "inbound": list(_block.get("inbound_list", [])) if _block else [],
             }
@@ -3018,6 +3115,7 @@ def create_issued_roster_snapshot(
                 "nurse_id": n.nurse_id,
                 "name": n.name,
                 "experience": n.experience,
+                **_team_fields(n.nurse_id),
                 "schedule": schedule_list,
                 "schedule_ids": schedule_ids,
                 "counts": counts,

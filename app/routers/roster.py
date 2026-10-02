@@ -93,6 +93,7 @@ from services.roster_service import (
     get_latest_schedule_service,
     get_issued_schedules_service,
     get_schedule_status_service,
+    attach_team_to_synth_rows,
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
     get_my_issued_roster_service,
@@ -737,6 +738,8 @@ def get_issued_roster_snapshot(
             #   ※ 발행 뒤 파견으로 행을 지어내면 읽는 병동 수가 늘 수 있어, 이 절감이
             #     그 증가분을 상쇄한다.
             _expand_target_rosters=False,
+            # 팀별 보기(성남 ① · PC·모바일 공용) — 이 EP 만 싣는다.
+            with_teams=True,
         )
         # ★ 발행본이 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 의 404 를
         #   `index.html` **200(text/html)** 으로 바꿔 보내고, 그 HTML 을 **URL 단위로
@@ -902,6 +905,8 @@ def get_issued_roster_snapshot(
                         "counts": {},
                     })
                     _synth_nids.add(_mnid)
+                if _synth_nids:
+                    attach_team_to_synth_rows(db, snapshot, _synth_nids, year, month)
 
             for _nurse in (_roster.get("nurses") or []):
                 _nid = str(_nurse.get("nurse_id", ""))
