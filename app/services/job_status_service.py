@@ -16,6 +16,14 @@ STATUS_SUCCESS = "SUCCESS"
 STATUS_FAILED = "FAILED"
 
 
+class JobNotFoundError(ValueError):
+    """job 행이 없음. ``ValueError`` 를 이어받아 기존 처리(``except ValueError``)는 그대로 둔다.
+
+    워커가 "FAILED 를 기록할 행 자체가 없는 경우"를 다른 기록 실패와 구별하는 데 쓴다 —
+    행이 없으면 RUNNING 으로 남을 것도 없으므로 재시도하지 않고 끝내도 된다.
+    """
+
+
 def create_job_record(
     db: Session,
     job_id: str,
@@ -79,7 +87,7 @@ def update_job_record(
     """
     job = db.query(RosterJob).filter(RosterJob.job_id == job_id).first()
     if not job:
-        raise ValueError(f"job_id를 찾을 수 없습니다: {job_id}")
+        raise JobNotFoundError(f"job_id를 찾을 수 없습니다: {job_id}")
 
     if status is not None:
         job.status = status

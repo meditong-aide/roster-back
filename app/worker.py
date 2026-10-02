@@ -246,6 +246,7 @@ def process_job(payload: dict) -> dict:
         STATUS_FAILED,
         STATUS_RUNNING,
         STATUS_SUCCESS,
+        JobNotFoundError,
         update_job_record,
     )
 
@@ -457,9 +458,11 @@ def process_job(payload: dict) -> dict:
         # 일시 장애가 아니면(결정론적 infeasibility·입력/설정 오류 등) 재시도 무의미 →
         # ack(정상 반환)로 SQS 메시지 삭제. DB 에는 이미 STATUS_FAILED(+narrative)가
         # 기록되어 프론트 조회에는 영향이 없다. 판정 기준은 ``_is_transient`` 참조.
-        # ★FAILED 기록 실패가 **일시 장애가 아니면**(job 행이 없음 등) 재시도해도 또 실패한다 —
-        #   RUNNING 으로 남을 행 자체가 없거나 다시 써도 같으므로 ack 한다(재시도 3회→DLQ 방지).
-        _can_ack = _recorded or (_record_err is not None and not _is_transient(_record_err))
+        # ★FAILED 를 못 남겼으면 ack 하지 않는다 — 행이 있는데 못 썼으면(스키마·권한·직렬화 오류 등)
+        #   ack 하는 순간 RUNNING 으로 영영 남는다. 예외는 **job 행 자체가 없을 때**(JobNotFoundError)
+        #   뿐이다 — RUNNING 으로 남을 행이 없고 몇 번을 돌려도 같으므로 끝낸다(재시도 3회→DLQ 방지).
+        _job_missing = isinstance(_record_err, JobNotFoundError)
+        _can_ack = _recorded or _job_missing
         # 끝내는 것은 **입력·설정 오류**뿐이다(``_is_input_failure``). 코드 버그는 일시 장애가
         # 아니어도 끝내지 않고 올려 Lambda 오류 알람이 세게 한다.
         if _can_ack and (is_deterministic_infeasible
