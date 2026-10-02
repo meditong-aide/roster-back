@@ -87,7 +87,14 @@ async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Opti
     text = (getattr(req, "request", None) or "").strip()
     if not text:
         return
-    group_id = req.group_id or getattr(current_user, "group_id", None)
+    # ★★분석 대상 그룹은 **본인 소속(home) 그룹**만. 분석은 그 그룹 간호사 이름 전체를 외부 LLM
+    #   으로 보내므로, 클라이언트가 준 group_id 를 그대로 쓰면 다른 병동·병원 간호사 실명이
+    #   새어 나간다(저장 단계의 403 은 분석이 끝난 **뒤**라 막지 못한다). 원티드는 본인 것이라
+    #   저장도 언제나 home 그룹에 된다(``_resolve_write_group_id`` · 기존 data 경로의 ``home_gid``).
+    #   그래서 req.group_id 는 분석에 쓰지 않는다 — 근무코드·기본 근무형도 저장과 같은 소속 병동
+    #   기준으로 해석된다. (req.group_id 가 home 과 다르면 분석 결과가 붙는 순간 신규 저장 경로가
+    #   403 을 낸다 — 이번 변경 전부터 있던 동작으로 별건.)
+    group_id = resolve_home_group_id(db, current_user)
     if not group_id:
         return
     try:
