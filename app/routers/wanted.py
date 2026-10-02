@@ -1,3 +1,4 @@
+import logging
 from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -539,65 +540,149 @@ def parse_preferences(
 
 # [Wanted] - 만료된 Wanted 자동 마감 처리
 @router.post("/close-expired")
-def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, Any]:
+def close_expired_wanted_endpoint(
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
     """
     현재 KST 기준으로 exp_date가 지난 Wanted 요청의 status를 'closed'로 일괄 변경하는 엔드포인트입니다.
+
+    ★ 관리자(ADM)만, 그리고 **호출자 병원(office) 안의 원티드만** 닫는다.
+      예전엔 인증 없이 누구나 전 병원 원티드 마감과 마감 푸시를 일으킬 수 있었다.
+      ADM 은 병원 단위 권한이라(resolve_managed_group_ids 가 같은 office 로 제한)
+      다른 병원 원티드를 닫으면 테넌트 침범이다.
+      운영 호출 이력(2026-07~10 Athena)에 정상 호출은 0건이고 외부 스캐너의
+      GET 탐색(405)만 있다 — 이 EP 를 부르는 크론은 없다.
     """
+    if not current_user.is_master_admin:
+        raise HTTPException(status_code=403, detail="관리자만 사용할 수 있습니다.")
+    if not current_user.office_id:
+        raise HTTPException(status_code=403, detail="병원 정보를 확인할 수 없습니다.")
     utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
     now_kst = (utc_now + timedelta(hours=9)).replace(tzinfo=None)
 
-    query = (
-        db.query(Wanted)
-        .filter(
-            Wanted.status == "requested",
-            Wanted.exp_date.isnot(None),
-            Wanted.exp_date < now_kst,
-        )
-    )
-
-    updated_count = 0
-    closed_wanteds = []
     try:
-        for wanted in query:
-            wanted.status = "closed"
-            closed_wanteds.append(wanted)
-            updated_count += 1
-
-        if updated_count > 0:
+        closed_keys = _close_expired_in_office(db, current_user.office_id, now_kst)
+        if closed_keys:
             db.commit()
             print(
-                f"Wanted 수동 마감 완료(KST 기준): {updated_count}건, now_kst={now_kst.isoformat()}"
+                f"Wanted 수동 마감 완료(KST 기준): {len(closed_keys)}건, now_kst={now_kst.isoformat()}"
             )
-        else:
-            db.flush()
     except Exception as exc:
         db.rollback()
         print(f"Wanted 수동 마감 중 오류: {exc}")
         raise
 
-    for wanted in closed_wanteds:
-        nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == wanted.group_id).all()
-        recipients = [nurse.nurse_id for nurse in nurses_in_group]
-        if not recipients:
-            continue
-        group = db.query(Group).filter(Group.group_id == wanted.group_id).first()
-        office_id = group.office_id if group else None
-        hn_id = (group.hn_id or [])[0] if group and group.hn_id else None
-        if not office_id or not hn_id:
-            continue
-        hn = db.query(Nurse).filter(Nurse.nurse_id == hn_id).first()
-        if not hn:
-            continue
-        send_wanted_close_push(
-            year=wanted.year,
-            month=wanted.month,
-            recipients=recipients,
-            office_code=office_id,
-            sender_emp_seq_no=hn.nurse_id,
-            sender_member_id=hn.account_id,
-        )
+    return {
+        "now_kst": now_kst.isoformat(),
+        "updated": len(closed_keys),
+        "notify_failed": _notify_closed_wanteds(db, closed_keys),
+    }
 
-    return {"now_kst": now_kst.isoformat(), "updated": updated_count}
+
+def _close_expired_in_office(
+    db: Session, office_id: str, now_kst: datetime
+) -> list[tuple]:
+    """호출자 병원의 만료 원티드를 닫고, **이번 호출이 직접 닫은** 키만 돌려준다.
+
+    ★ 행마다 조건부 UPDATE 다 — 만료 조건(`status='requested'`·`exp_date < now`)을
+      UPDATE 에서 **다시** 건다. 동시에 두 요청이 같은 행을 읽어도 먼저 갱신한 쪽만
+      rowcount 1 을 받고 뒤 요청은 0 을 받는다(같은 마감 알림이 두 번 가지 않는다).
+      후보 조회 뒤 수간호사가 마감일을 연장했다면 UPDATE 가 0 을 받아 닫지 않는다.
+    """
+    office_group_ids = db.query(Group.group_id).filter(Group.office_id == office_id)
+    expired = (
+        Wanted.status == "requested",
+        Wanted.exp_date.isnot(None),
+        Wanted.exp_date < now_kst,
+    )
+    candidates = (
+        db.query(Wanted.group_id, Wanted.year, Wanted.month)
+        .filter(Wanted.group_id.in_(office_group_ids), *expired)
+        .all()
+    )
+    closed = []
+    for gid, year, month in candidates:
+        changed = (
+            db.query(Wanted)
+            .filter(
+                Wanted.group_id == gid, Wanted.year == year, Wanted.month == month,
+                *expired,
+            )
+            .update({Wanted.status: "closed"}, synchronize_session=False)
+        )
+        if changed:
+            closed.append((gid, year, month))
+    return closed
+
+
+def _notify_closed_wanteds(db: Session, closed_keys: list[tuple]) -> list[dict]:
+    """닫은 원티드마다 마감 알림. 푸시가 단말까지 가지 않은 병동은 사유와 함께 돌려준다.
+
+    ★ 마감은 이미 커밋됐다. 한 병동이 실패해도 나머지는 계속 보낸다(예전엔 첫
+      실패에서 500 으로 끊겨 뒤 병동은 알림 없이 마감만 됐고, 재호출해도 이미
+      closed 라 못 잡았다). 발신 관리자 미설정처럼 **조용히 건너뛰던 경우도 실패로**
+      남긴다.
+    """
+    failed = []
+    for gid, year, month in closed_keys:
+        try:
+            reason = _notify_wanted_closed(db, gid, year, month)
+        except Exception:
+            logging.getLogger(__name__).error(
+                "원티드 마감 알림 실패 group=%s %s-%s", gid, year, month, exc_info=True,
+            )
+            reason = "발송 오류"
+        if reason:
+            logging.getLogger(__name__).warning(
+                "원티드 마감 알림 미발송 group=%s %s-%s 사유=%s", gid, year, month, reason,
+            )
+            failed.append({"group_id": gid, "year": year, "month": month, "reason": reason})
+    return failed
+
+
+def _notify_wanted_closed(db: Session, group_id: str, year: int, month: int) -> str | None:
+    """병동 전원에게 마감 푸시. 발신자는 그룹 첫 관리자. 못 보내면 사유를 돌려준다."""
+    recipients = [
+        n.nurse_id
+        for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()
+    ]
+    if not recipients:
+        return "수신자 없음"
+    group = db.query(Group).filter(Group.group_id == group_id).first()
+    office_id = group.office_id if group else None
+    hn_id = (group.hn_id or [])[0] if group and group.hn_id else None
+    if not office_id or not hn_id:
+        return "발신 관리자 미설정"
+    hn = db.query(Nurse).filter(Nurse.nurse_id == hn_id).first()
+    if not hn:
+        return "발신 관리자 계정 없음"
+    result = send_wanted_close_push(
+        year=year,
+        month=month,
+        recipients=recipients,
+        office_code=office_id,
+        sender_emp_seq_no=hn.nurse_id,
+        sender_member_id=hn.account_id,
+    )
+    return _push_not_delivered_reason(result)
+
+
+def _push_not_delivered_reason(result: dict | None) -> str | None:
+    """`set_app_push` 결과 → 단말 발송까지 갔으면 None, 아니면 사유.
+
+    ★ 발송 함수는 실패를 예외로 던지지 않고 결과로 돌려준다(fail·skipped).
+      `success` 도 두 가지다 — "push 발송 완료"(단말 큐 적재)와
+      "푸시 발송 대상이 없습니다."(알림함에만 기록, 받을 기기 0). 뒤의 것도
+      휴대폰에는 안 갔으므로 사유로 남긴다.
+    """
+    status = (result or {}).get("result")
+    message = (result or {}).get("message") or ""
+    if status == "success" and message == "push 발송 완료":
+        return None
+    if status == "success":
+        return f"받을 기기 없음({message})"
+    return f"{status or '결과 없음'}: {message}"
 
 
 # WantedConfig 관련 엔드포인트

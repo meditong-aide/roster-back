@@ -6,12 +6,18 @@
 import calendar
 import json
 import pprint
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import String, and_, cast, extract, inspect as sa_inspect, or_
 from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift, WantedConfig, Wanted, WantedMonthlyMemo
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
-from services.group_access import resolve_home_group_id
+from services.group_access import (
+    caller_is_manager,
+    resolve_effective_group,
+    resolve_home_group_id,
+    resolve_managed_group_ids,
+)
 from datetime import datetime, timezone, timedelta, date
 
 
@@ -1355,6 +1361,51 @@ def get_latest_preference_service(
         ),
     }
 
+def _resolve_all_preferences_scope(
+    db: Session, current_user: UserSchema, year: int, month: int,
+    override_group_id: str | None,
+) -> tuple[str | None, bool]:
+    """`/preferences/all` 대상 그룹과 전체 필드 노출 여부.
+
+    ★ 예전엔 요청 group_id 를 검증 없이 썼다 — 로그인만 하면 group_id 를 바꿔
+      다른 병동·다른 병원의 원티드 사유·짝꿍까지 받을 수 있었다.
+      판정은 `/wanted/{y}/{m}/shift-requests` 와 같은 단일 해석점을 쓴다.
+      파견 들어온 간호사는 그 달 파견 병동도 허용(issued_roster 와 동일).
+    ★ ADM 이 group_id 없이 부르면 None → 토큰 home 으로 폴백(기존 동작 유지).
+    """
+    target = resolve_effective_group(
+        db, current_user, override_group_id,
+        require_group=False,
+        allow_assignment_target=True,
+        assignment_window=(year, month),
+    ) or resolve_home_group_id(db, current_user)
+    if bool(getattr(current_user, "is_master_admin", False)):
+        return target, True
+    managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+    full = str(target) in managed and caller_is_manager(db, current_user)
+    return target, full
+
+
+def _staff_visible_preference(data_json: dict) -> dict:
+    """관리자가 아닌 직원용 — 날짜·근무코드만 남긴다.
+
+    PC·모바일 원티드 화면은 이 응답에서 `shift` 의 코드·날짜 키만 읽는다
+    (날짜별 신청 수 집계). 사유(comment)·자유기술(request)·짝꿍(preference)은
+    본인 것은 `/preferences/latest` 로, 병동 전체는 수간호사 화면에서만 본다.
+    키는 남겨 둔다 — 모바일 zod 스키마가 `request`·`preference` 를 필수로 검사한다.
+    날짜 값은 빈 객체다(점수·사유·`shifts_table_id` 없음) — 모바일 zod 의 날짜 값
+    객체는 필드가 전부 optional 이라 `{}` 도 통과한다.
+    """
+    return {
+        "request": None,
+        "shift": {
+            code: {day: {} for day in days}
+            for code, days in data_json["shift"].items()
+        },
+        "preference": [],
+    }
+
+
 def get_all_preferences_service(year: int, month: int, current_user, db: Session, override_group_id: str | None = None):
     """
     모든 간호사의 최신 선호도 데이터 조회 서비스 함수 (새 구조 기반)
@@ -1362,16 +1413,17 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
     - Output은 기존 ShiftPreference.data 구조와 동일하게 유지
 
     관리자(ADM)는 `override_group_id`로 대상 그룹을 지정할 수 있습니다.
+    대상 병동 관리자(ADM·수간호사·그룹관리자)가 아니면 날짜·근무코드만 돌려준다.
     """
     if not current_user:
-        raise Exception("Not authenticated")
+        raise HTTPException(status_code=401, detail="Not authenticated")
     month_str = f"{year}-{month:02d}"
 
-    # override_group_id 미지정 시 호출자 home group. (과거 정의되지 않은 home_gid 를
-    # 참조해 group_id 없이 호출하면 NameError → 500 이었다.)
-    target_group_id = override_group_id or resolve_home_group_id(db, current_user)
+    target_group_id, full_access = _resolve_all_preferences_scope(
+        db, current_user, year, month, override_group_id,
+    )
     if not target_group_id:
-        raise Exception("대상 그룹이 없습니다.")
+        raise HTTPException(status_code=400, detail="대상 그룹이 없습니다.")
     # ✅ 1️⃣ 그룹 내 간호사 목록 가져오기
     nurse_ids = [
         n.nurse_id
@@ -1380,9 +1432,12 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
         .all()
     ]
     # ✅ 2️⃣ 각 간호사별 최신 요청(WantedRequest) 찾기
+    #   ★ 이 병동에 낸 요청만 — 병동이동·파견으로 같은 달에 다른 병동 제출본이 생기면
+    #     그 사유·짝꿍이 이 병동 화면에 섞인다(`_submitted_nurse_ids` 와 같은 규칙).
     wanted_requests = (
         db.query(WantedRequest)
         .filter(
+            WantedRequest.group_id == target_group_id,
             WantedRequest.nurse_id.in_(nurse_ids),
             WantedRequest.month == month_str,
             WantedRequest.is_submitted == True,
@@ -1459,6 +1514,8 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             "shift": {k: v for k, v in shift_data.items() if v},
             "preference": pair_data,
         }
+        if not full_access:
+            data_json = _staff_visible_preference(data_json)
         results.append({
             "nurse_id": nurse_id,
             "year": year,

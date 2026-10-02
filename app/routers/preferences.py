@@ -1,6 +1,6 @@
 from schemas.roster_schema import PreferenceData, PreferenceSubmit, WantedEntryItem
 from services.wanted_service import WantedAnalysisError, analyze_wanted_text
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from services.group_access import (
     resolve_home_group_id,
     caller_is_head_nurse,
@@ -264,7 +264,7 @@ def get_all_preferences(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:

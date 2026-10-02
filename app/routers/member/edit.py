@@ -112,12 +112,26 @@ async def update_member_info(current_user: UserSchema = Depends(get_current_user
     else:
         return HTTPException(status_code=400, detail=f"Internal Server Error")
 
+def _require_adm(current_user: UserSchema) -> None:
+    """테스트 발송 EP 는 관리자(ADM)만.
+
+    ★ 예전엔 인증 의존성이 없어 로그인 없이도 누구나 실제 메일·푸시·문자 발송을
+      일으킬 수 있었다(수신자는 하드코딩된 사내 계정·번호). 문자는 건당 과금된다.
+    """
+    if not current_user.is_master_admin:
+        raise HTTPException(status_code=403, detail="관리자만 사용할 수 있습니다.")
+
+
 # Email 발송 테스트
 @router.post("/send-email-background", status_code=202)
-async def send_email_as_background(background_tasks: BackgroundTasks):
+async def send_email_as_background(
+        background_tasks: BackgroundTasks,
+        current_user: UserSchema = Depends(require_current_user),
+):
     """
     EmailSender 인스턴스의 send_in_background 메서드를 사용하여 메일 발송.
     """
+    _require_adm(current_user)
     body_data = {
         "name": "홍길동",
         "message": "메일 테스트 성공"
@@ -154,8 +168,11 @@ async def send_email_as_background(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Error processing email request: {e}")
 
 # 링크 메세지 테스트
+#   ★ 아래 세 EP 는 `def` 다 — 발송 함수가 동기 DB·HTTP 를 쓰므로 `async def` 면
+#     발송 동안 이벤트 루프가 멈춰 서버 전체가 응답하지 않는다.
 @router.post("/send-mlink-message", status_code=202)
-async def send_mlink_message():
+def send_mlink_message(current_user: UserSchema = Depends(require_current_user)):
+    _require_adm(current_user)
     empseqno = '430461'
     officecode = '100723'
     str_to_arr = '430461' # ,로 구분해서 전송
@@ -168,7 +185,8 @@ async def send_mlink_message():
 
 # 푸시 메세지 테스트
 @router.post("/send-push-message", status_code=202)
-async def send_push_message():
+def send_push_message(current_user: UserSchema = Depends(require_current_user)):
+    _require_adm(current_user)
     empseqno = '430461'
     officecode = '100723'
     str_to_arr = '430461' # ,로 구분해서 전송
@@ -190,7 +208,8 @@ async def send_push_message():
 
 # SMS 메세지 테스트
 @router.post("/send-sms-message", status_code=202)
-async def send_sms_message():
+def send_sms_message(current_user: UserSchema = Depends(require_current_user)):
+    _require_adm(current_user)
     sendPhoneNumber = "0269593214"
     userPhoneNumber = "01062496700"
     smsMessage = 'SMS 발송 테스트'
