@@ -230,12 +230,54 @@ def month_team_layout(
     #   (드물게 미등록)으로 마감에 박힌다 — 다시 마감하면 고쳐진다. 마감 스냅샷의 다른 부분(명단·근무
     #   행·시프트)도 같은 구조이고, 팀을 바꾸는 경로가 여럿이라 병동 잠금·격리 수준 변경은 하지 않았다.
     members = group_members_in_month(db, group_id, year, month)["members"]
+    return team_layout_from_members(db, group_id, members, year, month)
+
+
+def team_layout_from_members(
+    db: Session, group_id: str, members: list[dict], year: int, month: int,
+) -> tuple[dict[str, int | None], list[dict]]:
+    """이미 읽은 `group_members_in_month` 명단으로 팀 배치를 만든다(명단을 또 읽지 않게).
+
+    ★ 팀 목록은 명단을 **읽은 뒤에** 읽어야 한다(`month_team_layout` 주석) — 호출자가 명단을 먼저 넘긴다.
+    ★ 월초를 덮는 구간이 **없는** 사람은 그 달 안에서 시작하는 첫 구간의 팀을 쓴다(월중 합류 — 예:
+      9/15 병동이동). 생성기(`resolve_team_for_roster`)와 같은 규칙이라, 그 팀으로 만든 근무표가 그
+      팀으로 보인다. 예전엔 `as_of_team`(월초만)만 봐서 미등록으로 고정됐다(OMC 리뷰 2026-10-02).
+      월초를 덮는 구간이 있는데 팀이 비어 있으면(명시적 미배정) 그대로 둔다.
+    """
+    team_of: dict[str, int | None] = {
+        str(m["nurse_id"]): _coerce_team_int(m.get("as_of_team")) for m in members
+    }
+    # ★ 명단 **전원**에 대해 본다 — `as_of_team` 이 None 인 사람만 보면, 월초 구간이 없어 캐시
+    #   (`nurses.team_id`)가 채워진 소속 간호사의 월중 구간을 놓쳐 생성기와 갈린다(OMC 재리뷰 2026-10-02).
+    #   `_mid_month_teams` 는 월초를 덮는 구간이 있는 사람을 빼므로 명시적 미배정은 그대로다.
+    if team_of:
+        team_of.update(_mid_month_teams(db, group_id, list(team_of), year, month))
     names = active_team_names(db, group_id)
-    team_of: dict[str, int | None] = {}
-    for m in members:
-        tid = _coerce_team_int(m.get("as_of_team"))
-        team_of[str(m["nurse_id"])] = tid if tid in names else None
-    return team_of, ordered_teams(names)
+    return {nid: (tid if tid in names else None) for nid, tid in team_of.items()}, ordered_teams(names)
+
+
+def _mid_month_teams(db: Session, group_id: str, nurse_ids: list[str], year: int, month: int) -> dict[str, int | None]:
+    """월초를 덮는 구간이 없는 사람의 '그 달 첫 구간' 팀(1쿼리). 덮는 구간이 있으면 담지 않는다."""
+    m_start = date(year, month, 1)
+    m_end = date(year, month, monthrange(year, month)[1])
+    rows = (
+        db.query(NurseTeamPeriod.nurse_id, NurseTeamPeriod.valid_from, NurseTeamPeriod.valid_to, NurseTeamPeriod.team_id)
+        .filter(
+            NurseTeamPeriod.group_id == group_id,
+            NurseTeamPeriod.nurse_id.in_(nurse_ids),
+            NurseTeamPeriod.valid_from <= m_end,
+            or_(NurseTeamPeriod.valid_to.is_(None), NurseTeamPeriod.valid_to > m_start),
+        )
+        .order_by(NurseTeamPeriod.valid_from.asc())
+        .all()
+    )
+    covered = {str(r.nurse_id) for r in rows if r.valid_from <= m_start}
+    out: dict[str, int | None] = {}
+    for r in rows:
+        nid = str(r.nurse_id)
+        if nid not in covered and nid not in out:
+            out[nid] = _coerce_team_int(r.team_id)
+    return out
 
 
 def set_team_period(

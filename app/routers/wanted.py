@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.encoders import jsonable_encoder
@@ -57,6 +57,7 @@ from services.wanted_service import (
     reset_fixed_wanted_service,
     set_adjustment_applied_service,
     get_shift_requests_service,
+    get_wanted_overview_service,
     update_wanted_deadline_service,
     run_wanted_auto_close,
     enqueue_wanted_close_push,
@@ -1057,6 +1058,23 @@ def get_fixed_wanted(
 
 
 # [Wanted] - 전체 원티드 제출 현황 + shift 내역 일괄 조회
+@router.get("/{year:int}/{month:int}/overview")
+def get_wanted_overview(
+    year: int = Path(..., ge=2000, le=2100),
+    month: int = Path(..., ge=1, le=12),     # 범위 밖이면 date() 가 ValueError → 500 이었다
+    group_id: str | None = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """원티드 전체보기 — 같은 병동 근무자 전체의 신청 날짜·근무코드 + 그 달 팀(성남 ⑥).
+
+    같은 병동(그 달 파견 간 병동 포함)이면 일반 간호사도 본다. 사유·점수·짝꿍·상태 배지는 없다.
+    응답: `{group_id, year, month, teams:[{team_id, team_name}], nurses:[{nurse_id, name,
+    team_id, team_name, is_submitted, shifts:[{shift_date, shift}]}]}`.
+    """
+    return get_wanted_overview_service(db, current_user, year, month, group_id)
+
+
 @router.get("/{year:int}/{month:int}/shift-requests")
 def get_all_shift_requests(
     year: int,

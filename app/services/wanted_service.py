@@ -4350,6 +4350,7 @@ def get_shift_requests_service(
     year: int,
     month: int,
     shift_type: Optional[str] = None,
+    include_assignments: bool = True,
 ) -> List[Dict[str, Any]]:
     """해당 년/월 caller(target_group_id) 관할 간호사의 원티드 제출 여부 + shift 내역.
 
@@ -4357,6 +4358,8 @@ def get_shift_requests_service(
     - source 간호사(home == target_group_id): outbound 파견 기간 일자는 제외.
     - inbound 간호사(다른 병동 소속이나 target_group_id 로 파견): inbound 파견
       기간 일자만 포함.
+    `include_assignments=False` 면 파견 상세(`assignments` — 대상 병동 근무표 본문까지 읽는다)를
+    만들지 않는다(빈 목록). 원티드 전체보기(`get_wanted_overview_service`)는 코드만 쓴다.
     """
     # 1. source 간호사 (home == target_group_id)
     source_ids: List[str] = [
@@ -4486,6 +4489,10 @@ def get_shift_requests_service(
         allowed_dates[nid] = _valid
 
     # 6. 제출 현황 일괄 조회 (is_submitted=True인 최신 request_id만)
+    #   ★ 간호사별 **최신 제출 1건**만 쓴다(`submitted_at` 늦은 것 · 같으면 request_id 큰 것) —
+    #     간호사 본인 화면(`_latest_submitted_request`)과 같은 선택. 예전엔 제출된 요청을 전부 OR 로
+    #     합쳐, 제출이 둘 남은 사람은 재제출 때 지운 날짜가 남고 같은 날짜에 코드가 둘 붙었다
+    #     (실측 운영 1건 · 2026-04). 원티드 전체보기로 병동 전원이 보게 되어 함께 고쳤다(2026-10-02).
     submitted_requests = (
         db.query(WantedRequest)
         .filter(
@@ -4493,13 +4500,16 @@ def get_shift_requests_service(
             WantedRequest.month == month_str,
             WantedRequest.is_submitted == True,
         )
+        .order_by(WantedRequest.submitted_at.desc(), WantedRequest.request_id.desc())
         .all()
     )
-    submitted_map = {wr.nurse_id: wr for wr in submitted_requests}
+    submitted_map: dict[str, WantedRequest] = {}
+    for wr in submitted_requests:
+        submitted_map.setdefault(wr.nurse_id, wr)
 
     # 7. 제출된 간호사의 (nurse_id, request_id) 쌍으로 shift 필터
     submitted_pairs = [
-        (wr.nurse_id, wr.request_id) for wr in submitted_requests
+        (wr.nurse_id, wr.request_id) for wr in submitted_map.values()
     ]
 
     shift_map: Dict[str, list] = {}
@@ -4540,14 +4550,14 @@ def get_shift_requests_service(
         wr = submitted_map.get(nurse_id)
         # 파견 메타데이터 (adjustment 과 동일 스키마)
         assignments_payload: List[Dict[str, Any]] = []
-        for _asg in inbound_map.get(nurse_id, []):
+        for _asg in (inbound_map.get(nurse_id, []) if include_assignments else []):
             _w = _build_assignment_window(
                 _asg, "inbound", first_day, month_last, group_name_map,
                 nurse_id=nurse_id, body_loader=body_loader,
             )
             if _w is not None:
                 assignments_payload.append(_w.model_dump(mode="json"))
-        for _asg in outbound_map.get(nurse_id, []):
+        for _asg in (outbound_map.get(nurse_id, []) if include_assignments else []):
             _w = _build_assignment_window(
                 _asg, "outbound", first_day, month_last, group_name_map,
                 nurse_id=nurse_id, body_loader=body_loader,
@@ -4563,6 +4573,56 @@ def get_shift_requests_service(
         })
 
     return results
+
+
+def get_wanted_overview_service(
+    db: Session, current_user: UserSchema, year: int, month: int, override_group_id: str | None = None,
+) -> dict:
+    """원티드 전체보기(성남 요청 ⑥) — 같은 병동 근무자 전체의 신청 날짜·근무코드 + 그 달 팀.
+
+    ★ 노출 범위(사용자 결정 2026-10-02): 같은 병동(그 달 파견 간 병동 포함)이면 누구나, 제출 기간에도.
+      **날짜·근무코드만** — 사유·점수·짝꿍·자유기술·소속 상태 배지는 싣지 않는다(관리자도 이 응답에선 같다).
+    - 행 = 그 달 소속 명단(`group_members_in_month` — 근무자관리와 같은 기준) · `sequence` 순.
+    - 팀 = 그 달 팀(`team_layout_from_members` — 마감본 팀 고정과 같은 규칙) · 팀 목록은 팀명순.
+    - 코드 = 수간호사 원티드 표(`get_shift_requests_service`)와 같은 관할 날짜(파견 온 사람은 이 병동
+      기간만 · 파견 나간 사람은 이 병동에 있는 날만).
+    """
+    from services.assignment_service import group_members_in_month
+    from services.group_access import resolve_effective_group
+    from services.team_period import team_layout_from_members
+
+    target = resolve_effective_group(
+        db, current_user, override_group_id,
+        require_group=False, allow_assignment_target=True, assignment_window=(year, month),
+    ) or resolve_home_group_id(db, current_user)
+    if not target:
+        raise HTTPException(status_code=400, detail="대상 그룹이 없습니다.")
+    members = group_members_in_month(db, target, year, month)["members"]
+    team_of, teams = team_layout_from_members(db, target, members, year, month)
+    team_names = {t["team_id"]: t["team_name"] for t in teams}
+    requested = {
+        r["nurse_id"]: r
+        for r in get_shift_requests_service(db, target, year, month, include_assignments=False)
+    }
+    ids = [m["nurse_id"] for m in members]
+    seq = dict(db.query(Nurse.nurse_id, Nurse.sequence).filter(Nurse.nurse_id.in_(ids)).all()) if ids else {}
+    nurses = []
+    for m in members:
+        nid = m["nurse_id"]
+        req = requested.get(nid) or {}
+        tid = team_of.get(nid)
+        nurses.append({
+            "nurse_id": nid,
+            "name": m.get("name"),
+            "team_id": tid,
+            "team_name": team_names.get(tid),
+            # ★ 소속 상태·배지(파견·휴직·퇴사·N전담)는 싣지 않는다 — 휴직·퇴사가 병동 전원에게
+            #   보이게 된다(OMC 리뷰 → 사용자 결정 2026-10-02 "배지 모두 빼기").
+            "is_submitted": bool(req.get("is_submitted")),
+            "shifts": [{"shift_date": s["shift_date"], "shift": s["shift"]} for s in req.get("shifts", [])],
+        })
+    nurses.sort(key=lambda n: (seq.get(n["nurse_id"]) is None, seq.get(n["nurse_id"]) or 0, n["name"] or ""))
+    return {"group_id": target, "year": year, "month": month, "teams": teams, "nurses": nurses}
 
 
 def get_my_wanted_dashboard_service(current_user: UserSchema, db: Session) -> dict:

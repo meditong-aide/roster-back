@@ -999,7 +999,9 @@ def get_prev_month_tail_service(
     }
 
 
-def _attach_issued_teams(db: Session, snapshot: IssuedRosterSnapshot, nurses_json: list, roster: dict) -> tuple[list[dict], str]:
+def _attach_issued_teams(
+    db: Session, snapshot: IssuedRosterSnapshot, nurses_json: list, roster: dict, year: int, month: int,
+) -> tuple[list[dict], str]:
     """마감본 응답에 팀을 싣는다(① 팀별 보기). 반환 `(팀 목록, 기준)` — 기준 `issued`|`legacy`.
 
     ★ 팀은 **마감 시점 고정**(2026-10-02 결정). 새 마감본은 마감 때 박은 값(`meta.teams`·행별
@@ -1027,7 +1029,9 @@ def _attach_issued_teams(db: Session, snapshot: IssuedRosterSnapshot, nurses_jso
         }
     else:
         # 명단(팀 배치)을 먼저, 팀 목록을 나중에 — `month_team_layout` 과 같은 이유.
-        team_of = resolve_teams_for_month(db, snapshot.group_id, date(snapshot.year, snapshot.month, 1))
+        #   ★ 연월은 호출자 인자(= meta_json 으로 찾은 값)를 쓴다. 테이블 year/month 컬럼은 nullable 이고
+        #     2025-12-10 이전 마감본은 비어 있을 수 있다(조회도 meta 로 한다 — 2026-10-02 실측 활성 0건).
+        team_of = resolve_teams_for_month(db, snapshot.group_id, date(year, month, 1))
         names = active_team_names(db, snapshot.group_id)
         teams, basis, team_by_nurse = ordered_teams(names), "legacy", {}
         for n in nurses_json:
@@ -1046,27 +1050,20 @@ def _attach_issued_teams(db: Session, snapshot: IssuedRosterSnapshot, nurses_jso
 def attach_team_to_synth_rows(db: Session, snapshot: dict, nurse_ids: set, year: int, month: int) -> None:
     """마감 **뒤에** 파견이 잡혀 지어낸 행에 팀을 붙인다(마감 때 박은 값이 없으므로).
 
-    그 달 이 병동 팀 구간으로 계산한다. 월초를 덮는 구간이 있으면 **가장 늦게 시작한** 것(근무자관리
-    `as_of_team`·`get_team_period_on` 과 같은 선택), 없으면 그 달에 겹치는 구간(월중 합류).
-    ★ 월초 하루만 보면 월중에 파견 와서 그날부터 팀 구간이 시작된 사람을 놓친다 — 이 행이 바로
-      그런 사람이다(Codex 2026-10-02).
-    ★ `resolve_team_for_roster` 를 바로 쓰지 않는다 — 월초를 덮는 구간이 둘 이상 겹쳐 있으면
-      **가장 먼저 시작한** 것을 골라 화면과 다른 팀이 나온다(실측 운영 성남 61병동-RN 9/1·10/1 열린 구간
-      겹침 20쌍 · 팀이 다른 2명).
-    응답 팀 목록(`teams`)에 없는 팀이면 미등록(None).
+    `resolve_team_for_roster` — 월초를 덮는 구간이 있으면 가장 늦게 시작한 것(화면과 같은 선택),
+    없으면 그 달 안에서 시작하는 첫 구간(월중 합류). 마감 때 고정하는 규칙(`team_layout_from_members`)과
+    생성기와도 같다. ★ 월초 하루만 보면 월중에 파견 와서 그날부터 팀 구간이 시작된 사람을 놓친다 —
+    이 행이 바로 그런 사람이다(Codex 2026-10-02). 응답 팀 목록(`teams`)에 없는 팀이면 미등록(None).
     """
-    from services.team_period import _coerce_team_int, get_team_period_on, resolve_team_for_roster
+    from services.team_period import resolve_team_for_roster
 
     gid = snapshot.get("group_id")
     names = {t.get("team_id"): t.get("team_name") for t in snapshot.get("teams") or [] if isinstance(t, dict)}
-    month_start = date(year, month, 1)
     for row in (snapshot.get("roster") or {}).get("nurses") or []:
         nid = str(row.get("nurse_id", ""))
         if nid not in nurse_ids or not gid:
             continue
-        covering = get_team_period_on(db, nid, gid, month_start)
-        tid = (_coerce_team_int(covering.team_id) if covering is not None
-               else resolve_team_for_roster(db, nid, gid, year, month))
+        tid = resolve_team_for_roster(db, nid, gid, year, month)
         row["team_id"], row["team_name"] = (tid, names[tid]) if tid in names else (None, None)
 
 
@@ -1284,7 +1281,7 @@ def get_issued_roster_snapshot_service(
     _roster_json = matched_snapshot.roster_json or {}
     _team_out: dict = {}
     if with_teams:
-        _teams, _team_basis = _attach_issued_teams(db, matched_snapshot, _nurses_json, _roster_json)
+        _teams, _team_basis = _attach_issued_teams(db, matched_snapshot, _nurses_json, _roster_json, year, month)
         # 팀별 보기: 팀 목록(팀명순 · 미등록은 화면이 맨 뒤에 붙인다) + 행별 team_id/team_name.
         #   team_basis: issued=마감 때 박은 값 · legacy=옛 마감본이라 조회 때 그 달 팀으로 계산
         _team_out = {"teams": _teams, "team_basis": _team_basis}
