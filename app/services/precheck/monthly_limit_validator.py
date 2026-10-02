@@ -247,6 +247,21 @@ def _check_sum_coverage(
     return issues
 
 
+def _n_only_floor_fixes(label: str, n_floor: int, max_night: int) -> list[str]:
+    """N전담 월간 N 한도 > 상한일 때 고칠 방법. 상한 상향은 하드락 #6(1인 15) 안에서만 안내한다.
+
+    ★ N전담 15회 고정은 하드락이라 상한을 15 넘게 올리라고 하지 않는다(2026-10-02 사용자 지적).
+    """
+    from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _hard
+
+    fixes = [f"월간 N {label} 한도를 {min(max_night, _hard)} 이하로 낮추세요."]
+    if n_floor <= _hard:
+        fixes.append(f"월간 N 상한(max_night)을 {n_floor} 이상으로 올리세요.")
+    else:
+        fixes.append(f"월 나이트는 1인 최대 {_hard}회(하드락)라 {n_floor}회는 둘 수 없습니다.")
+    return fixes
+
+
 def _check_night_dedicated(
     row: Mapping[str, Any],
     *,
@@ -283,11 +298,7 @@ def _check_night_dedicated(
                     f"야간 전담은 한 달에 N을 {int(max_night)}회 넘게 배정할 수 없어 "
                     f"근무표를 생성할 수 없습니다."
                 ),
-                fix_suggestions_ko=[
-                    f"월간 N {label} 한도를 {int(max_night)} 이하로 낮추세요.",
-                    f"월간 N 상한(max_night)을 {int(n_floor)} 이상으로 올리세요.",
-                    "N 전담을 해제해 D/E도 가능하게 하세요.",
-                ],
+                fix_suggestions_ko=_n_only_floor_fixes(label, int(n_floor), int(max_night)),
             ))
 
     for p in ("d", "e"):

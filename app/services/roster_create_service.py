@@ -3262,6 +3262,35 @@ _CHANGE_LABEL_KO = {
 }
 
 
+def assert_night_caps_within_hard_lock(config_delta: dict | None, monthly_limit_release: list | None) -> None:
+    """해결 카드가 되돌려 보낸 월 야간 값이 하드락 #6(1인 월 15회)을 넘으면 400.
+
+    ★ 카드는 서버가 만들지만 적용 요청은 클라이언트가 그 값을 **그대로 echo** 한다 — 배포 전에 만든
+      카드·조작된 요청이 15 를 넘는 값을 넣을 수 있다(OMC 리뷰 2026-10-02). 큐에 넣기 전(라우터)에
+      막는다 — 워커에서 거부하면 SQS 재시도·DLQ 로 번진다. 설정 화면 저장값은 대상이 아니다.
+    """
+    from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _hard
+
+    def _num(v) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError) as exc:   # 숫자가 아니면 500 이 아니라 400
+            raise HTTPException(status_code=400, detail=f"월 나이트 값이 숫자가 아닙니다: {v!r}") from exc
+
+    over: list[str] = []
+    for key in ("max_nig_per_month", "max_night_shifts_per_month"):
+        val = (config_delta or {}).get(key)
+        if val is not None and _num(val) > _hard:
+            over.append(f"{key}={val}")
+    for rel in monthly_limit_release or []:
+        if not isinstance(rel, dict):
+            continue
+        if rel.get("field") in ("n_exact", "n_max", "n_min") and rel.get("value") is not None and _num(rel["value"]) > _hard:
+            over.append(f"{rel.get('nurse_id')}:{rel.get('field')}={rel.get('value')}")
+    if over:
+        raise HTTPException(status_code=400, detail=f"월 나이트는 1인 최대 {_hard}회(하드락)입니다: {', '.join(over)}")
+
+
 def _mk_change(nurse_id, attr, frm, to):
     """resolution_options.changes[*] 항목. 프론트가 label_ko/config_key 로 라벨을 렌더하므로
     (attr 만 주면 'undefined 표시') 둘을 함께 채운다.
@@ -7413,7 +7442,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                                 #   · fix_all_personal(월한도/주말) = 단일 통합 카드
                                 #   · banned/allowed(금지근무 모순) = 대안 2카드(HN 선택)
                                 _oid0 = _cards[0].get("option_id") or ""
-                                if _oid0 == "cause:fix_all_personal":
+                                if _oid0 in ("cause:fix_all_personal", "cause:night_only_over_hard_cap"):
+                                    # night_only_over_hard_cap(야간전담 >15 정정 안내)도 단독 — 안 그러면
+                                    # 그 위에 '상한을 올리라' 는 일반 설명카드가 함께 떠 서로 모순된다.
                                     unrecoverable["infeasibility"]["_sole_option"] = _cards[0]
                                 elif _oid0 in ("cause:banned_release", "cause:allowed_add"):
                                     unrecoverable["infeasibility"]["_sole_option"] = list(_cards)
@@ -7586,12 +7617,22 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                                     _cflags = (presolve_diag or {}).get("constraint_flags") or []
                                 except NameError:
                                     _cflags = []
+                                # ★ N전담이면 야간 쪽은 **아무것도 바꾸지 않는다** — N전담 15회 고정은 하드락이다
+                                #   (2026-10-02 사용자 지적). 개인 고정을 낮추지도, 병동 상한을 올리지도 않는다. 주말
+                                #   해제만 내되, 이 probe 검증은 월 한도를 안 봐서 야간 충돌이 남을 수 있으므로
+                                #   verified=False 로 낸다(아래 else 분기).
+                                from services.cp_sat.allowed_shift_types import is_n_only_profile as _is_n_only
+                                _culprit_nu = next((n for n in (nurses_for_engine or [])
+                                                    if str(getattr(n, "nurse_id", "")) == _culprit), None)
+                                _culprit_n_only = _is_n_only(getattr(_culprit_nu, "allowed_shifts", None),
+                                                             use_mid=bool((_probe_base or {}).get("use_mid")))
                                 _nflag = next(
                                     (f for f in _cflags
                                      if str(f.get("nurse_id")) == _culprit
                                      and f.get("type") == "night_floor_over_cap"), None)
-                                if _nflag:
-                                    _mn = int(_nflag.get("max_nig") or 0)
+                                if _nflag and not _culprit_n_only:
+                                    from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _HARD_N
+                                    _mn = min(int(_nflag.get("max_nig") or 0), _HARD_N)   # 하드락 #6 안으로
                                     _nf = int(_nflag.get("n_floor") or 0)
                                     _wk_opt = {
                                         "option_id": f"release_weekend_off+lower_night:{_culprit}",
@@ -7633,6 +7674,23 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                                             "config_key": None, "target": {"nurse_id": _culprit},
                                         },
                                     }
+                                    if _nflag:   # N전담 + 야간 고정이 병동 상한을 넘는 충돌 — 야간은 하드락이라 그대로
+                                        # ★ presolve 의 n_floor > max_nig 는 **산술로 확정된 모순**이라 주말만 풀면
+                                        #   반드시 다시 실패한다. 자동 적용하면 주말휴무만 영구로 사라지므로 수동
+                                        #   안내로 내리고 자동 적용 필드를 뺀다(OMC 리뷰 2026-10-02).
+                                        _wk_opt["verified"] = False
+                                        _wk_opt.pop("weekend_off_release", None)
+                                        _wk_opt["changes"] = []          # 자동으로 바꾸는 게 없다
+                                        _wk_opt["fix"]["mode"] = "manual"
+                                        _wk_opt["fix"]["how_ko"] = (
+                                            f"근무 설정의 '한 달 밤 근무 최대 횟수'와 {_nm} 간호사의 나이트 개수를 "
+                                            f"맞춘 뒤 다시 만드세요.")
+                                        _wk_opt["title_ko"] = f"{_nm} 간호사(야간전담) 나이트 설정 확인 필요"
+                                        _wk_opt["trade_off_ko"] = (
+                                            f"{_nm} 간호사(야간전담)의 나이트 개수가 병동 월 야간 상한보다 커서 그대로는 "
+                                            f"다시 만들어도 실패합니다. 근무 설정의 '한 달 밤 근무 최대 횟수'와 근무자의 "
+                                            f"나이트 개수(야간전담 15회 고정 — 하드락)가 맞는지 먼저 확인하세요. 주말 휴무 "
+                                            f"해제는 그다음에 필요하면 하세요.")
                                 # 그룹 전체 끄는 coarse '단독' 옵션(apply 가 weekend_off_only_enable 하나뿐)만
                                 # 개인 지목으로 대체. 콤보(예: weekend_off_only_enable + max_nig 상향)는 유효한
                                 # 대안이므로 남긴다 — 그래야 "개인 낮추기 / config 상한 올리기" 두 갈래가 모두 노출.
@@ -7663,8 +7721,14 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                             _cfg_mn = int(_probe_base.get("max_nig_per_month") or 0)
                             # 후보: n_exact 또는 n_max 가 config 야간 상한보다 큰 간호사(그 값을 상한
                             # 이하로 낮추면 충돌 해소). 야간이 상한을 초과할 수 없으니 이들이 병목 후보.
+                            # ★ N전담은 후보에서 뺀다 — N전담 15회 고정은 하드락이라 해결카드가 바꾸는 대상이
+                            #   아니다(2026-10-02 사용자 지적). 낮추면 나머지가 강제 OFF 가 되어 야간 공급도 준다.
+                            from services.cp_sat.allowed_shift_types import is_n_only_profile as _is_n_only
                             _nc_cands = []
                             for _n in (nurses_for_engine or []):
+                                if _is_n_only(getattr(_n, "allowed_shifts", None),
+                                              use_mid=bool(_probe_base.get("use_mid"))):
+                                    continue
                                 for _fld in ("n_exact", "n_max"):
                                     _val = getattr(_n, _fld, None)
                                     if _val is not None and _cfg_mn and int(_val) > _cfg_mn:

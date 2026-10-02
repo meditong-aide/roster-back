@@ -20,6 +20,7 @@ from routers.auth import get_current_user_from_cookie, require_current_user
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest, RosterConfigCreate
 from services.roster_create_service import (
+    assert_night_caps_within_hard_lock,
     generate_roster_service,
     # generate_roster_service_with_fixed_cells,
     request_schedule_service,
@@ -185,6 +186,9 @@ async def roster_create_async(
         _db, current_user, getattr(req, "group_id", None)
     )
     req.group_id = target_group_id
+    # 해결 카드 재생성 값이 하드락 #6(월 나이트 15)을 넘으면 큐에 넣기 전에 400.
+    assert_night_caps_within_hard_lock(
+        getattr(req, "config_override", None), getattr(req, "monthly_limit_release", None))
 
     # 모달 payload 제공 시: config 굳히기(materialize) + 라이브 동기화(apply).
     # 변경 시 '새로운 설정n' 신규 row, 동일 시 baseline 재사용. 이후 req.config_id 로 진행.
@@ -309,6 +313,8 @@ def generate_roster_endpoint(
     예시:
         year=2025, month=3 요청 시 동기 생성 결과 반환.
     """
+    assert_night_caps_within_hard_lock(
+        getattr(req, "config_override", None), getattr(req, "monthly_limit_release", None))
     try:
         # 해결책 재생성 파라미터를 서비스로 전달(누락 시 config_override 의 비-DB 솔버키
         # (예: weekend_off_only_enable)와 weekend_off_release/monthly_limit_release 가 반영 안 됨).
@@ -372,6 +378,7 @@ def apply_resolution_endpoint(
     treatment_ids = list(req.treatment_ids or [])
     if not delta and not treatment_ids:
         raise HTTPException(status_code=400, detail="apply(컬럼 delta) 또는 treatment_ids 가 필요합니다.")
+    assert_night_caps_within_hard_lock(delta, None)   # 하드락 #6(월 나이트 15) 초과 카드 값 거부
     gen_req = RosterRequest(year=req.year, month=req.month, grade_strategy=req.grade_strategy)
 
     # ── ontology treatment 경로: 런타임 적용(DB 미변경, 이번 생성만, persist N/A) ──
