@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +29,11 @@ from services.team_classify_service import (
     apply_team_classification,
     preview_team_classification,
 )
+
+
+# 배정 조작은 로그인 사용자를 요구한다(None=미인증 → 401). 권한 판정이 아니라 동작을 보는
+# 테스트라 마스터 관리자로 통과시킨다.
+_ADMIN = SimpleNamespace(is_master_admin=True)
 
 
 def _n(nid, grade=2, preceptor_id=None, off=(), fb=()):
@@ -369,7 +375,7 @@ def test_C06_flush_applies_shift_release(solo):
 def test_C07_cancel_pending_not_flushed(solo):
     r = create_permanent_change(solo, nurse_id="n", group_id="A", office_id="o1",
                                 start_date=date(2026, 8, 1), new_team_id=9)
-    cancel_assignment(r.id, solo, current_user=None)
+    cancel_assignment(r.id, solo, current_user=_ADMIN)
     n_flushed = flush_pending_permanent_changes(solo, as_of=date(2026, 8, 1))
     assert n_flushed == 0
     assert str(solo.query(Nurse).filter(Nurse.nurse_id == "n").first().team_id) == "1"

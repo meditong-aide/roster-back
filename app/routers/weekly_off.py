@@ -4,7 +4,7 @@ from typing import Optional
 
 from db.client2 import get_db
 from schemas.auth_schema import User as UserSchema
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from schemas.weekly_off_schema import (
     WeeklyOffSettingUpdate,
     WeeklyOffSettingResponse,
@@ -27,7 +27,7 @@ router = APIRouter(
 @router.get("/settings", response_model=WeeklyOffSettingResponse)
 def get_weekly_off_settings(
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -39,7 +39,7 @@ def get_weekly_off_settings(
 def update_weekly_off_settings(
     payload: WeeklyOffSettingUpdate,
     group_id: Optional[str] = Query(None),
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -52,7 +52,7 @@ def get_nurses_weekly_off(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -64,7 +64,7 @@ def get_nurses_weekly_off(
 def update_nurses_weekly_off(
     payload: WeeklyOffNurseUpdatePayload,
     group_id: Optional[str] = Query(None),
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -79,7 +79,7 @@ def get_my_weekly_off(
     year: int,
     month: int,
     nurse_id: Optional[str] = None, # 추가: 옵션 파라미터
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """

@@ -105,7 +105,7 @@ from services.roster_service import (
     get_prev_month_tail_service,
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
-from services.group_access import resolve_effective_group, resolve_home_group_id, caller_is_head_nurse, assert_caller_can_access_group
+from services.group_access import resolve_effective_group, resolve_home_group_id, caller_is_head_nurse, assert_caller_can_access_group, can_caller_access_nurse
 from services.weekly_off_service import get_nurses_weekly_off_service
 from services.assignment_service import transfer_shifts_on_publish, get_transfer_logs, get_transferred_wanted
 from utils.utils import send_roster_publish_push, send_roster_republish_push
@@ -4161,11 +4161,18 @@ def get_shift_transfers(
     month: int,
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,
-    user: User = Depends(get_current_user_from_cookie),
+    user: User = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
-    """전달 이력 조회 (운영자: group_id / 당사자: nurse_id)"""
-    _group = group_id or resolve_home_group_id(db, user)
+    """전달 이력 조회 (운영자: group_id / 당사자: nurse_id)
+
+    ★권한: 간호사를 지정하면 그 간호사를 볼 수 있어야 하고(``can_caller_access_nurse``),
+      그룹은 접근 가능한 그룹으로만 해석한다(``resolve_effective_group``). 예전엔 그룹이
+      비면 **필터 없이 전 병원 이력**이 나갔다.
+    """
+    if nurse_id and not can_caller_access_nurse(db, user, nurse_id):
+        raise HTTPException(status_code=403, detail="해당 간호사에 대한 접근 권한이 없습니다.")
+    _group = resolve_effective_group(db, user, group_id)
     _nurse = nurse_id or None
     logs = get_transfer_logs(db, year=year, month=month, group_id=_group, nurse_id=_nurse)
     return {"transfers": logs}
@@ -4176,8 +4183,13 @@ def get_transferred_wanted_api(
     nurse_id: str,
     year: int,
     month: int,
-    user: User = Depends(get_current_user_from_cookie),
+    user: User = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
-    """파견/병동이동 간호사의 원티드를 target group shift로 변환 조회"""
+    """파견/병동이동 간호사의 원티드를 target group shift로 변환 조회
+
+    ★권한: 그 간호사를 볼 수 있는 사람만(원티드 사유·수간호사 메모가 실린다).
+    """
+    if not can_caller_access_nurse(db, user, nurse_id):
+        raise HTTPException(status_code=403, detail="해당 간호사에 대한 접근 권한이 없습니다.")
     return get_transferred_wanted(db, nurse_id=nurse_id, year=year, month=month)

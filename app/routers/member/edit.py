@@ -11,7 +11,7 @@ from starlette.responses import JSONResponse
 
 from datalayer.member import Member
 from db.client2 import msdb_manager
-from routers.auth import get_current_user_from_cookie, require_current_user
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 # EmailSender 클래스 인스턴스를 import
 from utils.email import email_sender, EmailSchema
@@ -32,7 +32,7 @@ def member_edit_view(request: Request, current_user: UserSchema = Depends(requir
 
 
 @router.post("/edit")
-async def update_member_info(current_user: UserSchema = Depends(get_current_user_from_cookie),
+async def update_member_info(current_user: UserSchema = Depends(require_current_user),
         # 기본 정보 (읽기 전용 포함)
         EmpSeqNo: str = Form(...),
         account_id: str = Form(...),

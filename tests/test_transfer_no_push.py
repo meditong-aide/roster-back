@@ -8,6 +8,7 @@ set_app_push 는 비운영 환경에서 push 시도 시 `[push][skipped:non-prod
 즉 "assignment 쪽으로는 알림이 나갈 일이 없다"를 print 유무로 end-to-end 검증한다.
 """
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,11 @@ from services.assignment_service import (
     cancel_assignment,
     flush_pending_transfers,
 )
+
+
+# 배정 조작은 로그인 사용자를 요구한다(None=미인증 → 401). 권한 판정이 아니라 동작을 보는
+# 테스트라 마스터 관리자로 통과시킨다.
+_ADMIN = SimpleNamespace(is_master_admin=True)
 
 
 def _add_second_group(db):
@@ -65,7 +71,7 @@ def test_assignment_create_no_push(seed_data, db, capsys, nurse_id, reason, targ
         office_id="OFF001", start_date=date.today() + timedelta(days=1),
         expected_end_date=date.today() + timedelta(days=30), reason=reason,
     )
-    create_assignment(req, db, current_user=None)
+    create_assignment(req, db, current_user=_ADMIN)
 
     lines = _push_lines(capsys.readouterr())
     assert lines == [], f"{reason} 생성 알림이 나가면 안 됨. got={lines}"
@@ -80,10 +86,10 @@ def test_assignment_cancel_no_push(seed_data, db, capsys):
         office_id="OFF001", start_date=date.today() + timedelta(days=1),
         expected_end_date=date.today() + timedelta(days=30), reason="파견",
     )
-    created = create_assignment(req, db, current_user=None)
+    created = create_assignment(req, db, current_user=_ADMIN)
     capsys.readouterr()
 
-    cancel_assignment(created.id, db, current_user=None)
+    cancel_assignment(created.id, db, current_user=_ADMIN)
 
     lines = _push_lines(capsys.readouterr())
     assert lines == [], f"취소 알림이 나가면 안 됨. got={lines}"
@@ -98,7 +104,7 @@ def test_transfer_complete_no_push(seed_data, db, capsys):
         office_id="OFF001", start_date=date.today(),  # 오늘 발효 → flush 대상
         reason="병동이동",
     )
-    create_assignment(req, db, current_user=None)
+    create_assignment(req, db, current_user=_ADMIN)
     capsys.readouterr()
 
     count = flush_pending_transfers(db, "GRP002")

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,11 @@ from services.ward_redistribute_service import (
     apply_ward_redistribution,
     preview_ward_redistribution,
 )
+
+
+# 재분배 발행은 로그인 사용자를 요구한다(None=미인증 → 401). 권한 판정이 아니라 동작을 보는
+# 테스트라 마스터 관리자로 통과시킨다.
+_ADMIN = SimpleNamespace(is_master_admin=True)
 
 
 def _mk_nurse(db, nid, gid, grade):
@@ -207,7 +213,7 @@ def test_apply_creates_transfer_and_team_events(pool):
         {"nurse_id": "a2", "to_group_id": "A", "team_id": 1},   # 동일 → skip
     ]
     res = apply_ward_redistribution(
-        db, group_ids=["A", "B"], year=2026, month=7, assignments=assignments,
+        db, current_user=_ADMIN, group_ids=["A", "B"], year=2026, month=7, assignments=assignments,
     )
     assert res["transfers"] == 1
     assert res["team_changes"] == 1
@@ -234,7 +240,7 @@ def test_apply_writes_team_period_for_target_month(pool):
 
     db = pool
     apply_ward_redistribution(
-        db, group_ids=["A", "B"], year=2026, month=7,
+        db, current_user=_ADMIN, group_ids=["A", "B"], year=2026, month=7,
         assignments=[
             {"nurse_id": "a0", "to_group_id": "B", "team_id": 1},   # 이동 → B, 팀1
             {"nurse_id": "a1", "to_group_id": "A", "team_id": 2},   # 잔류 팀변경 → 팀2
@@ -261,7 +267,7 @@ def test_apply_writes_team_period_for_target_month(pool):
 def test_apply_skips_unknown_or_no_target(pool):
     db = pool
     res = apply_ward_redistribution(
-        db, group_ids=["A", "B"], year=2026, month=7,
+        db, current_user=_ADMIN, group_ids=["A", "B"], year=2026, month=7,
         assignments=[{"nurse_id": "ghost", "to_group_id": "B"},
                      {"nurse_id": "a0", "to_group_id": None}],
     )
@@ -365,7 +371,7 @@ def test_apply_graceful_skips_conflict(db):
                            status="active"))
     db.flush()
     res = apply_ward_redistribution(
-        db, group_ids=["A", "B"], year=2026, month=8,
+        db, current_user=_ADMIN, group_ids=["A", "B"], year=2026, month=8,
         assignments=[{"nurse_id": "x", "to_group_id": "B"},
                      {"nurse_id": "ok", "to_group_id": "B"}],
     )
@@ -542,7 +548,7 @@ def test_apply_creates_numbered_teams_and_assigns_for_month(db):
         {"nurse_id": "a3", "to_group_id": "A", "team_label": "2"},
     ]
     res = apply_ward_redistribution(
-        db, group_ids=["A"], year=2026, month=7, assignments=assignments
+        db, current_user=_ADMIN, group_ids=["A"], year=2026, month=7, assignments=assignments
     )
 
     # 번호 팀 2개 생성
@@ -561,7 +567,7 @@ def test_apply_creates_numbered_teams_and_assigns_for_month(db):
 
     # 멱등: 같은 저장 재실행 → 팀 수 그대로(team_id 안 늘어남)
     apply_ward_redistribution(
-        db, group_ids=["A"], year=2026, month=7, assignments=assignments
+        db, current_user=_ADMIN, group_ids=["A"], year=2026, month=7, assignments=assignments
     )
     teams2 = db.query(Team).filter(Team.group_id == "A", Team.active == 1).all()
     assert {t.team_name for t in teams2} == {"1", "2"} and len(teams2) == 2

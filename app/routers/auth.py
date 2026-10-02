@@ -98,12 +98,18 @@ def mworks_get_user (account_id: str, password: str, client_ip: str) :
     LogType = 'W'
     RegDate = datetime.now()
 
-    if aiuseyn.upper() != 'Y' :
-        raise HTTPException(status_code=500, detail=f"AI근무표 서비스에 가입되지 않았습니다.")
-
+    # ★사용자 입력·가입 상태 때문에 거절하는 것은 서버 오류(500)가 아니다. 예전엔 500 이라
+    #   운영 로그·알람에서 실제 장애와 섞였다.
+    #   ★403·404 는 쓰지 않는다 — CloudFront 가 /api 의 403·404 를 index.html 200 으로 바꿔
+    #   화면이 "네트워크 오류" 로 보인다(401·501 은 그대로 통과). 미가입은 위 미대상과 같은
+    #   **501 + "AI근무표 이용 대상"** 규약으로 낸다(PC·모바일 로그인 화면이 이 문구로 분기).
+    # ★비밀번호를 먼저 본다 — 아무 비밀번호로도 병원 가입 상태가 화면에 드러나지 않게.
     params = (account_id, RegDate, client_ip, EmpSeqNo, office_id, LogType)
     if not IsPWCorrect :
-        raise HTTPException(status_code=500, detail=f"Login failed")
+        raise HTTPException(status_code=401, detail=f"Login failed")
+
+    if aiuseyn.upper() != 'Y' :
+        raise HTTPException(status_code=501, detail="AI근무표 이용 대상이 아닙니다. AI근무표 서비스에 가입되지 않은 병원입니다.")
 
     # [gw-write-gate] 로그인 이력은 **운영 roster DB 로 붙었을 때만** 그룹웨어에 남긴다.
     # dev/localhost 는 인증(읽기)만 운영 gw 로 하고 쓰기는 건너뛴다. 이유 2가지:
@@ -514,8 +520,10 @@ def handle_find_pw_request(
     pw_chk_result = msdb_manager.fetch_all(Member.find_pw_chk(), params=(memberID, EmployeeName))
 
     if not pw_chk_result:
-        # return {"result": "fail", "message" : "일치하는 회원정보가 없습니다."}
-        raise HTTPException(status_code=500, detail="일치하는 회원정보가 없습니다.")
+        # 입력과 일치하는 회원이 없는 것 — 서버 오류가 아니다. 아래 휴대폰·email 불일치와 같은
+        # 200 + result=fail 로 낸다(화면은 이 message 를 토스트로 띄운다). 404 는 CloudFront 가
+        # index.html 200 으로 바꿔 토스트가 사라진다.
+        return {"result": "fail", "message": "일치하는 회원정보가 없습니다."}
 
     # 회원데이터
     phoneNum_chk = pw_chk_result[0]['PortableTel']

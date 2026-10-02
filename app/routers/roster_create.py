@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from db.client2 import get_db
 from db.models import RosterConfig
-from routers.auth import get_current_user_from_cookie, require_current_user
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest, RosterConfigCreate
 from services.roster_create_service import (
@@ -508,7 +508,7 @@ def request_schedule(
 @router.post("/roster_create/hold_generate")
 def hold_generate_roster_endpoint(
     req: HoldGenerateRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """

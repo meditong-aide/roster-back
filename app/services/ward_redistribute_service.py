@@ -602,7 +602,7 @@ def apply_ward_redistribution(
     year: int,
     month: int,
     assignments: list[dict],
-    current_user=None,
+    current_user,
     note: Optional[str] = None,
 ) -> dict:
     """승인된 병동 간 재분배를 이벤트로 발행 (대상월 1일 발효).

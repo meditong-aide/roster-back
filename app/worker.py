@@ -115,6 +115,109 @@ def _log_final_roster_tail(roster_data: dict, job_id, result_id) -> None:
 # =========================================================
 # 핵심 워커 실행
 # =========================================================
+# =========================================================
+# 재시도 판정
+# =========================================================
+_TRANSIENT_NAMES = {
+    # 드라이버·SDK 의 연결/시간초과 예외 — 이름으로 본다(무거운 import 를 피하려고).
+    ("pymssql", "InterfaceError"),
+    ("pymssql._pymssql", "InterfaceError"),
+    ("pymssql.exceptions", "InterfaceError"),
+    ("botocore.exceptions", "EndpointConnectionError"),
+    ("botocore.exceptions", "ConnectTimeoutError"),
+    ("botocore.exceptions", "ReadTimeoutError"),
+    ("botocore.exceptions", "ConnectionClosedError"),
+}
+# ★OperationalError 는 이름만으로 일시 장애라 하지 않는다 — pymssql 은 서버가 돌려준 오류
+#   상당수(잘못된 컬럼·제약 위반 등 몇 번을 돌려도 같은 것)를 OperationalError 로 던진다.
+#   오류 번호가 아래에 있을 때만 재시도한다: -2 쿼리 시간초과 · 1205 교착 희생 · 1222 잠금 대기
+#   초과 · 20003 DB-Lib 시간초과 · 20004 읽기 실패 · 20006 쓰기 실패 · 20009 서버 연결 불가 ·
+#   20017 예기치 않은 EOF · 20047 연결 끊김(DBPROCESS dead).
+_TRANSIENT_DB_ERRNOS = {-2, 1205, 1222, 20003, 20004, 20006, 20009, 20017, 20047}
+_OPERATIONAL_NAMES = {
+    ("pymssql", "OperationalError"), ("pymssql._pymssql", "OperationalError"),
+    ("pymssql.exceptions", "OperationalError"),
+}
+
+
+def _db_errno(e: BaseException) -> int | None:
+    """DB 드라이버 예외의 오류 번호. pymssql 은 ``args[0] == (번호, 메시지)``."""
+    orig = getattr(e, "orig", None) or e
+    args = getattr(orig, "args", None) or ()
+    first = args[0] if args else None
+    if isinstance(first, tuple) and first:
+        first = first[0]
+    return first if isinstance(first, int) else None
+
+
+def _is_transient(exc: BaseException | None) -> bool:
+    """다시 돌리면 결과가 바뀔 수 있는 실패인가 — **DB 연결·교착·잠금 대기·네트워크·시간초과만**.
+
+    ★★재시도는 일시 장애에만 의미가 있다. 입력·설정 때문에 난 실패(원티드 미요청,
+      주말휴무 고정근무 설정 400, 권한 없음, MID 하드 검증, 요구인원 0 …)는 몇 번을 돌려도
+      같다. 그런데 예전엔 "infeasibility" 만 빼고 전부 재시도해서, 그런 실패 1건마다
+      SQS 가 12분 간격으로 3번 다시 돌리고 Lambda 오류 알람·Slack 실패 알림이 반복되고
+      24분 뒤 DLQ 알람까지 울렸다(실측 2026-09-19 job-393718 400 오류 재실행,
+      2026-09-26 "wanted 먼저 요청").
+    ★그래서 **일시 장애로 확인된 것만 재시도**하고 나머지는 실패로 기록한 뒤 끝낸다.
+      새 입력 오류가 생겨도 따로 등록할 필요가 없다. 반대로 모르는 일시 장애가 섞이면
+      재시도 없이 FAILED 로 남는데, 사용자가 다시 생성하면 되고 기록도 남아 복구 가능하다
+      — 같은 실패를 세 번 돌리고 알람을 세 번 울리는 것보다 낫다.
+    ★원인 사슬(``__cause__``/``__context__``)까지 본다 — 서비스가 DB 오류를 다른 예외로
+      감싸 다시 던지는 곳이 많다.
+    """
+    try:
+        from sqlalchemy.exc import (
+            DBAPIError, DisconnectionError, InterfaceError, OperationalError,
+            TimeoutError as PoolTimeoutError,
+        )
+    except Exception:  # noqa: BLE001 — 판정 실패로 워커를 죽이지 않는다
+        DBAPIError = DisconnectionError = InterfaceError = OperationalError = None  # type: ignore
+        PoolTimeoutError = None  # type: ignore
+    sa_transient = tuple(t for t in (DisconnectionError, InterfaceError,
+                                     PoolTimeoutError) if t is not None)
+    seen: set[int] = set()
+    e = exc
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if isinstance(e, (ConnectionError, TimeoutError)):
+            return True
+        if sa_transient and isinstance(e, sa_transient):
+            return True
+        if DBAPIError is not None and isinstance(e, DBAPIError) and e.connection_invalidated:
+            return True
+        if (type(e).__module__, type(e).__name__) in _TRANSIENT_NAMES:
+            return True
+        is_operational = (
+            (OperationalError is not None and isinstance(e, OperationalError))
+            or (type(e).__module__, type(e).__name__) in _OPERATIONAL_NAMES
+        )
+        if is_operational and _db_errno(e) in _TRANSIENT_DB_ERRNOS:
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def _is_input_failure(exc: BaseException | None) -> bool:
+    """입력·설정 때문에 난 실패인가 — 다시 돌려도 같으므로 재시도 없이 끝내도 되는 것.
+
+    생성 경로는 입력·설정 오류를 **정해진 종류로만** 던진다: 순수 ``Exception(...)``
+    ("wanted 먼저 요청"·MID 하드 검증·권한 없음), ``ValueError``, ``HTTPException``,
+    워커의 ``RuntimeError``(설정 없음·사용자 없음). 그 밖의 예외(KeyError·AttributeError·
+    TypeError …)는 **코드 버그**로 보고 끝내지 않는다 — 끝내면 Lambda 오류 지표·알람이
+    세지 못해, 배포 후 모든 생성이 실패하는 회귀를 인프라 알람으로 못 잡는다.
+    """
+    if exc is None:
+        return False
+    try:
+        from fastapi import HTTPException as _HTTPException
+    except Exception:  # noqa: BLE001
+        _HTTPException = None  # type: ignore
+    if _HTTPException is not None and isinstance(exc, _HTTPException):
+        return True
+    return type(exc) in (Exception, RuntimeError) or isinstance(exc, ValueError)
+
+
 def process_job(payload: dict) -> dict:
     """SQS / JOB_JSON payload를 받아 솔버를 실행.
 
@@ -126,8 +229,11 @@ def process_job(payload: dict) -> dict:
         성공 시 {"status": "success", "job_id":..., "result_id":...}
     예외:
         - ValueError: payload 자체 부적절 (nurse_id 없음 등). 재시도 무의미.
-        - 그 외 Exception: 솔버 실행/DB 오류. DB STATUS_FAILED 기록 후 그대로 전파하여
-          호출자(SQS event source mapping, ECS exit code)가 재시도/실패 처리를 결정하도록 한다.
+        - 그 외 Exception: 솔버 실행/DB 오류. DB STATUS_FAILED 를 기록한 뒤
+          · 입력·설정 오류(``_is_input_failure``)·infeasibility 면 ``{"status": "failed", ...}`` 를
+            정상 반환한다 — 재시도해도 같으므로 ack.
+          · 일시 장애(``_is_transient``)·코드 버그이거나 FAILED 기록에 실패했으면 그대로
+            전파하여 호출자(SQS event source mapping, ECS exit code)가 재시도하게 한다.
           Caller는 exception swallow 금지 — transient 오류 시 메시지 영구 손실 방지.
     """
     # ↓↓↓ Lazy import: 무거운 모듈을 함수 내부로 이동하여 Lambda init phase 부하 절감.
@@ -304,6 +410,10 @@ def process_job(payload: dict) -> dict:
             db.rollback()
         except Exception as exc_rb:
             print(f"[worker] DB rollback 실패: {exc_rb}", file=sys.stderr)
+        # FAILED 를 실제로 남겼는가. 못 남겼으면 아래에서 ack 하지 않는다 — ack 하면 메시지가
+        # 지워져 작업이 RUNNING 으로 영영 남고 화면은 끝없이 "생성 중" 이 된다.
+        _recorded = False
+        _record_err: BaseException | None = None   # 마지막 FAILED 기록 실패 원인
         try:
             update_job_record(
                 db,
@@ -312,6 +422,7 @@ def process_job(payload: dict) -> dict:
                 progress=100,
                 error_message=err_msg,
             )
+            _recorded = True
         except Exception as exc2:
             print(f"[worker] Job 상태 업데이트 실패(FAILED): {exc2} → 새 session 으로 재시도", file=sys.stderr)
             try:
@@ -324,9 +435,11 @@ def process_job(payload: dict) -> dict:
                         progress=100,
                         error_message=err_msg,
                     )
+                    _recorded = True
                 finally:
                     db_retry.close()
             except Exception as exc3:
+                _record_err = exc3
                 print(f"[worker] Job 상태 업데이트 재시도 실패(FAILED): {exc3}", file=sys.stderr)
         # 모니터링 알림(fire-and-forget). current_user 는 로드 실패 시 미정의일 수 있어 방어적 접근.
         _cu = locals().get("current_user")
@@ -341,16 +454,29 @@ def process_job(payload: dict) -> dict:
             month=getattr(req, "month", None),
             error_message=err_msg,
         )
-        # 결정론적 infeasibility 는 재시도 무의미 → ack(정상 반환)로 SQS 메시지 삭제.
-        # DB 에는 이미 STATUS_FAILED + narrative 가 기록되어 프론트 조회에는 영향이 없다.
-        if is_deterministic_infeasible:
+        # 일시 장애가 아니면(결정론적 infeasibility·입력/설정 오류 등) 재시도 무의미 →
+        # ack(정상 반환)로 SQS 메시지 삭제. DB 에는 이미 STATUS_FAILED(+narrative)가
+        # 기록되어 프론트 조회에는 영향이 없다. 판정 기준은 ``_is_transient`` 참조.
+        # ★FAILED 기록 실패가 **일시 장애가 아니면**(job 행이 없음 등) 재시도해도 또 실패한다 —
+        #   RUNNING 으로 남을 행 자체가 없거나 다시 써도 같으므로 ack 한다(재시도 3회→DLQ 방지).
+        _can_ack = _recorded or (_record_err is not None and not _is_transient(_record_err))
+        # 끝내는 것은 **입력·설정 오류**뿐이다(``_is_input_failure``). 코드 버그는 일시 장애가
+        # 아니어도 끝내지 않고 올려 Lambda 오류 알람이 세게 한다.
+        if _can_ack and (is_deterministic_infeasible
+                         or (_is_input_failure(exc_obj) and not _is_transient(exc_obj))):
             print(
-                f"[worker] 결정론적 infeasibility → 재시도 안 함(ack). job_id={job_id}",
+                f"[worker] {'결정론적 infeasibility' if is_deterministic_infeasible else '일시 장애 아님'}"
+                f" → 재시도 안 함(ack). job_id={job_id} error={type(exc_obj).__name__}",
                 file=sys.stderr,
             )
-            return {"status": "failed", "job_id": job_id, "infeasible": True, "retriable": False}
-        # 그 외(DB 일시 단절·네트워크 등 transient 가능)는 caller 에 전파하여
-        # 영구 손실 없이 SQS 재시도되도록 한다.
+            return {"status": "failed", "job_id": job_id,
+                    "infeasible": bool(is_deterministic_infeasible), "retriable": False}
+        # DB 일시 단절·교착·네트워크·시간초과, 코드 버그, 또는 FAILED 기록 자체를 못 한
+        # 경우는 caller 에 전파하여 영구 손실 없이 SQS 재시도되도록 한다.
+        # ★ValueError 는 그대로 던지지 않는다 — lambda_handler 는 ValueError 를 "payload 오류"
+        #   로 보고 ack 하므로 재시도가 사라진다. 재시도용 예외로 감싼다.
+        if isinstance(exc_obj, ValueError):
+            raise RuntimeError(f"재시도 필요(원인 ValueError): {exc_obj}") from exc_obj
         raise
 
     finally:

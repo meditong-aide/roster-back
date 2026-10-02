@@ -64,15 +64,18 @@ def _assert_caller_owns_source(
     """파견/병동이동/휴직 등 assignment 조작 권한 검증.
 
     통과 조건 (OR):
-    - current_user is None → system/admin 경로로 간주
     - is_master_admin
     - caller 가 source_group_id 소유 (group_id / original_group_id / managed)
     - **target_group_id 가 주어지면**(취소 등) caller 가 target_group_id 소유여도 통과.
       A→B 파견을 전입 받은 B(target)에서도 취소→재등록할 수 있게. 생성·수정 호출은
       target_group_id 를 넘기지 않으므로 기존대로 **source 전용**으로 유지된다.
     """
+    # ★★``None`` 을 통과시키지 않는다(보안). 예전엔 "system/admin 경로" 로 보고 통과시켰는데,
+    #   라우터가 쿠키 사용자를 가드 없이 넘기는 바람에 **로그인 없이 파견·휴직을 만들고·바꾸고·
+    #   취소할 수 있었다**. 실제 호출자(라우터 3곳·일괄수정·병동 재분배)는 모두 로그인 사용자를
+    #   넘기므로 None 을 쓰는 정상 경로는 없다.
     if current_user is None:
-        return
+        raise HTTPException(status_code=401, detail="Not authenticated")
     if getattr(current_user, "is_master_admin", False):
         return
     _allowed = {str(source_group_id)}

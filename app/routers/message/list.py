@@ -2,13 +2,13 @@ from fastapi import APIRouter, HTTPException, Depends
 
 from datalayer.message import Message
 from db.client2 import msdb_manager
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 
 router = APIRouter()
 
 @router.get("/listcnt", summary="총 게시물수")
-def message_view(list_type: str, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def message_view(list_type: str, current_user: UserSchema = Depends(require_current_user)):
     """
     * list_type : send -> 보낸 메세지 리스트
     * list_type : reception -> 받은 메세지 리스트
@@ -32,7 +32,7 @@ def message_view(list_type: str, current_user: UserSchema = Depends(get_current_
 
 
 @router.get("/list", summary="메세지 리스트")
-def message_view(page: int, pagesize: int, list_type: str, current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def message_view(page: int, pagesize: int, list_type: str, current_user: UserSchema = Depends(require_current_user)):
     """
     * list_type : send -> 보낸 메세지 리스트
     * list_type : reception -> 받은 메세지 리스트

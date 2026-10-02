@@ -22,7 +22,7 @@ from db.models import (
     NurseAllowedShiftPeriod,
     NurseWeekendOffPeriod,
 )
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 from services.group_access import assert_caller_can_access_group
 from services.nurse_period_resolver import upsert_period, resolve_asof, fetch_periods
@@ -85,7 +85,7 @@ class BackfillResult(BaseModel):
 @router.post("/backfill", response_model=BackfillResult)
 def backfill_nurse_periods(
     payload: BackfillRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """그룹 소속 active 간호사의 현재 속성값을 period 첫 구간으로 시드(멱등)."""
@@ -151,7 +151,7 @@ class ChangeResult(BaseModel):
 @router.post("/change", response_model=ChangeResult)
 def change_nurse_period(
     payload: ChangeRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """한 간호사의 한 속성을 valid_from 부터 변경(close-before-open) + 단방향 캐시 투영."""
@@ -220,7 +220,7 @@ class RollResult(BaseModel):
 @router.post("/roll", response_model=RollResult)
 def roll_nurse_cache(
     payload: RollRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """as_of(기본 오늘) 기준 period 값을 nurses 캐시 컬럼에 투영(단방향 동기화).
@@ -297,7 +297,7 @@ def get_leave_flags(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """그룹 전원의 휴가 대상 3-state 를 대상월 기준으로 반환한다.
@@ -340,7 +340,7 @@ class LeaveFlagUpdate(BaseModel):
 @router.post("/leave-flags", response_model=LeaveFlagRow)
 def update_leave_flags(
     payload: LeaveFlagUpdate,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """한 간호사의 휴가 대상 3-state 를 바꾼다(close-before-open).
@@ -422,7 +422,7 @@ def get_night_cycle(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """그룹 전원의 수면OFF 주기 상태를 대상월 기준으로 반환한다.
@@ -516,7 +516,7 @@ class NightCycleRebuildRequest(BaseModel):
 @router.post("/night-cycle/rebuild", response_model=NightCycleResult)
 async def rebuild_night_cycle(
     payload: NightCycleRebuildRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """(year, month) **부터 이후 모든 마감본**의 앵커를 다시 계산한다.

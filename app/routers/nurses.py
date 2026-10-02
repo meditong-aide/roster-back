@@ -78,7 +78,7 @@ from services.nurse_monthly_limit_service import (
     upsert_nurse_monthly_limits_service,
     night_bulk_apply_service,
 )
-from services.group_access import resolve_home_group_id, resolve_effective_group, caller_is_head_nurse, resolve_managed_group_ids
+from services.group_access import resolve_home_group_id, resolve_effective_group, caller_is_head_nurse, resolve_managed_group_ids, can_caller_access_nurse
 from services.excel_service import (
     create_nurse_template,
     # process_excel_upload,
@@ -198,7 +198,7 @@ def get_managed_groups_summary(
 def get_monthly_limits(
     group_id: str,
     nurse_id: str,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     items = list_nurse_monthly_limits_service(
@@ -213,7 +213,7 @@ def get_monthly_limits(
 @router.put("/monthly-limits", response_model=NurseMonthlyLimitListResponse)
 def put_monthly_limits(
     body: NurseMonthlyLimitBulkUpsertRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     items = upsert_nurse_monthly_limits_service(
@@ -230,7 +230,7 @@ def put_monthly_limits(
 @router.post("/monthly-limits/night-bulk", response_model=NurseMonthlyLimitListResponse)
 def night_bulk_apply(
     body: NightBulkApplyRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """나이트 개수 일괄 적용: 현재 병동/월의 야간 가능 근무자 전체에 하나의 값을
@@ -290,7 +290,7 @@ def get_group_members_in_month(
     group_id: str,
     year: int,
     month: int,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """근무자관리 월 셀렉터 — 선택 월 '소속' 명단 + 상태 플래그 + 헤드카운트.
@@ -427,7 +427,7 @@ def get_nurses_in_group(
 def save_nurse_sequence(
     req: NurseSequenceUpdate,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -449,7 +449,7 @@ def save_nurse_sequence(
 def reorder_nurses(
     payload: ReorderPayload,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -474,7 +474,7 @@ def bulk_update_nurses(
     group_id: Optional[str] = None,
     year: Optional[int] = None,
     month: Optional[int] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -517,7 +517,7 @@ def download_template(
 
 @router.get("/template2-download")
 def download_template2(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
 ):
     """신규 엑셀 템플릿2 (계정ID/이름만) 다운로드 - ADM 전용"""
     try:
@@ -572,7 +572,7 @@ class Upload2ConfirmRequest(BaseModel):
 async def upload2_validate_endpoint(
     file: UploadFile = File(...),
     group_id: str = Query(..., description="병동 그룹 ID (필수)"),  # 추가
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """업로드2 - 검증 전용. 오류 목록과 정규화된 행을 반환한다."""
@@ -724,7 +724,7 @@ def get_available_members(
 @router.post("/add-to-group")
 def add_nurses_to_group(
     payload: AddToGroupRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -845,7 +845,7 @@ def confirm_upload(
 @router.post("/integrated-register")
 def integrated_register(
     payload: IntegratedRegisterRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -1064,7 +1064,7 @@ def partial_update_personnel_basic_info(
 @router.post("/profile-image")
 def upload_profile_image(
     file: UploadFile = File(...),
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -1082,7 +1082,7 @@ def upload_profile_image(
 
 @router.get("/profile-image")
 def get_profile_image(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -1097,7 +1097,7 @@ def get_profile_image(
 
 @router.delete("/profile-image")
 def delete_profile_image(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     try:
@@ -1247,7 +1247,7 @@ def verify_and_update_phone(
 )
 def create_nurse_assignment(
     req: NurseAssignmentCreate,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """[DEPRECATED] 배정/상태 변경 등록.
@@ -1263,7 +1263,7 @@ def get_nurse_assignments(
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,
     status: Optional[str] = "active",
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """배정 이력 조회.
@@ -1309,7 +1309,7 @@ class AssignmentPreviewRequest(BaseModel):
 @router.post("/assignments/preview")
 def preview_nurse_assignment(
     req: AssignmentPreviewRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """배정 생성/수정 전 영향 분석 (dry-run).
@@ -1322,7 +1322,11 @@ def preview_nurse_assignment(
     - notifications: 알림 대상
 
     참조: docs/NURSE_ASSIGNMENT_CRON_DESIGN.md §5
+
+    ★권한: 그 간호사를 볼 수 있는 사람만(이름·소속·휴직 등 배정 내역이 실린다).
     """
+    if not can_caller_access_nurse(db, current_user, req.nurse_id):
+        raise HTTPException(status_code=403, detail="해당 간호사에 대한 접근 권한이 없습니다.")
     return preview_assignment_impact(
         db,
         nurse_id=req.nurse_id,
@@ -1342,7 +1346,7 @@ def preview_nurse_assignment(
 def update_nurse_assignment(
     assignment_id: int,
     req: NurseAssignmentUpdate,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """[DEPRECATED] 배정 수정 (기간/상태 변경).
@@ -1359,7 +1363,7 @@ def update_nurse_assignment(
 )
 def delete_nurse_assignment(
     assignment_id: int,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """[DEPRECATED] 배정 취소 (status → cancelled).
@@ -1488,7 +1492,7 @@ def update_nurse_profile(
 @router.delete("/{nurse_id}")
 def delete_nurse(
     nurse_id: str,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """

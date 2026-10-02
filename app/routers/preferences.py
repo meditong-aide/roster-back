@@ -1,6 +1,6 @@
 from schemas.roster_schema import PreferenceData, PreferenceSubmit, WantedEntryItem
 from services.wanted_service import WantedAnalysisError, analyze_wanted_text
-from routers.auth import get_current_user_from_cookie, require_current_user
+from routers.auth import require_current_user
 from services.group_access import (
     resolve_home_group_id,
     caller_is_head_nurse,
@@ -132,7 +132,7 @@ async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Opti
 @router.post("")
 async def save_preference_draft(
     req: PreferenceData,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -158,7 +158,7 @@ async def save_preference_draft(
 @router.post("/submit")
 async def submit_preferences(
     req: PreferenceData,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -206,7 +206,7 @@ async def submit_preferences(
 @router.post("/submit/empty")
 def submit_empty_preferences(
     req: PreferenceSubmit,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -220,7 +220,7 @@ def submit_empty_preferences(
 @router.post("/retract")
 def retract_submission(
     req: PreferenceSubmit,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -239,7 +239,7 @@ def get_latest_preference(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -301,7 +301,7 @@ def get_monthly_memo(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """본인의 그 달 원티드 메모. 저장된 적 없으면 monthly_memo=null."""
@@ -321,7 +321,7 @@ def get_monthly_memo(
 @router.patch("/monthly-memo")
 def patch_monthly_memo(
     req: MonthlyMemoUpdate,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """월별 메모 저장. wanted_monthly_memo 외의 어떤 테이블도 건드리지 않는다."""
@@ -354,7 +354,7 @@ def list_group_monthly_memos(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """관리보드용 — 그룹에서 메모를 쓴 사람만 모아 돌려준다.
