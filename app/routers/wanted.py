@@ -1,14 +1,11 @@
-import hmac
-import logging
-import os
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.encoders import jsonable_encoder
 from typing import Optional, List, Dict, Any
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, date
 import uuid
 
 from schemas.roster_schema import (
@@ -27,7 +24,7 @@ from schemas.roster_schema import (
 from services.graph_service import graph_service
 from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse
 from routers.auth import get_current_user_from_cookie, require_current_user
-from utils.utils import push_not_delivered_reason, send_wanted_close_push
+from utils.utils import send_wanted_close_push
 from db.client2 import get_db
 from db.models import (
     Wanted,
@@ -36,7 +33,6 @@ from db.models import (
     WantedConfig,
     Nurse,
     ShiftPreference,
-    Group
 )
 from schemas.auth_schema import User as UserSchema
 from services.wanted_service import (
@@ -63,6 +59,7 @@ from services.wanted_service import (
     set_adjustment_applied_service,
     get_shift_requests_service,
     update_wanted_deadline_service,
+    run_wanted_auto_close,
 )
 from services.roster_service import get_my_wanted_reflection_service
 
@@ -326,9 +323,23 @@ def close_wanted_request(
 
     if not wanted:
         raise HTTPException(status_code=404, detail="해당 월의 wanted 요청을 찾을 수 없습니다.")
-    
-    wanted.status = 'closed'
+
+    # ★ 조건부 UPDATE — 이미 닫힌 원티드(자동 마감이 먼저 닫았거나 마감 버튼 두 번)에는
+    #   상태도 알림도 다시 내지 않는다. 속성 대입은 '변경 없음'이어도 알림은 나가던 구조였다.
+    changed = db.query(Wanted).filter(
+        Wanted.group_id == target_group_id, Wanted.year == year, Wanted.month == month,
+        or_(Wanted.status.is_(None), Wanted.status != "closed"),
+    ).update({Wanted.status: "closed"}, synchronize_session=False)
     db.commit()
+    if not changed:
+        return {"message": "이미 마감된 Wanted 요청입니다."}
+    # 보내기 직전에 상태를 다시 읽는다 — 그 사이 마감일 연장으로 다시 열렸으면 '마감' 알림을
+    # 보내지 않는다(자동 마감 `_notify_wanted_closed` 와 같은 방어). 컬럼 조회라 DB 값을 본다.
+    current = db.query(Wanted.status).filter(
+        Wanted.group_id == target_group_id, Wanted.year == year, Wanted.month == month,
+    ).scalar()
+    if current != "closed":
+        return {"message": "마감 직후 마감일 변경으로 다시 열려 마감 알림은 보내지 않았습니다."}
 
     nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
     recipients = [nurse.nurse_id for nurse in nurses_in_group]
@@ -515,180 +526,25 @@ def parse_preferences(
     return parsed
 
 
-_CRON_TOKEN_ENV = "WANTED_CLOSE_CRON_TOKEN"
-# 마감 알림은 최근 만료분에만 보낸다. 운영엔 자동 마감이 한 번도 돌지 않아 만료된 채
-# requested 로 남은 원티드가 2025-11 분부터 쌓여 있다(2026-10 실측 ~120건) — 첫 실행에
-# 그 알림이 한꺼번에 나가면 안 된다. 크론이 하루 이틀 빠져도 놓치지 않게 하루보다 넉넉히.
-_CLOSE_NOTIFY_WINDOW = timedelta(hours=72)
-
-
-# [Wanted] - 만료된 Wanted 자동 마감 처리
+# [Wanted] - 만료된 Wanted 일괄 마감 (관리자 수동)
 @router.post("/close-expired")
 def close_expired_wanted_endpoint(
-    x_cron_token: str | None = Header(default=None, alias="X-Cron-Token"),
-    current_user: UserSchema | None = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
     현재 KST 기준으로 exp_date가 지난 Wanted 요청의 status를 'closed'로 일괄 변경하는 엔드포인트입니다.
 
-    호출 주체 두 가지:
-    - 자동 마감 크론(EventBridge `daily_00cron` → Lambda `call-wanted-close-task`):
-      `X-Cron-Token` 헤더로 **전 병원**을 닫는다.
-    - 관리자(ADM) 쿠키: **자기 병원(office) 안**만 닫는다 — ADM 은 병원 단위 권한이다.
-
-    ★ 닫기만 한다. 다시 여는 건 수간호사가 마감일을 바꿀 때뿐이다
-      (`update_wanted_deadline_service`). 수동 마감(마감일 없이 closed)을 건드리지 않는다.
-    ★ 마감 알림은 `_CLOSE_NOTIFY_WINDOW` 안에 만료된 것만. 그보다 오래된 것은 알림 없이
-      닫고 `closed_silently` 로 돌려준다.
+    ★ 관리자(ADM)만, **자기 병원(office) 안**만 닫는다 — ADM 은 병원 단위 권한이다.
+    ★ 매일 자동 마감은 서버 안 스케줄러(`main._daily_wanted_close_scheduler`)가 한다.
+      예전 EventBridge→Lambda(`call-wanted-close-task`)는 dev API 를 불러 운영은 한 번도
+      닫히지 않았다(2026-10 실측). 로직은 `run_wanted_auto_close` 하나를 같이 쓴다.
     """
-    office_id = _close_expired_scope(x_cron_token, current_user)
-    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-    now_kst = (utc_now + timedelta(hours=9)).replace(tzinfo=None)
-
-    try:
-        closed = _close_expired_wanteds(db, office_id, now_kst)
-        if closed:
-            db.commit()
-            print(
-                f"Wanted 마감 완료(KST 기준): {len(closed)}건, scope={office_id or 'all'}, now_kst={now_kst.isoformat()}"
-            )
-    except Exception as exc:
-        db.rollback()
-        print(f"Wanted 마감 중 오류: {exc}")
-        raise
-
-    notify_from = now_kst - _CLOSE_NOTIFY_WINDOW
-    recent = [(g, y, m) for g, y, m, exp in closed if exp >= notify_from]
-    silent = [{"group_id": g, "year": y, "month": m} for g, y, m, exp in closed if exp < notify_from]
-    return {
-        "now_kst": now_kst.isoformat(),
-        "scope": office_id or "all",
-        "updated": len(closed),
-        "closed_silently": silent,
-        "notify_failed": _notify_closed_wanteds(db, recent),
-    }
-
-
-def _close_expired_scope(cron_token: str | None, current_user: UserSchema | None) -> str | None:
-    """호출 주체 → 처리할 병원(office_id). None = 전 병원(자동 마감 크론).
-
-    ★ 크론은 로그인 쿠키가 없다 → `X-Cron-Token` 을 환경변수 `WANTED_CLOSE_CRON_TOKEN`
-      과 비교한다. 환경변수가 비어 있으면 토큰 경로는 꺼진다(항상 401).
-      값은 요청마다 읽는다 — 모듈 상수로 두면 import 순서에 따라 빈 값이 굳는다.
-    """
-    if cron_token is not None:
-        expected = os.getenv(_CRON_TOKEN_ENV) or ""
-        if expected and hmac.compare_digest(cron_token.encode(), expected.encode()):
-            return None
-        raise HTTPException(status_code=401, detail="크론 토큰이 올바르지 않습니다.")
-    if current_user is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
     if not current_user.is_master_admin:
         raise HTTPException(status_code=403, detail="관리자만 사용할 수 있습니다.")
     if not current_user.office_id:
         raise HTTPException(status_code=403, detail="병원 정보를 확인할 수 없습니다.")
-    return str(current_user.office_id)
-
-
-def _close_expired_wanteds(
-    db: Session, office_id: str | None, now_kst: datetime
-) -> list[tuple]:
-    """만료 원티드를 닫고, **이번 호출이 직접 닫은** (group_id, year, month, exp_date) 만 돌려준다.
-
-    office_id 가 None 이면 전 병원(크론), 아니면 그 병원 그룹만.
-    ★ 행마다 조건부 UPDATE 다 — 만료 조건(`status='requested'`·`exp_date < now`)을
-      UPDATE 에서 **다시** 건다. 동시에 두 요청이 같은 행을 읽어도 먼저 갱신한 쪽만
-      rowcount 1 을 받고 뒤 요청은 0 을 받는다(같은 마감 알림이 두 번 가지 않는다).
-      후보 조회 뒤 수간호사가 마감일을 연장했다면 UPDATE 가 0 을 받아 닫지 않는다.
-    """
-    # ★ status 는 nullable 이다 — NULL 은 열린 상태로 본다(대시보드 `get_my_wanted_dashboard_service`
-    #   와 같은 규칙). `== 'requested'` 만 걸면 NULL 행은 만료돼도 영영 안 닫힌다(2026-10 실측 0행).
-    expired = (
-        or_(Wanted.status.is_(None), Wanted.status == "requested"),
-        Wanted.exp_date.isnot(None),
-        Wanted.exp_date < now_kst,
-    )
-    query = db.query(Wanted.group_id, Wanted.year, Wanted.month, Wanted.exp_date).filter(*expired)
-    if office_id is not None:
-        office_group_ids = db.query(Group.group_id).filter(Group.office_id == office_id)
-        query = query.filter(Wanted.group_id.in_(office_group_ids))
-    closed = []
-    for gid, year, month, exp_date in query.all():
-        changed = (
-            db.query(Wanted)
-            .filter(
-                Wanted.group_id == gid, Wanted.year == year, Wanted.month == month,
-                *expired,
-            )
-            .update({Wanted.status: "closed"}, synchronize_session=False)
-        )
-        if changed:
-            closed.append((gid, year, month, exp_date))
-    return closed
-
-
-def _notify_closed_wanteds(db: Session, closed_keys: list[tuple]) -> list[dict]:
-    """닫은 원티드마다 마감 알림. 푸시가 단말까지 가지 않은 병동은 사유와 함께 돌려준다.
-
-    ★ 마감은 이미 커밋됐다. 한 병동이 실패해도 나머지는 계속 보낸다(예전엔 첫
-      실패에서 500 으로 끊겨 뒤 병동은 알림 없이 마감만 됐고, 재호출해도 이미
-      closed 라 못 잡았다). 발신 관리자 미설정처럼 **조용히 건너뛰던 경우도 실패로**
-      남긴다.
-    """
-    failed = []
-    for gid, year, month in closed_keys:
-        try:
-            reason = _notify_wanted_closed(db, gid, year, month)
-        except Exception:
-            logging.getLogger(__name__).error(
-                "원티드 마감 알림 실패 group=%s %s-%s", gid, year, month, exc_info=True,
-            )
-            reason = "발송 오류"
-        if reason:
-            logging.getLogger(__name__).warning(
-                "원티드 마감 알림 미발송 group=%s %s-%s 사유=%s", gid, year, month, reason,
-            )
-            failed.append({"group_id": gid, "year": year, "month": month, "reason": reason})
-    return failed
-
-
-def _notify_wanted_closed(db: Session, group_id: str, year: int, month: int) -> str | None:
-    """병동 전원에게 마감 푸시. 발신자는 그룹 첫 관리자. 못 보내면 사유를 돌려준다."""
-    # ★ 보내기 직전에 상태를 다시 읽는다. 크론이 닫아 커밋한 뒤 수간호사가 마감일을 연장해
-    #   다시 열었으면, 이미 열린 원티드에 '마감' 알림이 뒤늦게 나간다(마감일 변경 알림과 모순).
-    #   컬럼 조회라 세션 캐시가 아닌 DB 값을 본다. 확인~발송 사이 틈은 남는다(재시도 큐 범위).
-    current = db.query(Wanted.status).filter(
-        Wanted.group_id == group_id, Wanted.year == year, Wanted.month == month,
-    ).scalar()
-    if current != "closed":
-        logging.getLogger(__name__).info(
-            "원티드 마감 알림 생략 — 이미 다시 열림 group=%s %s-%s status=%s", group_id, year, month, current,
-        )
-        return None
-    recipients = [
-        n.nurse_id
-        for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()
-    ]
-    if not recipients:
-        return "수신자 없음"
-    group = db.query(Group).filter(Group.group_id == group_id).first()
-    office_id = group.office_id if group else None
-    hn_id = (group.hn_id or [])[0] if group and group.hn_id else None
-    if not office_id or not hn_id:
-        return "발신 관리자 미설정"
-    hn = db.query(Nurse).filter(Nurse.nurse_id == hn_id).first()
-    if not hn:
-        return "발신 관리자 계정 없음"
-    result = send_wanted_close_push(
-        year=year,
-        month=month,
-        recipients=recipients,
-        office_code=office_id,
-        sender_emp_seq_no=hn.nurse_id,
-        sender_member_id=hn.account_id,
-    )
-    return push_not_delivered_reason(result)
+    return run_wanted_auto_close(db, office_id=str(current_user.office_id))
 
 
 # WantedConfig 관련 엔드포인트

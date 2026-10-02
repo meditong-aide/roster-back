@@ -270,6 +270,7 @@ jobs:
             GOOGLE_API_KEY=${{ secrets.PROD_ENV_GOOGLE }}
             ANTHROPIC_API_KEY=${{ secrets.PROD_ENV_ANTHROPIC }}
             OPENAI_API_KEY=${{ secrets.PROD_ENV_OPENAI }}
+            WANTED_AUTO_CLOSE_ENABLED=1
             EOF
               fi
 
@@ -308,6 +309,7 @@ jobs:
             GOOGLE_API_KEY=${{ secrets.DEV_ENV_GOOGLE }}
             ANTHROPIC_API_KEY=${{ secrets.DEV_ENV_ANTHROPIC }}
             OPENAI_API_KEY=${{ secrets.DEV_ENV_OPENAI }}
+            WANTED_AUTO_CLOSE_ENABLED=1
             EOF
             echo "/home/ubuntu/app/.env created for ${{ env.ENV }}"
 

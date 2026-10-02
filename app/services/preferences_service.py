@@ -45,8 +45,8 @@ def _now_kst() -> datetime:
     """KST 기준 naive 현재시각.
 
     wanted.exp_date 는 KST naive 로 저장되는데 API 컨테이너는 TZ 미설정(UTC)이라
-    datetime.now() 로 비교하면 마감이 9시간 느슨해진다. close-expired 라우터와
-    동일하게 UTC+9 로 맞춘다.
+    datetime.now() 로 비교하면 마감이 9시간 느슨해진다. 자동 마감
+    (`wanted_service.run_wanted_auto_close`)과 동일하게 UTC+9 로 맞춘다.
     """
     return (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=9))
 

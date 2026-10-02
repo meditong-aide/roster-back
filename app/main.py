@@ -54,7 +54,7 @@ import asyncio
 import logging
 
 from db.client2 import SessionLocal
-from services.wanted_service import close_expired_wanted
+from services.wanted_service import run_wanted_auto_close
 
 _scheduler_logger = logging.getLogger("scheduler")
 
@@ -238,15 +238,90 @@ async def _daily_nurse_sync_scheduler():
         await asyncio.to_thread(_run_nurse_sync)
 
 
+def _run_wanted_auto_close():
+    """만료 원티드 자동 마감 1회 실행(동기) — 전 병원.
+
+    ★ 이벤트 루프에서 직접 부르면 안 된다 — **동기 DB** 라 루프가 멈춘다. `to_thread` 로.
+    """
+    db = SessionLocal()
+    try:
+        _scheduler_logger.info("[Scheduler] 원티드 자동 마감 시작")
+        result = run_wanted_auto_close(db, office_id=None)
+        # ★ 0건이어도 남긴다 — '닫을 게 없었다'와 '안 돌았다'를 로그로 구분하려고.
+        _scheduler_logger.info(
+            "[Scheduler] 원티드 자동 마감 끝: 닫음 %d건 (알림 없이 %d건)",
+            result["updated"], len(result["closed_silently"]),
+        )
+        if result["close_failed"]:
+            _scheduler_logger.warning("[Scheduler] 원티드 마감 실패(다음 실행에 재시도): %s", result["close_failed"])
+        real_failures = [f for f in result["notify_failed"] if not f["reason"].startswith("skipped")]
+        if real_failures:
+            _scheduler_logger.warning("[Scheduler] 원티드 마감 알림 미발송: %s", real_failures)
+    except Exception as e:
+        _scheduler_logger.error("[Scheduler] 원티드 자동 마감 실패: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+async def _daily_wanted_close_scheduler():
+    """원티드 자동 마감 — 서버 기동 시 1회 + 매일 00:05(KST).
+
+    ★ 예전엔 EventBridge `daily_00cron` → Lambda `call-wanted-close-task` 가 HTTP 로 불렀는데
+      **dev API** 를 불러 운영은 한 번도 닫히지 않았다(2026-10 실측). 서버 안으로 옮겼다.
+    ★ 기동 시 1회는 서버가 내려가 있던 동안 놓친 마감을 따라잡는다. 이미 닫힌 건 다시 닫지
+      않고 알림도 다시 안 간다(조건부 UPDATE) — 재기동이 잦아도 안전하다.
+    ★ 켜는 스위치 `WANTED_AUTO_CLOSE_ENABLED=1` 은 배포 워크플로가 dev·prod .env 에 넣는다.
+      로컬 개발 서버는 꺼져 있다 — 개발자 PC 가 dev DB 원티드를 닫고 알림을 보내지 않게.
+    """
+    from datetime import timedelta
+
+    kst = timezone(timedelta(hours=9))
+    await asyncio.to_thread(_run_wanted_auto_close)
+    while True:
+        now = datetime.now(kst)
+        target = now.replace(hour=0, minute=5, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        _scheduler_logger.info("[Scheduler] 원티드 자동 마감 다음 실행: %s", target.isoformat())
+        await asyncio.sleep((target - now).total_seconds())
+        await asyncio.to_thread(_run_wanted_auto_close)
+
+
+def _log_task_end(task: asyncio.Task) -> None:
+    """스케줄러 작업이 예외로 끝나면 남긴다(취소는 정상 종료). 조용히 죽으면 아무도 모른다."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        _scheduler_logger.error("[Scheduler] %s 비정상 종료: %r", task.get_name(), exc)
+
+
+def _start_wanted_close_task() -> asyncio.Task | None:
+    """`WANTED_AUTO_CLOSE_ENABLED=1` 일 때만 원티드 자동 마감 스케줄러를 띄운다. 켜짐/꺼짐을 남긴다."""
+    enabled = os.getenv("WANTED_AUTO_CLOSE_ENABLED") == "1"
+    _scheduler_logger.info(
+        "[Scheduler] 원티드 자동 마감: %s (WANTED_AUTO_CLOSE_ENABLED=%r)",
+        "켜짐" if enabled else "꺼짐", os.getenv("WANTED_AUTO_CLOSE_ENABLED"),
+    )
+    if not enabled:
+        return None
+    task = asyncio.create_task(_daily_wanted_close_scheduler(), name="wanted_auto_close")
+    task.add_done_callback(_log_task_end)
+    return task
+
+
 @asynccontextmanager
 async def lifespan(app):
     flush_task = asyncio.create_task(_daily_flush_scheduler())
     sync_task = asyncio.create_task(_daily_nurse_sync_scheduler())
     janitor_task = asyncio.create_task(_stale_jobs_janitor())
+    wanted_close_task = _start_wanted_close_task()
     yield
     flush_task.cancel()
     sync_task.cancel()
     janitor_task.cancel()
+    if wanted_close_task is not None:
+        wanted_close_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
