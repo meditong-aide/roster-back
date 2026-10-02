@@ -227,6 +227,8 @@ def retract_submission(
         return retract_submission_service(req, current_user, db)
     except HTTPException:
         raise
+    except PreferenceConflictError as e:
+        _raise_domain_error(e)
     except Exception as e:
         print('[preferences.py] error', e)
         raise HTTPException(status_code=500, detail=f"제출 철회 실패: {str(e)}")

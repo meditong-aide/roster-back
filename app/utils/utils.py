@@ -287,6 +287,22 @@ def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
     return {"result": "success", "message": "푸시 발송 대상이 없습니다."}
 
 
+def push_not_delivered_reason(result: dict | None) -> str | None:
+    """`set_app_push` 결과 → 단말 발송까지 갔으면 None, 아니면 사유.
+
+    ★ 발송 함수는 실패를 예외로 던지지 않고 결과로 돌려준다(fail·skipped).
+      `success` 도 두 가지다 — "push 발송 완료"(단말 큐 적재)와
+      "푸시 발송 대상이 없습니다."(알림함에만 기록, 받을 기기 0). 뒤의 것도
+      휴대폰에는 안 갔으므로 사유로 남긴다.
+    """
+    status = (result or {}).get("result")
+    message = (result or {}).get("message") or ""
+    if status == "success" and message == "push 발송 완료":
+        return None
+    if status == "success":
+        return f"받을 기기 없음({message})"
+    return f"{status or '결과 없음'}: {message}"
+
 
 def send_roster_publish_push(
     year: int,

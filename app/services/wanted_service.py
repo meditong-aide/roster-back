@@ -5,9 +5,10 @@ Wanted(근무 희망 요청) 관련 서비스 로직 모듈
 """
 import calendar
 import json
+import logging
 import traceback
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dateutil.relativedelta import relativedelta
@@ -61,7 +62,7 @@ from services.weekly_off_service import (
     calc_weekly_off_weekday_by_month,
     calc_weekly_off_weekday_by_week,
 )
-from utils.utils import send_wanted_request_push
+from utils.utils import push_not_delivered_reason, send_wanted_deadline_update_push, send_wanted_request_push
 
 
 def _yyyymm(year: int, month: int) -> str:
@@ -1817,12 +1818,19 @@ def request_wanted_shifts_service(
     target_group_id = override_group_id or resolve_home_group_id(db, current_user)
     if not target_group_id:
         raise Exception("대상 그룹이 없습니다.")
-    if db.query(Wanted).filter(
+    existing = db.query(Wanted).filter(
         Wanted.group_id == target_group_id,
         Wanted.year == req.year,
         Wanted.month == req.month
-    ).first():
-        raise Exception("이미 해당 월의 요청이 존재합니다.")
+    ).first()
+    if existing:
+        # ★ 이미 있는 달 = 마감일 변경. 수간호사 PC 는 상태가 requested 가 아니면(=closed)
+        #   "마감일 변경하기"를 이 POST 로 보낸다(WantedSelectorModal·HeadNurseHeader).
+        #   예전엔 여기서 "이미 해당 월의 요청이 존재합니다" 500 이었다.
+        # ★ POST 는 exp_date 생략 = '마감일 없음'(스키마 계약·새 달 생성과 같은 의미)이다.
+        #   PATCH 의 '생략 = 변경 없음'과 다르므로 명시적으로 넘겨 '보낸 값'으로 만든다.
+        explicit = WantedDeadlineRequest(year=req.year, month=req.month, exp_date=req.exp_date)
+        return update_wanted_deadline_service(db, existing, explicit, current_user, target_group_id)
 
     # 마감일은 요청에서 전달된 값 사용 (향후 default_deadline_days 자동 계산 기능 추가 예정)
     new_wanted = Wanted(
@@ -1865,6 +1873,129 @@ def request_wanted_shifts_service(
         "current_exp_date": new_wanted.exp_date.isoformat() if new_wanted.exp_date else None,
         "display_exp_date": display_exp_date
     }
+
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _now_kst_naive() -> datetime:
+    """DB 의 마감일(`wanted.exp_date`)은 KST naive 다 — 비교도 KST naive 로 한다."""
+    return datetime.now(_KST).replace(tzinfo=None)
+
+
+def _to_kst_naive(value: datetime | None) -> datetime | None:
+    """시간대가 붙어 들어오면 KST naive 로 맞춘다. PC 는 'YYYY-MM-DD'(naive)로 보낸다."""
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(_KST).replace(tzinfo=None)
+
+
+def _deadline_response(wanted: Wanted, message: str) -> dict:
+    return {
+        "message": message,
+        "current_exp_date": wanted.exp_date.isoformat() if wanted.exp_date else None,
+        "display_exp_date": "마감일 없음" if wanted.exp_date is None else wanted.exp_date.strftime("%Y-%m-%d"),
+    }
+
+
+def update_wanted_deadline_service(
+    db: Session, wanted: Wanted, req: WantedDeadlineRequest, current_user, group_id: str,
+) -> dict:
+    """원티드 마감일 변경. 마감(closed)된 달도 새 마감일이 없거나 미래면 **다시 연다**.
+
+    ★ 만료 원티드는 자동 마감 크론(`POST /wanted/close-expired`)이 closed 로 바꾼다.
+      그래서 마감일이 지난 뒤의 연장은 곧 재오픈이다 — 막으면 수간호사가 해 오던
+      "마감 뒤 연장"이 끊긴다. 과거 날짜로는 다시 열지 않는다(다음 크론이 바로 닫는다).
+    ★ 크론은 닫기만 한다. 수동 마감(마감일 없이 closed)도 여기서만 다시 열린다.
+    ★ 순서는 **행 잠금**으로 정한다 — 아래 `_lock_wanted_row` 참고.
+    """
+    payload = req.model_dump(exclude_unset=True)
+    new_exp = _to_kst_naive(req.exp_date)
+    reopens = new_exp is None or new_exp > _now_kst_naive()
+    seen = (wanted.status, wanted.exp_date)
+    _lock_wanted_row(db, wanted)
+    if (wanted.status, wanted.exp_date) != seen:
+        return _concurrent_change_response(wanted, new_exp, reopens)
+    if wanted.status == "closed" and ("exp_date" not in payload or not reopens):
+        raise HTTPException(status_code=400, detail="마감된 wanted 요청의 마감일은 변경할 수 없습니다.")
+    if "exp_date" not in payload:
+        return _deadline_response(wanted, "마감일 변경 요청이 없어 기존 값이 유지됩니다.")
+    if wanted.status != "closed" and wanted.exp_date == new_exp:
+        # 같은 값 재요청(재시도·더블클릭)은 아무것도 안 바꾸고 알림도 다시 보내지 않는다.
+        return _deadline_response(wanted, "마감일이 이미 같은 값입니다.")
+    _write_deadline(db, wanted, new_exp, reopens)
+    message = "마감일이 제거되었습니다. (마감일 없음)" if new_exp is None else "마감일이 성공적으로 변경되었습니다."
+    response = _deadline_response(wanted, message)
+    response["notify_failed"] = _notify_deadline_change(db, wanted, current_user, group_id)
+    return response
+
+
+def _lock_wanted_row(db: Session, wanted: Wanted) -> None:
+    """원티드 행을 잠그고(커밋까지) 현재 값으로 다시 읽는다.
+
+    ★ 잠근 뒤로는 자동 마감 크론·수동 마감(`PATCH /wanted/close`)이 이 요청이 끝날 때까지
+      기다린다 → 끼어든 마감을 연장이 몰래 되돌리는 일이 없다. 잠금 전에 이미 바뀌었으면
+      호출부가 `seen` 과 비교해 걸러 낸다(크론 마감인지 수동 마감인지 구분하지 않는다).
+    ★ `with_for_update()` 는 이 환경(mssql+pymssql·SQLAlchemy 2.0)에서 SQL 에 아무것도
+      붙이지 않는다(실측) — 테이블 힌트로 건다. `populate_existing` 으로 세션 캐시를 덮는다.
+    """
+    db.query(Wanted).with_hint(Wanted, "WITH (UPDLOCK, ROWLOCK)", "mssql").populate_existing().filter(
+        Wanted.group_id == wanted.group_id, Wanted.year == wanted.year, Wanted.month == wanted.month,
+    ).first()
+
+
+def _concurrent_change_response(wanted: Wanted, new_exp: datetime | None, reopens: bool) -> dict:
+    """이 요청이 읽은 뒤 다른 요청이 행을 바꿨다. 이미 원하는 값이면 무변경, 아니면 409.
+
+    마감(크론·수동)이 끼어든 경우도 409 — 몰래 다시 열지 않는다. 수간호사가 새로고침 후
+    다시 연장하면 그때는 '닫힌 달 재오픈'으로 정상 처리된다.
+    """
+    if wanted.exp_date == new_exp and (not reopens or wanted.status == "requested"):
+        return _deadline_response(wanted, "마감일이 이미 같은 값입니다.")
+    raise HTTPException(status_code=409, detail="원티드가 방금 다른 요청으로 바뀌었습니다(마감 등). 새로고침 후 다시 시도해 주세요.")
+
+
+def _write_deadline(db: Session, wanted: Wanted, new_exp: datetime | None, reopens: bool) -> None:
+    """마감일(재오픈이면 상태도)을 쓴다. 행은 이미 잠겨 있다.
+
+    ★ 속성 대입이 아니라 UPDATE 로 **함께** 쓴다 — 읽은 값과 같은 status 대입은 SQLAlchemy 가
+      '변경 없음'으로 빼먹는다. 재오픈이면 status 를 항상 명시한다.
+    """
+    values = {Wanted.exp_date: new_exp}
+    if reopens:
+        values[Wanted.status] = "requested"
+    db.query(Wanted).filter(
+        Wanted.group_id == wanted.group_id, Wanted.year == wanted.year, Wanted.month == wanted.month,
+    ).update(values, synchronize_session=False)
+    db.commit()
+    db.refresh(wanted)
+
+
+def _notify_deadline_change(db: Session, wanted: Wanted, current_user, group_id: str) -> str | None:
+    """마감일 변경 알림. 단말까지 보냈으면 None, 아니면 사유.
+
+    ★ 변경은 이미 커밋됐다 — 알림 예외를 500 으로 올리면 '실패'로 보인 요청을 다시 보내
+      같은 알림이 두 번 간다. 예외는 기록하고 응답의 `notify_failed` 로만 알린다.
+    ★ 발송 함수는 실패를 대부분 예외 없이 결과로 돌려준다 → 결과로 판정한다.
+    """
+    try:
+        recipients = [n.nurse_id for n in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
+        result = send_wanted_deadline_update_push(
+            year=wanted.year,
+            month=wanted.month,
+            recipients=recipients,
+            office_code=current_user.office_id,
+            sender_emp_seq_no=current_user.nurse_id,
+            sender_member_id=current_user.account_id,
+            deadline=wanted.exp_date,
+        )
+        return push_not_delivered_reason(result)
+    except Exception:
+        logging.getLogger(__name__).error(
+            "원티드 마감일 변경 알림 실패 group=%s %s-%s", wanted.group_id, wanted.year, wanted.month,
+            exc_info=True,
+        )
+        return "발송 오류"
 
 
 def close_expired_wanted(db: Session) -> int:

@@ -1139,6 +1139,33 @@ def retract_submission_service(req: PreferenceSubmit, current_user, db: Session)
     ).order_by(WantedRequest.submitted_at.desc()).first()
     if not preference:
         raise Exception("No submitted preference found to retract")
+    # ★ 마감 뒤 철회 금지 — 철회하면 마감이라 다시 제출할 수 없어 제출본이 사라진 채
+    #   마감된다. PC 는 submitted 가 closed 보다 먼저라 마감 뒤에도 "제출 철회" 버튼이
+    #   보인다(모바일은 화면에서 숨김). 판정은 제출·저장과 같은 `_is_wanted_closed`.
+    # ★ 원티드 행을 **잠그고** 확인한다(커밋까지 유지). 확인과 철회 사이에 자동 마감 크론이나
+    #   수동 마감이 끼어들면 '열려 있다'고 보고 철회했는데 마감된 상태가 된다.
+    # ★ `with_for_update()` 는 이 환경(mssql+pymssql·SQLAlchemy 2.0)에서 SQL 에 아무것도
+    #   붙이지 않는다(실측) — 잠금 없이 지나간다. 테이블 힌트로 건다.
+    wanted = (
+        db.query(Wanted)
+        .with_hint(Wanted, "WITH (UPDLOCK, ROWLOCK)", "mssql")
+        .filter(
+            Wanted.group_id == preference.group_id,
+            Wanted.year == req.year,
+            Wanted.month == req.month,
+        )
+        .first()
+    )
+    # 원티드 행이 없으면 거부한다 — 철회하면 다시 제출할 수 없다(제출·저장 게이트
+    # `_assert_wanted_writable` 도 행 부재를 409 로 막는다). 열어 두면 제출본만 잃는다.
+    if wanted is None:
+        raise PreferenceConflictError(
+            f"{req.year}년 {req.month}월 원티드 요청이 없어 제출을 철회할 수 없습니다."
+        )
+    if _is_wanted_closed(wanted):
+        raise PreferenceConflictError(
+            f"{req.year}년 {req.month}월 원티드가 마감되어 제출을 철회할 수 없습니다."
+        )
     preference.is_submitted = False
     preference.submitted_at = None
     db.commit()
