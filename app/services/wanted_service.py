@@ -191,10 +191,7 @@ def _assignment_window_dates(
     if assignment is None or assignment.start_date is None:
         return ([], list(month_dates))
     start = assignment.start_date
-    if assignment.reason == "병동이동":
-        end = assignment.expected_end_date
-    else:
-        end = assignment.expected_end_date or assignment.end_date
+    end = _dispatch_end(assignment)
     in_period: List[date] = []
     out_period: List[date] = []
     for d in month_dates:
@@ -205,6 +202,54 @@ def _assignment_window_dates(
         else:
             in_period.append(d)
     return (in_period, out_period)
+
+
+def _done_dispatch_overlapping(first_day: date, last_day: date):
+    """그 달([first_day, last_day])과 겹치는 **끝난(completed) 파견** 조건.
+
+    ★ 파견은 끝나면(`flush_expired_dispatches`) completed 가 된다. 이걸 빼면 월중에 끝난 파견자가
+      받는 병동 화면·저장·생성에서 사라지고 보낸 병동 쪽엔 파견 기간이 다시 보인다(2026-10-02 원티드 표 ·
+      2026-10-06 조정판·확정 원티드). 끝 날짜는 end_date 우선 — 월 명단(`get_active_assignments_for_month`)·
+      날짜 판정(`_dispatch_end`)과 같은 기준.
+    """
+    return and_(
+        NurseAssignment.status == "completed",
+        NurseAssignment.reason == "파견",
+        NurseAssignment.start_date <= last_day,
+        func.coalesce(NurseAssignment.end_date, NurseAssignment.expected_end_date) >= first_day,
+    )
+
+
+def _month_assignment_status(first_day: date, last_day: date):
+    """그 달 화면·저장이 보는 파견/병동이동 상태 조건 — 진행 중 + 그 달에 시작한 끝난 병동이동 +
+    그 달과 겹치는 끝난 파견. 조정판 받는·보낸 병동 조회와 저장용 주휴 조회가 **같은 조건**을 쓴다
+    (한쪽만 바꾸면 같은 날 주휴가 화면과 저장에서 갈린다 — Codex 2026-10-06)."""
+    return or_(
+        NurseAssignment.status == "active",
+        and_(
+            NurseAssignment.status == "completed",
+            NurseAssignment.reason == "병동이동",
+            NurseAssignment.start_date >= first_day,
+            NurseAssignment.start_date <= last_day,
+        ),
+        _done_dispatch_overlapping(first_day, last_day),
+    )
+
+
+def _dispatch_end(asg: NurseAssignment) -> Optional[date]:
+    """관할 판정에 쓰는 배정 끝 날짜.
+
+    - 병동이동: flush 가 넣은 end_date(이동일)는 무시하고 expected_end_date 만(영구 이동).
+    - 진행 중 파견: expected_end_date 우선(조기 복귀는 예정 종료일을 고친다).
+    - **끝난(completed) 파견: end_date 우선** — 실제로 끝난 날이다. 월 명단(`get_active_assignments_for_month`)도
+      end_date 를 먼저 본다. 끝난 뒤 예정 종료일만 늘린 행을 예정일로 보면 복귀 뒤 날짜까지 받는 병동 것이
+      되고, 보낸 병동 표에선 그 날 신청이 사라졌다(OMC 검토 2026-10-02). 생성 경로는 active 만 넘겨 무관.
+    """
+    if asg.reason == "병동이동":
+        return asg.expected_end_date
+    if asg.status == "completed":
+        return asg.end_date or asg.expected_end_date
+    return asg.expected_end_date or asg.end_date
 
 
 def _resolve_owner_group_for_date_multi(
@@ -232,10 +277,7 @@ def _resolve_owner_group_for_date_multi(
     for asg in assignments:
         if asg.start_date is None:
             continue
-        if asg.reason == "병동이동":
-            end = asg.expected_end_date
-        else:
-            end = asg.expected_end_date or asg.end_date
+        end = _dispatch_end(asg)
         if target_date < asg.start_date:
             if asg.reason == "병동이동":
                 if (
@@ -281,10 +323,7 @@ def _build_assignment_window(
     _start = asg.start_date
     if _start is None:
         return None
-    if asg.reason == "병동이동":
-        _end = asg.expected_end_date
-    else:
-        _end = asg.expected_end_date or asg.end_date
+    _end = _dispatch_end(asg)
     if _start > month_last:
         return None
     if _end is not None and _end < month_first:
@@ -2595,21 +2634,14 @@ def get_wanted_adjustment_service(
 
     # Inbound 간호사 병합 (파견/병동이동 target=caller) — multi-dispatch list.
     # 병동이동은 flush 후 status=completed 가 되므로 이번 달에 transfer 가
-    # 발생한 케이스도 함께 포함한다.
+    # 발생한 케이스도 함께 포함한다. 그 달과 겹치는 끝난 파견도 넣는다(원티드 표와 같은 기준).
+    _month_status = _month_assignment_status(start_date, end_date - timedelta(days=1))
     inbound_rows = (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.target_group_id == group_id,
             NurseAssignment.reason.in_(_INBOUND_REASONS),
-            or_(
-                NurseAssignment.status == "active",
-                and_(
-                    NurseAssignment.status == "completed",
-                    NurseAssignment.reason == "병동이동",
-                    NurseAssignment.start_date >= start_date,
-                    NurseAssignment.start_date < end_date,
-                ),
-            ),
+            _month_status,
         )
         .order_by(NurseAssignment.start_date.desc())
         .all()
@@ -2627,22 +2659,14 @@ def get_wanted_adjustment_service(
         ).order_by(Nurse.sequence).all()
 
     # Outbound assignment (source=caller, target!=caller) — 병렬 파견 지원 (multi-dispatch list).
-    # 동일하게 이번 달에 transfer 가 발생한 completed 병동이동도 포함.
+    # 동일하게 이번 달에 transfer 가 발생한 completed 병동이동·그 달과 겹치는 끝난 파견도 포함.
     outbound_rows = (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.source_group_id == group_id,
             NurseAssignment.target_group_id != group_id,
             NurseAssignment.reason.in_(_INBOUND_REASONS),
-            or_(
-                NurseAssignment.status == "active",
-                and_(
-                    NurseAssignment.status == "completed",
-                    NurseAssignment.reason == "병동이동",
-                    NurseAssignment.start_date >= start_date,
-                    NurseAssignment.start_date < end_date,
-                ),
-            ),
+            _month_status,
         )
         .order_by(NurseAssignment.start_date.desc())
         .all()
@@ -2691,8 +2715,6 @@ def get_wanted_adjustment_service(
     for nurse in nurses:
         _inbound_asgs = inbound_map.get(nurse.nurse_id, [])
         _outbound_asgs = outbound_map.get(nurse.nurse_id, [])
-        # overlay: weekly-off 계산 시 대표 1건이 필요해 최신 inbound 우선.
-        assignment_overlay = _inbound_asgs[0] if _inbound_asgs else None
 
         # blocked_days 선계산 (entries 필터·주휴 절단에 재사용)
         # - inbound(caller == target): 모든 inbound 창 UNION 밖 일자가 blocked
@@ -2810,41 +2832,34 @@ def get_wanted_adjustment_service(
                     ))
                     monthly_summary[sr.shift] += 1
 
-        # 주휴 일자 계산 (inbound는 target_weekly_off_* overlay)
-        if assignment_overlay is not None:
-            weekly_off_enabled = bool(getattr(assignment_overlay, "target_weekly_off_enabled", None))
-        else:
-            weekly_off_enabled = getattr(nurse, "weekly_off_enabled", False) or False
-        weekly_off_days: List[int] = []
-        if weekly_off_enabled:
-            # outbound 케이스: nurse.weekly_off 가 활성이어도 파견 기간(blocked_set)은
-            # 타 병동 관할이라 source caller 에서 주휴를 드러내면 안 됨.
-            _raw_wo_days = sorted(_compute_weekly_off_days(
-                db, nurse.nurse_id, group_id, year, month,
-                assignment_overlay=assignment_overlay,
+        # 주휴 일자 계산 — inbound 는 배정마다 그 기간에 target_weekly_off_* (같은 달 파견이 둘이어도
+        #   각 기간이 자기 설정 · 저장 경로와 같은 `_weekly_off_days_for_caller`), 아니면 소속 설정.
+        # outbound 케이스: nurse.weekly_off 가 활성이어도 파견 기간(blocked_set)은
+        # 타 병동 관할이라 source caller 에서 주휴를 드러내면 안 됨.
+        _raw_wo_days = sorted(_weekly_off_days_for_caller(
+            db, nurse.nurse_id, group_id, year, month, _inbound_asgs,
+        ))
+        weekly_off_days: List[int] = [
+            day for day in _raw_wo_days
+            if date(year, month, day) not in blocked_set
+        ]
+        for day in weekly_off_days:
+            entries.append(FixedWantedEntryResponse(
+                id=-day,  # 음수 ID로 주휴 구분 (실제 DB ID가 아님)
+                group_id=group_id,
+                year=year,
+                month=month,
+                nurse_id=nurse.nurse_id,
+                shift_date=date(year, month, day),
+                shift_id="주",
+                is_applied=True,  # 주휴는 항상 적용됨 (토글 불가)
+                source_type="weekly_off",
+                original_shift_id=None,
+                reason=None,
+                created_by=None,
             ))
-            weekly_off_days = [
-                day for day in _raw_wo_days
-                if date(year, month, day) not in blocked_set
-            ]
-            if weekly_off_days:
-                for day in weekly_off_days:
-                    weekly_off_date = date(year, month, day)
-                    entries.append(FixedWantedEntryResponse(
-                        id=-day,  # 음수 ID로 주휴 구분 (실제 DB ID가 아님)
-                        group_id=group_id,
-                        year=year,
-                        month=month,
-                        nurse_id=nurse.nurse_id,
-                        shift_date=weekly_off_date,
-                        shift_id="주",
-                        is_applied=True,  # 주휴는 항상 적용됨 (토글 불가)
-                        source_type="weekly_off",
-                        original_shift_id=None,
-                        reason=None,
-                        created_by=None,
-                    ))
-                monthly_summary["주"] = len(weekly_off_days)
+        if weekly_off_days:
+            monthly_summary["주"] = len(weekly_off_days)
 
         # ── 금지 원티드(banned_wanted): caller 관할 일자만, shift_date 기준 최신 id ──
         # **출처 구분 없이 전부 노출한다**(응답의 `source` 로 구분).
@@ -2888,26 +2903,55 @@ def get_wanted_adjustment_service(
     )
 
 
-def _collect_assignment_map_for_nurses(
-    db: Session, nurse_ids: List[str]
-) -> Dict[str, NurseAssignment]:
-    """간호사별 최신 활성 파견/병동이동 assignment 맵 (scalar, multi-dispatch 미지원)."""
+def _inbound_assignments_for_caller(
+    db: Session, nurse_ids: List[str], caller_group_id: str, month_first: date, month_last: date,
+) -> Dict[str, List[NurseAssignment]]:
+    """간호사별 **그 병동으로 들어온** 그 달 배정 목록(`_month_assignment_status` — 조정판 inbound 와 같은 조건) — 주휴 계산용.
+
+    ★ 예전엔 병동을 안 가린 최신 1건(scalar)이라 ①보낸 병동 저장에도 파견지 주휴 요일이 씌워지고
+      ②같은 달 파견이 둘이면 최신 파견의 요일이 앞 파견 기간까지 덮었다(Codex 2026-10-06).
+      날짜별로 그 날을 덮는 배정의 설정을 쓰도록 목록으로 돌려준다(`_weekly_off_days_for_caller`).
+    """
     if not nurse_ids:
         return {}
     rows = (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.nurse_id.in_(nurse_ids),
-            NurseAssignment.status == "active",
+            NurseAssignment.target_group_id == caller_group_id,
             NurseAssignment.reason.in_(_INBOUND_REASONS),
+            _month_assignment_status(month_first, month_last),   # 조정판 inbound 와 같은 조건
         )
         .order_by(NurseAssignment.start_date.desc())
         .all()
     )
-    assignment_map: Dict[str, NurseAssignment] = {}
+    out: Dict[str, List[NurseAssignment]] = defaultdict(list)
     for row in rows:
-        assignment_map.setdefault(row.nurse_id, row)
-    return assignment_map
+        out[row.nurse_id].append(row)
+    return out
+
+
+def _weekly_off_days_for_caller(
+    db: Session, nurse_id: str, group_id: str, year: int, month: int,
+    inbound_asgs: List[NurseAssignment],
+) -> Set[int]:
+    """그 병동이 보는 주휴 일자(day set).
+
+    - 그 병동으로 들어온 배정이 있으면 **배정마다** 파견지 주휴 설정(target_weekly_off_*)으로 계산해
+      그 배정 기간 안의 날만 합친다 — 같은 달 파견이 둘이어도 각 기간이 자기 설정을 쓴다.
+    - 없으면 간호사 소속 주휴 설정(기존).
+    조정판 표시와 확정 원티드 저장(자동 주휴 '주' 건너뛰기)이 같이 쓴다.
+    """
+    if not inbound_asgs:
+        return _compute_weekly_off_days(db, nurse_id, group_id, year, month)
+    days: Set[int] = set()
+    for asg in inbound_asgs:
+        in_dates, _ = _assignment_window_dates(asg, year, month)
+        if not in_dates:
+            continue
+        wo = _compute_weekly_off_days(db, nurse_id, group_id, year, month, assignment_overlay=asg)
+        days |= {d.day for d in in_dates} & wo
+    return days
 
 
 def _collect_assignment_list_map_for_nurses(
@@ -2918,6 +2962,10 @@ def _collect_assignment_list_map_for_nurses(
     한 간호사가 병렬로 여러 병동에 파견된 경우를 대비해 scalar 맵과 분리.
     병동이동은 flush 후 status=completed 가 되어도 ownership 판정에는 계속 필요하므로
     completed 병동이동도 포함한다 (resolver 가 pre/post-transfer 분기 처리).
+    ★ 끝난(completed) 파견도 넣는다 — 빼면 파견이 끝난 달의 그 기간이 소속 병동 관할로 넘어가
+      받는 병동 저장은 막히고 보낸 병동 저장·생성 조회가 그 날을 가져갔다(2026-10-06). 날짜는
+      `_dispatch_end`(끝난 파견 = end_date 우선)가 가르므로 월 범위는 필요 없다. 끝 날짜가 둘 다 없는
+      끝난 파견은 뺀다 — 시작 뒤 모든 날을 영구히 파견지 관할로 만든다.
     """
     if not nurse_ids:
         return {}
@@ -2931,6 +2979,11 @@ def _collect_assignment_list_map_for_nurses(
                 and_(
                     NurseAssignment.status == "completed",
                     NurseAssignment.reason == "병동이동",
+                ),
+                and_(
+                    NurseAssignment.status == "completed",
+                    NurseAssignment.reason == "파견",
+                    func.coalesce(NurseAssignment.end_date, NurseAssignment.expected_end_date).isnot(None),
                 ),
             ),
         )
@@ -3207,7 +3260,9 @@ def save_fixed_wanted_service(
     nurse_name_map: Dict[str, str] = {
         nid: (n.name or nid) for nid, n in nurse_rows.items()
     }
-    assignment_map = _collect_assignment_map_for_nurses(db, request_nurse_ids)
+    # 주휴 계산용 — 저장하는 병동으로 **들어온** 그 달 배정 목록(조정판과 같은 기준).
+    inbound_for_caller = _inbound_assignments_for_caller(
+        db, request_nurse_ids, group_id, start_date, end_date - timedelta(days=1))
     # 다중 assignment(sequential 병동이동, 미래 transfer + 진행중 파견 등)를
     # 정확히 판정하기 위해 list 기반 맵도 별도로 구성한다.
     assignment_list_map = _collect_assignment_list_map_for_nurses(
@@ -3292,17 +3347,10 @@ def save_fixed_wanted_service(
         db, request_nurse_ids, month_str, start_date, end_date,
     )
     nurse_weekly_off_map: Dict[str, Set[int]] = {}
-    for nid, nurse_row in nurse_rows.items():
-        assignment_overlay = assignment_map.get(nid)
-        if assignment_overlay is not None:
-            wo_enabled = bool(getattr(assignment_overlay, "target_weekly_off_enabled", None))
-        else:
-            wo_enabled = bool(getattr(nurse_row, "weekly_off_enabled", False))
-        if not wo_enabled:
-            continue
-        days = _compute_weekly_off_days(
-            db, nid, group_id, req.year, req.month,
-            assignment_overlay=assignment_overlay,
+    for nid in nurse_rows:
+        # 날짜마다 그 날을 덮는 들어온 배정의 주휴 설정 · 없으면 소속 설정(켜짐 여부는 안에서 본다)
+        days = _weekly_off_days_for_caller(
+            db, nid, group_id, req.year, req.month, inbound_for_caller.get(nid, []),
         )
         if days:
             nurse_weekly_off_map[nid] = days
@@ -4261,10 +4309,12 @@ def _fetch_caller_owned_entries(
 ) -> List[FixedWantedEntry]:
     """caller 관할(shift_date 기준) 확정 원티드 엔트리 조회.
 
-    - 소속 간호사 + inbound 간호사(=caller 가 target 인 활성 assignment)의
+    - 소속 간호사 + inbound 간호사(=caller 가 target 인 활성 assignment · 그 달과 겹치는 끝난 파견)의
       해당 월 모든 엔트리를 stored group_id 불문 조회.
     - shift_date 기준 owner==caller 인 엔트리만 유지.
     - (nurse_id, shift_date) 기준 최신 id 우선으로 dedup (target 저장 entry 우선).
+    ★ 끝난 파견자를 빼면 받는 병동이 저장한 행이 조회에서 사라지는데, 생성 수집은 그 행을 가져가
+      화면과 생성이 어긋났다(Codex 2026-10-06) — 조정판·저장·생성 수집과 같은 대상.
     """
     source_nurse_ids = {
         nid for (nid,) in db.query(Nurse.nurse_id).filter(
@@ -4272,9 +4322,11 @@ def _fetch_caller_owned_entries(
             Nurse.active == 1,
         ).all()
     }
+    _m_first = date(year, month, 1)
+    _m_last = date(year, month, calendar.monthrange(year, month)[1])
     inbound_rows = db.query(NurseAssignment.nurse_id).filter(
         NurseAssignment.target_group_id == caller_group_id,
-        NurseAssignment.status == "active",
+        _month_assignment_status(_m_first, _m_last),   # 조정판·저장과 같은 조건
         NurseAssignment.reason.in_(_INBOUND_REASONS),
     ).all()
     inbound_nurse_ids = {r[0] for r in inbound_rows}
@@ -4376,20 +4428,14 @@ def get_shift_requests_service(
     # 2. inbound assignment (target == target_group_id) — multi-dispatch list
     # 병동이동은 flush 후 status=completed 가 되므로, 이번 달에 transfer 가
     # 발생한 병동이동(status=completed, start_date in month) 도 함께 포함한다.
+    # ★ 그 달과 겹치는 끝난(completed) 파견도 넣는다 — 조정판·저장과 같은 `_month_assignment_status`.
+    _month_status = _month_assignment_status(first_day, month_last)
     inbound_rows = (
         db.query(NurseAssignment)
         .filter(
             NurseAssignment.target_group_id == target_group_id,
             NurseAssignment.reason.in_(_INBOUND_REASONS),
-            or_(
-                NurseAssignment.status == "active",
-                and_(
-                    NurseAssignment.status == "completed",
-                    NurseAssignment.reason == "병동이동",
-                    NurseAssignment.start_date >= first_day,
-                    NurseAssignment.start_date <= month_last,
-                ),
-            ),
+            _month_status,
         )
         .order_by(NurseAssignment.start_date.desc())
         .all()
@@ -4406,15 +4452,7 @@ def get_shift_requests_service(
             NurseAssignment.source_group_id == target_group_id,
             NurseAssignment.target_group_id != target_group_id,
             NurseAssignment.reason.in_(_INBOUND_REASONS),
-            or_(
-                NurseAssignment.status == "active",
-                and_(
-                    NurseAssignment.status == "completed",
-                    NurseAssignment.reason == "병동이동",
-                    NurseAssignment.start_date >= first_day,
-                    NurseAssignment.start_date <= month_last,
-                ),
-            ),
+            _month_status,
         )
         .all()
     )
@@ -4450,7 +4488,10 @@ def get_shift_requests_service(
         ):
             group_name_map[gid] = gname or ""
 
-    # 5. 관할 일자 집합 계산 — fixed_wanted_entries 와 동일한 ownership 모델 사용.
+    # 5. 관할 일자 집합 계산 — fixed_wanted_entries 와 같은 날짜 판정 함수를 쓴다.
+    #   ★ 단 넣는 배정이 다르다: 이 표는 그 달과 겹치는 completed 파견을 넣고(위 2·3),
+    #     원티드 조정·확정 원티드(`_collect_assignment_list_map_for_nurses`)는 아직 active 파견만 본다.
+    #     파견이 끝난 달을 다시 볼 때만 갈린다(다음 달 생성은 파견이 active 라 무관) — 별건(2026-10-02).
     # 각 (nurse, date) 에 대해 _resolve_owner_group_for_date_multi 로 owner 산정,
     # owner == target_group_id 인 일자만 allowed.
     nurse_home_map: Dict[str, Optional[str]] = {
@@ -4575,6 +4616,21 @@ def get_shift_requests_service(
     return results
 
 
+def _inbound_in_month(db: Session, nurse_id: str, group_id: str, year: int, month: int) -> bool:
+    """그 달 그 병동으로 파견·병동이동 들어온 사람인가 — 월 명단(`group_members_in_month`)의 inbound 와
+    같은 배정 조회(`get_active_assignments_for_month`: active·completed, 그 달과 겹침, 앞뒤 여유 없음)."""
+    from services.assignment_service import get_active_assignments_for_month
+
+    # ★ 끝난(completed) 배정은 끝 날짜가 있을 때만 — 둘 다 없으면 월 조회가 "계속 겹침" 으로 봐서
+    #   끝난 파견이 모든 달의 접근을 열어 둔다(종료일 미정 파견을 API 로 completed 처리한 경우).
+    return any(
+        str(a.nurse_id) == str(nurse_id) and a.target_group_id == group_id and a.source_group_id != group_id
+        and a.reason in _INBOUND_REASONS
+        and (a.status != "completed" or a.end_date is not None or a.expected_end_date is not None)
+        for a in get_active_assignments_for_month(db, group_id, year, month)
+    )
+
+
 def get_wanted_overview_service(
     db: Session, current_user: UserSchema, year: int, month: int, override_group_id: str | None = None,
 ) -> dict:
@@ -4591,10 +4647,16 @@ def get_wanted_overview_service(
     from services.group_access import resolve_effective_group
     from services.team_period import team_layout_from_members
 
-    target = resolve_effective_group(
-        db, current_user, override_group_id,
-        require_group=False, allow_assignment_target=True, assignment_window=(year, month),
-    ) or resolve_home_group_id(db, current_user)
+    # ★ 파견 온 사람의 접근은 **그 달 명단 기준**으로 본다. 공용 판정(`allow_assignment_target`)은
+    #   근무표 화면용이라 앞뒤 6일을 넓혀 보고 active 만 봐서, 다음 달 초 파견 예정자가 이번 달 병동 전원의
+    #   신청을 보고 월중에 끝난(completed) 파견자는 같은 달인데 403 이 됐다(Codex 커밋 큐 2회차).
+    nid = getattr(current_user, "nurse_id", None)
+    if override_group_id and nid and _inbound_in_month(db, nid, override_group_id, year, month):
+        target = override_group_id
+    else:
+        target = resolve_effective_group(
+            db, current_user, override_group_id, require_group=False,
+        ) or resolve_home_group_id(db, current_user)
     if not target:
         raise HTTPException(status_code=400, detail="대상 그룹이 없습니다.")
     members = group_members_in_month(db, target, year, month)["members"]

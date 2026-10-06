@@ -1255,7 +1255,18 @@ def create_nurse_assignment(
     신규 호출은 `PATCH /nurses/{nurse_id}`에 `assignment: {operation: "create", ...}` payload로 대체해 주세요.
     (파견/휴직/퇴사/프리셉티/병동이동)
     """
+    _require_head_or_admin_for_assignment(db, current_user)
     return create_assignment(req, db, current_user=current_user)
+
+
+def _require_head_or_admin_for_assignment(db: Session, current_user: UserSchema) -> None:
+    """구 배정 생성·수정·취소 — 신규 경로(`PATCH /nurses/{id}`)와 같은 역할 검사(수간호사·관리자).
+
+    ★ 서비스 쪽 검사(`_assert_caller_owns_source`)는 토큰 병동이 출발 병동과 같으면 통과라, 같은 병동 일반
+      간호사가 동료를 다른 병동·다른 병원으로 파견할 수 있었다(실측 2026-10-02 · 프론트는 이 셋을 안 쓴다).
+    """
+    if not (current_user.is_master_admin or caller_is_head_nurse(db, current_user)):
+        raise HTTPException(status_code=403, detail="수간호사 또는 관리자만 배정을 등록·수정·취소할 수 있습니다.")
 
 
 @router.get("/assignments", response_model=NurseAssignmentListResponse)
@@ -1353,6 +1364,7 @@ def update_nurse_assignment(
 
     신규 호출은 `PATCH /nurses/{nurse_id}`에 `assignment: {operation: "update", assignment_id, ...}` payload로 대체해 주세요.
     """
+    _require_head_or_admin_for_assignment(db, current_user)
     return update_assignment(assignment_id, req, db, current_user=current_user)
 
 
@@ -1370,6 +1382,7 @@ def delete_nurse_assignment(
 
     신규 호출은 `PATCH /nurses/{nurse_id}`에 `assignment: {operation: "cancel", assignment_id}` payload로 대체해 주세요.
     """
+    _require_head_or_admin_for_assignment(db, current_user)
     return cancel_assignment(assignment_id, db, current_user=current_user)
 
 

@@ -944,7 +944,11 @@ def bulk_update_nurses_service(
     if not current_user:
         raise Exception("Not authenticated")
 
-    # 권한 체크: 수간호사(HDN) 또는 마스터 관리자(ADM)
+    # 권한 체크: 관리자·수간호사·그룹관리자만(사용자 결정 2026-10-02). 예전엔 이 주석만 있고 검사가 없어
+    #   같은 병동 일반 간호사가 동료의 등급·팀·근무형태와 배정(파견·휴직·취소)까지 바꿀 수 있었다.
+    from services.group_access import caller_is_manager
+    if not caller_is_manager(db, current_user):
+        raise HTTPException(status_code=403, detail="관리자·수간호사·그룹관리자만 일괄 수정할 수 있습니다.")
     if current_user.is_master_admin:
         target_group_id = override_group_id
     else:
@@ -1919,6 +1923,11 @@ def update_nurse_profile_service(
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
     if not nurse:
         raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
+    # ★ 역할만 보고 대상은 안 봐서, 수간호사면 다른 병동·다른 병원 간호사의 프로필·배정까지 바꿀 수 있었다
+    #   (OMC 검토 2026-10-02). 조회와 같은 기준 — 본인·소속·관리 병동·그 병동으로 파견 온 사람, 관리자는 전체.
+    from services.group_access import can_caller_access_nurse
+    if not can_caller_access_nurse(db, current_user, nurse_id):
+        raise HTTPException(status_code=403, detail="이 간호사를 수정할 권한이 없습니다.")
 
     fields = update_data.dict(exclude_unset=True)
     # period 쓰기 valid_from = 선택월 1일(월 셀렉터). 미동반 시 today(현재값 변경).

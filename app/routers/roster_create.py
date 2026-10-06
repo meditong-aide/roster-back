@@ -21,6 +21,7 @@ from schemas.auth_schema import User as UserSchema
 from schemas.roster_schema import RosterRequest, RosterConfigCreate
 from services.roster_create_service import (
     assert_night_caps_within_hard_lock,
+    assert_release_not_n_only,
     generate_roster_service,
     # generate_roster_service_with_fixed_cells,
     request_schedule_service,
@@ -186,9 +187,10 @@ async def roster_create_async(
         _db, current_user, getattr(req, "group_id", None)
     )
     req.group_id = target_group_id
-    # 해결 카드 재생성 값이 하드락 #6(월 나이트 15)을 넘으면 큐에 넣기 전에 400.
+    # 해결 카드 재생성 값이 하드락 #6(월 나이트 15)을 넘거나 N전담 횟수를 바꾸면 큐에 넣기 전에 400.
     assert_night_caps_within_hard_lock(
         getattr(req, "config_override", None), getattr(req, "monthly_limit_release", None))
+    assert_release_not_n_only(_db, target_group_id, req.year, req.month, getattr(req, "monthly_limit_release", None))
 
     # 모달 payload 제공 시: config 굳히기(materialize) + 라이브 동기화(apply).
     # 변경 시 '새로운 설정n' 신규 row, 동일 시 baseline 재사용. 이후 req.config_id 로 진행.
@@ -315,6 +317,9 @@ def generate_roster_endpoint(
     """
     assert_night_caps_within_hard_lock(
         getattr(req, "config_override", None), getattr(req, "monthly_limit_release", None))
+    if getattr(req, "monthly_limit_release", None):
+        assert_release_not_n_only(db, resolve_effective_group(db, current_user, getattr(req, "group_id", None)),
+                                  req.year, req.month, req.monthly_limit_release)
     try:
         # 해결책 재생성 파라미터를 서비스로 전달(누락 시 config_override 의 비-DB 솔버키
         # (예: weekend_off_only_enable)와 weekend_off_release/monthly_limit_release 가 반영 안 됨).

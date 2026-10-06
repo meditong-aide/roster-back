@@ -83,14 +83,19 @@ def caller_is_manager(db: Session, current_user: UserSchema) -> bool:
 def resolve_accessible_group_ids(
     db: Session, current_user: UserSchema
 ) -> Set[str]:
-    """호출자가 접근 가능한 group_id 집합 (home + HN multi-group managed)."""
+    """호출자가 접근 가능한 group_id 집합 (home + HN multi-group managed).
+
+    = 토큰 group_id ∪ `resolve_managed_group_ids`(DB 기준 — 그룹관리자면 소속+관리 병동, 아니면 소속 병동).
+    ★ 예전엔 토큰 hn_auth 가 HN 일 때만 관리 병동을 더해, 로그인 뒤 DB 에서 그룹관리자가 된 사람은 토큰을
+      다시 받기 전까지 관리 병동 간호사를 못 봤다. 이 판정이 프로필 수정·배정 생성(병동 재분배 포함)에도
+      걸리면서 403 회귀가 됐다(Codex 커밋 큐 6회차 · 2026-10-02). 합집합이라 기존 접근은 줄지 않는다.
+    """
     accessible: Set[str] = set()
     if current_user is None:
         return accessible
     if getattr(current_user, "group_id", None):
         accessible.add(str(current_user.group_id))
-    if str(getattr(current_user, "hn_auth", "") or "").upper() == "HN":
-        accessible.update(str(g) for g in resolve_managed_group_ids(db, current_user))
+    accessible.update(str(g) for g in resolve_managed_group_ids(db, current_user))
     return accessible
 
 

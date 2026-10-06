@@ -138,6 +138,15 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         ).all()
         if r[0] not in _source_ids
     ]
+    # ★ 그 달과 겹치는 **끝난 파견**으로 온 사람도 — 엔진 명단(아래 `get_active_assignments_for_month`:
+    #   active·completed)엔 들어가는데 원티드 수집에서만 빠져, 받는 병동 생성에 그 사람 원티드가
+    #   없었다(2026-10-06). 같은 조회로 맞춘다.
+    for _a in get_active_assignments_for_month(db, current_user.group_id, req.year, req.month):
+        _aid = str(_a.nurse_id)
+        if (_a.reason in _INBOUND_REASONS and _a.target_group_id == current_user.group_id
+                and _a.source_group_id != current_user.group_id
+                and _aid not in _source_ids and _aid not in _inbound_ids):
+            _inbound_ids.append(_aid)
     nurse_ids = _source_ids + _inbound_ids
     if _inbound_ids:
         print(f"[RosterCreate] fixed_wanted 조회 대상 inbound nurse 추가: {_inbound_ids}")
@@ -3291,6 +3300,42 @@ def assert_night_caps_within_hard_lock(config_delta: dict | None, monthly_limit_
         raise HTTPException(status_code=400, detail=f"월 나이트는 1인 최대 {_hard}회(하드락)입니다: {', '.join(over)}")
 
 
+def n_only_release_targets(db, group_id: str, year: int, month: int, monthly_limit_release: list | None) -> set[str]:
+    """해결 카드의 월 야간 한도 변경(`monthly_limit_release`) 대상 중 **그 달 N전담**인 간호사.
+
+    ★ 카드 생성은 N전담을 뺀다(96e4f86) — 하지만 적용 요청은 클라이언트가 카드 값을 echo 하므로,
+      일반 근무자일 때 받은 카드를 그 사람이 N전담이 된 뒤 다시 보내면 N전담 고정 횟수(n_exact)가
+      지워지고 즉시 커밋됐다(Codex 커밋 큐 3회차 HIGH). 판정은 카드 생성과 같은 `is_n_only_profile` 이되
+      **그 달 기준** 근무형태(`group_members_in_month` 의 as_of — 파견 온 사람은 파견지 근무형태)로 본다.
+    """
+    from services.assignment_service import group_members_in_month
+    from services.cp_sat.allowed_shift_types import is_n_only_profile
+
+    want = {str(r.get("nurse_id")) for r in (monthly_limit_release or [])
+            if isinstance(r, dict) and r.get("nurse_id") and r.get("field") in ("n_exact", "n_max", "n_min")}
+    if not want or not group_id:
+        return set()
+    # ★ use_mid 는 **설정과 무관하게 False 로** 본다 — MID 를 빼고 N 만 남으면 N전담. 생성이 쓰는 설정
+    #   (요청 config_id·모달 config·config_override)과 최신 설정이 달라 [N,M] 같은 프로필을 서로 다르게
+    #   판정하면 보호를 비켜 갔다(Codex 커밋 큐 4회차 HIGH). use_mid=True 에서 N전담이면 False 에서도
+    #   N전담이라 이쪽이 항상 넓다. 대가: MID 쓰는 병동의 N+M 근무자 카드도 막힌다(드물고 하드락 쪽이 안전).
+    use_mid = False
+    profile = {str(m["nurse_id"]): m.get("as_of_allowed_shifts")
+               for m in group_members_in_month(db, group_id, int(year), int(month))["members"]
+               if str(m["nurse_id"]) in want}
+    for nid, raw in db.query(Nurse.nurse_id, Nurse.allowed_shifts).filter(
+            Nurse.nurse_id.in_(list(want - set(profile)))).all():
+        profile[str(nid)] = raw   # 그 달 명단에 없으면 지금 프로필로
+    return {nid for nid, raw in profile.items() if is_n_only_profile(raw, use_mid=use_mid)}
+
+
+def assert_release_not_n_only(db, group_id: str, year: int, month: int, monthly_limit_release: list | None) -> None:
+    """N전담의 월 야간 한도를 바꾸려는 해결 카드 적용은 큐에 넣기 전에 400(N전담 횟수는 하드락·계약 값)."""
+    bad = n_only_release_targets(db, group_id, year, month, monthly_limit_release)
+    if bad:
+        raise HTTPException(status_code=400, detail=f"N전담 간호사의 월 나이트 횟수는 해결 카드로 바꿀 수 없습니다: {sorted(bad)}")
+
+
 def _mk_change(nurse_id, attr, frm, to):
     """resolution_options.changes[*] 항목. 프론트가 label_ko/config_key 로 라벨을 렌더하므로
     (attr 만 주면 'undefined 표시') 둘을 함께 채운다.
@@ -5173,11 +5218,17 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         from db.models import NurseMonthlyLimit as _NML
         _gid = str(current_user.group_id)
         _applied = []
+        # ★ 쓰기 직전에 다시 본다 — 큐 대기 중 N전담으로 바뀐 사람의 고정 횟수를 지우지 않게. 워커에서 예외를
+        #   내면 SQS 재시도로 번지므로 거부는 라우터(`assert_release_not_n_only`)가 하고 여기선 건너뛴다.
+        _n_only = n_only_release_targets(db, _gid, int(req.year), int(req.month), _mlr)
         for _rel in _mlr:
             _rnid = str(_rel.get("nurse_id") or "")
             _rfld = _rel.get("field")
             _rval = _rel.get("value")
             if not _rnid or _rfld not in ("n_exact", "n_max") or _rval is None:
+                continue
+            if _rnid in _n_only:
+                print(f"[RosterGenerate] N전담 월 야간 한도는 해결 카드로 바꾸지 않음 — 건너뜀: {_rnid}:{_rfld}={_rval}")
                 continue
             _row = (
                 db.query(_NML)

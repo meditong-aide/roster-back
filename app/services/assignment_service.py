@@ -410,6 +410,15 @@ def create_assignment(
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == req.nurse_id).first()
     if not nurse:
         raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다.")
+    # ★ 병원 경계는 **간호사의 실제 병원**으로 본다. 아래 target 검사는 요청 office_id 와 비교해서,
+    #   요청에 다른 병원을 적으면 다른 병원 병동으로 파견이 만들어지고 그 값이 배정 행에 저장됐다(실측 2026-10-02).
+    if str(req.office_id) != str(nurse.office_id):
+        raise HTTPException(status_code=400, detail="간호사 소속 병원과 요청 office_id 가 다릅니다.")
+    # ★ 출발 병동 소유만 보면 다른 병동·병원 간호사를 내 병동 출발로 적어 파견할 수 있었다 — 대상 간호사에
+    #   접근할 수 있는 사람만(조회·PATCH 와 같은 기준 · 관리자는 전체). 구 POST·일괄수정·재분배 경로 공통.
+    from services.group_access import can_caller_access_nurse
+    if not can_caller_access_nurse(db, current_user, req.nurse_id):
+        raise HTTPException(status_code=403, detail="이 간호사의 배정을 등록할 권한이 없습니다.")
 
     # 퇴사자 검증: resignation_date가 존재하고 start_date 이전이면 거부
     _resign = getattr(nurse, "resignation_date", None)
