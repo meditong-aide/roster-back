@@ -32,7 +32,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from db.models import Group, IssuedRosterSnapshot, Nurse, RosterChangeAck
-from services.schedule_compare_service import diff_cell_maps
+from services.schedule_compare_service import diff_cells_payload, diff_rows, shown_codes
 
 #: 확인 대상에서 빼는 그 달 소속 상태(`group_members_in_month.membership_status`)
 _NOT_TARGET_STATUSES = {"leave", "resigned"}
@@ -43,9 +43,11 @@ CHANGE_KEY = "change"
 # ───────── 스냅샷 → 칸 ─────────
 
 def snapshot_cells(snapshot: IssuedRosterSnapshot) -> tuple[dict, dict]:
-    """마감 스냅샷 → (칸 지도 `(nurse_id, 날짜) → (코드, None)`, 칸 색 `(nurse_id, 날짜) → 색`).
+    """마감 스냅샷 → (칸 지도 `(nurse_id, 날짜) → (코드, shifts.id)`, 칸 색 `(nurse_id, 날짜) → 색`).
 
     스냅샷 `roster_json.nurses[].schedule` 은 날짜순 `{code, color}`(빈 칸 '-'). 옛 모양(문자열)도 받는다.
+    id 는 같은 순서의 `schedule_ids`(없거나 숫자가 아니면 None) — 마감 뒤 이름만 바뀐 근무를 같은 근무로 보는 데 쓴다
+    (`schedule_compare_service.shown_codes`).
     색은 **그 마감 시점의 색**을 쓴다 — 병동이 나중에 색을 바꿔도 이전/이후 색이 그대로다.
     """
     rj = snapshot.roster_json or {}
@@ -57,41 +59,42 @@ def snapshot_cells(snapshot: IssuedRosterSnapshot) -> tuple[dict, dict]:
         nurse_id = str(n.get("nurse_id") or n.get("id") or "")
         if not nurse_id:
             continue
+        ids = n.get("schedule_ids") or []
         for i, item in enumerate((n.get("schedule") or [])[:days]):
             code = item.get("code") if isinstance(item, dict) else item
             if not code or str(code).strip() in ("", "-"):
                 continue
             key = (nurse_id, date(year, month, i + 1))
-            cells[key] = (str(code), None)
+            cells[key] = (str(code), _int_or_none(ids[i] if i < len(ids) else None))
             if isinstance(item, dict) and item.get("color"):
                 colors[key] = item["color"]
     return cells, colors
 
 
-def change_rows_between(base: IssuedRosterSnapshot, snapshot: IssuedRosterSnapshot) -> tuple[list[dict], object]:
+def _int_or_none(v) -> Optional[int]:
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def change_rows_between(
+    db: Session, base: IssuedRosterSnapshot, snapshot: IssuedRosterSnapshot,
+) -> tuple[list[dict], object]:
     """기준 → 이번 스냅샷의 바뀐 칸 행과 차이(`CellDiff`).
 
     행 = 바뀐 칸(kind='cell') + 명단에 생기거나 빠진 간호사의 칸(kind='added'|'removed').
+    ★ 양쪽 칸을 `shown_codes` 로 맞춘다 — 마감 뒤 근무코드 **이름만** 바뀐 근무(같은 shifts.id)는 실제 근무가 바뀐 게
+      아니라 알림 대상이 아니다(10-06 사용자 결정). 버전 변경 조회와 같은 규칙.
     """
     before, b_colors = snapshot_cells(base)
     after, a_colors = snapshot_cells(snapshot)
-    diff = diff_cell_maps(before, after)
-    rows = [_cell_row(n, d, "cell", b, a, b_colors, a_colors) for n, d, b, a in diff.changed]
-    for kind, ids, src in (("added", diff.added_nurses, after), ("removed", diff.removed_nurses, before)):
-        wanted = set(ids)
-        for (nurse_id, day), (code, _) in sorted(src.items()):
-            if nurse_id in wanted:
-                b, a = (None, code) if kind == "added" else (code, None)
-                rows.append(_cell_row(nurse_id, day, kind, b, a, b_colors, a_colors))
-    return rows, diff
-
-
-def _cell_row(nurse_id, day, kind, b, a, b_colors, a_colors) -> dict:
-    return {
-        "nurse_id": nurse_id, "work_date": day, "kind": kind,
-        "before_code": b, "before_color": b_colors.get((nurse_id, day)) if b else None,
-        "after_code": a, "after_color": a_colors.get((nurse_id, day)) if a else None,
-    }
+    before = shown_codes(db, snapshot.group_id, before)
+    after = shown_codes(db, snapshot.group_id, after)
+    # 행 모양은 버전 변경 조회(`schedule_changes`)와 공용 — 화면 컴포넌트 하나로 그린다.
+    return diff_rows(before, b_colors, after, a_colors)
 
 
 def change_meta(snapshot) -> Optional[dict]:
@@ -192,7 +195,7 @@ def record_change_notice(
     base = db.get(IssuedRosterSnapshot, base_id) if base_id else None
     if base is None:
         return None
-    rows, diff = change_rows_between(base, new_snapshot)
+    rows, diff = change_rows_between(db, base, new_snapshot)
     if not rows:
         return None
     targets = confirm_targets(db, group_id, year, month, publisher_id)
@@ -397,20 +400,11 @@ def _summary(snap, status: str, counts: dict, my: Optional[RosterChangeAck], nam
     }
 
 
-def _cells_payload(rows: list[dict], names: dict) -> list[dict]:
-    return [{
-        "nurse_id": r["nurse_id"], "nurse_name": names.get(str(r["nurse_id"])),
-        "date": r["work_date"].isoformat(), "kind": r["kind"],
-        "before": {"shift_id": r["before_code"], "color": r["before_color"]} if r["before_code"] else None,
-        "after": {"shift_id": r["after_code"], "color": r["after_color"]} if r["after_code"] else None,
-    } for r in sorted(rows, key=lambda r: (str(r["nurse_id"]), r["work_date"]))]
-
-
 def _rows_for(db: Session, snap: IssuedRosterSnapshot) -> list[dict]:
     """알림의 바뀐 칸 — 기준 스냅샷과 이번 스냅샷을 비교해 계산(저장하지 않는다)."""
     meta = change_meta(snap) or {}
     base = db.get(IssuedRosterSnapshot, int(meta["base_snapshot_id"])) if meta.get("base_snapshot_id") else None
-    return change_rows_between(base, snap)[0] if base is not None else []
+    return change_rows_between(db, base, snap)[0] if base is not None else []
 
 
 def _my_acks(db: Session, snapshot_ids: list[int], nurse_id: Optional[str]) -> dict:
@@ -464,7 +458,7 @@ def month_notices(db: Session, current_user, year: int, month: int, group_id: Op
         "group_id": target, "year": year, "month": month,
         "is_manager": _caller_is_manager_of(db, current_user, target),
         "notices": [dict(_summary(s, "open", counts[s.snapshot_id], mine.get(s.snapshot_id), names),
-                         cells=_cells_payload(rows_by[s.snapshot_id], names)) for s in snaps],
+                         cells=diff_cells_payload(rows_by[s.snapshot_id], names)) for s in snaps],
     }
 
 
@@ -535,7 +529,7 @@ def notice_detail(db: Session, current_user, notice_id: int) -> dict:
     names = _names(db, {r["nurse_id"] for r in rows} | {(change_meta(snap) or {}).get("published_by")}
                    | {a.nurse_id for a in acks})
     out = dict(_summary(snap, _status(snap, counts, later), counts, mine, names, _later_notice_id(db, later)),
-               cells=_cells_payload(rows, names), is_manager=is_manager)
+               cells=diff_cells_payload(rows, names), is_manager=is_manager)
     if is_manager:
         active = {str(n) for (n,) in db.query(Nurse.nurse_id).filter(
             Nurse.nurse_id.in_([a.nurse_id for a in acks]), Nurse.active == 1).all()} if acks else set()

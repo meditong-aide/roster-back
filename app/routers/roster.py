@@ -1436,7 +1436,7 @@ def _load_schedule_for_caller(
     그룹 스코프의 진실은 '스케줄 행의 group_id'다(schedule_id 가 그룹을 이미 확정).
     호출자-resolve group 을 쿼리 필터로 쓰면, 비-home 관리병동(HN multi-group)의
     스케줄이 group_id 미전송 시 home 으로 해석돼 404 로 숨는다 — 스코프는 행에서 가져오고
-    권한은 assert_caller_can_access_group 으로 별도 검증한다.
+    권한은 assert_caller_can_access_group 으로 별도 검증한다(관리자도 자기 병원 근무표만).
     """
     q = db.query(Schedule).filter(Schedule.schedule_id == schedule_id)
     if not include_dropped:
@@ -2461,8 +2461,8 @@ def _roster_payload_cells(
     #   조회가 0건이 된다. 그러면 아래 valid_* 가 전부 비어 클라이언트가 보낸 정상
     #   `schedule_ids` 가 무효 판정을 받고 **셀의 id 가 전량 NULL 로 저장된다** —
     #   에러 없이 200 이라 조용히 망가진다(실측: 589칸 소실).
-    #   ADM 은 assert_caller_can_access_group 에서 office 무관하게 통과하므로 실제로
-    #   도달 가능한 경로다. 그룹 접근 권한은 호출부의 `_load_schedule_for_caller` 가 본다.
+    #   (당시엔 ADM 이 assert_caller_can_access_group 에서 office 무관하게 통과해 실제로 도달했다 —
+    #   10-06 부터 ADM 도 자기 병원만.) 그룹 접근 권한은 호출부의 `_load_schedule_for_caller` 가 본다.
     # ★ 대표 행은 목록 조회와 같은 (sequence ASC, id ASC) **첫 행**이다
     #   (정본 `shift_service_mssql.SHIFT_LIST_ORDER`). 정렬 없이 dict 로 접으면
     #   중복 행 중 마지막이 이겨, 저장되는 `schedule_entries.id` 가 화면과 갈린다.
@@ -2487,6 +2487,7 @@ def _roster_payload_cells(
     for _s in shifts_for_group:
         if _s.id is not None:
             ids_by_shift_id.setdefault(_s.shift_id, set()).add(_s.id)
+    code_by_int_id = {_s.id: _s.shift_id for _s in shifts_for_group if _s.id is not None}
 
     def _normalize_shift_id_for_save_router(raw_shift: str) -> str:
         if raw_shift in valid_shift_ids:
@@ -2513,6 +2514,11 @@ def _roster_payload_cells(
                 norm_shift = _normalize_shift_id_for_save_router(str(shift_id))
                 # 기존 schedule_ids 값 우선 사용, 없으면(수동 수정 셀) shift_id로 lookup
                 int_id = schedule_ids[day_index] if day_index < len(schedule_ids) else None
+                # ★ 이 병동에 없는 옛 이름 코드(같은 id 에서 이름만 바뀐 근무)면 id 가 가리키는 행의 지금 코드로
+                #   저장한다 — 화면은 그 행으로 보여 줬다(프론트 해석). 그대로 두면 아래 검증이 id 를 버려 옛 이름만
+                #   남고, 손대지 않은 칸도 저장 한 번에 화면이 지금 코드 → 옛 이름으로 바뀐다.
+                if norm_shift not in valid_shift_ids and int_id in code_by_int_id:
+                    norm_shift = code_by_int_id[int_id]
                 # ★ 클라이언트가 보낸 값이므로 **그 그룹의 유효한 shifts.id 인지** 확인한다.
                 #   낡거나 조작된 값을 그대로 쓰면 근무표에 남을 뿐 아니라 이력에도
                 #   그대로 박혀 나중에 "그때 무슨 근무였나" 를 영원히 잘못 가리킨다.
@@ -2778,8 +2784,6 @@ def save_roster_as_new_version(
     if (int(req.year), int(req.month)) != (int(source.year), int(source.month)):
         raise HTTPException(status_code=400, detail="원본 근무표와 같은 연/월로만 저장할 수 있습니다.")
 
-    from services.schedule_history_service import snapshot_entries
-
     # ★ 원본 행을 먼저 잠근다(UPDLOCK) — 원본 칸을 읽은 직후 다른 `/roster/save` 가 원본을 바꾸고 커밋하면,
     #   출처의 바뀐 칸 수·save_as 이력은 옛 원본 기준인데 이후 `/roster/compare` 는 새 원본 기준이 된다
     #   (Codex 1회차 MEDIUM). `/roster/save` 는 원본 행을 갱신(flush)해 잠그므로 둘이 차례로 선다.
@@ -2791,7 +2795,10 @@ def save_roster_as_new_version(
         raise HTTPException(status_code=404, detail="원본 근무표를 찾을 수 없습니다.")
     # ★ 원본 읽기·칸 변환을 먼저 끝내고 버전 번호(그룹·달 잠금)는 마지막에 잡는다 — 잠금을 쥔 채
     #   원본 읽기에서 기다리면 같은 달의 복사·생성까지 줄줄이 기다린다.
-    before = snapshot_entries(db, source.schedule_id)
+    # 화면에 보이는 칸으로 센다(간호사 행 있는 사람만 · 코드는 id 기준) — `/roster/compare`·버전 변경 조회와
+    # 같은 기준(출처 요약 숫자가 같게).
+    from services.schedule_compare_service import schedule_cells
+    before = schedule_cells(db, source)
     cells = _roster_payload_cells(db, source.group_id, source.year, source.month, req.roster)
     new_schedule = _new_version_row(db, source, req, current_user)
     after: dict = {}
@@ -2846,6 +2853,30 @@ def compare_schedule_versions(
         raise HTTPException(status_code=400, detail="같은 병동·같은 달 근무표끼리만 비교할 수 있습니다.")
     from services.schedule_compare_service import compare_schedules
     return compare_schedules(db, src, dst)
+
+
+# [Roster] - 이 버전이 기준 대비 무엇이 바뀌었는지
+@router.get("/schedule/{schedule_id}/changes")
+def get_schedule_changes(
+    schedule_id: str,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """이 버전의 **기준 대비** 바뀐 칸(성남 ③ — 사용자 결정 10-06).
+
+    기준 = 이 버전의 최근 마감본(마감 → 철회 → 수정한 경우) → 없으면 [새 버전으로 저장]의 출처 버전 → 없으면 없음.
+    응답 칸 모양은 ② 변경 알림과 같다. 자세한 규칙은 `services.schedule_compare_service.schedule_changes`.
+    ★ 관리자 전용 — 초안 버전 칸을 보므로 `/roster/compare`·수정 이력과 같은 기준으로 막는다.
+    """
+    if not (
+        caller_is_head_nurse(db, current_user)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    schedule = _load_schedule_for_caller(db, current_user, schedule_id,
+                                         not_found_detail="근무표를 찾을 수 없습니다.")
+    from services.schedule_compare_service import schedule_changes
+    return schedule_changes(db, schedule)
 
 
 # [Roster] - 근무표 수정 이력

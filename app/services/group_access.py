@@ -24,6 +24,18 @@ from schemas.auth_schema import User as UserSchema
 _INBOUND_REASONS = ("파견", "병동이동")
 
 
+def _same_office(current_user: UserSchema, office_id) -> bool:
+    """대상의 병원이 호출자 병원과 같은가. 어느 쪽이든 비어 있으면 같지 않다(없는 대상·병원 없는 토큰)."""
+    mine = str(getattr(current_user, "office_id", "") or "")
+    return bool(mine) and office_id is not None and str(office_id) == mine
+
+
+def _group_in_caller_office(db: Session, current_user: UserSchema, group_id) -> bool:
+    """그 병동이 호출자 병원 소속인가 — ADM 범위 판정(없는 병동이면 False)."""
+    office = db.query(GroupModel.office_id).filter(GroupModel.group_id == str(group_id)).scalar()
+    return _same_office(current_user, office)
+
+
 def resolve_home_group_id(db: Session, current_user: UserSchema) -> Optional[str]:
     """nurse_id 기준 실제 소속 group_id (DB nurses 테이블). 토큰 group_id 는 무시한다.
 
@@ -105,7 +117,7 @@ def can_caller_access_nurse(
     """호출자가 해당 간호사를 조회/수정할 수 있는지 통합 판단.
 
     통과 경로:
-    - ADM(is_master_admin): 모든 간호사
+    - ADM(is_master_admin): **자기 병원(office_id)** 의 모든 간호사(10-06 — 예전엔 병원 무관 전체)
     - self: 본인 자기 자신 (str 비교)
     - 간호사 home group 이 caller 의 accessible groups 안에 있음
     - 간호사가 caller 의 accessible groups 중 하나로 inbound (파견/병동이동) 되어 있음
@@ -115,7 +127,8 @@ def can_caller_access_nurse(
     if current_user is None:
         return False
     if bool(getattr(current_user, "is_master_admin", False)):
-        return True
+        office = db.query(NurseModel.office_id).filter(NurseModel.nurse_id == nurse_id).scalar()
+        return _same_office(current_user, office)
     if str(nurse_id) == str(getattr(current_user, "nurse_id", "")):
         return True
 
@@ -292,21 +305,26 @@ def assert_caller_can_access_group(
     """호출자가 target_group_id 그룹에 접근 가능한지 검증. 외부면 403 raise.
 
     통과 조건 (OR):
-    - ADM(is_master_admin)
     - target_group_id 가 None / 빈 문자열 (호출 측이 caller.group_id fallback 처리)
+    - ADM(is_master_admin) 이고 target 이 **자기 병원(office_id)** 의 병동
     - target_group_id == caller.group_id (home)
     - target_group_id == caller.original_group_id (view 전환 중)
     - target_group_id ∈ resolve_managed_group_ids(caller)  — HN multi-group
+
+    ★ ADM 은 예전엔 병원을 안 보고 통과해, 다른 병원 근무표의 마감·철회·조회가 열려 있었다(10-06 사용자 결정
+      "막는 게 맞다"). 범위는 `resolve_managed_group_ids`·`resolve_effective_group` 과 같다(같은 office 의 group).
 
     사용처: grade/teams/weekly-off/issued_roster 등 단일 그룹 선택형 endpoint.
     HN multi-group 통합페이지의 managed group dropdown 선택을 지원하기 위함.
     """
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if bool(getattr(current_user, "is_master_admin", False)):
-        return
     if not target_group_id:
         return
+    if bool(getattr(current_user, "is_master_admin", False)):
+        if _group_in_caller_office(db, current_user, target_group_id):
+            return
+        raise HTTPException(status_code=403, detail="다른 병원의 병동에는 접근할 수 없습니다.")
     caller_gid = getattr(current_user, "group_id", None)
     if caller_gid and str(target_group_id) == str(caller_gid):
         return

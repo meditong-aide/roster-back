@@ -831,7 +831,8 @@ def move_nurse_with_active_service(
         nurse = (
             db.query(NurseModel)
             .select_from(NurseModel)
-            .filter(NurseModel.nurse_id == nurse_id)
+            # 관리자도 자기 병원 간호사만(10-06)
+            .filter(NurseModel.nurse_id == nurse_id, NurseModel.office_id == current_user.office_id)
             .first()
         )
         target_group_id = nurse.group_id if nurse else None
@@ -1924,7 +1925,7 @@ def update_nurse_profile_service(
     if not nurse:
         raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
     # ★ 역할만 보고 대상은 안 봐서, 수간호사면 다른 병동·다른 병원 간호사의 프로필·배정까지 바꿀 수 있었다
-    #   (OMC 검토 2026-10-02). 조회와 같은 기준 — 본인·소속·관리 병동·그 병동으로 파견 온 사람, 관리자는 전체.
+    #   (OMC 검토 2026-10-02). 조회와 같은 기준 — 본인·소속·관리 병동·그 병동으로 파견 온 사람, 관리자는 자기 병원 전체.
     from services.group_access import can_caller_access_nurse
     if not can_caller_access_nurse(db, current_user, nurse_id):
         raise HTTPException(status_code=403, detail="이 간호사를 수정할 권한이 없습니다.")
@@ -2627,20 +2628,21 @@ def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
     if not (caller_is_head_nurse(db, current_user) or current_user.is_master_admin):
         raise Exception("Permission denied")
 
-    # 대상 간호사 조회
+    # 대상 간호사 조회 — 관리자도 자기 병원 간호사만(10-06 · 예전엔 병원 조건 없이 아무 간호사나 지울 수 있었다)
     db_nurse = (
         db.query(NurseModel)
         .filter(
             NurseModel.nurse_id == nurse_id,
             NurseModel.group_id == current_user.group_id
             if not current_user.is_master_admin
-            else True,
+            else NurseModel.office_id == current_user.office_id,
         )
         .first()
     )
 
     if not db_nurse:
-        raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+        # 404 — 예전엔 일반 Exception 이라 라우터가 500 으로 바꿨다(다른 병원·병동 간호사도 여기로 온다 · 500 알람 소음).
+        raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다.")
 
     try:
         # 삭제 수행자 정보 조회

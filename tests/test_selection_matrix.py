@@ -32,8 +32,8 @@ from services.team_classify_service import (
 
 
 # 배정 조작은 로그인 사용자를 요구한다(None=미인증 → 401). 권한 판정이 아니라 동작을 보는
-# 테스트라 마스터 관리자로 통과시킨다.
-_ADMIN = SimpleNamespace(is_master_admin=True)
+# 테스트라 마스터 관리자로 통과시킨다. 관리자도 자기 병원 병동만 다루므로(10-06) 픽스처 병원을 준다.
+_ADMIN = SimpleNamespace(is_master_admin=True, office_id="o1")
 
 
 def _n(nid, grade=2, preceptor_id=None, off=(), fb=()):

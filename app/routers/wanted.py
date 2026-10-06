@@ -22,7 +22,7 @@ from schemas.roster_schema import (
     ToggleEntryResponse,
 )
 from services.graph_service import graph_service
-from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse
+from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse, assert_caller_can_access_group
 from routers.auth import get_current_user_from_cookie, require_current_user
 from db.client2 import get_db
 from db.models import (
@@ -32,6 +32,8 @@ from db.models import (
     WantedConfig,
     Nurse,
     ShiftPreference,
+    FixedWantedEntry,
+    BannedWantedEntry,
 )
 from schemas.auth_schema import User as UserSchema
 from services.wanted_service import (
@@ -736,6 +738,9 @@ def get_over_limit_nurses_api(
     # 관리자 권한 체크 (수간호사 여부는 토큰 대신 DB)
     if not (caller_is_head_nurse(db, current_user) or current_user.is_master_admin):
         raise HTTPException(403, "권한이 없습니다.")
+    # ★ 요청 group_id 를 그대로 쓰면 아무 병원·병동의 초과 간호사 명단이 나갔다(10-06). 관리 병동으로 해석한다
+    #   (관리자는 자기 병원 병동 · 무지정이면 None → 빈 목록).
+    group_id = resolve_effective_group(db, current_user, group_id, require_group=False)
 
     result = get_over_limit_nurses(db, year, month, group_id)
     return {"data": result, "count": len(result)}
@@ -750,7 +755,10 @@ def delete_excess_off_api(
     db: Session = Depends(get_db)
 ):
     if current_user.is_master_admin:
-        pass
+        # 관리자도 자기 병원 간호사만(10-06 · 예전엔 아무 병원 간호사의 원티드를 지울 수 있었다)
+        from services.group_access import can_caller_access_nurse
+        if not can_caller_access_nurse(db, current_user, nurse_id):
+            raise HTTPException(403, "다른 병원의 간호사입니다.")
     elif caller_is_head_nurse(db, current_user):
         # 토큰 group 대신 nurse_id→DB + groups.hn_id 로 관리 그룹 판정.
         target_nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
@@ -863,6 +871,16 @@ def save_fixed_wanted(
         raise HTTPException(status_code=500, detail=f"확정 원티드 저장 실패: {str(e)}")
 
 
+def _assert_admin_entry_office(db: Session, current_user: UserSchema, model, entry_id: int) -> None:
+    """관리자 토글 — 그 항목의 병동이 자기 병원이어야 한다(10-06). 관리자는 아래 서비스에 병동을 넘기지 않아
+    (`caller_group_id=None`) 예전엔 아무 병원의 항목이나 뒤집혔다. 없는 항목은 서비스가 404 로 돌려준다."""
+    if not getattr(current_user, "is_master_admin", False):
+        return
+    gid = db.query(model.group_id).filter(model.id == entry_id).scalar()
+    if gid is not None:
+        assert_caller_can_access_group(db, current_user, gid)
+
+
 @router.patch("/adjustment/entry/{entry_id}/toggle", response_model=ToggleEntryResponse)
 def toggle_fixed_wanted_entry(
     entry_id: int,
@@ -882,6 +900,8 @@ def toggle_fixed_wanted_entry(
     caller_group_id: Optional[str] = None
     if caller_is_head_nurse(db, current_user):
         caller_group_id = resolve_home_group_id(db, current_user)
+
+    _assert_admin_entry_office(db, current_user, FixedWantedEntry, entry_id)
 
     try:
         entry = toggle_fixed_wanted_entry_service(db, entry_id, caller_group_id=caller_group_id)
@@ -919,6 +939,8 @@ def toggle_banned_wanted_entry(
     caller_group_id: Optional[str] = None
     if caller_is_head_nurse(db, current_user):
         caller_group_id = resolve_home_group_id(db, current_user)
+
+    _assert_admin_entry_office(db, current_user, BannedWantedEntry, entry_id)
 
     try:
         entry = toggle_banned_wanted_entry_service(db, entry_id, caller_group_id=caller_group_id)

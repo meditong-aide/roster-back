@@ -64,7 +64,7 @@ def _assert_caller_owns_source(
     """파견/병동이동/휴직 등 assignment 조작 권한 검증.
 
     통과 조건 (OR):
-    - is_master_admin
+    - is_master_admin 이고 source(또는 주어진 target)가 자기 병원 병동
     - caller 가 source_group_id 소유 (group_id / original_group_id / managed)
     - **target_group_id 가 주어지면**(취소 등) caller 가 target_group_id 소유여도 통과.
       A→B 파견을 전입 받은 B(target)에서도 취소→재등록할 수 있게. 생성·수정 호출은
@@ -76,11 +76,16 @@ def _assert_caller_owns_source(
     #   넘기므로 None 을 쓰는 정상 경로는 없다.
     if current_user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    if getattr(current_user, "is_master_admin", False):
-        return
     _allowed = {str(source_group_id)}
     if target_group_id is not None:
         _allowed.add(str(target_group_id))
+    if getattr(current_user, "is_master_admin", False):
+        # ★ 관리자도 **자기 병원** 병동의 배정만(10-06 — 예전엔 병원을 안 보고 통과해 다른 병원 간호사의
+        #   파견·휴직을 만들고·바꾸고·취소할 수 있었다). 관리자의 관리 병동 = 같은 병원의 모든 병동.
+        from services.group_access import resolve_managed_group_ids
+        if db is not None and _allowed & {str(g) for g in resolve_managed_group_ids(db, current_user)}:
+            return
+        raise HTTPException(status_code=403, detail="다른 병원의 배정은 조작할 수 없습니다.")
     caller_gid = getattr(current_user, "group_id", None)
     if str(caller_gid) in _allowed:
         return
