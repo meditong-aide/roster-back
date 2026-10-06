@@ -4684,7 +4684,28 @@ def get_wanted_overview_service(
             "shifts": [{"shift_date": s["shift_date"], "shift": s["shift"]} for s in req.get("shifts", [])],
         })
     nurses.sort(key=lambda n: (seq.get(n["nurse_id"]) is None, seq.get(n["nurse_id"]) or 0, n["name"] or ""))
-    return {"group_id": target, "year": year, "month": month, "teams": teams, "nurses": nurses}
+    return {"group_id": target, "year": year, "month": month, "teams": teams, "nurses": nurses,
+            "my_groups": _my_overview_groups(db, current_user, year, month)}
+
+
+def _my_overview_groups(db: Session, current_user: UserSchema, year: int, month: int) -> list[dict]:
+    """전체보기에서 고를 수 있는 **내** 병동 — 소속 병동 + 그 달 파견·병동이동으로 들어간 병동.
+
+    모바일은 일반 간호사에게 소속 병동만 보내서 파견 간 병동의 전체보기를 볼 길이 없었다(10-06). 판정은
+    전체보기 접근과 같은 `_inbound_in_month` 라 여기 나온 병동은 `group_id` 로 넘기면 그대로 열린다.
+    """
+    from services.group_access import resolve_home_group_id
+
+    home = resolve_home_group_id(db, current_user)
+    nid = getattr(current_user, "nurse_id", None)
+    cands = [g for (g,) in db.query(NurseAssignment.target_group_id).filter(
+        NurseAssignment.nurse_id == nid, NurseAssignment.reason.in_(_INBOUND_REASONS),
+        NurseAssignment.target_group_id.isnot(None)).distinct().all()] if nid else []
+    gids = ([str(home)] if home else []) + sorted(
+        str(g) for g in cands if g and str(g) != str(home or "") and _inbound_in_month(db, nid, g, year, month))
+    names = dict(db.query(Group.group_id, Group.group_name).filter(Group.group_id.in_(gids)).all()) if gids else {}
+    return [{"group_id": g, "group_name": names.get(g), "kind": "home" if g == str(home or "") else "inbound"}
+            for g in gids]
 
 
 def get_my_wanted_dashboard_service(current_user: UserSchema, db: Session) -> dict:
