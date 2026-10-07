@@ -16,6 +16,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from agents_v2.auth_context import current_auth_user
 from agents_v2.grounding.internal import resolve_date, resolve_group
 from agents_v2.skills.manifest import skill
 from agents_v2.verify import VerifyResult, readback
@@ -333,7 +334,8 @@ def _create(db: Session, params: dict) -> Any:
         note=params.get("note"),
     )
     try:
-        assignment_service.create_assignment(req, db, current_user=None, notify=True)
+        # 정본은 current_user=None 을 401 로 막는다(로그인 없이 배정을 조작하던 구멍, dev 1548b08).
+        assignment_service.create_assignment(req, db, current_user=current_auth_user(), notify=True)
     except Exception as e:  # noqa: BLE001
         return {"error": _clean_error(e)}
     to_ward = gmap.get(target_group_id, target_group_id)
@@ -379,7 +381,7 @@ def _cancel(db: Session, params: dict) -> Any:
         }
 
     try:
-        assignment_service.cancel_assignment(target.id, db, current_user=None)
+        assignment_service.cancel_assignment(target.id, db, current_user=current_auth_user())
     except Exception as e:  # noqa: BLE001
         return {"error": _clean_error(e)}
     return {

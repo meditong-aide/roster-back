@@ -19,6 +19,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from agents_v2.auth_context import bind_auth_user
 from agents_v2.errors import ErrorType, classify
 from agents_v2.grounding.internal import (
     resolve_date,
@@ -221,7 +222,9 @@ def execute_skill(
     status = "SUCCESS"
     err_msg: str | None = None
     try:
-        result = run_skill(db, skill_name, args)
+        # 인증 사용자는 args 가 아니라 실행 순간에만 묶는다(감사·승인 대기 직렬화 차단).
+        with bind_auth_user(ctx.auth_user):
+            result = run_skill(db, skill_name, args)
         steps.append(MiddlewareStep("execution", "ok", detail=skill_name))
     except KeyError as e:
         result = {"error": f"Unknown skill: {e}"}

@@ -12,12 +12,14 @@ from agents_v2.grounding.internal import resolve_group
 from agents_v2.middleware import _check_permission, execute_skill
 from agents_v2.schemas.session_context import SessionContext
 from db.models import Group
+from tests.agent_qa.harness import make_auth_user
 
 
 def _hn_ctx() -> SessionContext:
     return SessionContext(
         office_id="OFF001", group_id="GRP001", year=2026, month=8,
         nurse_id="N001", nurse_name="김민지", user_role="HN",
+        auth_user=make_auth_user(),
     )
 
 
@@ -25,6 +27,7 @@ def _nurse_ctx() -> SessionContext:
     return SessionContext(
         office_id="OFF001", group_id="GRP001", year=2026, month=8,
         nurse_id="N003", nurse_name="이수정", user_role="nurse",
+        auth_user=make_auth_user("N003", "이수정", role="nurse"),
     )
 
 

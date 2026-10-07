@@ -14,11 +14,13 @@ from fastapi import HTTPException
 from agents_v2.middleware import execute_skill
 from agents_v2.schemas.session_context import SessionContext
 from db.models import Group, IssuedRosterSnapshot, NurseAssignment, Schedule
+from tests.agent_qa.harness import make_auth_user
 
 
 def _hn():
     return SessionContext(office_id="OFF001", group_id="GRP001", year=2026, month=8,
-                          nurse_id="N001", nurse_name="김민지", user_role="HN")
+                          nurse_id="N001", nurse_name="김민지", user_role="HN",
+                          auth_user=make_auth_user())
 
 
 @pytest.fixture
@@ -132,7 +134,8 @@ def test_guard_lives_in_service_not_only_skill(db, seed_data, target_ward):
         target_group_id="GRP002", start_date=date(2026, 9, 1),
         reason="병동이동",
     )
+    # 정본은 None 을 401 로 막으므로(dev 1548b08) 화면과 같은 로그인 수간호사로 부른다.
     with pytest.raises(HTTPException) as ei:
-        assignment_service.create_assignment(req, db, current_user=None, notify=False)
+        assignment_service.create_assignment(req, db, current_user=make_auth_user(), notify=False)
     assert ei.value.status_code == 409
     assert "발행된 근무표" in str(ei.value.detail)

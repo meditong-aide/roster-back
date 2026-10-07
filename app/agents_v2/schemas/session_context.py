@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from typing import Any
 
 
 @dataclass
@@ -25,6 +26,10 @@ class SessionContext:
     office_name: str | None = None
     # HN 이 관리하는 병동 이름들 (단일 병동이면 비움). 프롬프트에 이름만 노출.
     managed_group_names: list[str] = field(default_factory=list)
+    # 이 요청의 인증 사용자(토큰에서 온 User). 정본 서비스의 current_user 로만 쓴다.
+    # LLM 프롬프트·Redis·DB 에 남기지 않는다 — 스킬에는 agents_v2.auth_context 로 넘긴다.
+    # 승인 턴은 그 턴을 보낸 요청의 사용자다(pending_approval 에는 담지 않는다).
+    auth_user: Any = field(default=None, repr=False, compare=False)
 
     # Auto-computed
     today: str = field(default_factory=lambda: date.today().isoformat())

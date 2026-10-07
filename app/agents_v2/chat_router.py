@@ -143,6 +143,7 @@ def _build_session_ctx(
         nurse_id=user.nurse_id,
         nurse_name=user.name,
         conversation_id=conv_id,
+        auth_user=user,
     )
 
 
