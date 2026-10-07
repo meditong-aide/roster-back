@@ -208,13 +208,38 @@ def compare_schedules(db: Session, src: Schedule, dst: Schedule) -> dict:
     }
 
 
+def _snapshot_brief(snap) -> dict:
+    """비교 기준 마감 스냅샷 요약 — `base` 의 공통 키."""
+    return {"snapshot_id": snap.snapshot_id, "schedule_id": snap.schedule_id, "version": snap.version,
+            "issued_at": snap.created_at.isoformat() if snap.created_at else None,
+            "is_active_issued": bool(snap.is_active_issued)}
+
+
+def _previous_snapshot(db: Session, snap):
+    """그 달(같은 병동) 이 스냅샷 바로 앞 마감 스냅샷 — 다른 버전 것이어도·철회됐어도. 없으면 None."""
+    from db.models import IssuedRosterSnapshot
+
+    return (
+        db.query(IssuedRosterSnapshot)
+        .filter(IssuedRosterSnapshot.group_id == snap.group_id,
+                IssuedRosterSnapshot.year == snap.year, IssuedRosterSnapshot.month == snap.month,
+                IssuedRosterSnapshot.snapshot_id < snap.snapshot_id)
+        .order_by(IssuedRosterSnapshot.snapshot_id.desc())
+        .first()
+    )
+
+
 def schedule_changes(db: Session, schedule: Schedule) -> dict:
     """이 버전이 **기준 대비** 무엇이 바뀌었는지(성남 ③ — 사용자 결정 10-06).
 
     기준 고르기 — "가장 최근에 마감된 상태, 마감된 적이 없으면 원본":
+      0) 이 버전이 **지금 마감 중**이면 그 달 **직전 마감 스냅샷**(`base.kind='previous_issued'`). 자기
+         마감본과 비교하면 늘 0칸이라 근무표 만들기에서 재마감으로 바뀐 칸이 안 보였다(10-06 사용자 결정).
+         ② 변경 알림 기준(간호사가 마지막으로 본 마감본으로 이어받음)과 달리 바로 앞 마감본이다.
       1) 이 버전에 마감 기록이 있으면 그 **최근 마감 스냅샷**(철회돼 비활성이어도). 마감 → 철회 → 수정한
          경우 원본이 아니라 **그 마감본 대비 새로 바뀐 칸**을 보여 준다.
-      2) 없으면 [새 버전으로 저장]의 **출처 버전**(지금 칸 — `/roster/compare` 와 같다).
+      2) 없으면(또는 지금 마감 중인데 그 달 첫 마감이면) [새 버전으로 저장]의 **출처 버전**
+         (지금 칸 — `/roster/compare` 와 같다).
       3) 둘 다 없으면 기준 없음(`base` null · 칸 없음). 출처 버전이 지워졌으면 `base.kind='source_missing'`.
     ★ 마감 → 철회 → 같은 버전 수정에서는 마감 당시 칸이 스냅샷에만 남는다(버전 칸은 덮어써진다).
       그래서 `/roster/compare`(두 버전의 지금 칸)로는 재마감 전에 '마감본 대비 바뀐 칸'을 볼 수 없었다.
@@ -239,12 +264,17 @@ def schedule_changes(db: Session, schedule: Schedule) -> dict:
         .order_by(IssuedRosterSnapshot.snapshot_id.desc())
         .first()
     )
-    if snap is not None:
+    is_current_issued = (snap is not None and bool(snap.is_active_issued)
+                         and str(schedule.status or "") == "issued")
+    prev = _previous_snapshot(db, snap) if is_current_issued else None
+    if prev is not None:
+        before, b_colors = snapshot_cells(prev)
+        before = shown_codes(db, schedule.group_id, before)
+        base = dict(_snapshot_brief(prev), kind="previous_issued")
+    elif snap is not None and not is_current_issued:
         before, b_colors = snapshot_cells(snap)
         before = shown_codes(db, schedule.group_id, before)
-        base = {"kind": "issued", "snapshot_id": snap.snapshot_id, "schedule_id": schedule.schedule_id,
-                "version": snap.version, "issued_at": snap.created_at.isoformat() if snap.created_at else None,
-                "is_active_issued": bool(snap.is_active_issued)}
+        base = dict(_snapshot_brief(snap), kind="issued")
     else:
         lineage = db.get(ScheduleLineage, schedule.schedule_id)
         src = db.get(Schedule, lineage.source_schedule_id) if lineage is not None else None
@@ -257,7 +287,8 @@ def schedule_changes(db: Session, schedule: Schedule) -> dict:
             base = {"kind": "source_missing", "schedule_id": lineage.source_schedule_id,
                     "version": lineage.source_version}
     rows, diff = (diff_rows(before, b_colors, after, _cell_colors(after))
-                  if base is not None and base["kind"] in ("issued", "source") else ([], CellDiff()))
+                  if base is not None and base["kind"] in ("previous_issued", "issued", "source")
+                  else ([], CellDiff()))
     names = _nurse_names(db, {str(r["nurse_id"]) for r in rows})
     return {
         "schedule": _schedule_brief(schedule),
