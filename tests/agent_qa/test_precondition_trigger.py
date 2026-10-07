@@ -15,7 +15,11 @@ from db.models import IssuedRoster
 def test_bulk_mutation_encodes_finalized_precondition():
     d = next(t for t in SKILL_TOOLS if t["name"] == "bulk_mutation")["description"]
     assert "선행조건(확정 근무표)" in d
-    assert "조정판" in d  # 확정본 → 조정판 확인 경로 명시
+    # int-0b: 확정본 칸은 에이전트가 고치지 않는다 → 근무표 만들기 화면에서 마감 철회 후 수정으로 안내
+    assert "마감 철회" in d
+    assert "직접 수정할까요" not in d
+    assert "확정된 근무표의 시프트 셀" not in d  # 앞부분 정의가 뒤의 금지와 모순되지 않게
+    assert "[새 버전으로 저장]" not in d  # 화면에 없는 버튼 이름을 안내하지 않는다
 
 
 def test_draft_roster_returns_plain_list(db, seed_data):

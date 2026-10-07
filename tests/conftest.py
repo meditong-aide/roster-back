@@ -12,7 +12,7 @@ from datetime import datetime, date, time
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, func, event, Integer
+from sqlalchemy import BIGINT, create_engine, func, event, Integer
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.mysql import TINYINT
@@ -33,6 +33,14 @@ from sqlalchemy.ext.compiler import compiles as sa_compiles
 def _compile_tinyint_sqlite(type_, compiler, **kw):
     return "INTEGER"
 
+
+# BIGINT 기본키는 SQLite 에서 자동증가하지 않는다(INTEGER PRIMARY KEY 만 rowid 별칭) — push_outbox 등
+# BIGINT IDENTITY 테이블에 행을 넣으면 'NOT NULL constraint failed: <표>.id' 가 났다(int-0b·W72).
+# SQLite 의 INTEGER 는 64비트라 값 범위는 같다.
+@sa_compiles(BIGINT, "sqlite")
+def _compile_bigint_sqlite(type_, compiler, **kw):
+    return "INTEGER"
+
 _TestBase = declarative_base()
 _test_engine = create_engine(
     "sqlite:///:memory:",
@@ -46,6 +54,15 @@ _fake_client2.engine = _test_engine
 _fake_client2.SessionLocal = sessionmaker(bind=_test_engine)
 _fake_client2.get_db = lambda: None
 _fake_client2.msdb_manager = None
+# push_outbox_service 가 import 때 읽는다(발송기의 3-part 이름용). 없으면 import 가 실패해
+# 알림 적재가 테스트에서 늘 조용히 실패했다(int-0b·W72). 발송기는 테스트에서 돌지 않는다.
+_fake_client2.EUN_DB_NAME = "eun_roster_test"
+
+# 수집하지 않는 스크립트 — `python -m tests.test_real_llm_*` 로 돌리는 실 LLM 스크립트(테스트 함수 0개)다.
+# 수집되면 import 때 sys.modules['db.client2'] 를 자기 가짜(EUN_DB_NAME·msdb_manager 없음)로 바꿔
+# 끝까지 남겨서, 전체 스위트에서 지연 import(main·push_outbox_service)를 하는 테스트가 순서에 따라
+# ImportError 로 깨졌다(int-0b).
+collect_ignore = ["test_real_llm_constraint.py", "test_real_llm_wanted.py"]
 
 # Register the fake client2 in sys.modules.
 # The real 'db' package directory exists at app/db/, so Python will find
@@ -64,6 +81,7 @@ from db.models import (  # noqa: E402
     NursePrecepteePeriod, NurseMutualExclusionPeriod, NurseLeavePeriod, NurseNightCycle,
     AgentConversation, AgentConversationMessage, AgentUserMemory,
     AgentMemoryAudit, AgentSkillInvocation, AgentLlmUsage, AgentFeedback,
+    PushOutbox, ScheduleLineage, RosterChangeAck, ScheduleEntryLog, NurseAnnualLeaveBalance,
 )
 
 
@@ -103,6 +121,9 @@ _REQUIRED_TABLES = [
     AgentSkillInvocation.__table__,
     AgentLlmUsage.__table__,
     AgentFeedback.__table__,
+    # dev 10-02 이후 테이블(int-0b·W72) — 알림 대기열·버전 계보·재마감 확인·칸 이력·연차 장부
+    PushOutbox.__table__, ScheduleLineage.__table__, RosterChangeAck.__table__,
+    ScheduleEntryLog.__table__, NurseAnnualLeaveBalance.__table__,
 ]
 
 

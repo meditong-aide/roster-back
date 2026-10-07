@@ -236,7 +236,7 @@ SKILL_TOOLS: list[dict] = [
         "name": "bulk_mutation",
         "description": (
             "특정 날짜/시프트가 결합된 '스케줄 데이터'를 수정합니다. "
-            "원티드(특정 날짜의 근무 신청), 조정판, 확정 근무표의 시프트 변경.\n\n"
+            "원티드(특정 날짜의 근무 신청), 조정판, 근무표(작업본)의 시프트 변경.\n\n"
             "⚠️ 반드시 preview_only=true로 먼저 실행하고 사용자 확인 후 실제 수정하세요.\n"
             "⛔ 읽기 전용 조회에는 사용하지 마세요. query_schedule을 사용하세요.\n\n"
             "⛔ 간호사 자체의 속성(직급/팀/역할/야간전담/고정근무/수간호사/메모/원티드 한도 등) 변경에는 "
@@ -250,7 +250,7 @@ SKILL_TOOLS: list[dict] = [
             "scope별 의미:\n"
             "- 'wanted_submissions': 간호사가 제출하는 원티드 신청서 (특정 날짜의 근무 희망/회피).\n"
             "- 'wanted_adjustment': 원티드 조정판 (수간호사가 신청들을 모아 조율하는 단계).\n"
-            "- 'schedule': 확정된 근무표의 시프트 셀.\n\n"
+            "- 'schedule': 근무표(작업본·draft)의 시프트 셀. 마감된 근무표는 고칠 수 없습니다(아래 선행조건).\n\n"
             "scope × action 유효 조합:\n"
             "- wanted_submissions: cancel / add_shift / change_shift / update_deadline / clear_deadline\n"
             "- wanted_adjustment: apply(=승인) / unapply_off\n"
@@ -295,9 +295,10 @@ SKILL_TOOLS: list[dict] = [
             "- '박춘일 야간 전담 지정' (간호사 자체 속성)\n"
             "- '이다영 메모 추가' (간호사 메모)\n"
             "- '박혜미 원티드 최대 횟수 5' (사용자 한도, 특정 원티드 신청 아님)\n\n"
-            "⚠️ 선행조건(확정 근무표): 조회 결과에 'roster_source: 확정본(IssuedRoster)' 또는 "
-            "확정/마감 상태가 보이면, 곧바로 변경하지 말고 먼저 사용자에게 확인하세요 — "
-            "\"확정된 근무표입니다. 조정판을 통해 수정할까요, 아니면 확정본을 직접 수정할까요?\""
+            "⚠️ 선행조건(확정 근무표): 마감된 근무표(확정본)의 칸은 에이전트가 고칠 수 없습니다. 조회 결과에 "
+            "'roster_source: 확정본(IssuedRoster)' 또는 확정/마감 상태가 보이면 근무 칸을 바꾸지 말고, "
+            "근무표 만들기 화면에서 마감 철회 후 수정하도록 안내하세요 "
+            "(navigate(target='roster_create')). 원티드·조정판 수정은 해당 없음."
         ),
         "parameters": {
             "type": "object",
@@ -932,33 +933,27 @@ SKILL_TOOLS: list[dict] = [
     {
         "name": "publish_schedule",
         "description": (
-            "완성된 근무표를 **확정·발행**합니다 (draft → issued 전환 + 발행 스냅샷 저장). "
-            "사용자가 '이 근무표로 확정해줘', '근무표 발행해줘', '이걸로 확정/게시'처럼 "
+            "근무표 **마감(확정·발행) 요청을 안내**합니다. 에이전트는 마감하지 않습니다 — "
+            "대상 근무표(연·월·버전)를 확인해 알려 주고, 사용자가 근무표 만들기 화면에서 [마감] 버튼으로 "
+            "직접 하도록 안내합니다. 사용자가 '이 근무표로 확정해줘', '근무표 발행해줘', '마감해줘'처럼 "
             "최종 확정 의도를 표현할 때 사용.\n\n"
 
-            "⚠️ **위험연산**: 발행하면 간호사에게 공개되고, 같은 달 이전 발행본은 draft 로 내려갑니다.\n"
-            "⚠️ preview/confirm 필수: 첫 호출 preview_only=true 로 대상(year/month/version) 표시 → "
-            "사용자 동의 후 preview_only=false 로 실제 발행. HN/ADM 전용.\n\n"
+            "이 도구를 부른 뒤에는 navigate(target='roster_create') 로 근무표 만들기 화면을 열어 주세요. "
+            "'마감했습니다'라고 답하지 마세요(실제로 마감되지 않았습니다).\n\n"
 
             "─────────── 인접 스킬과의 경계 ───────────\n"
-            "- 근무표 **생성**(자동 짜기) → generate_schedule (발행 아님)\n"
-            "- 검증/교정 → validate_schedule / repair_schedule\n"
-            "- 발행 대상 근무표는 해당 월의 최신(또는 이미 발행된) 표를 자동 사용.\n\n"
+            "- 근무표 **생성**(자동 짜기) → generate_schedule (마감 아님)\n"
+            "- 검증/교정 → validate_schedule / repair_schedule\n\n"
 
             "예시:\n"
-            "- '8월 근무표 발행해줘' → year=2026, month=8, preview_only=true → 동의 → false\n"
-            "- '이걸로 확정' → 직전 맥락의 year/month 로 발행"
+            "- '8월 근무표 발행해줘' → year=2026, month=8 → 안내 + navigate(roster_create)\n"
+            "- '이걸로 확정' → 직전 맥락의 year/month 로 안내"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "year": {"type": "integer", "description": "발행 대상 연도"},
-                "month": {"type": "integer", "description": "발행 대상 월 (1~12)"},
-                "issue_comment": {"type": "string", "description": "발행 코멘트(선택)"},
-                "preview_only": {
-                    "type": "boolean", "default": True,
-                    "description": "true=대상만 표시(발행 안 함). 동의 후 false 로 실제 발행.",
-                },
+                "year": {"type": "integer", "description": "마감 대상 연도"},
+                "month": {"type": "integer", "description": "마감 대상 월 (1~12)"},
             },
             "required": ["year", "month"],
         },

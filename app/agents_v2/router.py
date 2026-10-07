@@ -57,6 +57,9 @@ CATEGORY_TOOLS: dict[str, list[str]] = {
         # [EVAL 2026-07-20] '김민지 5월 N 4번으로 맞춰줘' 같은 개인 월한도 변경이 mutate 로
         # 분류돼 update_monthly_limit(settings_rules 전용)을 놓쳤음 → 다중 배선으로 recall 복구.
         "update_monthly_limit",
+        # [int-0b 2026-10-07] 마감·마감본 칸 수정은 에이전트가 하지 않고 근무표 만들기 화면으로
+        # 안내한다(publish_schedule·bulk_mutation 설명이 navigate 를 지시) → mutate 턴에도 navigate 번들.
+        "navigate",
     ],
     # 근무표 자동 생성 (생성 vs roster_create 화면 gray → navigate 번들)
     # query_generation_job: '생성 어디까지?' 같은 상태 조회 동반 가능.

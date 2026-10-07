@@ -267,6 +267,13 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
             return {"error": f"No schedule found for {year}/{month}"}
         schedule_id = meta["schedule_id"]
 
+    # 마감본은 에이전트가 고치지 않는다(int-0b) — 미리보기에서부터 막아 '미리보기 OK → 승인 실패'를 없앤다.
+    # 여기서는 판정만 한다(잠금 없이). 잠금 뒤 재판정은 실제로 쓰는 update_schedule_entry 가 한다 —
+    # 여기서 잠그면 쓰지 않고 돌아가는 길에서 잠금이 턴 끝까지 남는다.
+    issued = schedule_tools.issued_overwrite_error(db, schedule_id, lock=False)
+    if issued:
+        return issued
+
     # Single entry update
     if nurse_ids and len(nurse_ids) == 1 and date and new_shift:
         entry = schedule_tools.find_schedule_entry(db, schedule_id, nurse_ids[0], date, group_id)
@@ -301,11 +308,40 @@ def _mutate_schedule_entries(db, params, mutation, preview_only):
     if not new_shift:
         return {"error": "target shift value required for bulk update"}
 
-    results = []
-    for e in entries:
-        result = schedule_tools.update_schedule_entry(db, e["entry_id"], new_shift, group_id)
-        results.append(result)
+    return _update_entries_all_or_nothing(db, entries, new_shift, group_id)
 
+
+class _CellWriteAbort(Exception):
+    def __init__(self, result: dict):
+        super().__init__("cell write aborted")
+        self.result = result
+
+
+def _update_entries_all_or_nothing(db, entries: list[dict], new_shift: str, group_id: str) -> dict:
+    """여러 칸을 한 번에 반영하거나 하나도 반영하지 않는다(int-0b).
+
+    칸마다 커밋하면 사이사이 근무표 행 잠금이 풀려 그 틈에 화면 마감이 끼어들고, 중간에 멈추면
+    앞 칸만 바뀐 채 남았다. 칸 쓰기 함수의 commit 을 flush 로 돌려 SAVEPOINT 안에서 모으고 마지막에
+    한 번 커밋한다(첫 칸의 잠금이 끝까지 유지된다). 실패하면 이 묶음만 되감고 트랜잭션을 끝내 잠금을 푼다.
+    바깥에 이미 원자 커밋(배치 승인·DAG)이 있으면 그 커밋 규약을 그대로 따른다.
+    """
+    real_commit = db.commit
+    db.commit = db.flush  # type: ignore[method-assign]
+    try:
+        with db.begin_nested():
+            results = []
+            for e in entries:
+                result = schedule_tools.update_schedule_entry(db, e["entry_id"], new_shift, group_id)
+                if isinstance(result, dict) and "error" in result:
+                    raise _CellWriteAbort(result)
+                results.append(result)
+    except _CellWriteAbort as abort:
+        db.commit = real_commit  # type: ignore[method-assign]
+        db.commit()  # 되감은 뒤 트랜잭션을 끝내 잠금을 푼다(감사 기록 등 앞선 flush 는 함께 확정)
+        return {**abort.result, "rolled_back": True, "applied_count": 0}
+    finally:
+        db.commit = real_commit  # type: ignore[method-assign]
+    db.commit()
     return {"affected_count": len(results), "results": results}
 
 

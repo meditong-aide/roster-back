@@ -321,7 +321,7 @@ def _query_schedule_entries(db, group_id, year, month, params):
     # 확정본이면 상태를 함께 노출(선행조건 트리거용). 작업본(미확정)은 기존 list 그대로.
     if roster_published:
         return {
-            "roster_source": "확정본(IssuedRoster·마감됨) — 직접 변경 전 사용자 확인 권장",
+            "roster_source": "확정본(IssuedRoster·마감됨) — 에이전트로 칸 수정 불가(근무표 만들기 화면에서 마감 철회 후 수정 안내)",
             "entries": entries,
         }
     return entries

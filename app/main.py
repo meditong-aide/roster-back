@@ -334,8 +334,23 @@ def _start_wanted_close_task() -> asyncio.Task | None:
     return task
 
 
+def _schedulers_disabled() -> bool:
+    """같은 DB 에 서버를 하나 더 띄울 때(테스트 인스턴스) 주기 작업을 끄는 스위치(int-0b·M15).
+
+    미설정이면 지금처럼 다 켠다(운영·dev 그대로). 끄지 않으면 병동이동 flush·간호사 동기화·
+    stale job·push 발송기·원티드 자동 마감이 두 벌 돈다.
+    """
+    return os.getenv("BACKGROUND_SCHEDULERS_DISABLED") == "1"
+
+
 @asynccontextmanager
 async def lifespan(app):
+    if _schedulers_disabled():
+        _scheduler_logger.warning(
+            "[Scheduler] BACKGROUND_SCHEDULERS_DISABLED=1 — 주기 작업을 하나도 띄우지 않습니다(테스트 인스턴스 전용)"
+        )
+        yield
+        return
     flush_task = asyncio.create_task(_daily_flush_scheduler())
     sync_task = asyncio.create_task(_daily_nurse_sync_scheduler())
     janitor_task = asyncio.create_task(_stale_jobs_janitor())
@@ -654,9 +669,15 @@ app.include_router(agent_test_router)
 from agents_v2.chat_router import router as agent_chat_router
 app.include_router(agent_chat_router)
 
-# Agent 사용량 대시보드 — LLM 토큰/비용 집계 (HN/ADM 전용)
-from agents_v2.usage_router import router as agent_usage_router
-app.include_router(agent_usage_router)
+# Agent 사용량 대시보드 — LLM 토큰/비용 집계. 브랜치 전용 화면이고 `/view` 가 무인증이라(N57)
+# 기본은 마운트하지 않는다(int-0b·M8). 켜기: AIDE_AGENT_USAGE_VIEW=1 — 인증·병원 경계(int-3) 전에는
+# 운영에서 켜지 않는다.
+# import 는 게이트 밖에 둔다 — 이미지 빌드 게이트(`import app.main`)가 기본 설정에서도 이 모듈의
+# import 깨짐을 잡게 한다. 마운트만 게이트 안이다.
+from agents_v2.usage_router import router as agent_usage_router  # noqa: E402
+
+if os.getenv("AIDE_AGENT_USAGE_VIEW") == "1":
+    app.include_router(agent_usage_router)
 
 import uvicorn
 

@@ -67,11 +67,14 @@ def record_llm_usage(
             output_tokens=output_tokens or 0,
             cost_usd=compute_cost(model, input_tokens or 0, output_tokens or 0),
         )
-        db.add(row)
-        db.flush()
+        # SAVEPOINT 로 감싼다(int-0b·M6) — 호출자 세션을 같이 쓰므로, flush 가 실패하면 savepoint 만
+        # 되감기고 호출자 작업(원티드 저장 등)은 산다. 감싸지 않으면 세션이 '롤백 대기'로 남아
+        # 호출자의 다음 flush/commit 이 PendingRollbackError 로 죽었다(병합 프로브 P5).
+        with db.begin_nested():
+            db.add(row)
+            db.flush()
     except Exception as e:  # noqa: BLE001
-        # 테이블 부재는 위 프로브가 이미 차단하므로 여기 도달 드묾. db.rollback() 은
-        # 하지 않는다(턴 내 미커밋 변경 clobber 방지 — _write_skill_audit 와 동일 정책).
+        # db.rollback() 은 하지 않는다(턴 내 미커밋 변경 clobber 방지 — _write_skill_audit 와 동일 정책).
         logger.warning("[usage] llm usage insert failed: %s", e)
 
 

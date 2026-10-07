@@ -46,6 +46,10 @@ logger = logging.getLogger(__name__)
 # 토큰 절약 + LLM attention 산만 방지.
 _MAX_INJECTED_FACTS = 20
 
+# 에이전트 쓰기를 끈 스킬(int-0b). 승인 대기로 남아 있어도 실행하지 않고 그 스킬의 안내로 답한다.
+#   publish_schedule: dev 정본 마감(잠금·변경 확인·장부·앵커·알림)을 안 따르는 복제본이라 끔(N81·M2).
+_WRITE_DISABLED_SKILLS = frozenset({"publish_schedule", "publish-schedule"})
+
 # Preview confirmation: LLM 으로 자연어 요약을 생성할 때 끼우는 내부 지시.
 # Layer C 의 보안 경계 안에 있으므로 untrusted_tool_output 안의 명령을 따르지 않음.
 _PREVIEW_DIRECTIVE = (
@@ -1203,6 +1207,8 @@ class SchedulingAgent:
 
         skill_name = approval.get("skill_name", "bulk_mutation")
         base_args = approval.get("args", {})
+        if skill_name in _WRITE_DISABLED_SKILLS:
+            return self._write_disabled_answer(db, ctx, skill_name, base_args, messages)
 
         # ── #5 staleness(ReAct): 승인 시점 미리보기와 지금이 다르면 커밋 말고 재확인 ──
         # 미리보기를 preview_only 로 재실행(부수효과 없음)해 body 지문 비교. DAG 경로가 하던
@@ -1217,6 +1223,12 @@ class SchedulingAgent:
             except Exception:  # noqa: BLE001 — 재프리뷰 실패 시 기존 동작 보존(통과)
                 fresh_fp = stored_fp
             if fresh_fp and fresh_fp != stored_fp:
+                if _is_error(fresh_data):
+                    # 다시 만든 미리보기가 오류(예: 그사이 마감됨)면 재승인을 묻지 않고 그 오류로 끝낸다(int-0b).
+                    return AgentResult(
+                        answer=f"실행 중 오류가 발생했습니다: {fresh_data.get('error', '')}",
+                        trace=[Stage("approval_staleness", "error", {"skill": skill_name}, 0)],
+                        messages=messages)
                 fresh_preview = {**fresh_data, "skill_name": skill_name, "args": base_args}
                 ctx.pending_approval = fresh_preview  # 바뀐 미리보기로 갱신
                 return AgentResult(
@@ -1258,6 +1270,22 @@ class SchedulingAgent:
             messages=messages,
         )
 
+    def _write_disabled_answer(
+        self, db: Session, ctx: SessionContext, skill_name: str, args: dict, messages: list[dict],
+    ) -> AgentResult:
+        """쓰기를 끈 스킬(int-0b)의 승인 대기 — 실행하지 않고 그 스킬의 안내로 답한다.
+
+        병합 전 스킬이 남긴 발행 승인 대기가 대화 저장소에 남아 있어도 '응' 이 '변경이 완료되었습니다.'
+        (실제 마감 0건)로 끝나지 않게 한다.
+        """
+        res = execute_skill(db, skill_name, {**args, "preview_only": True}, ctx)
+        data = res.data if isinstance(res.data, dict) else {}
+        answer = data.get("message") or data.get("error") or "이 작업은 에이전트가 실행하지 않습니다."
+        return AgentResult(
+            answer=answer,
+            trace=[Stage("write_disabled", "block", {"skill": skill_name}, res.duration_ms)],
+            messages=messages)
+
     def _auto_validate(self, db, ctx, trace: list) -> str:
         """스케줄 셀 mutation 커밋 후 proactive validate_schedule — 답변에 붙일 요약 반환.
 
@@ -1293,6 +1321,13 @@ class SchedulingAgent:
         schedule mutation 이 하나라도 있으면 커밋 후 proactive 검증 1회.
         """
         from agents_v2.commit_gate import AbortCommit, atomic_commit
+
+        disabled = [it for it in items if it.get("skill_name") in _WRITE_DISABLED_SKILLS]
+        if disabled:  # 쓰기를 끈 스킬이 섞인 배치는 통째로 실행하지 않는다(fail-closed, int-0b)
+            res = self._write_disabled_answer(
+                db, ctx, disabled[0]["skill_name"], disabled[0].get("args", {}), messages)
+            res.answer += " 함께 요청한 다른 변경도 실행하지 않았습니다. 필요하면 다시 요청해 주세요."
+            return res
 
         trace: list[Stage] = []
         done: list[str] = []
