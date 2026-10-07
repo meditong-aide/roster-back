@@ -16,7 +16,7 @@ router = APIRouter(prefix="/daily-shift", tags=["daily-shift"])
 
 
 @router.get("")
-async def get_month(
+def get_month(
     office_id: str,
     group_id: str,
     year: int,
@@ -43,7 +43,7 @@ async def get_month(
 
 
 @router.put("")
-async def put_month(
+def put_month(
     body: DailyShiftReplace,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),

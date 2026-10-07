@@ -28,7 +28,15 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1 day
 #   (`/login`)에서 믿으면 안 된다 — 두 요청은 독립이고 폼 값은 조작 가능하다.
 _DEMO_OFFICE_CODE = "100723"
 _DEMO_ROLE_ACCOUNTS = {
-    "admin": "yadmin",    # 통합관리자   — EmpAuthGbn='ADM' (nurses 미등록이지만 ADM 은 게이트 면제)
+    # ★★ 종전에는 `yadmin`(EmpAuthGbn='ADM')이었다. ADM 은 `is_master_admin` 이라
+    #   office 안을 무조건 다 보고 **관리 기능까지 열린다** — 시연은 "전 병동을
+    #   둘러보는" 것이 목적이라 권한이 과했다. 같은 범위를 그룹관리자(HN)로도
+    #   만들 수 있다: `resolve_managed_group_ids` 가 HN 에게 `groups.hn_id` 에
+    #   자기 nurse_id 가 든 병동을 모두 돌려주므로, 전 병동에 등록해 두면 된다.
+    # ★ 그래서 이 계정은 **nurses 에 있어야** 한다(ADM 과 달리 501 게이트 면제가
+    #   없다). `hn_auth='HN'` 과 각 `groups.hn_id` 등록이 전제다 — 둘 중 하나라도
+    #   빠지면 조용히 home 병동 하나만 보인다.
+    "admin": "yss0101",   # 모니터링     — nurses.hn_auth='HN' · 전 병동 groups.hn_id 등록
     "hn": "yss0401",      # 근무표관리자 — nurses.is_head_nurse=1 · hn_auth='HN'
     "nurse": "yss0414",   # 근무자       — nurses 일반
 }
@@ -85,7 +93,13 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
     - account_id: 조회할 계정 ID
 
     반환
-    - {'office_id', 'account_id', 'is_head_nurse', 'group_id'} 중 존재하는 값만 담은 dict
+    - {'office_id', 'account_id', 'is_head_nurse', 'group_id', 'hn_auth'} 중
+      존재하는 값만 담은 dict
+
+    ★★ `auth.py` 에 **같은 이름의 함수가 따로** 있다. 그쪽에 `hn_auth` 가 추가될 때
+      이 복사본이 같이 안 고쳐져, SSO 로 들어온 그룹 관리자는 토큰에 권한이 안 실려
+      PC 웹에서 **병동 전환 자체가 안 보였다**(DB 는 `hn_auth='HN'` 로 정상).
+      한쪽을 고치면 다른 쪽도 함께 본다.
     """
     try:
         nurse = db.query(Nurse).filter(Nurse.account_id == account_id).first()
@@ -96,6 +110,7 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
             "account_id": getattr(nurse, "account_id", None),
             "is_head_nurse": bool(getattr(nurse, "is_head_nurse", False)),
             "group_id": getattr(nurse, "group_id", None),
+            "hn_auth": getattr(nurse, "hn_auth", None),
         }
         # group_id 기준으로 groups 테이블에서 group_name 조회
         if result["group_id"]:
@@ -107,7 +122,7 @@ def get_extra_data_from_nurses(db: Session, account_id: str) -> dict:
         return {}
 
 @router.post("/", summary="Token 생성")
-async def get_token(response: Response,
+def get_token(response: Response,
                     clientId: str = Form(...),
                     clientSecret: str = Form(...)):
     """
@@ -124,7 +139,7 @@ async def get_token(response: Response,
     return {"token" : token}
 
 @router.post("/sso-mode", summary="SSO 진입 모드 — 시연 역할 선택이 필요한 계정인지")
-async def get_sso_mode(token: str = Form(...), MemberID: str = Form(...)):
+def get_sso_mode(token: str = Form(...), MemberID: str = Form(...)):
     """SSO 진입 직후 프론트가 역할 선택 모달을 띄울지 판단하기 위한 조회.
 
     반환
@@ -317,6 +332,9 @@ def login_for_access_token(response: Response,
             mb_part_name = extra_data.get("group_name") or mb_part_name
             if "is_head_nurse" in extra_data:
                 is_head_nurse = extra_data["is_head_nurse"]
+            # ★ 그룹 관리자 권한. 화면은 이 값 하나로 병동 전환 노출을 정한다
+            #   (`hn_auth === "HN"`). 토큰에 안 실으면 DB 가 맞아도 전환이 안 보인다.
+            hn_auth = extra_data.get("hn_auth")
 
             access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
             access_token = create_login_token(
@@ -336,6 +354,7 @@ def login_for_access_token(response: Response,
                     "gw_useYN": gw_useYN,
                     "qpis_useYN": qpis_useYN,
                     "official_title_name": official_title_name,  # 추가 필드
+                    "hn_auth": hn_auth,  # 그룹 관리자 권한
                     "original_group_id": group_id,  # 로그인 시 DB 기준 원래 소속 그룹
                 },
                 expires_delta=access_token_expires,
@@ -365,6 +384,8 @@ def login_for_access_token(response: Response,
                 gw_useYN=gw_useYN,
                 qpis_useYN=qpis_useYN,
                 official_title_name=official_title_name,  # 추가 필드
+                hn_auth=hn_auth,  # 그룹 관리자 권한
+                original_group_id=group_id,  # 토큰과 같은 값을 응답에도 싣는다
             )
 
             # return {"result": "succeed", "message": "Login successful", "account_id": MemberID}

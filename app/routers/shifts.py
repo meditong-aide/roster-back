@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from db.client2 import get_db
 from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig, Group
 from schemas.auth_schema import User as UserSchema
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from services.group_access import resolve_effective_group, caller_is_head_nurse
 from services.shift_manage_defaults import ensure_default_shift_manage
 from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest, ShiftUploadConfirmRequest, ShiftImportRequest
@@ -78,6 +78,11 @@ def get_shifts(
             if not g or g.office_id != current_user.office_id:
                 raise HTTPException(status_code=403, detail="해당 병동에 접근할 수 없습니다.")
             override_gid = group_id
+        # ★ 이 GET 은 서비스 안에서 기본 근무코드를 시딩한다(조회인데 INSERT 를 한다).
+        #   **여기서 재시도하지 않는다.** 서비스가 경쟁 충돌은 스스로 되돌리고 수렴시키므로,
+        #   그래도 밖으로 나온 IntegrityError 는 FK·NOT NULL 같은 **재시도로 안 풀리는
+        #   실패**다. 그걸 409 '준비 중' 으로 바꾸면 클라이언트가 헛되이 재시도하고
+        #   서버 장애 원인이 가려진다. 아래 catch-all 로 떨어져 500 + 로그가 되게 둔다.
         shifts = get_shifts_service_mssql(current_user, db, override_gid)
         for shift in shifts:
             shift["start_time"] = convert_time(shift["start_time"])
@@ -91,7 +96,7 @@ def get_shifts(
 
 
 @router.get("/shifts/paged")
-async def get_shifts_paged(
+def get_shifts_paged(
     group_id: str,
     cursor: Optional[str] = None,
     limit: int = 20,
@@ -156,10 +161,10 @@ def _is_weekly_off_slot(slot_data: dict[str, Any]) -> bool:
 VALID_NURSE_CLASSES = {"RN", "AN", "보조"}
 
 @router.post("/shifts/add")
-async def add_shift(
+def add_shift(
     req: ShiftAddRequest,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -167,15 +172,22 @@ async def add_shift(
         result = add_shift_service(req, current_user, db, group_id)
     except HTTPException:
         raise
+    except IntegrityError:
+        # ★ shifts 에 (office_id, group_id, shift_id) UNIQUE 가 걸리면 여기로 온다.
+        #   rollback 이 없으면 오염된 세션이 요청 끝까지 따라다닌다(get_db 는 close 만 한다).
+        #   ★ 응답 형태는 기존 사전검사 실패와 **같게** 둔다 — 프론트가 이미 이 500 의
+        #     detail 을 그대로 띄우고 있어서, 지금 상태코드를 바꾸면 문구가 사라진다.
+        db.rollback()
+        raise HTTPException(status_code=500, detail="근무코드 추가 실패: 이미 존재하는 근무코드입니다.")
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"근무코드 추가 실패: {str(e)}")
 
 @router.post("/shifts/update")
-async def update_shift(
+def update_shift(
     req: ShiftUpdateRequest,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -184,14 +196,21 @@ async def update_shift(
         return result
     except HTTPException:
         raise
+    except IntegrityError:
+        # ★ shifts 에 (office_id, group_id, shift_id) UNIQUE 가 걸리면 여기로 온다.
+        #   rollback 이 없으면 오염된 세션이 요청 끝까지 따라다닌다(get_db 는 close 만 한다).
+        #   ★ 응답 형태는 기존 사전검사 실패와 **같게** 둔다 — 프론트가 이미 이 500 의
+        #     detail 을 그대로 띄우고 있어서, 지금 상태코드를 바꾸면 문구가 사라진다.
+        db.rollback()
+        raise HTTPException(status_code=500, detail="근무코드 수정 실패: 이미 존재하는 근무코드입니다.")
     except Exception as e:
         print('error', e)
         raise HTTPException(status_code=500, detail=f"근무코드 수정 실패: {str(e)}")
 @router.post("/shifts/remove")
-async def remove_shift(
+def remove_shift(
     req: RemoveShiftRequest,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -202,10 +221,10 @@ async def remove_shift(
         raise HTTPException(status_code=500, detail=f"근무코드 삭제 실패: {str(e)}")
 
 @router.post("/shifts/move")
-async def move_shift(
+def move_shift(
     req: MoveShiftRequest,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -219,8 +238,8 @@ async def move_shift(
 
 # [Shifts] - 엑셀 일괄 업로드
 @router.get("/shifts/template-download")
-async def download_shift_template(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+def download_shift_template(
+    current_user: UserSchema = Depends(require_current_user),
 ):
     """근무코드 엑셀 업로드 템플릿 다운로드"""
     try:
@@ -247,6 +266,10 @@ async def shift_upload_validate_endpoint(
     try:
         if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, "is_master_admin", False)):
             raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
+        # 검증도 확정(upload-confirm)과 **같은 병동 규칙**으로 해석한다. 검증만 통과시키고
+        # 확정에서 막으면 사용자는 왜 막혔는지 알 수 없고, 반대로 검증 결과가 남의 병동
+        # 기준이면 화면에 보이는 중복 판정 자체가 틀린다.
+        group_id = resolve_effective_group(db, current_user, group_id)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
             content = await file.read()
             tmp_file.write(content)
@@ -263,7 +286,7 @@ async def shift_upload_validate_endpoint(
 
 
 @router.post("/shifts/upload-confirm")
-async def shift_upload_confirm_endpoint(
+def shift_upload_confirm_endpoint(
     payload: ShiftUploadConfirmRequest,
     group_id: str = Query(..., description="대상 병동 group_id (필수)"),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -274,23 +297,34 @@ async def shift_upload_confirm_endpoint(
         if not current_user or not (caller_is_head_nurse(db, current_user) or getattr(current_user, "is_master_admin", False)):
             raise HTTPException(status_code=403, detail="수간호사 또는 마스터 관리자만 접근 가능합니다.")
 
-        target_group_id = group_id
-        if not target_group_id:
-            target_group_id = getattr(current_user, "group_id", None)
+        target_group_id = group_id or getattr(current_user, "group_id", None)
         if not target_group_id:
             raise HTTPException(status_code=400, detail="group_id가 필요합니다. URL에 ?group_id=... 를 포함해주세요.")
+        # ★ 쓰기 경로다. 예전엔 클라이언트가 준 group_id 를 그대로 썼다 — 수간호사이기만 하면
+        #   병동 ID 를 아는 것만으로 **남의 병동에 근무코드를 심을 수 있었고**, 타 오피스
+        #   group_id 를 주면 호출자 office_id 와 외부 group_id 가 섞인 행까지 만들어졌다.
+        #   같은 파일의 import 엔드포인트는 이미 이 해석기로 막고 있다. 검증(validate)과
+        #   확정(confirm) 이 같은 규칙을 쓰도록 양쪽 모두에 적용한다.
+        target_group_id = resolve_effective_group(db, current_user, target_group_id)
 
         result = shift_upload_confirm(payload.rows, current_user, db, target_group_id)
         return result
     except HTTPException:
         raise
+    except IntegrityError:
+        # ★ shifts 에 (office_id, group_id, shift_id) UNIQUE 가 걸리면 여기로 온다.
+        #   rollback 이 없으면 오염된 세션이 요청 끝까지 따라다닌다(get_db 는 close 만 한다).
+        #   ★ 응답 형태는 기존 사전검사 실패와 **같게** 둔다 — 프론트가 이미 이 500 의
+        #     detail 을 그대로 띄우고 있어서, 지금 상태코드를 바꾸면 문구가 사라진다.
+        db.rollback()
+        raise HTTPException(status_code=500, detail="저장 실패: 이미 존재하는 근무코드입니다.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"저장 실패: {str(e)}")
 
 
 # [Shifts] - 타 병동 근무코드 가져오기
 @router.get("/shifts/available-imports")
-async def get_available_shift_imports(
+def get_available_shift_imports(
     group_id: str = Query(..., description="현재 선택된 병동 그룹 ID"),
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -304,7 +338,11 @@ async def get_available_shift_imports(
         if not office_id:
             raise HTTPException(status_code=400, detail="office_id를 확인할 수 없습니다.")
 
-        result = get_available_shifts_for_import(office_id, group_id, db)
+        # 대상 병동은 호출자가 관리하는 병동이어야 한다(HN=groups.hn_id / ADM=office).
+        # 다른 shift 라우트와 같은 해석기를 쓴다 — 여기만 검증이 없으면 병동 ID 만 알면
+        # 남의 병동 기준으로 후보 목록을 뽑아 볼 수 있다.
+        target_gid = resolve_effective_group(db, current_user, group_id)
+        result = get_available_shifts_for_import(office_id, target_gid, db)
         return result
     except HTTPException:
         raise
@@ -313,7 +351,7 @@ async def get_available_shift_imports(
 
 
 @router.post("/shifts/import-to-group")
-async def import_shifts_to_group_endpoint(
+def import_shifts_to_group_endpoint(
     payload: ShiftImportRequest,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
@@ -327,17 +365,32 @@ async def import_shifts_to_group_endpoint(
         if not office_id:
             raise HTTPException(status_code=400, detail="office_id를 확인할 수 없습니다.")
 
-        result = import_shifts_to_group(payload.shift_ids, payload.group_id, office_id, db)
+        # ★ 쓰기 경로다. 클라이언트가 준 group_id 를 그대로 쓰면 병동 ID 만 알면 남의
+        #   병동에 근무코드를 심을 수 있고, 타 오피스 group_id 를 주면 호출자 office_id 와
+        #   외부 group_id 가 섞인 행이 만들어진다. 원본(source_group_id) 검증은 읽는 쪽만
+        #   막아 이 경계를 지키지 못한다. 대상도 같은 해석기로 검증한다.
+        target_gid = resolve_effective_group(db, current_user, payload.group_id)
+        result = import_shifts_to_group(
+            payload.shift_ids, target_gid, office_id, db,
+            sources=payload.sources,
+        )
         return result
     except HTTPException:
         raise
+    except IntegrityError:
+        # ★ shifts 에 (office_id, group_id, shift_id) UNIQUE 가 걸리면 여기로 온다.
+        #   rollback 이 없으면 오염된 세션이 요청 끝까지 따라다닌다(get_db 는 close 만 한다).
+        #   ★ 응답 형태는 기존 사전검사 실패와 **같게** 둔다 — 프론트가 이미 이 500 의
+        #     detail 을 그대로 띄우고 있어서, 지금 상태코드를 바꾸면 문구가 사라진다.
+        db.rollback()
+        raise HTTPException(status_code=500, detail="가져오기 실패: 이미 존재하는 근무코드입니다.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"가져오기 실패: {str(e)}")
 
 
 # [Shift Management] - 시프트 관리 데이터 조회
 @router.get("/shift-manage/{class_name}")
-async def get_shift_manage(
+def get_shift_manage(
     class_name: Optional[str] = None,
     # config_version: Optional[str] = None,
     group_id: Optional[str] = None,
@@ -465,7 +518,7 @@ def _upsert_shift_manage_slots(
 
 
 @router.post("/shift-manage/save")
-async def save_shift_manage(
+def save_shift_manage(
     req: ShiftManageSaveRequest,
     # config_version: Optional[str] = None,
     group_id: Optional[str] = None,

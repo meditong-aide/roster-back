@@ -214,17 +214,20 @@ def detect_nurse_overconstrained(rs: Any) -> List[Dict[str, Any]]:
                     derivation.append({"step": 99, "conclusion": f"필요 N 구간 [{n_lower}, {n_upper}] — 빈집합"})
 
                 hints: List[Dict[str, Any]] = []
+                # ★ 하드락 #6(월 나이트 1인 최대 15) — 그보다 높은 상한·횟수는 안내하지 않는다(2026-10-02).
+                from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _HARD_N
                 if max_night_global > 0:
                     _night_to = max(
                         int(min_work_days),
                         int(n_exact) if n_exact is not None else 0,
                         int(n_lower),
                     )
-                    hints.append({
-                        "action": "increase_max_night_shifts_per_month",
-                        "params": {"from": max_night_global, "to_min": _night_to},
-                        "human_message_ko": f"월간 N 상한을 {max_night_global} → {_night_to}+ 로 늘리세요.",
-                    })
+                    if _night_to <= _HARD_N:
+                        hints.append({
+                            "action": "increase_max_night_shifts_per_month",
+                            "params": {"from": max_night_global, "to_min": _night_to},
+                            "human_message_ko": f"월간 N 상한을 {max_night_global} → {_night_to}+ 로 늘리세요.",
+                        })
                 if max_off is not None:
                     needed_off = num_days - n_upper
                     hints.append({
@@ -237,11 +240,13 @@ def detect_nurse_overconstrained(rs: Any) -> List[Dict[str, Any]]:
                     "params": {"nurse_idx": idx, "current": "N-only", "to": "N + (D or E)"},
                     "human_message_ko": "이 간호사 role을 D 또는 E도 가능한 다중 시프트로 변경하세요.",
                 })
-                if n_exact is not None:
+                # ★ 야간전담 N 고정 횟수는 하드락(15 고정)이라 "풀라" 고 안내하지 않는다. 15 를 넘는
+                #   값만 데이터 오류로 정정 안내한다(2026-10-02 사용자 지적).
+                if n_exact is not None and int(n_exact) > _HARD_N:
                     hints.append({
-                        "action": "relax_n_exact",
-                        "params": {"nurse_idx": idx, "current": n_exact},
-                        "human_message_ko": f"이 간호사 월간 N exact={n_exact} 제약을 풀거나 범위로 바꾸세요.",
+                        "action": "correct_n_exact_over_hard_cap",
+                        "params": {"nurse_idx": idx, "current": n_exact, "max": _HARD_N},
+                        "human_message_ko": f"이 간호사 나이트 개수 {n_exact}회가 하드락 {_HARD_N}회를 넘습니다 — {_HARD_N}회 이하로 정정하세요.",
                     })
 
                 if off_conflict:
@@ -377,16 +382,28 @@ def detect_capacity_shortage(rs: Any) -> List[Dict[str, Any]]:
                 {"step": 99, "conclusion": f"N 요구({n_required}) > N 공급({n_cap}) — N 산술 부족"},
             ],
             "conclusion": f"월 N 요구 {n_required} > 공급 상한 {n_cap}",
-            "resolution_hints": [
-                {"action": "reduce_daily_n_requirement",
-                 "human_message_ko": "일별 N 요구를 줄이세요."},
-                {"action": "increase_max_night",
-                 "human_message_ko": f"max_night_shifts_per_month를 {max_night_global} → {max(1, (n_required + nurse_count - 1) // nurse_count)} 이상으로 늘리세요."},
-            ],
+            "resolution_hints": _night_shortage_hints(max_night_global, n_required, nurse_count),
             "human_message_ko": "야간 인력 산술 부족.",
         })
 
     return cores
+
+
+def _night_shortage_hints(max_night_global: int, n_required: int, nurse_count: int) -> list[dict[str, Any]]:
+    """월 N 산술 부족 안내. 상한 상향은 하드락 #6(1인 15) 안에서만 — 넘으면 인원·요구 쪽만 안내."""
+    from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _HARD_N
+
+    need_per = max(1, (n_required + nurse_count - 1) // nurse_count) if nurse_count else _HARD_N + 1
+    hints: list[dict[str, Any]] = [
+        {"action": "reduce_daily_n_requirement", "human_message_ko": "일별 N 요구를 줄이세요."},
+    ]
+    if need_per <= _HARD_N:
+        hints.append({"action": "increase_max_night",
+                      "human_message_ko": f"max_night_shifts_per_month를 {max_night_global} → {need_per} 이상으로 늘리세요."})
+    else:
+        hints.append({"action": "add_night_capable_staff",
+                      "human_message_ko": f"1인 월 {_HARD_N}회(하드락)로도 부족합니다 — 야간 가능 인원을 늘리세요."})
+    return hints
 
 
 def run_conflict_detectors(rs: Any) -> List[Dict[str, Any]]:

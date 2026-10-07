@@ -54,9 +54,56 @@ import asyncio
 import logging
 
 from db.client2 import SessionLocal
-from services.wanted_service import close_expired_wanted
+from services.wanted_service import run_wanted_auto_close
 
 _scheduler_logger = logging.getLogger("scheduler")
+
+
+def _run_daily_flush():
+    """병동이동·파견·휴직·영구변경 flush 1회 실행(동기).
+
+    ★ 이벤트 루프에서 직접 부르면 안 된다 — 내부가 전부 **동기 DB** 라
+      루프가 통째로 멈춘다. 호출부는 `asyncio.to_thread` 로 감쌀 것.
+    """
+    db = SessionLocal()
+    try:
+        from services.assignment_service import (
+            flush_all_pending_transfers,
+            flush_expired_dispatches,
+            flush_expired_leaves,
+            flush_pending_permanent_changes,
+            reconcile_nurse_attrs,
+        )
+        count = flush_all_pending_transfers(db)
+        if count > 0:
+            _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
+        # [도려내기] 프리셉티 만료 flush 제거 — nurse_preceptee_period as-of resolver 가 자동 처리.
+        disp_count = flush_expired_dispatches(db)
+        if disp_count > 0:
+            _scheduler_logger.info("[Scheduler] 파견 자동 디엑티브: %d건", disp_count)
+        leave_count = flush_expired_leaves(db)
+        if leave_count > 0:
+            _scheduler_logger.info("[Scheduler] 휴직 자동 디엑티브: %d건", leave_count)
+        pc_count = flush_pending_permanent_changes(db)
+        if pc_count > 0:
+            _scheduler_logger.info("[Scheduler] 영구 속성변경 발효: %d건", pc_count)
+        # [퇴사자 삭제 비활성화] 퇴사자는 nurses.resignation_date 로만 관리하고 레코드는 보존한다.
+        #   월 명단 노출/미노출은 group_members_in_month 가 resignation_date 로 판정(퇴사月=표시,
+        #   다음 달=제외). hard delete 하면 퇴사月 표시도 사라지고 데이터도 잃으므로 호출하지 않는다.
+        # res_count = flush_resigned_nurses(db)
+        # if res_count > 0:
+        #     _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
+        # Nurses 캐시 vs NurseAssignment effective 값 정합성 점검 (read-only)
+        recon = reconcile_nurse_attrs(db)
+        if recon.get("mismatch_count", 0) > 0:
+            _scheduler_logger.warning(
+                "[Scheduler] reconcile 불일치 %d건 (검사 %d명) — 자동 동기화 없음, 운영자 확인 필요",
+                recon["mismatch_count"], recon["total_checked"],
+            )
+    except Exception as e:
+        _scheduler_logger.error("[Scheduler] 자동 flush 실패: %s", e, exc_info=True)
+    finally:
+        db.close()
 
 
 async def _daily_flush_scheduler():
@@ -66,46 +113,7 @@ async def _daily_flush_scheduler():
         now = datetime.now()
         tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         await asyncio.sleep((tomorrow - now).total_seconds())
-
-        db = SessionLocal()
-        try:
-            from services.assignment_service import (
-                flush_all_pending_transfers,
-                flush_expired_dispatches,
-                flush_expired_leaves,
-                flush_pending_permanent_changes,
-                reconcile_nurse_attrs,
-            )
-            count = flush_all_pending_transfers(db)
-            if count > 0:
-                _scheduler_logger.info("[Scheduler] 병동이동 자동 flush: %d건", count)
-            # [도려내기] 프리셉티 만료 flush 제거 — nurse_preceptee_period as-of resolver 가 자동 처리.
-            disp_count = flush_expired_dispatches(db)
-            if disp_count > 0:
-                _scheduler_logger.info("[Scheduler] 파견 자동 디엑티브: %d건", disp_count)
-            leave_count = flush_expired_leaves(db)
-            if leave_count > 0:
-                _scheduler_logger.info("[Scheduler] 휴직 자동 디엑티브: %d건", leave_count)
-            pc_count = flush_pending_permanent_changes(db)
-            if pc_count > 0:
-                _scheduler_logger.info("[Scheduler] 영구 속성변경 발효: %d건", pc_count)
-            # [퇴사자 삭제 비활성화] 퇴사자는 nurses.resignation_date 로만 관리하고 레코드는 보존한다.
-            #   월 명단 노출/미노출은 group_members_in_month 가 resignation_date 로 판정(퇴사月=표시,
-            #   다음 달=제외). hard delete 하면 퇴사月 표시도 사라지고 데이터도 잃으므로 호출하지 않는다.
-            # res_count = flush_resigned_nurses(db)
-            # if res_count > 0:
-            #     _scheduler_logger.info("[Scheduler] 퇴사자 자동 삭제: %d건", res_count)
-            # Nurses 캐시 vs NurseAssignment effective 값 정합성 점검 (read-only)
-            recon = reconcile_nurse_attrs(db)
-            if recon.get("mismatch_count", 0) > 0:
-                _scheduler_logger.warning(
-                    "[Scheduler] reconcile 불일치 %d건 (검사 %d명) — 자동 동기화 없음, 운영자 확인 필요",
-                    recon["mismatch_count"], recon["total_checked"],
-                )
-        except Exception as e:
-            _scheduler_logger.error("[Scheduler] 자동 flush 실패: %s", e, exc_info=True)
-        finally:
-            db.close()
+        await asyncio.to_thread(_run_daily_flush)
 
 
 def _expire_stale_status(db, status_in: str, cutoff_seconds: int, message: str) -> int:
@@ -160,21 +168,30 @@ async def _stale_jobs_janitor():
     """
     while True:
         await asyncio.sleep(60)
-        db = SessionLocal()
-        try:
-            queued, running = _sweep_stale_jobs(db)
-            if queued or running:
-                _scheduler_logger.warning(
-                    "[Scheduler] stale jobs swept: queued→failed=%d, running→failed=%d",
-                    queued,
-                    running,
-                )
-        except Exception as e:
-            _scheduler_logger.error(
-                "[Scheduler] stale jobs sweep 실패: %s", e, exc_info=True
+        await asyncio.to_thread(_run_stale_jobs_sweep)
+
+
+def _run_stale_jobs_sweep():
+    """stale job 정리 1회 실행(동기).
+
+    ★ 이벤트 루프에서 직접 부르면 안 된다 — **동기 DB** 라 루프가 멈춘다.
+      60초 주기라 한 번 물리면 서버가 매분 정지한다.
+    """
+    db = SessionLocal()
+    try:
+        queued, running = _sweep_stale_jobs(db)
+        if queued or running:
+            _scheduler_logger.warning(
+                "[Scheduler] stale jobs swept: queued→failed=%d, running→failed=%d",
+                queued,
+                running,
             )
-        finally:
-            db.close()
+    except Exception as e:
+        _scheduler_logger.error(
+            "[Scheduler] stale jobs sweep 실패: %s", e, exc_info=True
+        )
+    finally:
+        db.close()
 
 
 def _run_nurse_sync():
@@ -200,10 +217,17 @@ def _run_nurse_sync():
 
 
 async def _daily_nurse_sync_scheduler():
-    """서버 시작 시 즉시 1회 실행 후, 매일 새벽 3시에 반복 실행."""
+    """서버 시작 시 즉시 1회 실행 후, 매일 새벽 3시에 반복 실행.
+
+    ★★ `_run_nurse_sync` 는 **동기 DB**(그룹웨어 전 간호사 스윕)라 루프에서 직접 부르면
+       그 쿼리가 끝날 때까지 서버 전체가 정지한다. roster-back 은 **쿼리 타임아웃이 없어서**
+       공용 DB 가 느려지면 무한 대기가 된다(실측: 워커 재기동 후 12분째 전 요청 000 ·
+       CPU 0% · 스택이 `task_step_impl → pymssql execute → poll()` 에 고정).
+       ★ 여기가 특히 위험한 이유는 **시작 즉시 1회** 라 재기동할 때마다 걸린다는 것.
+    """
     from datetime import timedelta
 
-    _run_nurse_sync()
+    await asyncio.to_thread(_run_nurse_sync)
 
     while True:
         now = datetime.now()
@@ -211,7 +235,103 @@ async def _daily_nurse_sync_scheduler():
         if target <= now:
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
-        _run_nurse_sync()
+        await asyncio.to_thread(_run_nurse_sync)
+
+
+def _run_wanted_auto_close():
+    """만료 원티드 자동 마감 1회 실행(동기) — 전 병원.
+
+    ★ 이벤트 루프에서 직접 부르면 안 된다 — **동기 DB** 라 루프가 멈춘다. `to_thread` 로.
+    """
+    db = SessionLocal()
+    try:
+        _scheduler_logger.info("[Scheduler] 원티드 자동 마감 시작")
+        result = run_wanted_auto_close(db, office_id=None)
+        # ★ 0건이어도 남긴다 — '닫을 게 없었다'와 '안 돌았다'를 로그로 구분하려고.
+        _scheduler_logger.info(
+            "[Scheduler] 원티드 자동 마감 끝: 닫음 %d건 (알림 대기열 %d건 · 알림 없이 %d건)",
+            result["updated"], result["queued"], len(result["closed_silently"]),
+        )
+        if result["close_failed"]:
+            _scheduler_logger.warning("[Scheduler] 원티드 마감 실패(다음 실행에 재시도): %s", result["close_failed"])
+    except Exception as e:
+        _scheduler_logger.error("[Scheduler] 원티드 자동 마감 실패: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+async def _daily_wanted_close_scheduler():
+    """원티드 자동 마감 — 서버 기동 시 1회 + 매일 00:05(KST).
+
+    ★ 예전엔 EventBridge `daily_00cron` → Lambda `call-wanted-close-task` 가 HTTP 로 불렀는데
+      **dev API** 를 불러 운영은 한 번도 닫히지 않았다(2026-10 실측). 서버 안으로 옮겼다.
+    ★ 기동 시 1회는 서버가 내려가 있던 동안 놓친 마감을 따라잡는다. 이미 닫힌 건 다시 닫지
+      않고 알림도 다시 안 간다(조건부 UPDATE) — 재기동이 잦아도 안전하다.
+    ★ 켜는 스위치 `WANTED_AUTO_CLOSE_ENABLED=1` 은 배포 워크플로가 dev·prod .env 에 넣는다.
+      로컬 개발 서버는 꺼져 있다 — 개발자 PC 가 dev DB 원티드를 닫고 알림을 보내지 않게.
+    """
+    from datetime import timedelta
+
+    kst = timezone(timedelta(hours=9))
+    await asyncio.to_thread(_run_wanted_auto_close)
+    while True:
+        now = datetime.now(kst)
+        target = now.replace(hour=0, minute=5, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        _scheduler_logger.info("[Scheduler] 원티드 자동 마감 다음 실행: %s", target.isoformat())
+        await asyncio.sleep((target - now).total_seconds())
+        await asyncio.to_thread(_run_wanted_auto_close)
+
+
+def _run_push_dispatch():
+    """앱 알림 발송 대기열 1회 처리(동기). ★ 동기 DB·그룹웨어 쓰기라 `to_thread` 로 부를 것."""
+    from services.push_outbox_service import dispatch_due
+
+    db = SessionLocal()
+    try:
+        counts = dispatch_due(db)
+        if counts:
+            _scheduler_logger.info("[Scheduler] 알림 발송: %s", counts)
+    except Exception as e:
+        _scheduler_logger.error("[Scheduler] 알림 발송기 오류: %s", e, exc_info=True)
+    finally:
+        db.close()
+
+
+async def _push_outbox_dispatcher():
+    """앱 알림 발송기 — 10초마다 보낼 차례인 알림을 보낸다(`services.push_outbox_service`).
+
+    ★ 업무 코드는 알림을 대기열에 넣기만 한다(업무 저장과 같은 트랜잭션). 실제 발송·재시도는
+      여기서 한다. 여러 프로세스가 돌아도 행을 `UPDLOCK, READPAST` 로 나눠 잡아 겹치지 않는다.
+    ★ 운영 외 환경(dev·로컬)에선 실제로 보내지 않고 skipped 로 접는다(`push_enabled`).
+    """
+    while True:
+        await asyncio.sleep(10)
+        await asyncio.to_thread(_run_push_dispatch)
+
+
+def _log_task_end(task: asyncio.Task) -> None:
+    """스케줄러 작업이 예외로 끝나면 남긴다(취소는 정상 종료). 조용히 죽으면 아무도 모른다."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        _scheduler_logger.error("[Scheduler] %s 비정상 종료: %r", task.get_name(), exc)
+
+
+def _start_wanted_close_task() -> asyncio.Task | None:
+    """`WANTED_AUTO_CLOSE_ENABLED=1` 일 때만 원티드 자동 마감 스케줄러를 띄운다. 켜짐/꺼짐을 남긴다."""
+    enabled = os.getenv("WANTED_AUTO_CLOSE_ENABLED") == "1"
+    _scheduler_logger.info(
+        "[Scheduler] 원티드 자동 마감: %s (WANTED_AUTO_CLOSE_ENABLED=%r)",
+        "켜짐" if enabled else "꺼짐", os.getenv("WANTED_AUTO_CLOSE_ENABLED"),
+    )
+    if not enabled:
+        return None
+    task = asyncio.create_task(_daily_wanted_close_scheduler(), name="wanted_auto_close")
+    task.add_done_callback(_log_task_end)
+    return task
 
 
 @asynccontextmanager
@@ -219,10 +339,16 @@ async def lifespan(app):
     flush_task = asyncio.create_task(_daily_flush_scheduler())
     sync_task = asyncio.create_task(_daily_nurse_sync_scheduler())
     janitor_task = asyncio.create_task(_stale_jobs_janitor())
+    wanted_close_task = _start_wanted_close_task()
+    push_task = asyncio.create_task(_push_outbox_dispatcher(), name="push_outbox_dispatcher")
+    push_task.add_done_callback(_log_task_end)
     yield
     flush_task.cancel()
     sync_task.cancel()
     janitor_task.cancel()
+    push_task.cancel()
+    if wanted_close_task is not None:
+        wanted_close_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -289,6 +415,13 @@ _LOG_EXCLUDE_PREFIX = ("/static", "/health", "/docs", "/openapi", "/favicon", "/
 #   2026-08-27 실측: 미인증 GET 7종이 401 아닌 **500** 으로 나가는데(가드 누락) 전부 기록이
 #   없었다 — GET 미포함 + `call_next` 가 try 밖이라는 두 겹 때문이었다.
 _LOG_FAILURE_FROM = 400
+# ★ 느린 요청은 **method 무관하게** 남긴다(2026-09-09 추가).
+#   위 규칙만으로는 "성공한 GET" 이 통째로 안 남아 성능 진단에 사각지대가 생긴다.
+#   실제로 2026-09-09 11:21 prod 응답이 26초(ALB 실측)였는데 call_history 에는
+#   그 요청이 없었다 — 조회 성공분이라 기록 대상이 아니었기 때문이다.
+#   양은 거의 안 는다: 2개월치에서 3초 초과가 20건 남짓이라 Firehose·S3 비용 영향은 무시 가능.
+#   GET 의 query 는 아래에서 값을 버리고 키만 남기므로 PII 원칙도 그대로 유지된다.
+_LOG_SLOW_MS = 3000
 
 # 경로→(page/section/action) 라벨 + 요청본문 화이트리스트 카탈로그(의미 보강용).
 import call_action_catalog as _catalog
@@ -353,7 +486,24 @@ async def _call_action_logger(request: Request, call_next):
         status = getattr(response, "status_code", None) if response is not None else 500
         # 예외로 빠졌으면 아직 응답이 없다 — 실제로 나갈 값(500)으로 기록한다.
         failed = exc is not None or (status is not None and status >= _LOG_FAILURE_FROM)
-        if ((method in _LOG_METHODS or failed)
+        # ★ 소요시간을 조건 판정 **전에** 한 번만 재고 아래 event 에서 재사용한다.
+        #   판정과 기록이 같은 값을 쓰게 하려는 것이다(기존엔 event 안에서 다시 쟀다).
+        #
+        # ★★ 알려진 한계 — **스트리밍 응답은 헤더까지만 측정된다.**
+        #   `BaseHTTPMiddleware` 의 `call_next()` 는 응답 **헤더가 준비된 시점**에 반환되고,
+        #   본문은 그 뒤에 생성·전송된다. 따라서 `FileResponse`/`StreamingResponse` 를 쓰는
+        #   GET 9곳(`/schedule/{id}/export` · `/*-download` · `/s/{token}/image` 등)은
+        #   실제로 오래 걸려도 여기선 "빠름" 으로 분류돼 slow 기록에서 빠진다.
+        #   → **의도적으로 두는 한계다.** end-to-end 로 재려면 이 미들웨어를 순수 ASGI 로
+        #     바꿔 `send` 를 감싸야 하는데, `_CallBodyTapMiddleware` 와의 순서·
+        #     `CancelledError` 전파·CORS 순서까지 걸려 회귀 범위가 이 기능에 비해 과하다.
+        #   → 다운로드 계열은 **경로가 한정적이고**(9곳) ALB `TargetResponseTime` 지표와
+        #     `roster-{prod,dev}-alb-slow` 알람이 계층을 달리해 이미 감시한다.
+        #     실제로 2026-09-09 11:21 의 26초도 그 지표가 잡았다.
+        #   (2026-09-09 Codex 리뷰 2회차 P2 지적 — 재현으로 사실 확인 후 범위를 이렇게 정함)
+        dur_ms = int((time.perf_counter() - start) * 1000)
+        slow = dur_ms >= _LOG_SLOW_MS
+        if ((method in _LOG_METHODS or failed or slow)
                 and not path.startswith(_LOG_EXCLUDE_PREFIX)):
             xff = request.headers.get("x-forwarded-for", "")
             ip = xff.split(",")[0].strip() if xff else (
@@ -377,7 +527,7 @@ async def _call_action_logger(request: Request, call_next):
                 "path": path[:500],
                 "query": (qs[:1000] if qs else None),
                 "status": status,
-                "dur_ms": int((time.perf_counter() - start) * 1000),
+                "dur_ms": dur_ms,
                 # 예외로 끝난 요청만 채워진다. ★**타입만** 남긴다 —
                 # 예외 메시지에는 쿼리 바인딩 값·요청 데이터가 그대로 실릴 수 있어(pymssql 등)
                 # 이 로그의 "본문 미저장" 원칙과 충돌한다. 길이 제한은 방어가 못 된다.
@@ -468,6 +618,8 @@ app.include_router(auth.router)
 app.include_router(nurses.router)
 # app.include_router(schedules.router)
 app.include_router(roster.router)
+from routers import roster_change_notice  # noqa: E402
+app.include_router(roster_change_notice.router)
 app.include_router(dates.router) 
 app.include_router(wanted.router) 
 app.include_router(preferences.router) 

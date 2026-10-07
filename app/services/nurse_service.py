@@ -32,6 +32,7 @@ import secrets
 import time
 import boto3
 from threading import Lock
+from functools import lru_cache
 from urllib.parse import quote
 import base64
 import json
@@ -64,7 +65,18 @@ def get_profile_image_url(image_key: Optional[str]) -> Optional[str]:
     return _build_profile_image_url(image_key)
 
 
+@lru_cache(maxsize=8)
 def _build_s3_client(region: str):
+    """S3 클라이언트. **리전별로 한 번만 만든다.**
+
+    ★ boto3 클라이언트 생성은 실측 **1회 0.77초** 다(로더가 서비스 모델 JSON 을
+      매번 파싱한다). 이 함수는 프로필 이미지 URL 을 만들 때 **간호사 1명당 1회**
+      불리므로, 캐시가 없으면 26명 병동 명단 조회 하나가 여기서만 20초를 쓴다.
+      presign 자체는 로컬 서명이라 네트워크 왕복이 없다 — 비용은 전부 생성 쪽이다.
+    ★ 자격증명은 프로세스 기동 시 환경에서 정해지고 런타임에 바뀌지 않으므로
+      캐시해도 값이 어긋나지 않는다. 클라이언트는 스레드에서 공유해도 안전하다
+      (요청 객체를 공유하지 않고 서명만 한다).
+    """
     access_key = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY")
     secret_key = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_KEY")
     session_token = os.getenv("AWS_SESSION_TOKEN")
@@ -819,7 +831,8 @@ def move_nurse_with_active_service(
         nurse = (
             db.query(NurseModel)
             .select_from(NurseModel)
-            .filter(NurseModel.nurse_id == nurse_id)
+            # 관리자도 자기 병원 간호사만(10-06)
+            .filter(NurseModel.nurse_id == nurse_id, NurseModel.office_id == current_user.office_id)
             .first()
         )
         target_group_id = nurse.group_id if nurse else None
@@ -932,7 +945,11 @@ def bulk_update_nurses_service(
     if not current_user:
         raise Exception("Not authenticated")
 
-    # 권한 체크: 수간호사(HDN) 또는 마스터 관리자(ADM)
+    # 권한 체크: 관리자·수간호사·그룹관리자만(사용자 결정 2026-10-02). 예전엔 이 주석만 있고 검사가 없어
+    #   같은 병동 일반 간호사가 동료의 등급·팀·근무형태와 배정(파견·휴직·취소)까지 바꿀 수 있었다.
+    from services.group_access import caller_is_manager
+    if not caller_is_manager(db, current_user):
+        raise HTTPException(status_code=403, detail="관리자·수간호사·그룹관리자만 일괄 수정할 수 있습니다.")
     if current_user.is_master_admin:
         target_group_id = override_group_id
     else:
@@ -1907,6 +1924,11 @@ def update_nurse_profile_service(
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
     if not nurse:
         raise HTTPException(status_code=404, detail="간호사 정보를 찾을 수 없습니다.")
+    # ★ 역할만 보고 대상은 안 봐서, 수간호사면 다른 병동·다른 병원 간호사의 프로필·배정까지 바꿀 수 있었다
+    #   (OMC 검토 2026-10-02). 조회와 같은 기준 — 본인·소속·관리 병동·그 병동으로 파견 온 사람, 관리자는 자기 병원 전체.
+    from services.group_access import can_caller_access_nurse
+    if not can_caller_access_nurse(db, current_user, nurse_id):
+        raise HTTPException(status_code=403, detail="이 간호사를 수정할 권한이 없습니다.")
 
     fields = update_data.dict(exclude_unset=True)
     # period 쓰기 valid_from = 선택월 1일(월 셀렉터). 미동반 시 today(현재값 변경).
@@ -2606,20 +2628,21 @@ def delete_nurse_service(nurse_id: str, current_user: UserSchema, db: Session):
     if not (caller_is_head_nurse(db, current_user) or current_user.is_master_admin):
         raise Exception("Permission denied")
 
-    # 대상 간호사 조회
+    # 대상 간호사 조회 — 관리자도 자기 병원 간호사만(10-06 · 예전엔 병원 조건 없이 아무 간호사나 지울 수 있었다)
     db_nurse = (
         db.query(NurseModel)
         .filter(
             NurseModel.nurse_id == nurse_id,
             NurseModel.group_id == current_user.group_id
             if not current_user.is_master_admin
-            else True,
+            else NurseModel.office_id == current_user.office_id,
         )
         .first()
     )
 
     if not db_nurse:
-        raise Exception(f"Nurse with nurse_id {nurse_id} not found")
+        # 404 — 예전엔 일반 Exception 이라 라우터가 500 으로 바꿨다(다른 병원·병동 간호사도 여기로 온다 · 500 알람 소음).
+        raise HTTPException(status_code=404, detail="간호사를 찾을 수 없습니다.")
 
     try:
         # 삭제 수행자 정보 조회

@@ -561,8 +561,16 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
         _more = f" 외 {len(personal_conflicts) - 3}명" if len(personal_conflicts) > 3 else ""
         # 야간전담이 끼면 '내리기'가 아니라 '월 야간 상한 올리기'가 정답이라 문구도 그에 맞춘다.
         _has_no = any(t.get("is_night_only") for t in personal_targets)
-        _suffix = (" — 야간전담이라 월 야간 상한을 올려 그만큼 서게 하면 돼요."
-                   if _has_no else " — 그 간호사 설정만 바꾸면 돼요.")
+        # ★ 하드락 #6(월 나이트 1인 15) — 야간전담 요구가 15 를 넘으면 상한을 올려 수용할 수 없다.
+        #   그건 나이트 개수 데이터 오류라 정정 안내로 바꾼다(2026-10-02 · mcs_trace 수동 카드와 같은 판정).
+        from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _HARD_N
+        _no_over = any(t.get("is_night_only") and int(t.get("current") or 0) > _HARD_N for t in personal_targets)
+        if _no_over:
+            _suffix = f" — 야간전담 나이트 개수가 월 {_HARD_N}회(하드락)를 넘어요. {_HARD_N}회 이하로 고쳐야 해요."
+        elif _has_no:
+            _suffix = f" — 야간전담이라 월 야간 상한을 올려(최대 {_HARD_N}회) 그만큼 서게 하면 돼요."
+        else:
+            _suffix = " — 그 간호사 설정만 바꾸면 돼요."
         cert = "; ".join(personal_conflicts[:3]) + _more + _suffix
         return InfeasibilityExplanation(
             "personal_infeasible", "monthly_limit", {}, cert,

@@ -1,10 +1,11 @@
-from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.encoders import jsonable_encoder
 from typing import Optional, List, Dict, Any
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, date
 import uuid
 
 from schemas.roster_schema import (
@@ -21,9 +22,8 @@ from schemas.roster_schema import (
     ToggleEntryResponse,
 )
 from services.graph_service import graph_service
-from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse
+from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse, assert_caller_can_access_group
 from routers.auth import get_current_user_from_cookie, require_current_user
-from utils.utils import send_wanted_close_push, send_wanted_deadline_update_push
 from db.client2 import get_db
 from db.models import (
     Wanted,
@@ -32,7 +32,8 @@ from db.models import (
     WantedConfig,
     Nurse,
     ShiftPreference,
-    Group
+    FixedWantedEntry,
+    BannedWantedEntry,
 )
 from schemas.auth_schema import User as UserSchema
 from services.wanted_service import (
@@ -58,6 +59,10 @@ from services.wanted_service import (
     reset_fixed_wanted_service,
     set_adjustment_applied_service,
     get_shift_requests_service,
+    get_wanted_overview_service,
+    update_wanted_deadline_service,
+    run_wanted_auto_close,
+    enqueue_wanted_close_push,
 )
 from services.roster_service import get_my_wanted_reflection_service
 
@@ -71,7 +76,7 @@ templates = Jinja2Templates(directory="app/templates")
 
 # [Wanted] - Wanted 작성 요청 생성 (수간호사용)
 @router.post("/request")
-async def request_wanted_shifts(
+def request_wanted_shifts(
     payload: WantedDeadlineRequest,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -97,7 +102,7 @@ async def request_wanted_shifts(
 
 # [Wanted] - 특정 그룹의 Wanted 상태 조회
 @router.get("/status")
-async def get_wanted_status(
+def get_wanted_status(
     year: int, month: int,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -204,7 +209,7 @@ def get_my_wanted_reflection(
 
 # [Wanted] - 특정 스케줄의 모든 간호사 제출 현황 확인
 @router.get("/{year}/{month}/submissions")
-async def get_submission_statuses(
+def get_submission_statuses(
     year: int, month: int,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -261,18 +266,45 @@ def get_all_wanted(
     wanted_list = db.query(Wanted).filter(
         Wanted.group_id == target_group_id
     ).order_by(Wanted.year.desc(), Wanted.month.desc()).all()
+
+    # 로그인 사용자 **본인**의 월별 제출 상태를 쿼리 1회로 덧붙인다(월 수와 무관).
+    #   `status` 는 병동의 요청 상태 그대로 두고 덮어쓰지 않는다 — 축이 다르다.
+    # ★ `nurse_id` 가 없는 호출자(관리자 등)에겐 **None** 을 준다.
+    #   not_started 로 채우면 "작성 전" 과 "알 수 없음" 이 구분되지 않는다.
+    # ★ 판정 축은 `/preferences/latest`·`/wanted/me/dashboard` 와 **동일**하다
+    #   (`wanted_requests`). 세 화면이 갈리지 않게 같은 헬퍼를 쓴다.
+    from services.preferences_service import load_wanted_request_states
+
+    _nurse_id = getattr(current_user, "nurse_id", None)
+    _states = (
+        load_wanted_request_states(
+            db, _nurse_id, {f"{w.year}-{w.month:02d}" for w in wanted_list}
+        )
+        if _nurse_id
+        else {}
+    )
+
+    def _submission_status(w) -> Optional[str]:
+        if not _nurse_id:
+            return None
+        hit = _states.get(f"{w.year}-{w.month:02d}")
+        if hit is None:
+            return "not_started"
+        return "submitted" if hit else "draft"
+
     return [{
         "year": wanted.year,
         "month": wanted.month,
         "status": wanted.status,
         "exp_date": wanted.exp_date.isoformat() if wanted.exp_date else None,
-        "created_at": wanted.created_at.isoformat() if wanted.created_at else None
+        "created_at": wanted.created_at.isoformat() if wanted.created_at else None,
+        "submission_status": _submission_status(wanted),
     } for wanted in wanted_list]
 
 
 # [Wanted] - Wanted 상태를 closed로 변경
 @router.patch("/close")
-async def close_wanted_request(
+def close_wanted_request(
     year: int, month: int,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -294,27 +326,29 @@ async def close_wanted_request(
 
     if not wanted:
         raise HTTPException(status_code=404, detail="해당 월의 wanted 요청을 찾을 수 없습니다.")
-    
-    wanted.status = 'closed'
-    db.commit()
 
-    nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
-    recipients = [nurse.nurse_id for nurse in nurses_in_group]
-    send_wanted_close_push(
-        year=wanted.year,
-        month=wanted.month,
-        recipients=recipients,
-        office_code=current_user.office_id,
-        sender_emp_seq_no=current_user.nurse_id,
-        sender_member_id=current_user.account_id,
+    # ★ 조건부 UPDATE — 이미 닫힌 원티드(자동 마감이 먼저 닫았거나 마감 버튼 두 번)에는
+    #   상태도 알림도 다시 내지 않는다. 속성 대입은 '변경 없음'이어도 알림은 나가던 구조였다.
+    changed = db.query(Wanted).filter(
+        Wanted.group_id == target_group_id, Wanted.year == year, Wanted.month == month,
+        or_(Wanted.status.is_(None), Wanted.status != "closed"),
+    ).update({Wanted.status: "closed"}, synchronize_session=False)
+    if not changed:
+        db.rollback()
+        return {"message": "이미 마감된 Wanted 요청입니다."}
+    # 마감과 알림을 한 트랜잭션으로 — 알림은 발송 대기열에 들어가고 발송기가 보낸다.
+    # 보내기 직전에 다시 열렸는지는 발송기가 guard 로 확인한다(`enqueue_wanted_close_push`).
+    enqueue_wanted_close_push(
+        db, target_group_id, year, month, source="wanted_manual_close",
+        sender_emp_seq_no=current_user.nurse_id, sender_member_id=current_user.account_id,
     )
-
+    db.commit()
     return {"message": "Wanted 요청이 마감되었습니다."}
 
 
 # [Wanted] - Wanted 마감일 변경
 @router.patch("/deadline")
-async def update_wanted_deadline(
+def update_wanted_deadline(
     req: WantedDeadlineRequest,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -336,37 +370,10 @@ async def update_wanted_deadline(
     
     if not wanted:
         raise HTTPException(status_code=404, detail="해당 월의 wanted 요청을 찾을 수 없습니다.")
-    
-    if wanted.status == 'closed':
-        raise HTTPException(status_code=400, detail="마감된 wanted 요청의 마감일은 변경할 수 없습니다.")
-    
-    payload = req.model_dump(exclude_unset=True)
-    if "exp_date" in payload:
-        wanted.exp_date = req.exp_date
-        db.commit()
-        db.refresh(wanted)
-        message = "마감일이 제거되었습니다. (마감일 없음)" if req.exp_date is None else "마감일이 성공적으로 변경되었습니다."
-        nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
-        recipients = [nurse.nurse_id for nurse in nurses_in_group]
-        send_wanted_deadline_update_push(
-            year=wanted.year,
-            month=wanted.month,
-            recipients=recipients,
-            office_code=current_user.office_id,
-            sender_emp_seq_no=current_user.nurse_id,
-            sender_member_id=current_user.account_id,
-            deadline=wanted.exp_date,
-        )
-    else:
-        message = "마감일 변경 요청이 없어 기존 값이 유지됩니다."
-    
-    display_exp_date = "마감일 없음" if wanted.exp_date is None else wanted.exp_date.strftime("%Y-%m-%d")
-    
-    return {
-        "message": message,
-        "current_exp_date": wanted.exp_date.isoformat() if wanted.exp_date else None,
-        "display_exp_date": display_exp_date
-    }
+
+    # 마감(closed)된 달도 새 마감일이 없거나 미래면 다시 연다 — 규칙은 서비스 한 곳.
+    #   (`POST /wanted/request` 의 '이미 있는 달' 분기도 같은 함수를 쓴다.)
+    return update_wanted_deadline_service(db, wanted, req, current_user, target_group_id)
 
 
 # @router.post("/invoke", response_model=WantedInvokeResponse)
@@ -510,67 +517,25 @@ def parse_preferences(
     return parsed
 
 
-# [Wanted] - 만료된 Wanted 자동 마감 처리
+# [Wanted] - 만료된 Wanted 일괄 마감 (관리자 수동)
 @router.post("/close-expired")
-def close_expired_wanted_endpoint(db: Session = Depends(get_db)) -> Dict[str, Any]:
+def close_expired_wanted_endpoint(
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
     """
     현재 KST 기준으로 exp_date가 지난 Wanted 요청의 status를 'closed'로 일괄 변경하는 엔드포인트입니다.
+
+    ★ 관리자(ADM)만, **자기 병원(office) 안**만 닫는다 — ADM 은 병원 단위 권한이다.
+    ★ 매일 자동 마감은 서버 안 스케줄러(`main._daily_wanted_close_scheduler`)가 한다.
+      예전 EventBridge→Lambda(`call-wanted-close-task`)는 dev API 를 불러 운영은 한 번도
+      닫히지 않았다(2026-10 실측). 로직은 `run_wanted_auto_close` 하나를 같이 쓴다.
     """
-    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-    now_kst = (utc_now + timedelta(hours=9)).replace(tzinfo=None)
-
-    query = (
-        db.query(Wanted)
-        .filter(
-            Wanted.status == "requested",
-            Wanted.exp_date.isnot(None),
-            Wanted.exp_date < now_kst,
-        )
-    )
-
-    updated_count = 0
-    closed_wanteds = []
-    try:
-        for wanted in query:
-            wanted.status = "closed"
-            closed_wanteds.append(wanted)
-            updated_count += 1
-
-        if updated_count > 0:
-            db.commit()
-            print(
-                f"Wanted 수동 마감 완료(KST 기준): {updated_count}건, now_kst={now_kst.isoformat()}"
-            )
-        else:
-            db.flush()
-    except Exception as exc:
-        db.rollback()
-        print(f"Wanted 수동 마감 중 오류: {exc}")
-        raise
-
-    for wanted in closed_wanteds:
-        nurses_in_group = db.query(Nurse.nurse_id).filter(Nurse.group_id == wanted.group_id).all()
-        recipients = [nurse.nurse_id for nurse in nurses_in_group]
-        if not recipients:
-            continue
-        group = db.query(Group).filter(Group.group_id == wanted.group_id).first()
-        office_id = group.office_id if group else None
-        hn_id = (group.hn_id or [])[0] if group and group.hn_id else None
-        if not office_id or not hn_id:
-            continue
-        hn = db.query(Nurse).filter(Nurse.nurse_id == hn_id).first()
-        if not hn:
-            continue
-        send_wanted_close_push(
-            year=wanted.year,
-            month=wanted.month,
-            recipients=recipients,
-            office_code=office_id,
-            sender_emp_seq_no=hn.nurse_id,
-            sender_member_id=hn.account_id,
-        )
-
-    return {"now_kst": now_kst.isoformat(), "updated": updated_count}
+    if not current_user.is_master_admin:
+        raise HTTPException(status_code=403, detail="관리자만 사용할 수 있습니다.")
+    if not current_user.office_id:
+        raise HTTPException(status_code=403, detail="병원 정보를 확인할 수 없습니다.")
+    return run_wanted_auto_close(db, office_id=str(current_user.office_id))
 
 
 # WantedConfig 관련 엔드포인트
@@ -689,7 +654,7 @@ def delete_wanted_config_endpoint(
 
 
 @router.delete("/config/toggle")
-async def delete_wanted_config_by_month_endpoint(
+def delete_wanted_config_by_month_endpoint(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -724,7 +689,7 @@ async def delete_wanted_config_by_month_endpoint(
 
 
 @router.post("/validate-limits")
-async def validate_wanted_limits_endpoint(
+def validate_wanted_limits_endpoint(
     nurse_id: str,
     year: int,
     month: int,
@@ -763,7 +728,7 @@ async def validate_wanted_limits_endpoint(
 
 # 간호사 원티드 개수 제한 초과분인 경우에 대한 조회 및 무조건적인 삭제 기능 서비스 함수
 @router.get("/over-limit-nurses")
-async def get_over_limit_nurses_api(
+def get_over_limit_nurses_api(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -773,13 +738,16 @@ async def get_over_limit_nurses_api(
     # 관리자 권한 체크 (수간호사 여부는 토큰 대신 DB)
     if not (caller_is_head_nurse(db, current_user) or current_user.is_master_admin):
         raise HTTPException(403, "권한이 없습니다.")
+    # ★ 요청 group_id 를 그대로 쓰면 아무 병원·병동의 초과 간호사 명단이 나갔다(10-06). 관리 병동으로 해석한다
+    #   (관리자는 자기 병원 병동 · 무지정이면 None → 빈 목록).
+    group_id = resolve_effective_group(db, current_user, group_id, require_group=False)
 
     result = get_over_limit_nurses(db, year, month, group_id)
     return {"data": result, "count": len(result)}
 
 
 @router.post("/delete-excess-off/{nurse_id}")
-async def delete_excess_off_api(
+def delete_excess_off_api(
     nurse_id: str,
     year: int,
     month: int,
@@ -787,7 +755,10 @@ async def delete_excess_off_api(
     db: Session = Depends(get_db)
 ):
     if current_user.is_master_admin:
-        pass
+        # 관리자도 자기 병원 간호사만(10-06 · 예전엔 아무 병원 간호사의 원티드를 지울 수 있었다)
+        from services.group_access import can_caller_access_nurse
+        if not can_caller_access_nurse(db, current_user, nurse_id):
+            raise HTTPException(403, "다른 병원의 간호사입니다.")
     elif caller_is_head_nurse(db, current_user):
         # 토큰 group 대신 nurse_id→DB + groups.hn_id 로 관리 그룹 판정.
         target_nurse = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
@@ -803,7 +774,7 @@ async def delete_excess_off_api(
 
 # Fixed Wanted 관련 엔드포인트
 @router.get("/adjustment/{year}/{month}", response_model=AdjustmentResponse)
-async def get_wanted_adjustment(
+def get_wanted_adjustment(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -836,7 +807,7 @@ async def get_wanted_adjustment(
 
 
 @router.post("/adjustment", response_model=FixedWantedListResponse)
-async def save_fixed_wanted(
+def save_fixed_wanted(
     req: FixedWantedCreate,
     group_id: Optional[str] = None,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
@@ -900,8 +871,18 @@ async def save_fixed_wanted(
         raise HTTPException(status_code=500, detail=f"확정 원티드 저장 실패: {str(e)}")
 
 
+def _assert_admin_entry_office(db: Session, current_user: UserSchema, model, entry_id: int) -> None:
+    """관리자 토글 — 그 항목의 병동이 자기 병원이어야 한다(10-06). 관리자는 아래 서비스에 병동을 넘기지 않아
+    (`caller_group_id=None`) 예전엔 아무 병원의 항목이나 뒤집혔다. 없는 항목은 서비스가 404 로 돌려준다."""
+    if not getattr(current_user, "is_master_admin", False):
+        return
+    gid = db.query(model.group_id).filter(model.id == entry_id).scalar()
+    if gid is not None:
+        assert_caller_can_access_group(db, current_user, gid)
+
+
 @router.patch("/adjustment/entry/{entry_id}/toggle", response_model=ToggleEntryResponse)
-async def toggle_fixed_wanted_entry(
+def toggle_fixed_wanted_entry(
     entry_id: int,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -919,6 +900,8 @@ async def toggle_fixed_wanted_entry(
     caller_group_id: Optional[str] = None
     if caller_is_head_nurse(db, current_user):
         caller_group_id = resolve_home_group_id(db, current_user)
+
+    _assert_admin_entry_office(db, current_user, FixedWantedEntry, entry_id)
 
     try:
         entry = toggle_fixed_wanted_entry_service(db, entry_id, caller_group_id=caller_group_id)
@@ -938,7 +921,7 @@ async def toggle_fixed_wanted_entry(
 
 
 @router.patch("/adjustment/banned/entry/{entry_id}/toggle", response_model=ToggleEntryResponse)
-async def toggle_banned_wanted_entry(
+def toggle_banned_wanted_entry(
     entry_id: int,
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db)
@@ -956,6 +939,8 @@ async def toggle_banned_wanted_entry(
     caller_group_id: Optional[str] = None
     if caller_is_head_nurse(db, current_user):
         caller_group_id = resolve_home_group_id(db, current_user)
+
+    _assert_admin_entry_office(db, current_user, BannedWantedEntry, entry_id)
 
     try:
         entry = toggle_banned_wanted_entry_service(db, entry_id, caller_group_id=caller_group_id)
@@ -975,7 +960,7 @@ async def toggle_banned_wanted_entry(
 
 
 @router.post("/adjustment/{year}/{month}/reset", response_model=AdjustmentResponse)
-async def reset_fixed_wanted(
+def reset_fixed_wanted(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -1007,7 +992,7 @@ async def reset_fixed_wanted(
 
 
 @router.post("/adjustment/{year}/{month}/apply-all", response_model=AdjustmentResponse)
-async def set_adjustment_applied(
+def set_adjustment_applied(
     year: int,
     month: int,
     req: AdjustmentApplyAllRequest,
@@ -1048,7 +1033,7 @@ async def set_adjustment_applied(
 
 
 @router.get("/fixed/{year}/{month}")
-async def get_fixed_wanted(
+def get_fixed_wanted(
     year: int,
     month: int,
     group_id: Optional[str] = None,
@@ -1095,8 +1080,25 @@ async def get_fixed_wanted(
 
 
 # [Wanted] - 전체 원티드 제출 현황 + shift 내역 일괄 조회
+@router.get("/{year:int}/{month:int}/overview")
+def get_wanted_overview(
+    year: int = Path(..., ge=2000, le=2100),
+    month: int = Path(..., ge=1, le=12),     # 범위 밖이면 date() 가 ValueError → 500 이었다
+    group_id: str | None = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """원티드 전체보기 — 같은 병동 근무자 전체의 신청 날짜·근무코드 + 그 달 팀(성남 ⑥).
+
+    같은 병동(그 달 파견 간 병동 포함)이면 일반 간호사도 본다. 사유·점수·짝꿍·상태 배지는 없다.
+    응답: `{group_id, year, month, teams:[{team_id, team_name}], nurses:[{nurse_id, name,
+    team_id, team_name, is_submitted, shifts:[{shift_date, shift}]}]}`.
+    """
+    return get_wanted_overview_service(db, current_user, year, month, group_id)
+
+
 @router.get("/{year:int}/{month:int}/shift-requests")
-async def get_all_shift_requests(
+def get_all_shift_requests(
     year: int,
     month: int,
     group_id: Optional[str] = None,

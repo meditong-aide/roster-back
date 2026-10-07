@@ -13,6 +13,7 @@ from services.group_access import (
     assert_caller_can_access_group,
     caller_is_head_nurse,
     resolve_home_group_id,
+    resolve_managed_group_ids,
 )
 from schemas.roster_schema import (
     NurseMonthlyLimitItem,
@@ -290,6 +291,10 @@ def _list_by_year_month(
     if current_user.is_master_admin:
         if group_id:
             q = q.filter(NurseMonthlyLimit.group_id == group_id)
+        else:
+            # 여러 병동을 한 번에 저장한 뒤 목록 — 관리자도 자기 병원 병동만(10-06 · 예전엔 전 병원 행이 나갔다)
+            q = q.filter(NurseMonthlyLimit.group_id.in_(
+                [str(g) for g in resolve_managed_group_ids(db, current_user)] or [""]))
     else:
         q = q.filter(NurseMonthlyLimit.group_id == gid)
     q = q.order_by(NurseMonthlyLimit.year.desc(), NurseMonthlyLimit.month.desc())

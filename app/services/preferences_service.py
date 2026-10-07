@@ -6,12 +6,18 @@
 import calendar
 import json
 import pprint
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import String, and_, cast, extract, inspect as sa_inspect, or_
 from db.models import WantedRequest, Nurse, NurseShiftRequest, NursePairRequest, ShiftPreference, Shift, WantedConfig, Wanted, WantedMonthlyMemo
 from schemas.roster_schema import PreferenceData, PreferenceSubmit
 from schemas.auth_schema import User as UserSchema
-from services.group_access import resolve_home_group_id
+from services.group_access import (
+    caller_is_manager,
+    resolve_effective_group,
+    resolve_home_group_id,
+    resolve_managed_group_ids,
+)
 from datetime import datetime, timezone, timedelta, date
 
 
@@ -39,8 +45,8 @@ def _now_kst() -> datetime:
     """KST 기준 naive 현재시각.
 
     wanted.exp_date 는 KST naive 로 저장되는데 API 컨테이너는 TZ 미설정(UTC)이라
-    datetime.now() 로 비교하면 마감이 9시간 느슨해진다. close-expired 라우터와
-    동일하게 UTC+9 로 맞춘다.
+    datetime.now() 로 비교하면 마감이 9시간 느슨해진다. 자동 마감
+    (`wanted_service.run_wanted_auto_close`)과 동일하게 UTC+9 로 맞춘다.
     """
     return (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=9))
 
@@ -621,12 +627,19 @@ def _replace_shift_requests(
         NurseShiftRequest.shift_date < end_date,
     ).delete(synchronize_session=False)
 
-    shift_table_ids = {
-        sid: tid
-        for sid, tid in db.query(Shift.shift_id, Shift.id)
+    # ★ 대표 행은 목록 조회와 같은 (sequence ASC, id ASC) **첫 행**이어야 한다
+    #   (정본 `shift_service_mssql.SHIFT_LIST_ORDER`). `shifts` 에 UNIQUE 가 없어
+    #   같은 (group, shift_id) 행이 여럿이고, 정렬 없이 dict 로 접으면 마지막 행이 이긴다.
+    #   ★★ 이 경로는 바로 위에서 그 달 요청을 **전량 delete 후 재삽입**한다 —
+    #      대표가 흔들리면 저장할 때마다 다른 `shifts_table_id` 가 박힌다.
+    shift_table_ids: dict = {}
+    for _sid, _tid in (
+        db.query(Shift.shift_id, Shift.id)
         .filter(Shift.group_id == group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
         .all()
-    }
+    ):
+        shift_table_ids.setdefault(_sid, _tid)
     for detailed_id, entry in enumerate(entries, start=1):
         db.add(NurseShiftRequest(
             nurse_id=nurse_id,
@@ -1000,12 +1013,18 @@ def submit_preferences_service(
     # shifts.id 매핑
     _nurse_row = db.query(Nurse).filter(Nurse.nurse_id == current_user.nurse_id).first()
     _grp_id = _nurse_row.group_id if _nurse_row else None
+    # ★ 위 `_replace_shift_requests` 와 **같은 대표 선정 규칙**을 쓴다(첫 행 우선).
+    #   두 경로가 서로 다른 행을 고르면 같은 간호사의 같은 코드가 경로에 따라
+    #   다른 `shifts_table_id` 로 저장된다.
     _shift_id_to_table_id = {}
     if _grp_id:
-        _shift_id_to_table_id = {
-            s.shift_id: s.id
-            for s in db.query(Shift.shift_id, Shift.id).filter(Shift.group_id == _grp_id).all()
-        }
+        for _s in (
+            db.query(Shift.shift_id, Shift.id)
+            .filter(Shift.group_id == _grp_id)
+            .order_by(Shift.sequence.asc(), Shift.id.asc())
+            .all()
+        ):
+            _shift_id_to_table_id.setdefault(_s.shift_id, _s.id)
 
     detailed_id = 1
     for date_str, shift_id in data_to_save.items():
@@ -1120,6 +1139,33 @@ def retract_submission_service(req: PreferenceSubmit, current_user, db: Session)
     ).order_by(WantedRequest.submitted_at.desc()).first()
     if not preference:
         raise Exception("No submitted preference found to retract")
+    # ★ 마감 뒤 철회 금지 — 철회하면 마감이라 다시 제출할 수 없어 제출본이 사라진 채
+    #   마감된다. PC 는 submitted 가 closed 보다 먼저라 마감 뒤에도 "제출 철회" 버튼이
+    #   보인다(모바일은 화면에서 숨김). 판정은 제출·저장과 같은 `_is_wanted_closed`.
+    # ★ 원티드 행을 **잠그고** 확인한다(커밋까지 유지). 확인과 철회 사이에 자동 마감 크론이나
+    #   수동 마감이 끼어들면 '열려 있다'고 보고 철회했는데 마감된 상태가 된다.
+    # ★ `with_for_update()` 는 이 환경(mssql+pymssql·SQLAlchemy 2.0)에서 SQL 에 아무것도
+    #   붙이지 않는다(실측) — 잠금 없이 지나간다. 테이블 힌트로 건다.
+    wanted = (
+        db.query(Wanted)
+        .with_hint(Wanted, "WITH (UPDLOCK, ROWLOCK)", "mssql")
+        .filter(
+            Wanted.group_id == preference.group_id,
+            Wanted.year == req.year,
+            Wanted.month == req.month,
+        )
+        .first()
+    )
+    # 원티드 행이 없으면 거부한다 — 철회하면 다시 제출할 수 없다(제출·저장 게이트
+    # `_assert_wanted_writable` 도 행 부재를 409 로 막는다). 열어 두면 제출본만 잃는다.
+    if wanted is None:
+        raise PreferenceConflictError(
+            f"{req.year}년 {req.month}월 원티드 요청이 없어 제출을 철회할 수 없습니다."
+        )
+    if _is_wanted_closed(wanted):
+        raise PreferenceConflictError(
+            f"{req.year}년 {req.month}월 원티드가 마감되어 제출을 철회할 수 없습니다."
+        )
     preference.is_submitted = False
     preference.submitted_at = None
     db.commit()
@@ -1140,6 +1186,42 @@ def _resolve_submission_status(wanted, target_wr) -> str:
     if _is_wanted_closed(wanted):
         return "closed"
     return "requested"
+
+
+def load_wanted_request_states(
+    db: Session, nurse_id: str, months: set[str]
+) -> dict[str, bool]:
+    """월별 원티드 요청 상태를 **한 번의 쿼리**로 읽는다.
+
+    반환: `{'YYYY-MM': is_submitted}`. 요청 이력이 아예 없는 달은 **키가 없다**.
+      한 달에 여러 요청이 있으면 `is_submitted=True` 가 하나라도 있으면 True —
+      `get_latest_preference_service` 가 제출 요청을 우선 선택하는 것과 같은 판정이다.
+
+    ★★ 제출 상태의 정본은 **`wanted_requests`** 다. 제출(`save_wanted_entries_service`)도
+      철회(`retract_submission_service`)도 이 테이블만 건드린다.
+      `shift_preferences` 는 **별도 이력 축**이라 제출 상태를 따라가지 못한다 —
+      실측(2026-09 운영): `wanted_requests` 제출 242건인데 `shift_preferences` 는 **0행**,
+      전체로도 2026-04 이후 기록이 끊겼다. 그걸 보고 판정하면 전원 미작성으로 보인다.
+      상태를 묻는 자리는 **반드시 이 함수를 거친다.**
+
+    Args:
+        months: `'YYYY-MM'` 문자열 집합. `WantedRequest.month` 가 CHAR(7) 이라 문자열이다.
+    """
+    if not nurse_id or not months:
+        return {}
+    out: dict[str, bool] = {}
+    rows = (
+        db.query(WantedRequest.month, WantedRequest.is_submitted)
+        .filter(
+            WantedRequest.nurse_id == nurse_id,
+            WantedRequest.month.in_(months),
+        )
+        .all()
+    )
+    for m, submitted in rows:
+        key = str(m).strip()
+        out[key] = bool(out.get(key, False) or bool(submitted))
+    return out
 
 
 def _build_request_limit(db: Session, nurse_id: str, group_id: str | None, entries: list[dict]) -> dict:
@@ -1306,6 +1388,51 @@ def get_latest_preference_service(
         ),
     }
 
+def _resolve_all_preferences_scope(
+    db: Session, current_user: UserSchema, year: int, month: int,
+    override_group_id: str | None,
+) -> tuple[str | None, bool]:
+    """`/preferences/all` 대상 그룹과 전체 필드 노출 여부.
+
+    ★ 예전엔 요청 group_id 를 검증 없이 썼다 — 로그인만 하면 group_id 를 바꿔
+      다른 병동·다른 병원의 원티드 사유·짝꿍까지 받을 수 있었다.
+      판정은 `/wanted/{y}/{m}/shift-requests` 와 같은 단일 해석점을 쓴다.
+      파견 들어온 간호사는 그 달 파견 병동도 허용(issued_roster 와 동일).
+    ★ ADM 이 group_id 없이 부르면 None → 토큰 home 으로 폴백(기존 동작 유지).
+    """
+    target = resolve_effective_group(
+        db, current_user, override_group_id,
+        require_group=False,
+        allow_assignment_target=True,
+        assignment_window=(year, month),
+    ) or resolve_home_group_id(db, current_user)
+    if bool(getattr(current_user, "is_master_admin", False)):
+        return target, True
+    managed = {str(g) for g in resolve_managed_group_ids(db, current_user)}
+    full = str(target) in managed and caller_is_manager(db, current_user)
+    return target, full
+
+
+def _staff_visible_preference(data_json: dict) -> dict:
+    """관리자가 아닌 직원용 — 날짜·근무코드만 남긴다.
+
+    PC·모바일 원티드 화면은 이 응답에서 `shift` 의 코드·날짜 키만 읽는다
+    (날짜별 신청 수 집계). 사유(comment)·자유기술(request)·짝꿍(preference)은
+    본인 것은 `/preferences/latest` 로, 병동 전체는 수간호사 화면에서만 본다.
+    키는 남겨 둔다 — 모바일 zod 스키마가 `request`·`preference` 를 필수로 검사한다.
+    날짜 값은 빈 객체다(점수·사유·`shifts_table_id` 없음) — 모바일 zod 의 날짜 값
+    객체는 필드가 전부 optional 이라 `{}` 도 통과한다.
+    """
+    return {
+        "request": None,
+        "shift": {
+            code: {day: {} for day in days}
+            for code, days in data_json["shift"].items()
+        },
+        "preference": [],
+    }
+
+
 def get_all_preferences_service(year: int, month: int, current_user, db: Session, override_group_id: str | None = None):
     """
     모든 간호사의 최신 선호도 데이터 조회 서비스 함수 (새 구조 기반)
@@ -1313,16 +1440,17 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
     - Output은 기존 ShiftPreference.data 구조와 동일하게 유지
 
     관리자(ADM)는 `override_group_id`로 대상 그룹을 지정할 수 있습니다.
+    대상 병동 관리자(ADM·수간호사·그룹관리자)가 아니면 날짜·근무코드만 돌려준다.
     """
     if not current_user:
-        raise Exception("Not authenticated")
+        raise HTTPException(status_code=401, detail="Not authenticated")
     month_str = f"{year}-{month:02d}"
 
-    # override_group_id 미지정 시 호출자 home group. (과거 정의되지 않은 home_gid 를
-    # 참조해 group_id 없이 호출하면 NameError → 500 이었다.)
-    target_group_id = override_group_id or resolve_home_group_id(db, current_user)
+    target_group_id, full_access = _resolve_all_preferences_scope(
+        db, current_user, year, month, override_group_id,
+    )
     if not target_group_id:
-        raise Exception("대상 그룹이 없습니다.")
+        raise HTTPException(status_code=400, detail="대상 그룹이 없습니다.")
     # ✅ 1️⃣ 그룹 내 간호사 목록 가져오기
     nurse_ids = [
         n.nurse_id
@@ -1331,9 +1459,12 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
         .all()
     ]
     # ✅ 2️⃣ 각 간호사별 최신 요청(WantedRequest) 찾기
+    #   ★ 이 병동에 낸 요청만 — 병동이동·파견으로 같은 달에 다른 병동 제출본이 생기면
+    #     그 사유·짝꿍이 이 병동 화면에 섞인다(`_submitted_nurse_ids` 와 같은 규칙).
     wanted_requests = (
         db.query(WantedRequest)
         .filter(
+            WantedRequest.group_id == target_group_id,
             WantedRequest.nurse_id.in_(nurse_ids),
             WantedRequest.month == month_str,
             WantedRequest.is_submitted == True,
@@ -1410,6 +1541,8 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             "shift": {k: v for k, v in shift_data.items() if v},
             "preference": pair_data,
         }
+        if not full_access:
+            data_json = _staff_visible_preference(data_json)
         results.append({
             "nurse_id": nurse_id,
             "year": year,

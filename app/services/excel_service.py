@@ -948,38 +948,156 @@ def _merge_team_cell(ws, col, first_row, last_row, label, center, border_all, gr
 
 
 def _sort_team_ids_by_name(team_name_map: dict) -> list:
-    """팀 id 들을 근무표 만들기 화면(team-sort-util.sortTeamGroupsByTeamName)과 동일
-    순서로 정렬한다. 1순위 그룹: 한글(0) < 영문(1) < 숫자(2) < 기타(3). 2순위: 자연
-    정렬(숫자 런은 int 로 비교)+소문자. 3순위: team_id.
-    (export 엔 활성 실팀만 오므로 미배정/임시팀 분기는 불필요.)
+    """팀명순 정렬 — 정본은 `team_period.sort_team_ids_by_name`(마감본 팀 목록과 공용)."""
+    from services.team_period import sort_team_ids_by_name
+
+    return sort_team_ids_by_name(team_name_map)
+
+
+#: 요일 라벨. `calendar.weekday()` 가 월=0 이므로 그 순서다.
+_WD = ["월", "화", "수", "목", "금", "토", "일"]
+
+#: 헤더 글자색 — 병원이 준 시트의 실측값을 그대로 쓴다(2026-10 시트).
+#:   토 파랑 · 일 빨강 · 공휴일 빨강. **공휴일이 토요일을 이긴다**(10/3 개천절이 토인데 빨강).
+_C_SAT = "FF0000FF"
+_C_SUN_HOL = "FFFF0000"
+
+
+def _kr_holidays_in_month(year: int, month: int) -> set:
+    """그 달의 한국 공휴일(대체공휴일 포함). 조회 실패 시 **빈 집합**.
+
+    ★ `holiday_pack` 을 쓰지 않는다 — 그쪽은 import 실패 시 `ImportError` 를 그대로
+      raise 해서 모듈이 통째로 깨지고, 쓰지도 않는 `langchain_core.tools` 를 끌어온다.
+      엑셀 다운로드가 패키지 문제 하나로 죽으면 안 되므로,
+      `roster_create_service._kr_holidays_in_month` 와 같은 방어형으로 간다.
+    ★ 표시용이라 그룹 설정(`fixed_holiday_off_yn`)과 무관하게 **달력 기준**으로 칠한다.
+      그 설정은 고정근무자 배정용이지 표시 규칙이 아니다.
     """
-    import re as _re
+    try:
+        import holidays as _h
 
-    def _group_rank(name: str) -> int:
-        first = (name or "").strip()[:1]
-        if not first:
-            return 3
-        if "가" <= first <= "힣":
-            return 0
-        if first.isascii() and first.isalpha():
-            return 1
-        if first.isdigit():
-            return 2
-        return 3
+        return {d.day for d in _h.KR(years=[year]) if d.year == year and d.month == month}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Excel] 공휴일 조회 실패 — 주말만 칠한다: {exc}")
+        return set()
 
-    def _natural_key(name: str) -> list:
-        # Intl.Collator({numeric:true}) 근사: 숫자 런은 (0,int), 그 외는 (1,소문자).
-        # 토큰 타입을 앞에 둬 int/str 직접 비교(TypeError)를 원천 차단.
-        out = []
-        for tok in _re.findall(r"\d+|\D+", name or ""):
-            out.append((0, int(tok)) if tok.isdigit() else (1, tok.casefold()))
-        return out
 
-    def _key(tid):
-        name = team_name_map.get(tid) or ""
-        return (_group_rank(name), _natural_key(name), tid)
+def _tenure_text(joining_date, year: int, month: int) -> str:
+    """현재 병원 **근속**을 'N년 M개월' 로. 값이 없거나 미래 입사면 빈 문자열.
 
-    return sorted(team_name_map.keys(), key=_key)
+    ★ 기준일은 `date.today()` 가 아니라 **그 근무표 월의 말일**이다.
+      마이페이지(`routers/nurses.py:950-961`)는 "오늘 기준 재직기간" 이 맞지만,
+      근무표 엑셀은 과거 달을 다시 받는 일이 흔해 오늘로 잡으면 **같은 파일이
+      받을 때마다 다른 값**으로 나온다. 월 말일로 고정해야 재현된다.
+    ★ `experience`(이직 전 경력 합산)를 대체한다 — 같은 병동 안에서 누가 오래
+      일했는지를 나타내려면 현재 병원 근속이어야 한다(2026-09-21 병동 요청).
+    """
+    if not joining_date:
+        return ""
+    try:
+        from calendar import monthrange
+        from datetime import date as _date
+        from dateutil.relativedelta import relativedelta
+
+        jd = joining_date.date() if hasattr(joining_date, "date") else joining_date
+        base = _date(year, month, monthrange(year, month)[1])
+        if jd > base:
+            return ""
+        delta = relativedelta(base, jd)
+        return f"{delta.years}년 {delta.months}개월"
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Excel] 근속 계산 실패 — 빈 칸으로 둔다: {exc}")
+        return ""
+
+
+def _join_date_text(joining_date) -> str:
+    """입사일 'YYYY-MM-DD'. 값이 없으면 빈 문자열."""
+    if not joining_date:
+        return ""
+    try:
+        jd = joining_date.date() if hasattr(joining_date, "date") else joining_date
+        return jd.isoformat()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _day_font_color(year: int, month: int, day: int, holidays: set):
+    """일자/요일 헤더의 글자색. 해당 없으면 None(기본 검정)."""
+    import calendar as _cal
+
+    if day in holidays:
+        return _C_SUN_HOL
+    wd = _cal.weekday(year, month, day)
+    if wd == 6:
+        return _C_SUN_HOL
+    if wd == 5:
+        return _C_SAT
+    return None
+
+
+def _norm_hex(color) -> Optional[str]:
+    """`shifts.color` → openpyxl 이 받는 `RRGGBB`. 못 읽으면 None.
+
+    ★ openpyxl 은 `#` 를 붙이면 값을 버리거나 예외를 낸다. 반드시 떼야 한다.
+    ★ 값 검증이 어디에도 없어 `#RGB` 축약형과 빈 문자열이 실제로 들어온다.
+      **빈 값을 흰색으로 떨어뜨리면 안 된다** — 흰 배경에 흰 글자가 되어 완전히 안 보인다.
+      읽을 수 없으면 None 을 돌려 호출부가 색을 아예 안 칠하게 한다.
+    """
+    s = str(color or "").strip().lstrip("#")
+    if len(s) == 3 and all(ch in "0123456789abcdefABCDEF" for ch in s):
+        s = "".join(ch * 2 for ch in s)          # #abc → aabbcc
+    if len(s) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in s):
+        return None
+    return s.upper()
+
+
+#: 이 명도 이상이면 **검은 글자**, 아니면 흰 글자. YIQ 기준.
+#:
+#: ★★ 프론트(`getReadableShiftCodeTextColor`)는 **225** 를 쓰는데, 엑셀에는 그대로
+#:   못 쓴다. 실제 근무코드 색이 전부 **149~212** 구간이라 225 로는 **18개 코드가 전부
+#:   흰 글자**가 된다(실측). `#FFA0D2`(OFF, 명도 194)·`#C8E0B8`(보수, 212) 같은 파스텔에
+#:   흰 글자면 종이로 뽑았을 때 사실상 안 보인다.
+#:   150 이면 17/18 이 검은 글자가 되고, 어두운 `DA`(#7E9BB5, 149.3) 만 흰 글자로 남는다.
+#: ★ 화면과 판정이 갈리는 것은 **의도한 것**이다 — 엑셀은 작은 셀에 인쇄되는 매체라
+#:   가독성을 우선한다. 화면과 맞추고 싶으면 이 값만 225 로 되돌리면 된다.
+_YIQ_DARK_TEXT_THRESHOLD = 150
+
+
+def _readable_text_color(bg_hex: str) -> str:
+    """배경 위에 얹을 글자색. 계산식은 프론트와 같고 **임계만** 다르다(위 상수 참조)."""
+    return "FF101828" if _yiq(bg_hex) >= _YIQ_DARK_TEXT_THRESHOLD else "FFFFFFFF"
+
+
+def _yiq(bg_hex: str) -> float:
+    """`RRGGBB` 의 YIQ 명도. `_norm_hex` 를 통과한 값만 넣는다."""
+    r, g, b = int(bg_hex[0:2], 16), int(bg_hex[2:4], 16), int(bg_hex[4:6], 16)
+    return (r * 299 + g * 587 + b * 114) / 1000
+
+
+#: 원티드 표시색 — 가르는 축은 **누가 그 칸을 정했는가** 다.
+#:   · 간호사가 제출한 원티드가 반영된 칸       → 빨강
+#:   · 수간호사가 확정 원티드에 덮어쓰거나 넣은 칸 → 파랑
+#: 원티드와 무관한 칸은 색을 주지 않는다(검정).
+#: ★ 판별은 제출 테이블(`nurse_shift_requests`)과 **직접 대조**한다. `source_type` 은
+#:   저장 시점 판정이라 수간호사가 간호사 제출 전에 넣어 두면 'added' 로 굳어 버린다.
+#: ★ 배정 영역은 대표 코드에만 배경을 칠하므로, 무배경 흰 셀에서도 읽히는 진한 색을 쓴다.
+_EMPTY_SET: frozenset = frozenset()
+_EMPTY_MAP: dict = {}
+#: 팀별보기에서 파트장 행의 그룹 키. `team_of` 의 정상값(int·None)과 겹치지 않아야
+#:   병합이 파트장 구간을 팀 블록과 섞지 않는다.
+_HN_TEAM_KEY = "__hn__"
+
+
+def _as_date(v):
+    """`date`/`datetime`/None 을 `date`(또는 None)로 맞춘다.
+
+    ★ `datetime` 은 `date` 의 **서브클래스**라 `isinstance` 순서를 뒤집으면 안 된다.
+    """
+    if v is None:
+        return None
+    return v.date() if isinstance(v, datetime) else v
+_C_WANTED = "FFFF0000"            # 확정 원티드로 들어간 칸 — 빨강
+_C_SPECIAL = "FF0000FF"           # 기타 특수코드(보수교육·공가·연차 등) — 파랑
 
 
 def export_schedule_excel_bytes(
@@ -1003,7 +1121,7 @@ def export_schedule_excel_bytes(
     완전히 동일하게 그리고 team_view=False 를 반환한다(회귀 0).
     """
     from io import BytesIO
-    from datetime import date
+    from datetime import date, timedelta
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
@@ -1022,7 +1140,10 @@ def export_schedule_excel_bytes(
     year, month = schedule.year, schedule.month
     days_in_month = calendar.monthrange(year, month)[1]
 
-    nurses = db.query(Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role).filter(
+    nurses = db.query(
+        Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.joining_date, Nurse.sequence, Nurse.role,
+        Nurse.hn_auth,
+    ).filter(
         Nurse.group_id == target_group_id
     ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
 
@@ -1040,7 +1161,8 @@ def export_schedule_excel_bytes(
     _inbound_ids = _entry_nurse_ids - _home_nurse_ids
     if _inbound_ids:
         inbound_nurses = db.query(
-            Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.sequence, Nurse.role
+            Nurse.nurse_id, Nurse.name, Nurse.experience, Nurse.joining_date, Nurse.sequence, Nurse.role,
+            Nurse.hn_auth,
         ).filter(
             Nurse.nurse_id.in_(_inbound_ids)
         ).order_by(Nurse.sequence.asc(), Nurse.nurse_id.asc()).all()
@@ -1111,6 +1233,32 @@ def export_schedule_excel_bytes(
                     "미등록" if tid is None else (_team_name_map.get(tid) or f"팀 {tid}")
                 )
 
+    # ───────── 파트장(hn_auth='HN')은 항상 맨 위 ─────────
+    #   기본 보기에서는 파트장의 `sequence` 가 1 이라 대개 이미 맨 위지만, **팀별보기는
+    #   팀 순서로 다시 정렬**하므로 팀이 없는 파트장이 '미등록' 블록과 함께 맨 끝으로
+    #   밀린다(실측: 성남 중환자실-RN 송순진 `team_id=None`). 두 레이아웃을 같게 만들기
+    #   위해 **모든 정렬이 끝난 뒤** 한 번 더 끌어올린다.
+    #   ★ 안정 정렬이라 파트장끼리·나머지끼리의 기존 순서(팀 순서·sequence)는 그대로다.
+    #   ★ 판정은 `hn_auth` 한 축이다 — `is_head_nurse` 는 별개 축이고(스위치가 아니라
+    #     표시용) 둘이 어긋난 계정이 실재한다([[feedback_hn_auth_orthogonal]]).
+    def _is_hn(_n) -> bool:
+        return str(getattr(_n, "hn_auth", "") or "").upper() == "HN"
+
+    nurses = sorted(nurses, key=lambda _n: 0 if _is_hn(_n) else 1)
+
+    # ★★ 팀별보기에서는 **팀 컬럼도 같이 옮겨야** 한다. 파트장만 위로 빼고 라벨을 그대로
+    #   두면 그 라벨이 **두 블록으로 쪼개진다** — 병합은 연속 구간만 합치기 때문이다.
+    #   (실측 운영: 파트장 보유 28개 그룹 중 7곳에서 발현 — 6곳은 '미등록' 이 위아래로
+    #    갈리고, 별관1병동은 파트장이 팀2 소속이라 팀2 블록이 둘로 쪼개진다.)
+    #   그래서 파트장 행은 **자체 구간**으로 만든다. 팀을 옮기는 게 아니라 '이 줄은
+    #   파트장' 이라고 표시하는 것이라 정보가 사라지지 않는다.
+    if team_view:
+        for _n in nurses:
+            if _is_hn(_n):
+                _nid = str(_n.nurse_id)
+                team_of[_nid] = _HN_TEAM_KEY
+                nurse_team_label[_nid] = "파트장"
+
     entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
 
     # alias_map 생성
@@ -1131,9 +1279,15 @@ def export_schedule_excel_bytes(
     alias_map.setdefault('O', 'O')
 
     def to_base(code: str) -> str:
-        if not code:
+        # ★ 정규화는 **여기 한 곳에서만** 한다(strip + upper). 예전엔 strip 이 없어
+        #   `' - '` 처럼 공백이 붙은 값이 base 로 그대로 남았다. 그러면 하단 집계
+        #   (`footer_labels`)는 strip 후 sentinel 로 걸러 내는데 우측 요약 열
+        #   (`used_codes`)은 못 걸러, **하단엔 없는 하이픈 열이 우측에만 생긴다.**
+        #   실데이터는 dev·prod 모두 0건이지만, 두 축이 같은 함수를 쓰는 이상
+        #   정규화가 한 곳에 모여 있어야 어긋나지 않는다.
+        u = str(code or "").strip().upper()
+        if not u:
             return '-'
-        u = code.upper()
         if u in alias_map:
             return alias_map[u]
         if u.startswith('D'): return 'D'
@@ -1155,10 +1309,319 @@ def export_schedule_excel_bytes(
     tail_labels = core_codes + extra_codes
     summary_cols = len(tail_labels)
 
+    # ───────── 2-a) 하단 「일일 근무 현황」용 — **세부 코드 그대로** ─────────
+    #   우측 요약 열(`tail_labels`)은 base 로 접어 1인당 D/E/N/O 합을 보여주는 자리라
+    #   그대로 둔다. 반면 하단 일일 집계는 병동이 **그 날 어떤 코드가 몇 개 나갔는지**를
+    #   보는 곳이라, `D2`·`D1` 같은 하위코드가 `D` 로 접히면 쓸 수가 없다(병동 요청).
+    #   ★ 코드 마스터 전체가 아니라 **그 근무표에 실제로 발생한 코드만** 행이 된다 —
+    #     안 쓴 코드까지 깔면 0 행이 수십 줄 생긴다.
+    #   ★ 정렬은 base 묶음 순(D 계열 → E → N → O → 그 외)이라 D 하위코드가 붙어 보인다.
+    #   ★ **미배정 sentinel `-` 를 뺀다.** 위 base 수집이 `base != '-'` 로 거르는 것과
+    #     같은 규약이다. `shifts` 마스터에 없는 값인데 `schedule_entries` 에는 실제로
+    #     저장돼 있어(운영·dev 양쪽 실측: `29dba53a16a1` 2026-03), 안 거르면 하단에
+    #     `-` 행이 생겨 **미배정 칸이 근무 인원으로 읽힌다**.
+    used_raw_codes = {
+        _c for _c in (str(e.shift_id or "").strip() for e in entries)
+        if _c and to_base(_c) != "-"
+    }
+    _base_rank = {c: i for i, c in enumerate(core_codes)}
+    footer_labels = sorted(
+        used_raw_codes,
+        key=lambda c: (_base_rank.get(to_base(c), len(core_codes)), to_base(c), c),
+    )
+
     # nurse별 매핑
     by_nurse: dict[str, dict[int, str]] = {}
     for e in entries:
         by_nurse.setdefault(e.nurse_id, {})[e.work_date.day] = e.shift_id
+
+    # ───────── 2-b) 표시용 부가 데이터 ─────────
+    #   ★ `shifts` 는 **group_id 로 좁혀** 읽는다. PK·FK 가 없고 `shifts.id` 가 병동 간
+    #     중복되므로(id=1874 가 동탄시티 'OFF' 와 시화 '반반반' 양쪽) 전역 조회하면
+    #     남의 병동 색을 집는다.
+    #   ★ 코드→색은 `sequence`·`id` 순 **대표 1건**만 쓴다. 같은 `(group_id, shift_id)` 가
+    #     여러 행인 경우가 실재한다(전사 중복 81개).
+    _shift_rows = (
+        db.query(Shift)
+        .filter(Shift.group_id == target_group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
+        .all()
+    )
+    code_bg: Dict[str, str] = {}
+    #: 배정 영역에서 **배경을 칠할** 코드 — 둘이다:
+    #:   ① 3교대 대표(`default_shift ∈ D,E,N`)
+    #:   ② **연차 계열(`annual_leave_unit IS NOT NULL`)** — `Y`(1.0)·`Y1`/`Y2`(0.5)·
+    #:      `Y3`(0.25) 처럼 연차 일수로 환산되는 코드. 이 컬럼은 연차 정산에 쓰이므로
+    #:      채워져 있어야만 하는 값이라 기준으로 삼기에 안정적이다.
+    #: ★★ `off_swap_target` 은 **여기 넣지 않는다**(병동 요청으로 OFF 축 배경을 걷어낼 때
+    #:   같이 정리). 그 플래그는 `off_axis_codes`(=빨간 글자 대상)에도 들어가므로,
+    #:   `fill_codes` 에까지 넣으면 **OFF 축인데 배경이 칠해지는** 코드가 생긴다.
+    #:   실측(2026-09-21 운영): `FB`(9병동·중환자실1/2·중환자실1/2-NA/LP)·`T`(4병동)·
+    #:   `연`(3병동-RN) 7건이 `annual_leave_unit` 없이 색만 있어 정확히 그 상태였다.
+    #:   연차인 `Y`·`Y4` 는 `leave_unit_codes` 로 걸려 배경이 그대로 유지된다.
+    #: 나머지 고정근무·특수코드까지 칠하면 표가 얼룩덜룩해 글자색 표시가 묻힌다.
+    #: 범례·집계는 이 제한을 받지 않는다.
+    fill_codes: set = set()
+    #: **OFF 축** — 원티드가 들어주어진 것을 빨간 글자로 표시할 대상.
+    #:   `default_shift == 'O'`(OFF) · `'주'`(주휴) · `off_swap_target`(연차전환대상).
+    #:   ★ 주휴를 여기 넣는 건 파랑(특수코드)으로 새는 것을 막기 위함이다. 주휴는
+    #:     자동 배정이라 원티드로 들어오지 않으므로 빨강이 켜지지는 않는다.
+    off_axis_codes: set = set()
+    #: **근무 축** 코드 — 파랑(특수코드) 판정에서 뺀다.
+    #:   ★ `M`(MID)까지 넣는다. 배경은 병원 요청대로 D/E/N 만 칠하지만, MID 는 교육·공가
+    #:     같은 '특수코드' 가 아니라 엄연한 교대 근무다. 안 빼면 MID 를 쓰는 병동에서
+    #:     근무 칸이 통째로 파래진다(실측 dev 61병동-AN `D2` 22칸).
+    den_codes: set = set()
+    #: `shifts.type == '근무'` 인 코드. 고정근무 코드를 **전역으로** 파랑에서 뺄 때의
+    #:   안전판이다 — `fixed_shift` 컬럼은 아무 코드나 담을 수 있어(스키마상 제약 없음),
+    #:   누가 실수로 연차 코드를 고정근무로 넣으면 그 코드가 **전 병동에서** 파랑을
+    #:   잃는다. 실측 전사 `fixed_shift` 11종·2,044행은 모두 `type='근무'` 라 지금은
+    #:   차이가 없지만, 구멍을 열어 둘 이유가 없다.
+    work_type_codes: set = set()
+    #: 연차 계열(`annual_leave_unit` 이 채워진 코드). 배경을 칠하고 **파랑에서도 뺀다** —
+    #:   연차는 교육·공가 같은 '기타 특수코드' 가 아니라 자체 축이고, 원본 근무표 관례상
+    #:   원티드로 받은 휴가는 빨간 글자로 나타낸다.
+    leave_unit_codes: set = set()
+    _seen_code: set = set()
+    for _s in _shift_rows:
+        _code = str(_s.shift_id or "").strip()
+        # ★ 대표 1건 판정은 **별도 집합**으로 한다. 예전엔 `_code in code_bg` 로 걸렀는데
+        #   색이 없는 코드는 code_bg 에 안 들어가 뒤쪽 중복행이 계속 덮었다.
+        if not _code or _code in _seen_code:
+            continue
+        _seen_code.add(_code)
+        _hex = _norm_hex(_s.color)
+        if _hex:
+            code_bg[_code] = _hex
+        # ★ `default_shift` 는 표기가 하나가 아니다. 생성 경로가 `{"OFF","주"} → "O"` 로
+        #   정규화하고 주휴를 `W` 로도 받으므로(`roster_create_service.py:3840-3842`)
+        #   여기서도 같은 규약으로 먼저 접는다. 실측상 두 DB 의 `shifts.default_shift`
+        #   에는 `O`·`주` 만 있으나, 한쪽만 알아들으면 그 병동에서 OFF 가 조용히
+        #   '기타 특수코드'(파랑)로 새고 빨강도 안 켜진다.
+        _axis = str(_s.default_shift or "").strip().upper()
+        if _axis in ("OFF", "주", "W"):
+            _axis = "O"
+        _swap = bool(getattr(_s, "off_swap_target", False))
+        # ★★ **`shift_gb` 가 제품 자신의 분류축**이다. `default_shift` 만 보면 안 된다 —
+        #   전사 1,891행 중 `default_shift` 가 채워진 건 511행뿐인데 `shift_gb` 는
+        #   527행이고, 값이 `O`·데이·이브닝·나이트·미드·고정 여섯뿐이라 `type` 과
+        #   1:1 로 떨어진다(고정/데이/이브닝/나이트/미드=근무 · O=휴무).
+        #   특히 `'고정'` 35행이 파트장·MID고정·탄력근무·일반상근 같은 **고정근무 변형**을
+        #   정확히 집는다. 이걸 안 쓰면 `default_shift` 가 빈 근무 변형이 '기타 특수코드'로
+        #   새어 파랗게 나온다.
+        _gb = str(getattr(_s, "shift_gb", "") or "").strip()
+        if str(getattr(_s, "type", "") or "").strip() == "근무":
+            work_type_codes.add(_code)
+        if _axis in ("D", "E", "N", "M") or _gb in (
+            "데이", "이브닝", "나이트", "미드", "고정",
+        ):
+            den_codes.add(_code)
+        if _axis == "O" or _gb == "O" or _swap:
+            off_axis_codes.add(_code)
+        if getattr(_s, "annual_leave_unit", None) is not None:
+            leave_unit_codes.add(_code)
+        # ★ `_swap` 을 조건에서 뺐다 — 위 `code_bg` 주석 참조. OFF 축과 배경이 한 코드에
+        #   겹치지 않게 한다. 연차는 `leave_unit_codes` 로 남는다.
+        if _axis in ("D", "E", "N") or _code in leave_unit_codes:
+            fill_codes.add(_code)
+
+    # 고정근무 — **그 사람의 그 칸은 배경을 칠하지 않는다.** 상시 근무라 한 줄이 통째로
+    #   같은 색이 되고, 정작 봐야 할 글자색 표시가 묻힌다.
+    #   ★★ 축이 **둘**이라 집합도 둘이다. 하나로 묶으면 한쪽이 반드시 틀린다:
+    #     · `fixed_by_nurse` (간호사 단위) = **배경 억제**. 코드 단위로 지우면 안 된다 —
+    #       고정근무가 `D` 인 사람이 한 명만 있어도 **전 병동의 D 배경이 사라진다**
+    #       (실측 성남 중환자실-RN 김은경 `fixed_shift='D'`).
+    #     · `fixed_codes` (코드 단위) = **파랑 제외**. 누군가의 고정근무로 쓰이는 코드는
+    #       교육·공가 같은 특수코드가 아니라 근무 코드이므로, 다른 사람이 하루 받아도
+    #       파랗게 칠하지 않는다.
+    #   SSOT 는 `nurse_allowed_shift_period`(as-of 대상월 1일)다. `nurses.fixed_shift`
+    #   컬럼은 as-of-TODAY 단방향 캐시라 미래월에 stale 해 쓰지 않는다.
+    #   ★ 대상은 `Nurse.group_id` 가 아니라 **이 파일에 실제로 실리는 간호사**다.
+    #     전출·인바운드는 현재 소속이 달라도 근무표에 나오므로(위에서 inbound 를 합친다),
+    #     소속으로 거르면 그 사람의 고정근무 칸만 처리가 빠진다.
+    fixed_codes: set = set()
+    #: 간호사 → {일(day): {그 날 유효한 고정근무 코드}}.
+    #:   ★★ **날짜까지 봐야 한다.** 달과 겹치기만 하면 그 코드를 한 달 내내 억제하는
+    #:     식으로 짜면, 15일부터 고정근무가 시작된 사람의 1~14일 **일반 배정**까지
+    #:     배경을 잃는다(월 중 코드가 바뀌면 두 코드 모두 한 달 전체가 눌린다).
+    #:     억제 대상은 '그 사람의 그 날 고정근무 칸' 이지 '그 사람의 그 코드' 가 아니다.
+    fixed_by_nurse: Dict[str, Dict[int, set]] = {}
+    try:
+        from sqlalchemy import or_
+        from db.models import NurseAllowedShiftPeriod
+        #   ★ 월초 시점(as-of)이 아니라 **그 달과 겹치는 구간 전부**를 읽는다. 고정근무가
+        #     월 중간부터 시작하는 경우가 있는데, 월초 기준으로만 보면 그 뒤 칸들이
+        #     빠진다. `fetch_periods` 와 같은 반열린 구간 규약이다.
+        _ms = date(year, month, 1)
+        _me = _ms + timedelta(days=days_in_month)
+        _nids = [str(_n.nurse_id) for _n in nurses]
+        if _nids:
+            for _fp in (
+                db.query(
+                    NurseAllowedShiftPeriod.nurse_id,
+                    NurseAllowedShiftPeriod.fixed_shift,
+                    NurseAllowedShiftPeriod.valid_from,
+                    NurseAllowedShiftPeriod.valid_to,
+                )
+                .filter(
+                    NurseAllowedShiftPeriod.nurse_id.in_(_nids),
+                    NurseAllowedShiftPeriod.valid_from < _me,
+                    or_(
+                        NurseAllowedShiftPeriod.valid_to.is_(None),
+                        NurseAllowedShiftPeriod.valid_to > _ms,
+                    ),
+                )
+                .all()
+            ):
+                _fc2 = str(_fp[1] or "").strip()
+                if not _fc2:
+                    continue
+                # 전역 제외는 **근무 코드일 때만**. 그래야 잘못 설정된 휴가·교육 코드가
+                #   남의 칸에서까지 파랑을 잃지 않는다(그 사람 칸은 아래 날짜 맵이 맡는다).
+                if _fc2 in work_type_codes:
+                    fixed_codes.add(_fc2)
+                # 구간을 대상월 안으로 자른다. datetime 으로 올 수 있어 date 로 맞춘다.
+                _vf, _vt = _as_date(_fp[2]), _as_date(_fp[3])
+                _d0 = max(1, (_vf - _ms).days + 1) if _vf else 1
+                _d1 = min(days_in_month, (_vt - _ms).days) if _vt else days_in_month
+                if _d1 < _d0:
+                    continue
+                _slot = fixed_by_nurse.setdefault(str(_fp[0]), {})
+                for _dd in range(_d0, _d1 + 1):
+                    _slot.setdefault(_dd, set()).add(_fc2)
+    except Exception as _fx_exc:
+        # 실패하면 고정근무 칸에 배경이 남고, 전용 고정근무 코드는 '기타 특수코드' 로
+        #   흘러 파랗게 나온다. 근무표 자체는 내려가야 하므로 표시만 포기하고 사유를 남긴다.
+        print(f"[Excel] 고정근무 조회 실패 — 배경 억제·특수코드 제외 모두 생략: {_fx_exc}")
+
+    holidays = _kr_holidays_in_month(year, month)
+
+    # ───────── 2-c) 확정 원티드 ─────────
+    #   **확정 원티드(`fixed_wanted_entries`, `is_applied=True`) ∩ 간호사 제출본에
+    #     같은 (간호사, 날짜)가 있는 칸 = 빨간 글자.**
+    #   ★★ **2026-09-21 방침 변경 — 제출본 대조를 다시 건다.**
+    #     색의 의미를 "확정 원티드에 올라갔다" 가 아니라 **"간호사가 낸 신청이
+    #     반영됐다"** 로 좁힌다(병동 요청). 수간호사가 종이 휴가계획서를 보고 직접
+    #     넣은 칸은 간호사 신청이 아니므로 **바탕색 없이 검정**으로 둔다.
+    #     예) 성남 중환자실-RN 홍난희 10/1·10/2 OF 는 `reason='10월 원티드 9.17 수정본'`
+    #         이지만 제출본에 없어 수간호사 입력이다 → 검정.
+    #   ★★ 예전에 같은 대조를 걸었다가 "빨강이 한 칸도 안 나온다" 고 되돌린 적이 있다.
+    #     그 현상 자체는 지금도 같다 — 실측 2026-10 제출본/확정원티드:
+    #         성남 중환자실-RN 0/225 · 동탄 7B-RN 0/95 · 8병동 0/37 · 6B-RN 0/35
+    #         성남 61병동-RN 64/112 · 61병동-AN 6/7
+    #     즉 **성남 61병동 말고는 색이 사라진다**. 그때는 버그였지만 이번엔 그게
+    #     의도한 결과다(신청하지 않은 칸을 신청분처럼 보이게 하지 않는다).
+    #   ★ 대조 대상은 `nurse_shift_requests` 다. `wanted_requests` 는 (간호사,월) 헤더라
+    #     날짜가 없어 칸 단위 판정에 못 쓴다.
+    #   ★ 판정은 **(간호사, 날짜)** 로만 한다 — 코드 일치까지 요구하지 않는다.
+    #     수간호사가 제출을 보고 코드를 조정하는 일이 흔한데(희망 OF → 확정 Y 등),
+    #     그것도 신청이 반영된 것이다.
+    submitted_days: set = set()       # (간호사, 일) — 간호사가 실제로 제출한 칸
+    try:
+        from db.models import NurseShiftRequest
+
+        for _s in (
+            db.query(NurseShiftRequest.nurse_id, NurseShiftRequest.shift_date)
+            .filter(
+                NurseShiftRequest.group_id == target_group_id,
+                NurseShiftRequest.shift_date >= date(year, month, 1),
+                NurseShiftRequest.shift_date < (
+                    date(year, month, 1) + timedelta(days=days_in_month)
+                ),
+            )
+            .all()
+        ):
+            if _s.shift_date:
+                submitted_days.add((str(_s.nurse_id), _s.shift_date.day))
+    except Exception as _sub_exc:
+        # 실패하면 **아무 칸도 빨강이 아니게** 된다. 조용히 넘기면 "원래 신청이 없는
+        #   병동" 과 구분이 안 되므로 사유를 남긴다.
+        print(f"[Excel] 제출 원티드 조회 실패 — 빨강 판정 전부 꺼진다: {_sub_exc}")
+    #   ★★ `year`·`month` 필터를 반드시 건다. `request_id` 가 (간호사,월) 스코프로 1부터
+    #     재채번돼, 월 필터 없는 조회가 다른 달 셀을 **일(day)만 떼어** 같은 날짜로 반영한
+    #     사고가 있었다(운영 전사 236건). 날짜 범위도 함께 걸어 이중으로 막는다.
+    #   ★ 조회가 실패해도 근무표 자체는 내려가야 한다 — 표시만 생략한다.
+    wanted_req: Dict[tuple, str] = {}     # (간호사,일) → 확정 원티드 코드
+    _wm_start = date(year, month, 1)
+    _wm_end = _wm_start + timedelta(days=days_in_month)
+    try:
+        #    ★ `is_applied == False` 는 **수간호사가 꺼 둔 것**이라 제외한다. 생성·원티드
+        #      API 도 전부 `is_applied == True` 만 쓴다
+        #      (`wanted_service.py:2841·3639·3980·4070`). 실측으로 성남시의료원에만
+        #      꺼진 행이 46건 있다.
+        from db.models import FixedWantedEntry
+        for _w in (
+            db.query(FixedWantedEntry)
+            .filter(
+                FixedWantedEntry.group_id == target_group_id,
+                FixedWantedEntry.year == year,
+                FixedWantedEntry.month == month,
+                FixedWantedEntry.is_applied == True,      # noqa: E712
+                FixedWantedEntry.shift_date >= _wm_start,
+                FixedWantedEntry.shift_date < _wm_end,
+            )
+            .all()
+        ):
+            _wc = str(_w.shift_id or "").strip()
+            if not (_w.shift_date and _wc):
+                continue
+            _key = (str(_w.nurse_id), _w.shift_date.day)
+            # ★ 제출본에 없는 칸 = 수간호사 직접 입력 → 색을 주지 않는다(검정).
+            if _key not in submitted_days:
+                continue
+            wanted_req[_key] = _wc
+    except Exception as _w_exc:
+        print(f"[Excel] 확정 원티드 조회 실패: {_w_exc}")
+
+    # 연차 잔여 — 장부의 `opening` 만 읽는다. '사용'·'당월잔여' 는 **이 근무표 기준**으로
+    #   실시간 계산한다(draft 를 받아도 "이대로 마감하면 잔여가 얼마" 가 보여야 한다).
+    #: ★★ 장부 **조회**와 사용량 **계산**을 따로 감싼다.
+    #:   하나로 묶으면 계산만 실패해도 `leave_opening` 이 비워져 **연차 3열이 통째로
+    #:   사라진 채 정상 파일처럼** 내려간다. 사용자는 그게 장애인지 원래 없는 병동인지
+    #:   구분할 수 없다 — 조용한 실패가 성공처럼 보이는 것이 가장 나쁘다.
+    leave_opening: Dict[str, Any] = {}
+    leave_stale = False
+    leave_used: Optional[Dict[str, Any]] = {}   # None = 계산 못 함(빈 dict 와 구분한다)
+    leave_error: Optional[str] = None
+    try:
+        from db.models import NurseAnnualLeaveBalance
+
+        for _b in (
+            db.query(NurseAnnualLeaveBalance)
+            .filter(
+                NurseAnnualLeaveBalance.group_id == target_group_id,
+                NurseAnnualLeaveBalance.year == year,
+                NurseAnnualLeaveBalance.month == month,
+            )
+            .all()
+        ):
+            leave_opening[str(_b.nurse_id)] = _b.opening
+            # ★★ 장부가 **뒤처졌는지** 여기서 판정한다. 재계산 훅은 fail-open 이라
+            #   실패해도 근무표는 커밋된다 — 그러면 틀린 잔여가 맞는 것처럼 보인다.
+            #   그 달 마감본이 있는데 `used` 가 비었거나 다른 근무표를 가리키면 stale 이다.
+            if schedule.status == "issued":
+                if _b.used is None or str(_b.source_schedule_id or "") != str(schedule_id):
+                    leave_stale = True
+    except Exception as _lv_exc:  # noqa: BLE001
+        # 장부 자체를 못 읽었다 → 열을 낼 근거가 없다. 대신 **경고를 남긴다.**
+        print(f"[Excel] 연차 장부 조회 실패: {_lv_exc}")
+        leave_opening = {}
+        leave_error = "연차 장부를 읽지 못했습니다"
+
+    if leave_opening:
+        try:
+            from services.leave.annual_leave_service import compute_leave_used
+
+            leave_used = compute_leave_used(db, schedule)
+        except Exception as _lu_exc:  # noqa: BLE001
+            # ★ 계산만 실패했다 → **열은 유지**하고 `사용`·`당월잔여` 만 비운다.
+            #   `전월잔여` 는 장부에서 읽은 확정값이라 그대로 보여줄 수 있다.
+            print(f"[Excel] 연차 사용량 계산 실패(사용/당월잔여 생략): {_lu_exc}")
+            leave_used = None
+            leave_error = "연차 사용량을 계산하지 못했습니다"
+
+    #: 연차 열은 **장부가 있는 병동에서만** 낸다(성남시의료원 중환자실 선제공).
+    leave_labels = ["전월잔여", "사용", "당월잔여"] if leave_opening else []
 
     # ───────── 3) 워크북/시트 ─────────
     wb = Workbook()
@@ -1176,16 +1639,26 @@ def export_schedule_excel_bytes(
 
     # ───────── 4) 제목 영역 ─────────
     title = f"{year}년 {month}월 근무표"
-    # 팀별보기면 맨 앞(컬럼1)에 팀 컬럼 1개 추가 → static_cols 4→5.
-    # 배치: 팀(1) · 번호(2) · 이름(3) · 구분(4) · 경력(5). 기본: 번호(1) · 이름(2) · 구분(3) · 경력(4).
+    # 팀별보기면 맨 앞(컬럼1)에 팀 컬럼 1개 추가 → static_cols 5→6.
+    # 배치: 팀(1) · 번호(2) · 이름(3) · 구분(4) · 근속(5) · 입사일(6).
+    #       기본: 번호(1) · 이름(2) · 구분(3) · 근속(4) · 입사일(5).
     # 날짜 시작열·spacer·요약열은 static_cols 에서 파생되므로 자동 보정.
-    static_cols = 5 if team_view else 4
+    #
+    # ★ '경력'(`nurses.experience`) 대신 **현재 병원 근속**(`joining_date` 기준)을 낸다
+    #   (2026-09-21 병동 요청). experience 는 이직 전 경력까지 합산된 값이라 같은 병동
+    #   안에서 누가 오래 일했는지를 나타내지 못한다. 근속 계산은 마이페이지가 쓰는
+    #   `routers/nurses.py:950-961` 과 같은 식(relativedelta)을 쓰되, 기준일만
+    #   **그 근무표 월의 말일**로 바꾼다 — `date.today()` 로 잡으면 과거 근무표를 다시
+    #   받을 때마다 값이 커져 같은 파일이 다르게 나온다.
+    static_cols = 6 if team_view else 5
     idx_col  = 2 if team_view else 1  # 번호 컬럼
     name_col = 3 if team_view else 2  # 이름 컬럼
     role_col = name_col + 1           # 구분
-    exp_col  = name_col + 2           # 경력
+    exp_col  = name_col + 2           # 근속(현재 병원)
+    join_col = name_col + 3           # 입사일
     spacer_cols = 2
-    total_cols = static_cols + days_in_month + spacer_cols + summary_cols
+    leave_cols = len(leave_labels)
+    total_cols = static_cols + days_in_month + spacer_cols + summary_cols + leave_cols
 
     ws.merge_cells(start_row=2, start_column=1, end_row=3, end_column=total_cols)
     ws.cell(row=2, column=1, value=title).font = title_font
@@ -1200,7 +1673,8 @@ def export_schedule_excel_bytes(
         ws.cell(row=header_row, column=1, value="번호").font = header_font
     ws.cell(row=header_row, column=name_col, value="이름").font = header_font
     ws.cell(row=header_row, column=role_col, value="구분").font = header_font
-    ws.cell(row=header_row, column=exp_col, value="경력").font = header_font
+    ws.cell(row=header_row, column=exp_col, value="근속").font = header_font
+    ws.cell(row=header_row, column=join_col, value="입사일").font = header_font
 
     for c in range(1, static_cols + 1):
         cell = ws.cell(row=header_row, column=c)
@@ -1208,10 +1682,21 @@ def export_schedule_excel_bytes(
         cell.border = border_all
         cell.fill = gray_fill
 
+    # ★ 요일 행 — 헤더 바로 위(그동안 비어 있던 자리)에 넣는다. `header_row` 를 건드리면
+    #   본문·풋터 오프셋이 전부 파생돼 어긋나므로 **행을 늘리지 않고** 빈 줄을 쓴다.
+    wd_row = header_row - 1
     for d in range(1, days_in_month + 1):
         col = static_cols + d
+        _fc = _day_font_color(year, month, d, holidays)
+        wcell = ws.cell(row=wd_row, column=col, value=_WD[calendar.weekday(year, month, d)])
+        wcell.font = Font(bold=True, size=10, color=_fc) if _fc else Font(bold=True, size=10)
+        wcell.alignment = center
+        wcell.border = border_all
+        wcell.fill = gray_fill
+
         cell = ws.cell(row=header_row, column=col, value=d)
-        cell.font = header_font
+        # 일자도 같은 색 — 병원 시트가 두 행을 같은 색으로 칠한다(실측).
+        cell.font = Font(bold=True, size=12, color=_fc) if _fc else header_font
         cell.alignment = center
         cell.border = border_all
         cell.fill = gray_fill
@@ -1224,6 +1709,43 @@ def export_schedule_excel_bytes(
         cell.alignment = center
         cell.border = border_all
         cell.fill = gray_fill
+        # ★ 본문 셀과 **같은 규약**으로 채운다 — 색이 있는 코드는 전부.
+        #   본문만 칠하고 집계는 안 칠하면 같은 코드가 두 형식으로 보여 오히려 헷갈린다.
+        _bg = code_bg.get(lab)
+        if _bg:
+            cell.fill = PatternFill("solid", fgColor=_bg)
+            cell.font = Font(bold=True, size=12, color=_readable_text_color(_bg))
+
+    # 요일 행의 빈 구간(정적 컬럼·스페이서·요약열)도 같은 배경·테두리로 이어 붙인다.
+    #   그렇지 않으면 일자 위에만 띠가 있고 좌우가 끊겨 표가 깨져 보인다.
+    for _c in list(range(1, static_cols + 1)) + list(
+            range(static_cols + days_in_month + 1, tail_start_col + summary_cols)):
+        _cell = ws.cell(row=wd_row, column=_c)
+        _cell.border = border_all
+        _cell.fill = gray_fill
+
+    leave_start_col = tail_start_col + summary_cols
+    for i, lab in enumerate(leave_labels):
+        cell = ws.cell(row=header_row, column=leave_start_col + i, value=lab)
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border_all
+        cell.fill = gray_fill
+    if leave_labels:
+        # ★★ **병합하지 않는다.** `merge_cells` 는 좌상단을 뺀 나머지를 `MergedCell` 로
+        #   갈아치우면서 스타일을 버려, 마지막 열에 테두리가 빠지고 박스가 깨진다
+        #   (병합 전에 스타일을 걸어도 마찬가지다 — 실측으로 두 순서 다 확인).
+        #   `centerContinuous` 는 셀을 합치지 않고 **글자만 가로로 펼쳐** 가운데 정렬한다.
+        #   테두리·배경이 셀마다 그대로 남아 박스가 온전하다.
+        _span = Alignment(horizontal="centerContinuous", vertical="center")
+        for i in range(leave_cols):
+            _c = ws.cell(row=wd_row, column=leave_start_col + i)
+            _c.border = border_all
+            _c.fill = gray_fill
+            _c.alignment = _span
+        _lh = ws.cell(row=wd_row, column=leave_start_col, value="연차사용현황")
+        _lh.font = header_font
+        _lh.alignment = _span
 
     # 열 너비 (팀별보기: A=팀8, B=번호5 / 기본: A=번호5)
     if team_view:
@@ -1233,7 +1755,8 @@ def export_schedule_excel_bytes(
         ws.column_dimensions['A'].width = 5  # 번호
     ws.column_dimensions[get_column_letter(name_col)].width = 12  # 이름
     ws.column_dimensions[get_column_letter(role_col)].width = 6   # 구분
-    ws.column_dimensions[get_column_letter(exp_col)].width = 6    # 경력
+    ws.column_dimensions[get_column_letter(exp_col)].width = 11   # 근속 (N년 M개월)
+    ws.column_dimensions[get_column_letter(join_col)].width = 11  # 입사일 (YYYY-MM-DD)
     for d in range(1, days_in_month + 1):
         ws.column_dimensions[get_column_letter(static_cols + d)].width = 4
     for s in range(spacer_cols):
@@ -1241,10 +1764,15 @@ def export_schedule_excel_bytes(
     for i, lab in enumerate(tail_labels):
         col_letter = get_column_letter(tail_start_col + i)
         ws.column_dimensions[col_letter].width = 6 if len(lab) > 1 else 5
+    for i, lab in enumerate(leave_labels):
+        ws.column_dimensions[get_column_letter(leave_start_col + i)].width = 9
 
     # ───────── 6) 본문 ─────────
     start_row = header_row + 1
-    daily_counts = {d: {code: 0 for code in tail_labels} for d in range(1, days_in_month + 1)}
+    # 하단 일일 집계는 **세부 코드** 축(`footer_labels`)이다. 우측 요약 열의 base 축
+    #   (`row_counts` / `tail_labels`)과 축이 다르므로 같은 dict 를 쓰면 안 된다.
+    daily_counts = {d: {code: 0 for code in footer_labels}
+                    for d in range(1, days_in_month + 1)}
 
     def write_nurse_row(n, r: int, idx: int):
         """간호사 1명을 r 행에 작성하고 daily_counts 를 누적한다."""
@@ -1253,7 +1781,10 @@ def export_schedule_excel_bytes(
         ws.cell(row=r, column=idx_col, value=idx)
         ws.cell(row=r, column=name_col, value=n.name)
         ws.cell(row=r, column=role_col, value=n.role)
-        ws.cell(row=r, column=exp_col, value=n.experience)
+        ws.cell(row=r, column=exp_col, value=_tenure_text(
+            getattr(n, "joining_date", None), year, month))
+        ws.cell(row=r, column=join_col, value=_join_date_text(
+            getattr(n, "joining_date", None)))
         # 팀 컬럼(col1)은 본문 작성 후 팀 그룹 경계로 세로병합하므로 여기선 비워둔다.
 
         for c in range(1, static_cols + 1):
@@ -1265,19 +1796,85 @@ def export_schedule_excel_bytes(
 
         row_counts = {code: 0 for code in tail_labels}
         schedule_map = by_nurse.get(n.nurse_id, {})
+        #: 이 사람의 **날짜별** 고정근무 코드 — 그 칸만 배경을 뺀다.
+        #:   코드 단위로 빼면 남의 D 까지 지워지고, 날짜를 안 보면 월 중 고정근무가
+        #:   시작·변경된 사람의 일반 배정까지 지워진다.
+        _my_fixed_days = fixed_by_nurse.get(str(n.nurse_id), _EMPTY_MAP)
 
         for d in range(1, days_in_month + 1):
             shift_code = schedule_map.get(d, '-')
             cell = ws.cell(row=r, column=static_cols + d, value=shift_code)
             cell.alignment = center
             cell.border = border_all
-            if is_current_user:
+            # ★★ 배정 영역은 **대표 코드에만** 배경을 칠한다(3교대 D/E/N + OFF 교환 대상).
+            #   특수코드까지 칠하면 표가 얼룩덜룩해 정작 봐야 할 원티드 표시가 묻힌다.
+            #   (범례·집계는 이 제한을 받지 않는다 — 거기선 색이 코드를 가리키는 축이다.)
+            _code = str(shift_code).strip()
+            _bg = (
+                code_bg.get(_code)
+                if (
+                    _code in fill_codes
+                    and _code not in _my_fixed_days.get(d, _EMPTY_SET)
+                )
+                else None
+            )
+            if _bg:
+                cell.fill = PatternFill("solid", fgColor=_bg)
+                cell.font = Font(color=_readable_text_color(_bg))
+            if is_current_user and not _bg:
+                # 색이 있는 칸은 덮지 않는다 — 덮으면 코드 색이 사라진다.
                 cell.fill = highlight_fill
 
+            # 원티드 표시 — 배경은 그대로 두고 **글자색만** 덮는다. 누가 정한 칸인지를
+            #   나타내므로 코드 색(무슨 근무인가)과 축이 다르다. 볼드는 쓰지 않는다.
+            #   ★★ **요청 코드와 실제 배정이 같을 때만** 칠한다. 표시하려는 것은
+            #     '반영된 내역' 이므로, 신청했지만 다른 근무가 들어간 칸까지 칠하면
+            #     들어준 것과 못 들어준 것이 같은 색이 되어 구분이 사라진다.
+            #     (확정 원티드는 하드 고정이라 대개 일치하지만, 생성 뒤 수동 수정으로
+            #      어긋날 수 있어 여기서도 같은 기준을 적용한다.)
+            #   글자색 축은 **둘**이고 빨강이 우선한다:
+            #     · 빨강 = **확정 원티드로 들어간 쉬는 날**. 확정 원티드에 있고 실제 배정이
+            #       그 코드이며, 코드가 **OFF축이거나 연차 계열**일 때만 칠한다.
+            #       (제출 테이블과는 대조하지 않는다 — 위 2-c 주석)
+            #       ★ 원티드로 받은 근무(D/E/N)·교육·공가까지 빨갛게 하면 "쉬는 날" 신호가
+            #         흐려진다. 실측 운영 중환자실-RN 2026-10 확정원티드 164건 중
+            #         OFF·연차가 123건, 특수코드 32건, 근무 9건이다.
+            #     · 파랑 = 기타 특수코드(보수교육·직무교육·공가·병가 등). 연차는 자체 축이라
+            #       여기 안 든다(배경을 칠한다).
+            #   ★ 고정근무 코드(`DA`·`DD` 등)는 어느 쪽도 아니다. 그 사람에겐 상시 근무라
+            #     특수코드로 묶으면 한 줄이 통째로 파래진다.
+            #   ★ **요청 코드와 실제 배정이 같을 때만** 칠한다. 확정 원티드는 하드 고정이라
+            #     대개 일치하지만 생성 뒤 수동 수정으로 어긋날 수 있고, 그때 칠하면
+            #     들어준 것과 못 들어준 것이 같은 색이 되어 구분이 사라진다.
+            _w = wanted_req.get((str(n.nurse_id), d))
+            if _w and _w == _code and (
+                _code in off_axis_codes or _code in leave_unit_codes
+            ):
+                cell.font = Font(color=_C_WANTED)
+                # ★ OFF 축은 **원티드 여부와 무관하게 배경을 칠하지 않는다**(병동 요청).
+                #   한때 "신청해서 받은 OFF" 에만 배경을 넣어 솔버가 준 휴무와 구분했으나,
+                #   병동이 OFF 칸은 전부 바탕 없이 보는 쪽을 택했다. 구분은 **글자색 빨강**
+                #   하나로 충분하다. 연차 계열은 `fill_codes` 라 여전히 배경이 있다.
+            elif (
+                _code and _code != "-"
+                and _code not in den_codes
+                and _code not in off_axis_codes
+                and _code not in leave_unit_codes
+                # 고정근무 제외는 두 겹이다 — 근무 코드는 전역(남이 하루 받아도 근무다),
+                #   그 밖의 코드는 **그 사람·그 날**에 한해서만.
+                and _code not in fixed_codes
+                and _code not in _my_fixed_days.get(d, _EMPTY_SET)
+            ):
+                cell.font = Font(color=_C_SPECIAL)
+
+            # 우측 요약 열은 base 축, 하단 일일 집계는 세부 코드 축 — 따로 센다.
             base = to_base(shift_code)
             if base in row_counts:
                 row_counts[base] += 1
-                daily_counts[d][base] += 1
+            #   `footer_labels` 와 **같은 정규화**를 써야 키가 어긋나지 않는다(양쪽 strip).
+            _raw = str(shift_code or "").strip()
+            if _raw in daily_counts[d]:
+                daily_counts[d][_raw] += 1
 
         # 요약 열: 0도 그대로 표시 (빈칸 → 0)
         for i, lab in enumerate(tail_labels):
@@ -1288,6 +1885,29 @@ def export_schedule_excel_bytes(
             cell.border = border_all
             if is_current_user:
                 cell.fill = highlight_fill
+
+        # 연차 3열 — `전월잔여` 는 장부에서, `사용`·`당월잔여` 는 **이 근무표**에서.
+        #   ★ 장부의 `used`/`closing` 을 읽지 않는 이유: draft 를 내려받아도 "이대로
+        #     마감하면 잔여가 얼마가 되는지" 가 보여야 한다. 장부는 마감본 전용이다.
+        #   ★ 행이 없는 간호사(전월 기록 없음)는 **빈칸**으로 둔다 — 0 으로 찍으면
+        #     "연차가 없다" 로 오해된다.
+        if leave_labels:
+            _op = leave_opening.get(str(n.nurse_id))
+            _us = leave_used.get(str(n.nurse_id)) if leave_used is not None else None
+            if _op is None:
+                _vals = [None, None, None]
+            elif leave_used is None:
+                # 계산 실패 — 전월잔여(확정값)만 보여주고 나머지는 비운다.
+                _vals = [float(_op), None, None]
+            else:
+                _u = _us if _us is not None else 0
+                _vals = [float(_op), float(_u), float(_op) - float(_u)]
+            for i, v in enumerate(_vals):
+                cell = ws.cell(row=r, column=leave_start_col + i, value=v)
+                cell.alignment = center
+                cell.border = border_all
+                if is_current_user:
+                    cell.fill = highlight_fill
 
     # 본문은 팀별보기·기본 모두 동일한 연속 행으로 작성한다(레이아웃 동일). 팀별보기면
     # 작성하면서 같은 팀 라벨의 연속 행 구간을 모아 컬럼2를 세로 병합한다.
@@ -1323,7 +1943,14 @@ def export_schedule_excel_bytes(
     ws.cell(row=footer_start, column=name_col, value="일일 근무 현황").font = header_font
 
     def write_footer_row(label: str, values: list[int], row_idx: int):
-        ws.cell(row=row_idx, column=role_col, value=label).font = header_font
+        lab_cell = ws.cell(row=row_idx, column=role_col, value=label)
+        lab_cell.font = header_font
+        lab_cell.alignment = center
+        # ★ 요약 열·본문과 같은 규약 — 색이 있는 코드는 전부 채운다.
+        _bg = code_bg.get(label)
+        if _bg:
+            lab_cell.fill = PatternFill("solid", fgColor=_bg)
+            lab_cell.font = Font(bold=True, size=12, color=_readable_text_color(_bg))
         for c in range(1, static_cols):
             ws.cell(row=row_idx, column=c).border = border_all
 
@@ -1333,22 +1960,39 @@ def export_schedule_excel_bytes(
             cell.alignment = center
             cell.border = border_all
 
-        for i in range(spacer_cols + summary_cols):
+        for i in range(spacer_cols + summary_cols + leave_cols):
             col = static_cols + days_in_month + 1 + i
             ws.cell(row=row_idx, column=col).border = border_all
 
-    for i, lab in enumerate(tail_labels):
+    for i, lab in enumerate(footer_labels):
         row_idx = footer_start + 1 + i
         vals = [daily_counts[d][lab] for d in range(1, days_in_month + 1)]
         write_footer_row(lab, vals, row_idx)
 
     # ───────── 8) 테두리 보정 ─────────
-    max_col = tail_start_col + len(tail_labels) - 1
-    for row in ws.iter_rows(min_row=header_row, max_row=footer_start + len(tail_labels) + 1,
+    #   가로 끝은 우측 요약 열 기준(`tail_labels`), 세로 끝은 하단 집계 행 수
+    #   기준(`footer_labels`)이다 — 축이 서로 다르다.
+    max_col = tail_start_col + len(tail_labels) + leave_cols - 1
+    for row in ws.iter_rows(min_row=wd_row, max_row=footer_start + len(footer_labels) + 1,
                             min_col=1, max_col=max_col):
         for cell in row:
             if cell.value is not None and (cell.border is None or cell.border.left.style is None):
                 cell.border = border_all
+
+    # ★★ 연차 장부가 현재 마감본과 어긋나면 그 사실을 **보이게** 한다.
+    #   재계산 훅은 fail-open 이라 실패해도 근무표는 커밋된다(데드락·유니크 경합 등).
+    #   그때 `전월잔여` 가 옛값인 채 남는데, 숫자만 보면 맞는지 알 수 없다.
+    _warn_msg = None
+    if leave_error:
+        _warn_msg = f"※ {leave_error} — 연차 값이 불완전합니다"
+    elif leave_labels and leave_stale:
+        _warn_msg = "※ 연차 잔여가 최신 마감본과 다릅니다 — 재계산 필요"
+    if _warn_msg:
+        # ★ 장부가 없는 병동이라 열이 아예 없을 때도 **실패는 알린다** —
+        #   조용히 빠진 것과 원래 없는 것을 사용자가 구분할 수 있어야 한다.
+        _warn = ws.cell(row=footer_start, column=tail_start_col, value=_warn_msg)
+        _warn.font = Font(bold=True, color=_C_SUN_HOL)
+        print(f"[Excel] {schedule_id} {_warn_msg}")
 
     # ───────── 저장 ─────────
     bio = BytesIO()

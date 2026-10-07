@@ -85,6 +85,12 @@ def _infer_target_value(
     if not isinstance(cur, int):
         return None
     if direction == "increase":
+        # ★ 월 야간 상한은 하드락 #6(1인 15) — 15 이상이면 올리지 않는다(None → 수동 분류).
+        #   예전엔 15 → 16 을 만들었다(OMC 재리뷰 2026-10-02).
+        if config_key in ("max_nig_per_month", "max_night_shifts_per_month"):
+            from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH
+            if cur <= 0 or cur >= HARD_MAX_NIGHTS_PER_MONTH:
+                return None
         return cur + 1
     if direction == "decrease":
         return max(0, cur - 1)

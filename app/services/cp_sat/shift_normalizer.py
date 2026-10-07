@@ -30,6 +30,13 @@ def build_shift_normalizer(
     canonical = {"D", "E", "N", "M", "O", "주", "W"}
     id_to_main: dict[str, str] = {}
     main_to_id: dict[str, str] = {c: c for c in canonical}
+    # ★ 대표 자리를 **실제 코드가** 이미 차지한 메인코드.
+    #   초기값(자기 자신)과 실제 코드 `O` 가 같은 문자열이라 값만 보고는 구분이 안 된다.
+    #   예전엔 `current in {None, main_code}` 로 판정해, 실제 `O` 가 먼저 자리를 잡아도
+    #   뒤에 오는 `shift_gb='O'` 코드(`산모OFF`·`격휴`)가 대표를 덮어써 **생성된 OFF 전부가
+    #   그 코드로 저장됐다**(2026-09-28 여수 55병동·동탄 7병동-RN 실측). 행 순서는 DB 반환
+    #   순서라 병동마다 우연히 갈렸다.
+    claimed: set[str] = set()
 
     for row in shift_defs or []:
         raw_id = str(row.get("shift_id") or "").strip()
@@ -65,9 +72,10 @@ def build_shift_normalizer(
 
         id_to_main[sid_upper] = main_code
         if not skip_main_to_id:
-            current = main_to_id.get(main_code)
-            if current in {None, main_code} or sid_upper == main_code:
+            # 먼저 자리를 잡은 코드가 대표. 단 코드 자체가 메인코드인 행(`O`)은 순서와 무관하게 이긴다.
+            if sid_upper == main_code or main_code not in claimed:
                 main_to_id[main_code] = raw_id
+                claimed.add(main_code)
 
     return id_to_main, main_to_id
 

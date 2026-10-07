@@ -238,6 +238,14 @@ class RosterSystem:
                     print(f"경고: 휴무 요청 대상 간호사(ID={target_nurse_id})를 찾을 수 없어 건너뜁니다.")
                     break
                 self.preference_matrix[n_idx, day_idx, off_idx] = base_weight + delta
+                # [S0 계측] 사용자 선호가 닿은 칸을 **원본 delta 와 함께** 기록한다.
+                #   ★ 최종 점수(P)의 부호로 요청/기피를 가르면 안 된다 — baseline 이
+                #     양수(default_weight=5 등)라 기피 -1.5 도 P=3.5 로 양수가 된다.
+                #     신호는 delta 이므로 그것을 남긴다.
+                #   ★ preference_matrix 전체로 재도 안 된다. 기본값이 전 칸에 깔린
+                #     '스코어 매트릭스' 라 선호와 무관한 값이 나온다(실측 0.9484).
+                self._pref_cells = getattr(self, "_pref_cells", {})
+                self._pref_cells[(n_idx, day_idx, off_idx)] = float(delta)
             
     def apply_shift_preferences(self, shift_preferences: Dict[str, Dict[str, Dict[str, float]]]):
         """
@@ -274,6 +282,8 @@ class RosterSystem:
                             print(f"경고: 근무 유형 선호 대상 간호사(ID={target_nurse_id})를 찾을 수 없어 건너뜁니다.")
                             break
                         self.preference_matrix[n_idx, day_idx, shift_idx] = default_weight + delta
+                        self._pref_cells = getattr(self, "_pref_cells", {})
+                        self._pref_cells[(n_idx, day_idx, shift_idx)] = float(delta)
         print("근무 유형 선호도 적용 완료")
         
     def apply_pair_preferences(self, pair_preferences: Dict[str, List[Dict[str, Union[int, float]]]]):
@@ -287,6 +297,15 @@ class RosterSystem:
                 }
         """
         print("간호사 페어링 선호도 초기화 중...")
+        # [S0 계측] pair 요청 건수. stage3 목적이 pair 도 최적화하므로 stage3 가
+        #   INFEASIBLE 이면 같이 소실된다. 다만 pair 는 (간호사,일자,시프트) 셀이 아니라
+        #   쌍 단위라 _pref_cells 로는 못 잰다 — 존재만 드러내고 별도 지표는 후속 과제로 둔다.
+        try:
+            self._pair_req_count = sum(
+                len(v or []) for v in (pair_preferences or {}).values()
+            )
+        except Exception:
+            self._pair_req_count = 0
         
         # 간호사 페어링 선호도 매트릭스 초기화 (간호사 × 간호사)
         self.pair_matrix = {

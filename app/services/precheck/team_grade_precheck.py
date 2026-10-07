@@ -1002,6 +1002,9 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
             #    이게 없으면 해결카드가 config·recovery 를 넘는 값을 제안하고 거기서 멈춘다.
             "cap_by_axis": _axis,
             "personal_night_cap": n.night_cap,
+            # ★ N전담(허용 근무 = N 하나) — 공급량(night_cap)은 그대로 세되, 해결카드가 개인 N
+            #   한도를 **바꾸는 대상에서는 뺀다**(N전담 횟수는 계약·운영으로 정한 값이다 — 2026-10-02).
+            "is_night_dedicated": _allowed_set(n, S) == {"N"},
         })
     n_capable_caps.sort(key=lambda x: x["capacity_days"])
 

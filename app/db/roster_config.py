@@ -58,6 +58,18 @@ class NurseRosterConfig:
     # 같은 시프트(D/E/N) 연속 ≤3 soft. True면 4연속 같은 시프트 (예: D D D D)에 패널티.
     max_same_shift: bool = True
     max_same_shift_penalty_weight: int = 10000
+    # 같은 시프트 연속 **하드** 상한. **기본 3** = D/E/N 각 4연속 이상 금지. 0 이면 미적용.
+    # ★ 하드로 걸어보고 INFEASIBLE 이면 `team_min` 과 같은 규약으로 **자동 soft 전환**한다
+    #   (roster_create_service 가 이 값을 0 으로 내려 1회 재생성 → 위 soft 벌점이 이어받는다).
+    #   단일 시프트 전담은 그 코드 연속이 강제되므로 제약에서 제외된다.
+    same_shift_hard_k: int = 3
+    # 고립근무(O-W-O · OFF 사이 단일 근무) **하드** 금지. 기본 True.
+    # ★ soft 벌점(ISOLATED_WORK_PENALTY 1500)만으로는 못 줄인다 — 스윕 실측에서
+    #   1500/4000/10000/30000 이 9·9·7·9 로 **방향성이 없었다**(가중치 문제가 아니다).
+    # ★ `same_shift_hard_k` 와 같은 규약으로 INFEASIBLE 시 **자동 soft 전환**한다
+    #   (roster_create_service 가 False 로 내려 재생성 → 위 soft 벌점이 이어받는다).
+    #   N 단독(O-N-O)은 하드락 7(1N 금지)이 별도 관리하므로 여기서 제외한다.
+    isolated_work_hard: bool = True
     # 4O 연속 휴무 hard 제약(당월 내 + 월경계). True면 4연속 OFF 금지. False면 제약 제거.
     # 디폴트는 False(해제): 운영 검증 결과 자연 발생률 ~10-13%로 무리 없는 수준.
     enforce_4o_hard: bool = False
@@ -66,6 +78,16 @@ class NurseRosterConfig:
     n_to_n_interval_target: int = 10
     n_to_n_interval_penalty_weight: int = 50
     n_to_n_interval_max_window: int = 15
+    # N 블록 간 **최소 간격 하드**(일). 0=해제. 3 이하는 2N/3N 후 2OFF 하드가 이미 보장하므로
+    # 실효는 4부터 — `N O O N`(회복 OFF 직후 재-N)을 막는다.
+    # ★★ 위 soft(`n_to_n_interval_target`)로는 이 바닥이 **안 올라간다**. 실측(성남 중환자실-RN
+    #   2026-10 · 동일조건 10판)에서 최소 간격이 10판 전부 정확히 3이었다. `n2n` 은 lex 5번째
+    #   패스라 앞 패스(off_range·grade·team·n_range)가 굳혀 놓은 뒤에는 못 민다.
+    #   목적식 축으로 여섯 번 시도해 여섯 번 다 기각됐고, target 을 낮추는 건 **역효과**였다
+    #   (벌점이 `target−gap` 한쪽이라 target 이 곧 압력의 도달 거리다).
+    # ★ `isolated_work_hard`·`same_shift_hard_k` 와 같은 규약으로 INFEASIBLE 시
+    #   **자동 soft 전환**한다(roster_create_service 가 0 으로 내려 재생성 → 위 soft 가 이어받는다).
+    n2n_min_gap: int = 0
     # D/E(데이·이브닝) per-nurse 균등 — fallback stage2 lex 5-pass.
     # OFF/N/n2n 동결 후 nurse별 |D-E| 의 tolerance 초과분만 최소화(완전 동일이 아닌 밴드).
     # 수렴된 균등해가 stage3 warm-start hint로 상속되어 X축(D/E 1.5배) 균형을 안정화한다.

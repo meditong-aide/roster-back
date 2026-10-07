@@ -87,22 +87,31 @@ class MssqlDatabasemanager:
 
             return rows
 
-    def execute(self, query: str, params: tuple | None = None, database: str | None = None) -> int:
-        """INSERT/UPDATE/DELETE 쿼리를 실행하고 영향 받은 행 수를 반환합니다."""
+    def execute(self, query: str, params: tuple | None = None, database: str | None = None,
+                timeout: int | None = None) -> int:
+        """INSERT/UPDATE/DELETE 쿼리를 실행하고 영향 받은 행 수를 반환합니다.
+
+        `timeout` 을 주면 그 초를 넘길 때 예외가 난다. 안 주면 **무한 대기**다(pymssql 기본).
+        ★ 쓰기는 락 경합에 걸리기 쉬워 읽기보다 오래 물린다. 동기 라우터에서 부르면
+          그 동안 Starlette 공용 스레드풀 토큰을 점유해, 쌓이면 다른 동기 엔드포인트까지
+          실행되지 못한다. 사용자 요청 경로의 쓰기에는 상한을 거는 편이 안전하다.
+        """
         charset = 'UTF-8'
 
-        with self.connection(database, charset) as conn:
+        with self.connection(database, charset, timeout=timeout) as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
             conn.commit()
             return cursor.rowcount
 
-    def bulk_execute(self, query: str, params: list, database: str | None = None) -> int:
+    def bulk_execute(self, query: str, params: list, database: str | None = None,
+                     timeout: int | None = None) -> int:
+        """여러 행을 한 번에 실행한다. `timeout` 의미는 `execute` 와 같다."""
         if not isinstance(params, list) or not all(isinstance(item, (tuple, list)) for item in params):
             raise TypeError("params argument must be a list of tuples or lists.")
         charset = 'UTF-8'
 
-        with self.connection(database, charset) as conn:
+        with self.connection(database, charset, timeout=timeout) as conn:
             cursor = conn.cursor()
             cursor.executemany(query, params)
             conn.commit()
@@ -197,6 +206,17 @@ EUN_DB_NAME = os.getenv("EUN_DB_NAME")
 
 DATABASE_URL = f"mssql+pymssql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{EUN_DB_NAME}"
 
+# ★★ pymssql 은 기본이 **무한 대기**다(timeout=0). 응답이 안 오면 `poll()` 에서 영원히
+#   멈추는데, DB 쪽엔 실행 중인 쿼리가 **없어도** 그렇다(연결이 조용히 끊긴 경우).
+#   실측 2026-09-15: dev 서버 워커가 이 상태로 15분 넘게 전 요청 000 · CPU 0% ·
+#   스택이 `pymssql execute → tds_select → poll()` 에 고정. `dm_exec_requests` 엔 0건.
+#   ★ 기본값은 **끔**(None) — 운영 동작을 바꾸지 않는다. 로컬 `.env` 에서만 켠다.
+_DB_QUERY_TIMEOUT = int(os.getenv("DB_QUERY_TIMEOUT", "0") or 0)
+_connect_args: dict = {}
+if _DB_QUERY_TIMEOUT > 0:
+    _connect_args["timeout"] = _DB_QUERY_TIMEOUT
+    _connect_args["login_timeout"] = min(_DB_QUERY_TIMEOUT, 15)
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
@@ -205,6 +225,7 @@ engine = create_engine(
     # 더 많이 유지해 동시 요청이 재로그인 대신 재사용하도록 풀 확대(env 로 조정).
     pool_size=int(os.getenv("DB_POOL_SIZE", "20")),
     max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "30")),
+    connect_args=_connect_args,
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()

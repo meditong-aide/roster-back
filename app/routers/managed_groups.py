@@ -27,7 +27,7 @@ router = APIRouter(
 
 
 @router.get("/roster-create/summary")
-async def get_roster_create_summary(
+def get_roster_create_summary(
     year: int = Query(..., ge=2000, le=2100),
     month: int = Query(..., ge=1, le=12),
     current_user: UserSchema = Depends(get_current_user_from_cookie),

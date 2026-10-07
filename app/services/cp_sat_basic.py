@@ -453,6 +453,13 @@ class CPSATBasicEngine:
         print('config_data', config_data.get('shift_priority'))
         # 법규 제약사항 (Hard Constraints)
         max_conseq_work = config_data.get('max_conseq_work', 5)
+        # 연속근무 하드 상한 A/B 주입구. 하드락 #1 은 "최대 5일 **이하**" 라
+        # **낮추는 방향만** 허용한다 — min() 으로 상향을 막는다(올리면 정책 위반).
+        import os as _os_mcw
+        _mcw_env = _os_mcw.environ.get("AIDE_MAX_CONSEC_WORK")
+        if _mcw_env:
+            max_conseq_work = min(int(max_conseq_work or 5), int(_mcw_env))
+            print(f"[MaxConsecWork] hard={max_conseq_work} (env={_mcw_env})")
         banned_day_after_eve = config_data.get('banned_day_after_eve', True)
         three_seq_nig = config_data.get('three_seq_nig', True)
         two_offs_after_three_nig = config_data.get('two_offs_after_three_nig', True)
@@ -604,13 +611,28 @@ class CPSATBasicEngine:
             max_conseq_off_penalty_weight=int(config_data.get("max_conseq_off_penalty_weight", 5000) or 0),
             # 같은 시프트(D/E/N) 연속 ≤3 soft
             max_same_shift=bool(config_data.get("max_same_shift", True)),
+            # ★ 300 유지 — 2000 상향은 **활성 5곳 실측으로 기각**(2026-09-14).
+            #   D/E/N 4연속 창에 **함께** 걸리는 값이라 올리면 E4 를 피하느라 E 가 흩어지고
+            #   그 자리를 D 가 메워 **D4 가 되레 늘었다**(9A 6→8 · 중환1 6→8 · 중환2 5→11).
+            #   고립근무도 3곳 악화·2곳 동일로 악화 방향이 일관됐다.
+            #   D 만 조이려면 `AIDE_SAME_SHIFT_MODE=dmul`(D 전용 곱연산)을 쓴다.
             max_same_shift_penalty_weight=int(config_data.get("max_same_shift_penalty_weight", 300) or 0),
+            # 같은 시프트 연속 하드 상한(0=미적용). INFEASIBLE 시 호출부가 0 으로 내려 재생성한다.
+            same_shift_hard_k=int(config_data.get("same_shift_hard_k", 3) or 0),
+            # 고립근무 하드 금지(기본 True). INFEASIBLE 시 호출부가 False 로 내려 재생성한다.
+            isolated_work_hard=bool(config_data.get("isolated_work_hard", True)),
             # 4O 연속 휴무 hard 제약 (디폴트 False = 해제)
             enforce_4o_hard=bool(config_data.get("enforce_4o_hard", False)),
             # N 블록 간 간격 soft (목표 10일, 한쪽 페널티: 10일 미만만 벌점)
             n_to_n_interval_target=int(config_data.get("n_to_n_interval_target", 10) or 0),
             n_to_n_interval_penalty_weight=int(config_data.get("n_to_n_interval_penalty_weight", 300) or 0),
             n_to_n_interval_max_window=int(config_data.get("n_to_n_interval_max_window", 15) or 0),
+            # N 블록 간 **최소 간격 하드**(0=해제, 실효는 4 부터). INFEASIBLE 시 호출부가
+            #   0 으로 내려 재생성한다 — `same_shift_hard_k`·`isolated_work_hard` 와 같은 규약.
+            # ★ 기본이 0(해제)이라 `or 0` 이 안전하다. 컬럼이 NULL 로 추가돼도 0 = 해제로
+            #   의도와 일치한다(기본값이 10 인 `n_to_n_interval_target` 은 같은 패턴이면
+            #   NULL 을 0 으로 읽어 패스가 통째로 꺼지는 함정이 있다 — 혼동하지 말 것).
+            n2n_min_gap=int(config_data.get("n2n_min_gap", 0) or 0),
             # 분배 정책 모드/월단위 선호 가중치
             distribution_mode=str(config_data.get("distribution_mode", "hybrid") or "hybrid"),
             monthly_preference_weight=int(config_data.get("monthly_preference_weight", 60) or 0),
@@ -1499,6 +1521,19 @@ class CPSATBasicEngine:
                 print(f"{self.logger_prefix} [Config] primary 스킵(default), 바로 폴백 (해제: SKIP_PRIMARY=0)")
                 success = False
             else:
+                # ★ 여기부터가 primary(가중합 단일 Maximize) 경로다. 기본값에서는 실행되지
+                #   않는다 — 2026-05-28(3a0fc53) 에 fallback_lex(순차 렉시코)가 10런 검증에서
+                #   시간 -54~61% · coverage 0/10 · 품질 동급↑ 로 우세해 기본을 스킵으로 올렸다.
+                #   그때 남긴 **잔여 리스크가 아직 해소되지 않았다**:
+                #     "스코어형 소프트선호 다수 병동 미검증(실데이터상 희박, fallback stage3 가
+                #      선호 처리). 문제 시 SKIP_PRIMARY=0 또는 revert."
+                #   그런데 그 stage3 가 실측 55%(11곳 중 6곳) INFEASIBLE 이라 선호가 소실되는
+                #   구조여서, 지금 이 경로로 비교해도 공정한 검증이 안 된다.
+                #   → 삭제는 전환 S6(단일 모델 체인) 이후로 미뤄져 있다.
+                print(
+                    f"{self.logger_prefix} [WARN] SKIP_PRIMARY=0 — primary(가중합) 경로로 진입합니다. "
+                    "이 경로는 2026-05-28 이후 기본 비활성이며 소프트선호 다수 병동에서 미검증입니다."
+                )
                 success = self._optimize_with_enhanced_constraints(roster_system, time_limit_seconds, nurses, grouped, randomize=randomize, seed=seed)
             # fallback_success = False
             if not success:
@@ -1513,6 +1548,12 @@ class CPSATBasicEngine:
                 # 폴백 결과 진단(log-only, 솔버 무영향) — [HardViolations] 요약 노출.
                 # N균등([N균등-결과])은 fallback_lex.py stage3에서 이미 출력하므로 여기선 제외.
                 _log_post_solve_result_diagnostics(roster_system, self.logger_prefix)
+                # [S0 계측] 소프트선호 반영률. stage3 가 INFEASIBLE 이면 stage2 해가
+                #   커밋되는데 선호는 stage3 목적에만 있어(fallback_objectives.py:68-78)
+                #   그 회차의 선호가 통째로 소실된다. 실측 stage3 INFEASIBLE 이 11곳 중 6곳이라
+                #   이 지표 없이는 S2(선호를 lex 패스로) 전후 비교도, primary 삭제 검증도 못 한다.
+                #   ★ 하드고정 원티드는 제약이라 항상 반영되므로 여기 분모·분자에 안 들어간다.
+                _log_soft_preference_rate(roster_system, self.logger_prefix)
             # if not success and not fallback_success:
             #     raise RuntimeError("HARD_INFEASIBLE: stage1/fallback 모두 해 없음")
         # 9-1. 불필요 OFF 정리 (N-only 제외)
@@ -3814,6 +3855,16 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 )
             if mid is not None:
                 m.Add(X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
+            if w_idx is not None:
+                # 메인코드 없는 근무(W)에도 `E→` · `N→` 금지를 건다. 위 전이 금지는
+                #   day 인덱스만 봐서 W 로 접힌 주간 근무(`DD` 등)가 통과했다.
+                #   lex 쪽(fallback_lex) 과 같은 규약 — 상세 주석은 그쪽에 있다.
+                if getattr(cfg, "ban_e_to_d", True):
+                    if not (fixed.get((n, d - 1)) == eve and fixed.get((n, d)) == w_idx):
+                        m.Add(X(n, d - 1, eve) + X(n, d, w_idx) <= 1)
+                if getattr(cfg, "ban_n_to_d", True):
+                    if not (fixed.get((n, d - 1)) == night and fixed.get((n, d)) == w_idx):
+                        m.Add(X(n, d - 1, night) + X(n, d, w_idx) <= 1)
             # if getattr(cfg, "ban_d_to_n", True):
             #     m.Add(X(n,d,night)+X(n,d-1,day)<=1)
 
@@ -3975,7 +4026,15 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         continue
                     if d == 0 and (n, 0) in fixed and fixed[(n, 0)] == night:
                         continue  # 1N day0 N 고정(경계) 시 해당일 1N 제약 스킵
-                    if d == 0 and getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0) > 0:
+                    # ★★ 전월 N 꼬리가 있어도 **그 뒤에 OFF 가 이미 붙었으면** 블록은 끊긴 것이라
+                    #   10/1 의 N 은 새 블록의 첫날이다 → 1N 금지를 그대로 적용해야 한다.
+                    #   `consecutive_night_tail` 은 꼬리 OFF 를 건너뛴 뒤의 N 개수라
+                    #   `N N N O O` 도 3 이 나온다. 이 값만 보고 면제하면 단독 N 이 통과한다.
+                    #   (동탄 8병동 실측: 박서이 9/26~28 N · 9/29~30 O 인데 10/1 단독 N 이 배정됐다.
+                    #    연속N·2N2OFF·3N2OFF 는 이미 `prev_month_n_offs_after_by_idx` 를 함께 보는데
+                    #    1N 금지만 빠져 있었다 — line 4148·4504·4655 참조.)
+                    if d == 0 and getattr(rs, "prev_month_n_tail_by_idx", {}).get(n, 0) > 0 \
+                            and (getattr(rs, "prev_month_n_offs_after_by_idx", {}) or {}).get(n, 0) == 0:
                         continue
                     neighbors = []
                     if d - 1 >= T0:
@@ -5027,6 +5086,75 @@ _FALLBACK_DIAG_HARD_TYPES = {
     'initial_forbidden', 'weekend_off_only',
     'consecutive_4off', 'cross_month_4off',
 }
+
+
+def _log_soft_preference_rate(roster_system, logger_prefix: str) -> None:
+    """소프트 시프트선호 반영률을 로그로 남긴다(log-only · 솔버 무영향).
+
+        rate = Σ_(요청셀) P·x  /  Σ_(요청한 날) max_s P      … 요청(delta>0)만
+        want  = 요청 셀(delta>0) 중 실제로 배정된 수
+        avoid = 기피 셀(delta<0) 중 배정되지 **않은** 수
+
+    ★ 요청/기피는 **원본 delta 의 부호**로 가른다. 최종 점수 P 로 가르면 안 된다 —
+      baseline 이 양수(`default_weight`=5 등)라 기피 -1.5 도 P=3.5 가 되어 전부
+      요청으로 분류되고 avoid 가 영영 0 이 된다. 그래서 `_pref_cells` 는
+      좌표→delta 의 dict 다.
+    ★ 요청과 기피를 합쳐 세면 뜻이 뒤집힌다 — 기피 셀에 배정된 것은 사용자가 피하고
+      싶던 결과인데 "만족" 으로 잡힌다. 그래서 둘을 나눠 보고한다.
+    ★ 분모는 **날마다** 최선이다. 간호사당 한 칸(`Σ_n max_(d,s) P`)으로 잡으면
+      분자는 한 달 전체를 더하는데 분모는 칸 하나라 비율이 1 을 넘는다(설계 초안 오류).
+    ★ pair 요청(work_together/work_apart)은 셀이 아니라 쌍 단위라 이 지표에 안 들어간다.
+      그런데 stage3 목적은 pair 도 최적화하므로 INFEASIBLE 이면 같이 소실된다.
+      건수(`pair=N`)만 함께 찍어 존재를 드러내고, 별도 지표는 후속 과제로 둔다.
+
+    stage3 상태를 함께 찍는다 — INFEASIBLE 회차와 FEASIBLE 회차를 나눠 보지 않으면
+    P1(선호 소실)이 평균에 묻혀 안 보인다.
+    """
+    try:
+        import numpy as _np
+        P = getattr(roster_system, "preference_matrix", None)
+        R = getattr(roster_system, "roster", None)
+        cells = getattr(roster_system, "_pref_cells", None)
+        if P is None or R is None:
+            return
+        P = _np.asarray(P, dtype=float)
+        R = _np.asarray(R, dtype=float)
+        if P.shape != R.shape or P.size == 0:
+            return
+        # ★ 전체 매트릭스로 재면 안 된다. preference_matrix 는 기본값 1 이 전 칸에 깔린
+        #   '스코어 매트릭스' 라(nurse_config.py:98 `np.ones(...)`) 사용자 선호가 하나도
+        #   반영되지 않아도 0.94 같은 값이 나온다(실측). **사용자 선호가 실제로 덮어쓴 칸**
+        #   (roster_system 이 기록한 _pref_cells)만 대상으로 한다.
+        _pairs = int(getattr(roster_system, "_pair_req_count", 0) or 0)
+        _s3 = getattr(roster_system, "_lex_stage3_status", "?")
+        if not cells:
+            # ★ pair 요청(work_together/work_apart)은 셀이 아니라 쌍 단위라 여기서 못 잰다.
+            #   그런데 stage3 목적은 pair 도 최적화하므로 stage3 가 INFEASIBLE 이면 같이
+            #   소실된다. "0건" 으로만 찍으면 그 손실이 안 보이므로 존재를 드러낸다.
+            print(f"{logger_prefix} [PrefRate] 시프트선호 입력 0건 — 측정 생략 "
+                  f"(pair 요청 {_pairs}건은 이 지표 대상 아님) stage3={_s3}")
+            return
+        # ★ 요청/기피는 **원본 delta 의 부호**로 가른다. 최종 점수 P 로 가르면 안 된다 —
+        #   baseline 이 양수(default_weight=5 등)라 기피 -1.5 도 P=3.5 가 되어 전부
+        #   요청으로 분류되고 avoid 가 영영 0 이 된다(실측에서 avoid_ok=0/0 만 나왔다).
+        # ★ 합쳐서 세도 안 된다 — 기피 셀에 배정된 것은 사용자가 피하고 싶던 결과인데
+        #   hit 으로 잡혀 뜻이 뒤집힌다.
+        want = [c for c, dl in cells.items() if dl > 0]
+        avoid = [c for c, dl in cells.items() if dl < 0]
+        want_hit = sum(1 for (n, d, s) in want if R[n, d, s] > 0)
+        avoid_ok = sum(1 for (n, d, s) in avoid if R[n, d, s] <= 0)
+        # 점수 기반 비율은 요청(양수)만으로 낸다. 기피는 위 avoid_ok 로 따로 본다.
+        by_nd: dict = {}
+        for (n, d, s) in want:
+            by_nd.setdefault((n, d), []).append(s)
+        got = float(sum(P[n, d, s] * R[n, d, s] for (n, d, s) in want))
+        best = float(sum(max(P[n, d, s] for s in ss) for (n, d), ss in by_nd.items()))
+        rate = (got / best) if best > 0 else 0.0
+        print(f"{logger_prefix} [PrefRate] rate={rate:.4f} "
+              f"want={want_hit}/{len(want)} avoid_ok={avoid_ok}/{len(avoid)} "
+              f"got={got:.1f} best={best:.1f} pair={_pairs} stage3={_s3}")
+    except Exception as exc:      # 계측 실패가 생성을 막아선 안 된다
+        print(f"{logger_prefix} [PrefRate] 계산 실패(무시): {exc}")
 
 
 def _log_post_solve_result_diagnostics(roster_system, logger_prefix: str) -> None:

@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from db.client2 import get_db
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 from services.precheck.team_grade_precheck import (
     PrecheckInput,
@@ -91,7 +91,7 @@ def _to_input(req: PrecheckRequest) -> PrecheckInput:
 def precheck_roster(
     group_id: str,
     req: PrecheckRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """Team × Grade × Common Pool infeasibility precheck."""

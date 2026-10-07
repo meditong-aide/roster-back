@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from db.client2 import get_db
-from routers.auth import get_current_user_from_cookie, require_current_user
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 from schemas.team_schema import TeamBulkOpsRequest, TeamWithMembers
 from services.team_service import list_teams_with_members, apply_team_ops
@@ -121,7 +121,7 @@ def _resolve_managed_target(
 
 
 @router.get("", response_model=list[TeamWithMembers])
-async def get_teams(
+def get_teams(
     current_user: UserSchema = Depends(require_current_user),
     group_id: str | None = None,
     year: int | None = None,
@@ -148,7 +148,7 @@ async def get_teams(
 
 
 @router.put("", response_model=list[TeamWithMembers])
-async def put_teams(
+def put_teams(
     body: TeamBulkOpsRequest,
     current_user: UserSchema = Depends(require_current_user),
     group_id: str | None = None,
@@ -185,9 +185,9 @@ async def put_teams(
 
 
 @router.post("/classify/preview")
-async def classify_preview(
+def classify_preview(
     body: TeamClassifyPreviewRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """원티드 기반 팀 분류 미리보기 (read-only). 확정 원티드로 제안 팀+변경 diff 반환."""
@@ -203,7 +203,7 @@ async def classify_preview(
 
 
 @router.post("/classify/apply")
-async def classify_apply(
+def classify_apply(
     body: TeamClassifyApplyRequest,
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
@@ -226,9 +226,9 @@ async def classify_apply(
 
 
 @router.post("/redistribute/preview")
-async def redistribute_preview(
+def redistribute_preview(
     body: WardRedistributePreviewRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """병동 간 재분배 미리보기 (read-only). 그룹→팀→간호사 + 이동 diff 반환.
@@ -254,9 +254,9 @@ async def redistribute_preview(
 
 
 @router.post("/redistribute/apply")
-async def redistribute_apply(
+def redistribute_apply(
     body: WardRedistributeApplyRequest,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """승인된 병동 간 재분배 발행: 이동→병동이동(transfer), 팀변경→permanent_change."""

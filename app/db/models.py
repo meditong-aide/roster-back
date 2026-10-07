@@ -286,6 +286,69 @@ class NurseNightCycle(Base):
     )
 
 
+class NurseAnnualLeaveBalance(Base):
+    """연차 잔여 — **월별 스냅샷**. 위 `NurseNightCycle` 과 같은 층위다.
+
+    ★ 왜 월별인가 — 병원이 쓰는 근무표 시트가 `전월잔여 / 사용 / 당월잔여` 3열이다.
+      그룹웨어는 연 단위(`vacation_tbl`)라 월 개념이 없어, 월 축은 우리 확장이다.
+
+    ★★ **확정(`used`·`closing`)은 마감(issued) 근무표 기준이다.**
+      엑셀에 보이는 '사용' 은 이 컬럼이 아니라 **내려받는 그 근무표에서 실시간 계산**한다
+      (draft 를 받아도 "이대로 마감하면 잔여가 얼마" 가 보여야 하기 때문).
+      즉 이 테이블은 *확정 장부*, 엑셀 표시는 *현재 안(案)* 이다.
+
+    ★ 행이 없는 사람은 **집계하지 않는다** — 전월 기록이 없으면 차감할 근거가 없다
+      (성남시의료원 중환자실의 파트장·휴직자·PA 3명이 그렇다).
+
+    ## 그룹웨어 정렬 (연동은 아직 하지 않음)
+
+    `eun_gw.bizwiz20db.vacation_tbl (OfficeCode, EmpSeqNo, vca_year)` 에
+    `vca_countall/countspend/countremain DECIMAL(6,3)` 이 있다. 나중에 붙일 때
+    재설계가 없도록 **정밀도와 키 모양만** 맞췄다. 성립해야 하는 롤업 등식:
+
+        SUM(used) over 그 해        ==  vca_countspend
+        그 해 마지막 달 closing      ==  vca_countremain
+
+    ★ 연동 시 함정: 그쪽 `OfficeCode`·`EmpSeqNo` 는 `char(6)` 고정폭이라 공백 패딩된다.
+      SQL 조인은 collation 이 맞춰 주지만 **파이썬 딕셔너리 조회는 조용히 빗나간다.**
+    """
+
+    __tablename__ = "nurse_annual_leave_balance"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    office_id = Column(VARCHAR(50), nullable=False)   # = vacation_tbl.OfficeCode
+    group_id = Column(VARCHAR(50), nullable=False)    # 그룹웨어엔 없는 우리 스코프
+    nurse_id = Column(VARCHAR(50), nullable=False)    # = vacation_tbl.EmpSeqNo
+    year = Column(SMALLINT, nullable=False)           # = vacation_tbl.vca_year
+    month = Column(TINYINT, nullable=False)
+
+    #: 그 달 시작 잔여. 전월 `closing` 을 이어받고, 최초 달은 시드값이다.
+    opening = Column(DECIMAL(6, 3), nullable=False)
+    #: 그 달 사용량 = 마감본에서 `shifts.annual_leave_unit` 합. **미마감이면 NULL.**
+    used = Column(DECIMAL(6, 3), nullable=True)
+    #: `opening - used`. `used` 가 NULL 이면 NULL — 다음 달 `opening` 을 못 정한다는 뜻이다.
+    closing = Column(DECIMAL(6, 3), nullable=True)
+
+    #: `used` 를 계산한 마감본. 마감취소 후 다른 근무표로 재마감되면 여기가 바뀐다.
+    #: NULL 이면 그 달은 아직 마감되지 않았다는 뜻이다(= 마감 여부의 판별자).
+    source_schedule_id = Column(VARCHAR(50), nullable=True)
+    #: **`opening` 의 출처**. 'seed'(사람이 넣은 최초값) | 'carried'(전월 closing 승계).
+    #:   ★ 마감 여부를 여기 담으면 안 된다 — 재발행 때 seed 행이 덮여 앵커 자격을 잃고,
+    #:     다음 재계산에서 그 달 장부가 통째로 지워진다. 마감 여부는 `source_schedule_id` 다.
+    source = Column(VARCHAR(20), nullable=True)
+    #: 그룹웨어 반영 시각. **예약 컬럼** — 지금은 아무도 읽지도 쓰지도 않는다.
+    gw_synced_at = Column(DATETIME, nullable=True)
+    note = Column(VARCHAR(200), nullable=True)
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id", "nurse_id", "year", "month", name="ux_nalb_cell"
+        ),
+    )
+
+
 class EffectiveDatedPeriodMixin:
     """시점 속성(effective-dated) 공통 컬럼.
 
@@ -508,10 +571,49 @@ class ScheduleEntry(Base):
     id = Column(INTEGER, nullable=True)  # shifts.id (stable key)
 
 
+class PushOutbox(Base):
+    """앱 알림 발송 대기열 — 업무 저장과 같은 트랜잭션에 '보낼 알림'을 남기고 발송기가 따로 보낸다.
+
+    ★ 예전엔 커밋 뒤 그룹웨어에 바로 썼다. 그 사이 프로세스가 죽거나 그룹웨어가 잠깐 느리면
+      알림이 영영 빠졌고 다시 보낼 근거도 없었다. 이제 이 행이 남으므로 재시도할 수 있다.
+    ★ 그룹웨어 쓰기와 'sent' 표시는 한 트랜잭션이다(`push_outbox_service._deliver`).
+    상태: pending → sending → sent | skipped(운영 외) | failed(재시도 소진·24시간 경과)
+          | cancelled(guard 불충족).
+    DDL: `migrations/2026_10_02_add_push_outbox.sql`.
+    """
+
+    __tablename__ = "push_outbox"
+
+    id = Column(BIGINT, primary_key=True, autoincrement=True)
+    source = Column(VARCHAR(50), nullable=False)
+    push_code = Column(VARCHAR(10), nullable=False)
+    push_sub_code = Column(VARCHAR(10), nullable=False)
+    office_code = Column(VARCHAR(50), nullable=False)
+    sender_emp_seq_no = Column(VARCHAR(50), nullable=False)
+    sender_member_id = Column(VARCHAR(100), nullable=False)
+    recipients = Column(TEXT, nullable=False)        # 콤마 구분 사번(varchar(max))
+    recipient_count = Column(INTEGER, nullable=False)
+    message = Column(NVARCHAR(1000), nullable=False)
+    org_message = Column(NVARCHAR(2000), nullable=False)
+    link_url = Column(NVARCHAR(500), nullable=False, default="")
+    link_code = Column(NVARCHAR(100), nullable=False, default="")
+    guard = Column(VARCHAR(200), nullable=True)
+    status = Column(NVARCHAR(20), nullable=False, default="pending")  # nvarchar 인 이유는 DDL 주석
+    attempts = Column(INTEGER, nullable=False, default=0)
+    next_attempt_at = Column(DATETIME, nullable=False)
+    claimed_at = Column(DATETIME, nullable=True)
+    master_idx = Column(BIGINT, nullable=True)
+    device_count = Column(INTEGER, nullable=True)
+    last_error = Column(NVARCHAR(1000), nullable=True)
+    created_at = Column(DATETIME, nullable=False)
+    sent_at = Column(DATETIME, nullable=True)
+
+
 class ScheduleEntryLog(Base):
     """근무표 셀 **수동 수정** 이력. `schedule_entries` 는 현재 상태만 유지하고 이력은 여기 쌓인다.
 
-    ★ 대상은 `/roster/save`(사람이 화면에서 고친 것)뿐이다. 생성·재생성은 남기지 않는다 —
+    ★ 대상은 사람이 화면에서 고친 것 — `/roster/save`(source='manual')와 `/roster/save-as`
+      (source='save_as', 원본 버전 대비 바뀐 칸)뿐이다. 생성·재생성은 남기지 않는다 —
       한 번에 수백 행이 바뀌어 로그가 금세 커지고, 사용자가 보려는 "내가 고친 이력"과 성격이 다르다.
       나중에 방침이 바뀌어도 `source` 로 구분만 하면 되도록 컬럼은 미리 뒀다.
 
@@ -542,13 +644,53 @@ class ScheduleEntryLog(Base):
 
     group_id = Column(VARCHAR(50), nullable=True)       # (group_id, shifts.id) 라야 shift 가 유일
     action = Column(VARCHAR(10), nullable=False)        # 'update' | 'insert' | 'delete'
-    source = Column(VARCHAR(10), nullable=False)        # 'manual' | 'generate'
+    source = Column(VARCHAR(10), nullable=False)        # 'manual' | 'save_as' ('generate' 는 예약)
     changed_by = Column(VARCHAR(50), nullable=True)
     changed_at = Column(DATETIME, nullable=False)
     #: 그 셀의 **마지막 변경 기록**인가. 셀당 1행만 True 여야 한다.
     #: ★ "현재값" 과 다르다 — 재생성되면 근무표는 바뀌지만 이 로그는 그대로다.
     #:   현재값의 정본은 언제나 `schedule_entries` 다.
     is_latest = Column(BOOLEAN, nullable=False, default=True)
+
+
+class ScheduleLineage(Base):
+    """근무표 버전 출처 — [새 버전으로 저장]으로 만든 버전 1개 = 1행.
+
+    ★ `schedules` 에 컬럼을 더하지 않고 따로 둔다. 모델 컬럼이면 모든 근무표 조회가 읽어서
+      DDL 없이 배포되면 근무표 화면 전체가 멈춘다(`migrations/2026_10_02_add_schedule_lineage.sql`).
+    ★ 원본 대비 바뀐 칸 자체는 `schedule_entry_log`(source='save_as')에 있다. 여기는 요약만.
+    """
+
+    __tablename__ = "schedule_lineage"
+
+    schedule_id = Column(VARCHAR(50), primary_key=True)        # 새로 만든 버전
+    source_schedule_id = Column(VARCHAR(50), nullable=False)   # 원본 버전
+    source_version = Column(BIGINT, nullable=True)             # 저장 시점 원본 VER
+    kind = Column(VARCHAR(10), nullable=False)                 # 'save_as'
+    # 원본 대비 요약 — `/roster/compare` 의 summary 와 같은 기준(근무코드·명단 분리)
+    changed_cells = Column(INTEGER, nullable=False)            # 양쪽 명단에 다 있는 간호사의 바뀐 칸 수
+    added_nurses = Column(INTEGER, nullable=False)             # 새 버전에만 있는 간호사 수
+    removed_nurses = Column(INTEGER, nullable=False)           # 원본에만 있던 간호사 수
+    created_by = Column(VARCHAR(50), nullable=True)            # 저장한 사람 account_id(`schedules.created_by` 와 같은 기준)
+    created_at = Column(DATETIME, nullable=False)
+
+
+class RosterChangeAck(Base):
+    """재마감 변경 확인 — 확인 대상자 1명 = 1행(성남 ②). `migrations/2026_10_02_add_roster_change_ack.sql`.
+
+    ★ 알림 자체는 따로 두지 않는다. 알림 = 바뀐 칸이 있는 재마감의 **마감 스냅샷**이다
+      (`issued_roster_snapshot.meta_json.change` 에 비교 기준·요약). 바뀐 칸은 두 스냅샷을 비교해
+      그때그때 계산한다 — 스냅샷이 이미 남아 있어 같은 정보를 한 번 더 저장할 이유가 없다.
+    ★ 재마감 시점에 대상자 행을 미리 만든다 — "N명 중 M명" 과 미확인자 목록이 바로 나온다.
+    """
+
+    __tablename__ = "roster_change_ack"
+
+    snapshot_id = Column(INTEGER, primary_key=True)      # issued_roster_snapshot.snapshot_id (= 알림 번호)
+    nurse_id = Column(VARCHAR(50), primary_key=True)
+    my_changed_cells = Column(INTEGER, nullable=False)   # 이 사람 칸이 바뀐 수(명단 변경 포함)
+    acked_at = Column(DATETIME, nullable=True)           # 미확인이면 None
+    ack_via = Column(VARCHAR(10), nullable=True)         # app | web
 
 
 class Shift(Base):
@@ -589,6 +731,16 @@ class Shift(Base):
     # 수면OFF 부여 대상 코드 표식. 그룹당 1건만 True (앱단 검증).
     #   보건휴가와 같은 관례. 코드가 없는 그룹(응급실-AN)은 켤 행이 없어 자동 미사용.
     sleep_off_target = Column(BOOLEAN, nullable=False, default=False)
+    # 연차 **차감 단위**. NULL = 차감 대상 아님(기본) · 1.000 종일 · 0.500 반차 · 0.250 반반차.
+    #   ★ 위 `*_target` 들과 달리 불리언이 아닌 이유 — 마스터에 `VYH 반연차+HALF`(6개 그룹)·
+    #     `V2/V3 오후반차` 같은 코드가 실재하는데 담을 자리가 없다. `duration` 은 전사
+    #     전 행 NULL 이고 `allday` 도 휴가 계열에서 0 고정이다.
+    #   ★ `type='휴가'` 로는 못 가른다 — 전사 98종·한 그룹 최대 38개이고 출산휴가·병가·
+    #     교육까지 섞인다(실증: 잔여 0 인 사람에게 '특별' 1건이 있어 -1 이 된다).
+    #   ★ 정밀도 DECIMAL(6,3) 은 그룹웨어 `eun_gw.bizwiz20db.vacation_tbl` 의
+    #     `vca_countall/spend/remain` 과 동일하게 맞춘 값이다(연동 시 반올림 손실 방지).
+    #     **연동은 아직 하지 않는다** — 모양만 맞춰 둔다.
+    annual_leave_unit = Column(DECIMAL(6, 3), nullable=True)
     # 근무코드 설명(자유 텍스트). MSSQL NVARCHAR(MAX) = NVARCHAR(-1).
     description = Column(NVARCHAR(None), nullable=True)
 
@@ -635,8 +787,17 @@ class ShiftManage(Base):
     year = Column(SMALLINT, nullable=True)
     month = Column(INTEGER, nullable=True)
     config_version = Column(VARCHAR(20), nullable=True)
-    created_at = Column(DATETIME, nullable=True)
-    updated_at = Column(DATETIME, nullable=True)
+    # ★★ `default` 가 **반드시** 있어야 한다. 없으면 SQLAlchemy 가 이 컬럼을 INSERT 문에
+    #   포함시키고 값이 없으니 **명시적 NULL** 을 보낸다(실측 2026-09-19:
+    #   `INSERT INTO shift_manage (..., created_at, updated_at) VALUES (..., NULL, NULL)`).
+    #   `shift_manage.created_at` 은 **dev 는 nullable, 운영은 NOT NULL** 이라
+    #   dev 에서만 통과하고 **운영에서는 IntegrityError** 가 난다.
+    #   그 예외를 `ensure_default_shift_manage` 가 로그 없이 삼켜서, 신규 병동의
+    #   기본 슬롯이 **운영에서만 한 번도 안 만들어졌다**(동탄시티병원 8병동·모니터링 실사례.
+    #   `GET /shifts` 는 "근무코드 설정을 준비하지 못했습니다" 로 500).
+    #   이 모델만 default 가 빠져 있었다 — 다른 테이블은 전부 `default=func.now()` 다.
+    created_at = Column(DATETIME, nullable=True, default=func.now())
+    updated_at = Column(DATETIME, nullable=True, default=func.now(), onupdate=func.now())
 
     __table_args__ = (
         UniqueConstraint(

@@ -138,6 +138,15 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         ).all()
         if r[0] not in _source_ids
     ]
+    # ★ 그 달과 겹치는 **끝난 파견**으로 온 사람도 — 엔진 명단(아래 `get_active_assignments_for_month`:
+    #   active·completed)엔 들어가는데 원티드 수집에서만 빠져, 받는 병동 생성에 그 사람 원티드가
+    #   없었다(2026-10-06). 같은 조회로 맞춘다.
+    for _a in get_active_assignments_for_month(db, current_user.group_id, req.year, req.month):
+        _aid = str(_a.nurse_id)
+        if (_a.reason in _INBOUND_REASONS and _a.target_group_id == current_user.group_id
+                and _a.source_group_id != current_user.group_id
+                and _aid not in _source_ids and _aid not in _inbound_ids):
+            _inbound_ids.append(_aid)
     nurse_ids = _source_ids + _inbound_ids
     if _inbound_ids:
         print(f"[RosterCreate] fixed_wanted 조회 대상 inbound nurse 추가: {_inbound_ids}")
@@ -145,6 +154,32 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
     preferences = []
     special_shift_map = _load_special_shift_map(db, current_user.group_id, current_user.office_id)
     special_fixed_requests: list[dict] = []
+    # ★★ 원본 `shift_id` 를 대표코드(D/E/N/O)로 옮기는 맵.
+    #   아래 DENO 분류가 `shift_id` 를 리터럴 {"D","E","N","O"} 와 **직접 비교**하고 있었다.
+    #   병동이 OFF 를 `OF`·`오프` 로 쓰면 `"OF" in {...}` 가 False 라 **원티드 OFF 가 통째로
+    #   미분류로 버려진다**(실측 2026-09-17 성남 중환자실-RN: 확정 원티드 168건 중 `OF` 91건이
+    #   미분류. 그 병동은 `fixed_wanted_use_yn=True` 라 다른 경로로 살아나 드러나지 않았다).
+    #   지금 26/27 병동이 OFF 코드를 `O` 로 써서 **우연히** 동작할 뿐이다.
+    #   ★ `fixed_wanted_use_yn=True` 경로는 원본 코드를 그대로 넘겨 솔버가 정규화한다 —
+    #     같은 데이터를 두 경로가 다르게 분류하던 비대칭을 여기서 맞춘다.
+    #   ★★ `shifts` 는 PK·UNIQUE 가 없어 같은 `(group_id, shift_id)` 가 **여러 행**일 수 있다.
+    #     정렬 없이 `=` 로 대입하면 **DB 반환 순서에 따라 대표 `default_shift` 가 달라져**
+    #     같은 원티드가 실행마다 다른 D/E/N/O 버킷으로 분류될 수 있다.
+    #     코드베이스의 다른 자리와 같은 규약으로 `(sequence, id)` 오름차순 + 첫 행 채택.
+    _deno_main_map: dict[str, str] = {}
+    try:
+        _shift_rows = (
+            db.query(Shift)
+            .filter(Shift.group_id == current_user.group_id)
+            .order_by(Shift.sequence.asc(), Shift.id.asc())
+            .all()
+        )
+        for _s in _shift_rows:
+            _ds = str(getattr(_s, "default_shift", "") or "").strip().upper()
+            if _ds in ("D", "E", "N", "O"):
+                _deno_main_map.setdefault(str(_s.shift_id).strip().upper(), _ds)
+    except Exception as _dm_exc:
+        print(f"[RosterCreate][WARN] DENO 대표코드 맵 구성 실패 — 원본 코드로 진행: {_dm_exc}")
 
     # FixedWantedEntry 존재 여부 확인 (단일 테이블 구조)
     # → 해당 년/월에 확정 원티드가 존재하면 자동으로 사용 (프론트에서 플래그 전달 불필요)
@@ -180,9 +215,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
                 shift_code = shift_code_raw.upper()
                 day_str = str(fe.shift_date.day)
 
-                if shift_code in shift_data:
+                # ★ 원본 코드가 대표코드와 우연히 같은 경우(`D`·`O`)뿐 아니라
+                #   `OF`·`오프` 처럼 다른 경우도 `default_shift` 로 옮겨 잡는다.
+                _deno = _deno_main_map.get(shift_code, shift_code)
+                if _deno in shift_data:
                     # 확정 원티드는 최고 우선순위 (score=10)
-                    shift_data[shift_code][day_str] = 10
+                    shift_data[_deno][day_str] = 10
                     _fw_deno_count += 1
                     continue
 
@@ -254,6 +292,12 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
     # 2️⃣ 각 간호사별 submitted → draft 순으로 선호도 가져오기
     _wr_deno_count = 0
     _wr_special_count = 0
+    # ★ request_id 는 (간호사, 월) 스코프로 1부터 다시 채번된다(`wanted_service._next_request_id`).
+    #   그래서 같은 (nurse_id, request_id) 가 여러 달에 존재하고, 아래 셀 조회를 월로 묶지
+    #   않으면 다른 달 셀이 딸려 와 **일(day)만 떼어 쓰는 DENO 경로에서 같은 날짜로 잘못
+    #   반영된다.** 특수코드 분기는 이미 year/month 를 확인하는데 DENO 만 빠져 있었다.
+    _wr_start = date(req.year, req.month, 1)
+    _wr_end = _wr_start + timedelta(days=calendar.monthrange(req.year, req.month)[1])
     for nurse_id in nurse_ids:
         submitted_wr = (
             db.query(WantedRequest)
@@ -279,7 +323,10 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             .filter(
                 NurseShiftRequest.nurse_id == nurse_id,
                 NurseShiftRequest.request_id == target_wr.request_id,
-                # cast(NurseShiftRequest.shift_date, String).like(f"{month_str}-%"),
+                # 반열린 구간 [1일, 다음달 1일) — `wanted_service.py:1086-1088` 과 같은 형태다.
+                # 문자열 LIKE 는 SARGable 이 아니라 쓰지 않는다.
+                NurseShiftRequest.shift_date >= _wr_start,
+                NurseShiftRequest.shift_date < _wr_end,
             )
             .all()
         )
@@ -288,8 +335,11 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
             shift_code_raw = str(s.shift or "").strip()
             shift_code = shift_code_raw.upper()
             day_str = str(int(str(s.shift_date).split("-")[-1]))
-            if shift_code in shift_data:
-                shift_data[shift_code][day_str] = int(s.score) if s.score is not None else 0
+            # ★ FixedWantedEntry 경로와 **같은 기준**으로 대표코드를 맞춘다.
+            #   한쪽만 고치면 `FixedWantedEntry` 가 없는 달에서 도로 `OF` 가 버려진다.
+            _deno_wr = _deno_main_map.get(shift_code, shift_code)
+            if _deno_wr in shift_data:
+                shift_data[_deno_wr][day_str] = int(s.score) if s.score is not None else 0
                 _wr_deno_count += 1
                 continue
             if (
@@ -1197,6 +1247,90 @@ def _holiday_off_enabled(db: Session, group_id: str) -> bool:
     except Exception as exc:  # noqa: BLE001
         print(f"[Holiday] 설정 조회 실패 — 미적용으로 진행: {exc}")
         return False
+
+
+def _n2n_min_gap_setting(db: Session, group_id: str) -> int:
+    """`roster_config.n2n_min_gap` — N 블록 간 최소 간격 하드(0=해제, 실효 4부터).
+
+    ★ `_holiday_off_enabled` 와 **같은 규약**으로 raw SQL 로 읽는다.
+      `roster_config` 는 dev·prod 스키마가 갈려 있어(모델에만 있는 컬럼 10개 ·
+      dev 에만 있는 컬럼 11개) 모델에 얹으면 컬럼 없는 환경에서 설정 조회가 통째로
+      깨진다. 존재를 먼저 확인하고 없으면 0(해제)으로 떨어뜨리므로 **코드를 먼저
+      배포하고 DDL 을 나중에 넣어도 안전하다.**
+
+    ★★ 이 함수가 없으면 DDL 을 넣어도 **엔진이 못 읽는다** — ORM 모델에 없는 컬럼이라
+      `latest_config.__dict__` 에 안 담기고, `config_data.get("n2n_min_gap", 0)` 이
+      항상 0 이 되어 하드가 영원히 꺼져 있다.
+
+    ★★ **`n2n_min_gap IS NOT NULL` 조건이 핵심이다.** 생성은 시작할 때 config 를 포크하는데
+      (`materialize_generation_config` · `roster_create_service:5127`), 그 INSERT 는 모델 밖
+      컬럼을 담지 못해 새 config 의 `n2n_min_gap` 이 **NULL** 이 된다. 그런데 이 조회는
+      포크 **뒤**(:5532)에 돌기 때문에, 조건 없이 `ORDER BY config_id DESC` 로 읽으면
+      **방금 만들어진 NULL 행**을 집어 항상 0 이 된다 — 켜 둔 설정이 첫 생성부터 무시된다.
+      NULL 행을 건너뛰면 운영자가 실제로 값을 넣은 config 를 찾으므로
+      `_PRESERVE_RAW_COLUMNS` 승계 여부와 **무관하게** 동작한다(그 승계가 없는 main 에서도).
+    ★ 끄려면 NULL 이 아니라 **0 을 명시**해야 한다. NULL 은 "설정한 적 없음" 이다.
+    """
+    from sqlalchemy import text
+
+    try:
+        has_col = db.execute(text(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'roster_config' AND COLUMN_NAME = 'n2n_min_gap'"
+        )).first()
+        if not has_col:
+            return 0
+        row = db.execute(text(
+            "SELECT TOP 1 n2n_min_gap FROM roster_config "
+            "WHERE group_id = :g AND n2n_min_gap IS NOT NULL "
+            "ORDER BY config_id DESC"
+        ), {"g": group_id}).first()
+        return int(row[0]) if (row and row[0] is not None) else 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"[N2N-MinGap] 설정 조회 실패 — 해제로 진행: {exc}")
+        return 0
+
+
+def inherit_n2n_min_gap(db: Session, group_id: str, new_config_id) -> None:
+    """포크된 새 config 에 `n2n_min_gap` 을 승계한다(값이 비어 있을 때만).
+
+    ★ 왜 필요한가 — 생성이 config 를 포크할 때(`materialize_generation_config`) 그 INSERT 는
+      **모델 밖 컬럼을 담지 못해** 새 config 의 `n2n_min_gap` 이 NULL 이 된다.
+      조회(`_n2n_min_gap_setting`)는 `IS NOT NULL` 로 값 있는 행을 찾으므로 **설정은 유지되지만**,
+      config 가 쌓일수록 **끄기가 어려워진다** — 최신 행을 NULL 로 되돌려도 옛 행이 읽힌다.
+      승계해 두면 최신 config 에 항상 값이 있어 **그 행만 0 으로 바꾸면 꺼진다.**
+    ★ `roster_service._PRESERVE_RAW_COLUMNS` 와 같은 목적인데, 그쪽은 `roster_service.py` 가
+      main↔dev 로 크게 갈려 있어(2026-09-18 실측 1474줄) 여기서 처리한다.
+    ★ 컬럼이 없는 환경에서도 안전하도록 존재를 먼저 확인한다.
+    ★ **이미 값이 있으면 건드리지 않는다**(`AND n2n_min_gap IS NULL`) — 운영자가 새 config 에
+      직접 넣은 값을 옛 값으로 덮으면 안 된다.
+    ★★ 출처는 **baseline(포크 직전 config)** 이다 — "값이 있는 아무 config" 가 아니다.
+      운영자가 고른 baseline 을 그대로 따라야 설정 이력이 갈리지 않는다. baseline 이
+      비어 있으면 새 config 도 비는 게 맞다(그 config 에는 원래 설정이 없었다는 뜻).
+    """
+    if not new_config_id:
+        return
+    from sqlalchemy import text
+
+    try:
+        has_col = db.execute(text(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'roster_config' AND COLUMN_NAME = 'n2n_min_gap'"
+        )).first()
+        if not has_col:
+            return
+        db.execute(text(
+            "UPDATE roster_config SET n2n_min_gap = ("
+            "  SELECT TOP 1 n2n_min_gap FROM roster_config "
+            "  WHERE group_id = :g AND config_id < :n "
+            "  ORDER BY config_id DESC"
+            ") WHERE config_id = :n AND n2n_min_gap IS NULL"
+        ), {"g": group_id, "n": new_config_id})
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        # 승계 실패가 생성을 막지 않게 한다 — 조회의 `IS NOT NULL` 이 백업으로 동작한다.
+        db.rollback()
+        print(f"[N2N-MinGap] config 승계 실패(무시): {exc}")
 
 
 def _kr_holidays_in_month(year: int, month: int) -> set[int]:
@@ -3137,6 +3271,71 @@ _CHANGE_LABEL_KO = {
 }
 
 
+def assert_night_caps_within_hard_lock(config_delta: dict | None, monthly_limit_release: list | None) -> None:
+    """해결 카드가 되돌려 보낸 월 야간 값이 하드락 #6(1인 월 15회)을 넘으면 400.
+
+    ★ 카드는 서버가 만들지만 적용 요청은 클라이언트가 그 값을 **그대로 echo** 한다 — 배포 전에 만든
+      카드·조작된 요청이 15 를 넘는 값을 넣을 수 있다(OMC 리뷰 2026-10-02). 큐에 넣기 전(라우터)에
+      막는다 — 워커에서 거부하면 SQS 재시도·DLQ 로 번진다. 설정 화면 저장값은 대상이 아니다.
+    """
+    from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _hard
+
+    def _num(v) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError) as exc:   # 숫자가 아니면 500 이 아니라 400
+            raise HTTPException(status_code=400, detail=f"월 나이트 값이 숫자가 아닙니다: {v!r}") from exc
+
+    over: list[str] = []
+    for key in ("max_nig_per_month", "max_night_shifts_per_month"):
+        val = (config_delta or {}).get(key)
+        if val is not None and _num(val) > _hard:
+            over.append(f"{key}={val}")
+    for rel in monthly_limit_release or []:
+        if not isinstance(rel, dict):
+            continue
+        if rel.get("field") in ("n_exact", "n_max", "n_min") and rel.get("value") is not None and _num(rel["value"]) > _hard:
+            over.append(f"{rel.get('nurse_id')}:{rel.get('field')}={rel.get('value')}")
+    if over:
+        raise HTTPException(status_code=400, detail=f"월 나이트는 1인 최대 {_hard}회(하드락)입니다: {', '.join(over)}")
+
+
+def n_only_release_targets(db, group_id: str, year: int, month: int, monthly_limit_release: list | None) -> set[str]:
+    """해결 카드의 월 야간 한도 변경(`monthly_limit_release`) 대상 중 **그 달 N전담**인 간호사.
+
+    ★ 카드 생성은 N전담을 뺀다(96e4f86) — 하지만 적용 요청은 클라이언트가 카드 값을 echo 하므로,
+      일반 근무자일 때 받은 카드를 그 사람이 N전담이 된 뒤 다시 보내면 N전담 고정 횟수(n_exact)가
+      지워지고 즉시 커밋됐다(Codex 커밋 큐 3회차 HIGH). 판정은 카드 생성과 같은 `is_n_only_profile` 이되
+      **그 달 기준** 근무형태(`group_members_in_month` 의 as_of — 파견 온 사람은 파견지 근무형태)로 본다.
+    """
+    from services.assignment_service import group_members_in_month
+    from services.cp_sat.allowed_shift_types import is_n_only_profile
+
+    want = {str(r.get("nurse_id")) for r in (monthly_limit_release or [])
+            if isinstance(r, dict) and r.get("nurse_id") and r.get("field") in ("n_exact", "n_max", "n_min")}
+    if not want or not group_id:
+        return set()
+    # ★ use_mid 는 **설정과 무관하게 False 로** 본다 — MID 를 빼고 N 만 남으면 N전담. 생성이 쓰는 설정
+    #   (요청 config_id·모달 config·config_override)과 최신 설정이 달라 [N,M] 같은 프로필을 서로 다르게
+    #   판정하면 보호를 비켜 갔다(Codex 커밋 큐 4회차 HIGH). use_mid=True 에서 N전담이면 False 에서도
+    #   N전담이라 이쪽이 항상 넓다. 대가: MID 쓰는 병동의 N+M 근무자 카드도 막힌다(드물고 하드락 쪽이 안전).
+    use_mid = False
+    profile = {str(m["nurse_id"]): m.get("as_of_allowed_shifts")
+               for m in group_members_in_month(db, group_id, int(year), int(month))["members"]
+               if str(m["nurse_id"]) in want}
+    for nid, raw in db.query(Nurse.nurse_id, Nurse.allowed_shifts).filter(
+            Nurse.nurse_id.in_(list(want - set(profile)))).all():
+        profile[str(nid)] = raw   # 그 달 명단에 없으면 지금 프로필로
+    return {nid for nid, raw in profile.items() if is_n_only_profile(raw, use_mid=use_mid)}
+
+
+def assert_release_not_n_only(db, group_id: str, year: int, month: int, monthly_limit_release: list | None) -> None:
+    """N전담의 월 야간 한도를 바꾸려는 해결 카드 적용은 큐에 넣기 전에 400(N전담 횟수는 하드락·계약 값)."""
+    bad = n_only_release_targets(db, group_id, year, month, monthly_limit_release)
+    if bad:
+        raise HTTPException(status_code=400, detail=f"N전담 간호사의 월 나이트 횟수는 해결 카드로 바꿀 수 없습니다: {sorted(bad)}")
+
+
 def _mk_change(nurse_id, attr, frm, to):
     """resolution_options.changes[*] 항목. 프론트가 label_ko/config_key 로 라벨을 렌더하므로
     (attr 만 주면 'undefined 표시') 둘을 함께 채운다.
@@ -3185,6 +3384,55 @@ def _priority_families_from_presolve(presolve_diag) -> list:
     return out
 
 
+def build_team_min_by_team(
+    team_rows,
+    member_team_ids: set[str],
+    use_mid: bool,
+) -> dict[str, dict[str, int]]:
+    """팀별 최소 인원(`team_min_by_team`)을 구성한다.
+
+    ★★ **생성과 precheck 가 같은 함수를 써야 한다.** 예전엔 두 곳이 따로 만들었고, 생성만
+      `teams.min_shift` 를 읽고 precheck 는 디폴트(D:1, E:1)만 넣었다. 그래서 저장값이
+      더 엄격하면(예: N:1) precheck 를 통과하고 솔버에서 실패했고, 반대로 D 를 0 으로 둔
+      팀은 **없는 제약으로 precheck 가 요청을 막았다.** 진단 차이가 아니라 정상 생성이
+      차단되거나 성공을 잘못 예고하는 문제다.
+
+    규칙:
+      - `teams.min_shift` 가 저장돼 있으면 **그 값이 우선**이다.
+      - 미설정 팀만 디폴트(D:1, E:1, N:0[, use_mid 면 M:0])로 채운다.
+      - 0 은 무제약이라 제외한다 — 디폴트의 실효 제약은 팀별 D≥1·E≥1 이다.
+      - **멤버가 배정된 팀에만** 적용한다. 인원 0 팀에 넣으면 precheck 가
+        TEAM_SIZE_INSUFFICIENT 로 오블로킹한다.
+
+    Args:
+        team_rows: 활성 Team ORM 행.
+        member_team_ids: 실제 간호사가 배정된 team_id 문자열 집합.
+        use_mid: MID 근무코드 사용 여부.
+    """
+    default_min: dict[str, int] = {"D": 1, "E": 1, "N": 0}
+    if use_mid:
+        default_min["M"] = 0
+
+    result: dict[str, dict[str, int]] = {}
+    for t in team_rows:
+        tid = str(t.team_id)
+        if tid not in member_team_ids:
+            continue
+        raw = t.min_shift if isinstance(t.min_shift, dict) else None
+        src = raw if raw else default_min
+        cleaned: dict[str, int] = {}
+        for k, v in src.items():
+            try:
+                iv = int(v or 0)
+            except (TypeError, ValueError):
+                continue
+            if iv > 0:
+                cleaned[k] = iv
+        if cleaned:
+            result[tid] = cleaned
+    return result
+
+
 def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, latest_config, req, shift_manage_data, fixed_cells=None, time_limit_seconds=60, config_override: dict | None = None, _assignments=None, _inbound_assignments=None, _outbound_assignments=None, weekend_off_override: dict | None = None):
     """cp_sat_basic 엔진 호출을 표준화한다."""
     cp_sat_result = None
@@ -3229,33 +3477,33 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                 )
                 .all()
             )
-            team_min_by_team: dict[str, dict[str, int]] = {}
             team_handoff_policy_by_team: dict[str, dict] = {}
-            # teams.min_shift 는 현재 저장 수단/디폴트가 없어 보지 않는다. 존재하는 활성 팀마다
-            # 디폴트 최소인원(D:1, E:1, N:0[, use_mid면 M:0])을 적용한다. 0(=무제약)은 제외하므로
-            # 실효 제약은 팀별 D≥1·E≥1. (N/M 은 최소 0 = 제약 없음.)
-            _use_mid = bool(config_dict.get("use_mid", False))
-            _default_team_min: dict[str, int] = {"D": 1, "E": 1, "N": 0}
-            if _use_mid:
-                _default_team_min["M"] = 0
             # 멤버가 배정된 팀에만 team_min 적용 — 솔버(team_members)·precheck(members_by_team)와
-            # 동일 기준. 인원 0 팀에 디폴트를 넣으면 precheck 가 TEAM_SIZE_INSUFFICIENT 로 오블로킹.
+            # 동일 기준. 구성 규칙은 build_team_min_by_team 에 한 곳으로 모여 있다(precheck 와 공유).
             _member_team_ids = {
                 str(getattr(n, "team_id", None))
                 for n in nurses_in_group
                 if getattr(n, "team_id", None) not in (None, "", 0)
             }
+            # ★★ 런타임에서 이미 들어온 값(치료·config_override)이 있으면 **그것이 이긴다.**
+            #   예전엔 조건 없이 `teams.min_shift` 로 다시 만들어 덮어썼다. precheck 는
+            #   반대로 값이 있으면 그대로 썼기 때문에, 팀 최소인원을 완화한 override 가
+            #   **precheck 는 통과하고 솔버 직전에 버려져** 사전검증과 실제 생성이 또 갈렸다.
+            #   (override 를 넣어도 안 먹는다는 뜻이기도 하다.)
+            #   두 경로 모두 "없을 때만 저장값으로 구성" 으로 맞춘다.
+            if "team_min_by_team" not in config_dict:
+                team_min_by_team = build_team_min_by_team(
+                    team_rows,
+                    _member_team_ids,
+                    bool(config_dict.get("use_mid", False)),
+                )
+                if team_min_by_team:
+                    config_dict["team_min_by_team"] = team_min_by_team
             for t in team_rows:
                 _tid = str(t.team_id)
-                if _tid in _member_team_ids:
-                    cleaned = {k: v for k, v in _default_team_min.items() if v > 0}
-                    if cleaned:
-                        team_min_by_team[_tid] = cleaned
                 hp = t.handoff_policy if isinstance(t.handoff_policy, dict) else None
                 if hp and isinstance(hp.get("restrictions"), list) and hp["restrictions"]:
                     team_handoff_policy_by_team[_tid] = hp
-            if team_min_by_team:
-                config_dict["team_min_by_team"] = team_min_by_team
             if team_handoff_policy_by_team:
                 config_dict["team_handoff_policy_by_team"] = team_handoff_policy_by_team
         except Exception as e:
@@ -3540,6 +3788,46 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     return cp_sat_result, {}, None
 
 
+def _enqueue_assignment_created_push(db: Session, req, current_user, assignments, nurses_in_group) -> None:
+    """파견·병동이동 대상자에게 '근무표 생성' 알림(S09)을 발송 대기열에 넣는다. **커밋은 호출부**.
+
+    알림 준비가 실패해도 근무표 저장은 막지 않는다.
+    ★ 준비용 조회(병동 이름·간호사 이름)는 **별도 읽기 세션**에서 한다. 업무 세션에서 조회하다
+      DB 오류(시간 초과·교착)가 나면 세션이 실패 상태가 되어, 예외를 삼켜도 뒤이은 근무표 저장
+      commit 이 함께 실패한다(Codex 2026-10-02). 업무 세션에는 대기열 행 추가(`db.add`)만 한다.
+    ★ 저장 **전**에 부르므로 `nurses_in_group` 에 파견 들어온 간호사가 아직 없다(저장 뒤에 붙인다).
+      거기서 못 찾은 이름은 간호사 테이블에서 직접 읽는다 — 안 그러면 알림에 사번이 찍힌다.
+    """
+    try:
+        from db.client2 import SessionLocal
+        from services.assignment_service import _get_group_name
+        from utils.utils import send_assignment_roster_created_push
+        nurse_ids = {
+            str(a.nurse_id) for a in assignments
+            if a.reason in ("파견", "병동이동") and a.status != "cancelled"
+        }
+        if not nurse_ids:
+            return
+        names_by_id = {str(n.nurse_id): n.name for n in nurses_in_group}
+        ordered = [str(n.nurse_id) for n in nurses_in_group if str(n.nurse_id) in nurse_ids]
+        rest = sorted(nurse_ids - set(ordered))
+        with SessionLocal() as read_db:
+            group_name = _get_group_name(read_db, current_user.group_id) or str(current_user.group_id)
+            if rest:
+                names_by_id.update({
+                    str(nid): name
+                    for nid, name in read_db.query(Nurse.nurse_id, Nurse.name).filter(Nurse.nurse_id.in_(rest))
+                })
+        names = [names_by_id.get(nid) or nid for nid in ordered + rest]
+        send_assignment_roster_created_push(
+            nurse_name=", ".join(names), group_name=group_name, year=req.year, month=req.month,
+            recipients=list(nurse_ids), office_code=current_user.office_id,
+            sender_emp_seq_no=current_user.nurse_id, sender_member_id=current_user.account_id, db=db,
+        )
+    except Exception as e:
+        print(f"[RosterCreate] assignment 생성 알림 준비 실패: {e}")
+
+
 def _persist_entries(db: Session, schedule, generated, req):
     """생성된 근무표를 ScheduleEntry로 저장한다."""
     db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule.schedule_id).delete()
@@ -3547,9 +3835,18 @@ def _persist_entries(db: Session, schedule, generated, req):
     shifts_db = (
         db.query(Shift)
         .filter(Shift.group_id == schedule.group_id, Shift.office_id == schedule.office_id)
+        # ★ 같은 병동에 같은 `shift_id` 가 여러 행일 수 있다(실측: 운영 9개 병동 75조합).
+        #   `shifts` 에 UNIQUE 제약이 아직 없어 개명·일괄업로드로 중복이 만들어졌다.
+        #   정렬 없이 dict 로 접으면 **DB 가 돌려주는 마지막 행**이 이겨서, 근무코드 화면이
+        #   보여 주는 행(sequence 순 첫 행)과 근무표 셀이 가리키는 행이 갈렸다
+        #   — 사용자에겐 "코드를 고쳤는데 근무표에 반영이 안 된다" 로 보인다.
+        #   화면과 같은 순서로 정렬하고 아래에서 **첫 행이 이기게** 한다.
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
         .all()
     )
-    shift_id_to_int_id = {s.shift_id: s.id for s in shifts_db}
+    shift_id_to_int_id: dict[str, int] = {}
+    for s in shifts_db:
+        shift_id_to_int_id.setdefault(s.shift_id, s.id)
     weekend_off_nurse_ids: set[str] = set()
     try:
         # 주말휴무 SSOT = nurse_weekendoff_period (as-of month). 컬럼 미의존.
@@ -3649,12 +3946,21 @@ def _copy_transferred_entries(
         # source shift → default_shift → target shift_id 매핑
         src_shifts = db.query(Shift).filter(Shift.group_id == src_gid).all()
         src_to_default = {s.shift_id: s.default_shift for s in src_shifts if s.default_shift}
-        tgt_shifts = db.query(Shift).filter(Shift.group_id == group_id).all()
+        # ★ 중복 shift_id 대비 — _persist_entries 와 **같은 순서**로 정렬해 같은 행을 고른다.
+        #   여기만 다른 행을 고르면 파견/병동이동 전달분만 다른 코드 행을 가리킨다.
+        tgt_shifts = (
+            db.query(Shift)
+            .filter(Shift.group_id == group_id)
+            .order_by(Shift.sequence.asc(), Shift.id.asc())
+            .all()
+        )
         default_to_tgt = {}
         for s in tgt_shifts:
             if s.default_shift and s.default_shift not in default_to_tgt:
                 default_to_tgt[s.default_shift] = s.shift_id
-        tgt_shift_id_to_int = {s.shift_id: s.id for s in tgt_shifts}
+        tgt_shift_id_to_int: dict[str, int] = {}
+        for s in tgt_shifts:
+            tgt_shift_id_to_int.setdefault(s.shift_id, s.id)
 
         # 전달 기간
         a_end = a.end_date or a.expected_end_date or month_end
@@ -4912,11 +5218,17 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         from db.models import NurseMonthlyLimit as _NML
         _gid = str(current_user.group_id)
         _applied = []
+        # ★ 쓰기 직전에 다시 본다 — 큐 대기 중 N전담으로 바뀐 사람의 고정 횟수를 지우지 않게. 워커에서 예외를
+        #   내면 SQS 재시도로 번지므로 거부는 라우터(`assert_release_not_n_only`)가 하고 여기선 건너뛴다.
+        _n_only = n_only_release_targets(db, _gid, int(req.year), int(req.month), _mlr)
         for _rel in _mlr:
             _rnid = str(_rel.get("nurse_id") or "")
             _rfld = _rel.get("field")
             _rval = _rel.get("value")
             if not _rnid or _rfld not in ("n_exact", "n_max") or _rval is None:
+                continue
+            if _rnid in _n_only:
+                print(f"[RosterGenerate] N전담 월 야간 한도는 해결 카드로 바꾸지 않음 — 건너뜀: {_rnid}:{_rfld}={_rval}")
                 continue
             _row = (
                 db.query(_NML)
@@ -4997,6 +5309,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             override_group_id=current_user.group_id,
         )
         req.config_id = _mat.config_id
+        # 포크된 새 config 에 모델 밖 컬럼을 baseline 에서 승계한다. 안 하면 값이 NULL 로
+        #   들어가 config 가 쌓일수록 **끄기가 어려워진다**(옛 행이 계속 읽힌다).
+        inherit_n2n_min_gap(db, current_user.group_id, _mat.config_id)
         req.config = None
     wanted = (
         db.query(Wanted)
@@ -5394,6 +5709,10 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     # 일자별 요구치 우선 적용
     config_dict['daily_shift_requirements_by_day'] = daily_shift_requirements_by_day
     config_dict['daily_shift_requirements_max_by_day'] = daily_shift_requirements_max_by_day
+    # N 블록 간 최소 간격 하드 — 모델 밖 컬럼이라 raw SQL 로 읽어 주입한다.
+    #   컬럼이 없는 환경에서는 0(해제)이라 동작 불변. `config_override` 가 아래에서 덮으므로
+    #   A/B·완화 재시도가 이 값을 이긴다(4차 완화가 0 으로 내려 재생성하는 경로).
+    config_dict["n2n_min_gap"] = _n2n_min_gap_setting(db, current_user.group_id)
     # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
     if getattr(req, "not_one_night", None) is not None:
         config_dict["not_one_night"] = bool(req.not_one_night)
@@ -6191,25 +6510,20 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                         )
                         .all()
                     )
-                    _team_min_by_team: dict[str, dict[str, int]] = {}
-                    # teams.min_shift 미사용 — 활성 팀 중 '멤버가 배정된 팀'에만 디폴트 최소
-                    # (D:1, E:1, N:0[, use_mid면 M:0]). 인원 0 팀은 솔버가 무시하므로 team_min 에서도
-                    # 제외(안 그러면 TEAM_SIZE_INSUFFICIENT 로 오블로킹). 멤버십은 솔버와 동일 기준.
-                    _use_mid = bool(precheck_config.get("use_mid", False))
-                    _default_tm: dict[str, int] = {"D": 1, "E": 1, "N": 0}
-                    if _use_mid:
-                        _default_tm["M"] = 0
+                    # ★ 생성 경로와 **같은 함수**를 쓴다. 예전엔 여기만 `teams.min_shift` 를
+                    #   무시하고 디폴트만 넣어서, 사전검증과 실제 생성이 서로 다른 제약을
+                    #   검사했다(저장값이 엄하면 통과 후 솔버 실패, D 를 0 으로 둔 팀이면
+                    #   없는 제약으로 오블로킹).
                     _member_team_ids = {
                         str(_n.get("team_id"))
                         for _n in _nurses_dict_for_precheck
                         if _n.get("team_id") not in (None, "", 0)
                     }
-                    for _t in _team_rows:
-                        if str(_t.team_id) not in _member_team_ids:
-                            continue
-                        _cleaned = {k: v for k, v in _default_tm.items() if v > 0}
-                        if _cleaned:
-                            _team_min_by_team[str(_t.team_id)] = _cleaned
+                    _team_min_by_team = build_team_min_by_team(
+                        _team_rows,
+                        _member_team_ids,
+                        bool(precheck_config.get("use_mid", False)),
+                    )
                     if _team_min_by_team:
                         precheck_config["team_min_by_team"] = _team_min_by_team
                 except Exception as _team_exc:
@@ -6331,7 +6645,119 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             print(f"[Precheck] 실행 실패(무시하고 솔버 진행): {_pre_exc}")
             precheck_result = None
 
+    # ── 고정근무자 몫을 커버리지 요구에서 뺀다 ────────────────────────────────
+    # ★★ 고정근무자(`fixed_shift`)는 `_split_fixed_nurses` 로 갈려 **솔버를 타지 않고**
+    #   나중에 `fixed_roster` 로 병합된다. 그래서 솔버의 커버리지 식은 이들을 못 본다.
+    #   요구 D=4 인 날 솔버가 4명을 채우고 거기에 고정근무자 1명이 얹혀 **5명**이 됐다
+    #   (성남ICU-RN 2026-10 실측: 평일 11일 전부 정확히 +1 · E/N 은 0건 —
+    #    고정 코드가 D 뿐이라 D 에만 생겼다).
+    #   ★ `off_first` 와 무관한 결함이다. `off_first=True` 의 `assigned <= need` 하드는
+    #     정상 작동하고 있었고, **그 상한이 보는 세계 밖에서** 1명이 더해진 것이다.
+    #     `off_first=False` 일 때도 같은 +1 이 얹히지만 그쪽은 초과가 soft 라 덜 보였다.
+    # 일자별로 빼야 한다 — 고정근무자는 평일만 근무하고 주말·공휴일은 OFF 다.
+    if fixed_nurses and nurses_for_engine:
+        try:
+            _fx_roster_pre = _build_fixed_shift_roster(
+                fixed_nurses,
+                req.year,
+                req.month,
+                weekday_off_code="O",
+                sunday_code="주",
+                holiday_off=_holiday_off_enabled(db, current_user.group_id),
+                shift_lookup=_load_shift_lookup(
+                    db, current_user.office_id, current_user.group_id
+                ),
+                weekly_off_active=bool(
+                    config_dict.get("weekly_off_settings_activate", False)
+                ),
+            )
+            # ★★ 오버레이까지 적용한 **최종본**으로 차감해야 한다. `_build_fixed_shift_roster`
+            #   는 평일을 기계적으로 fixed_shift 로 채우는데, 그 뒤 확정 원티드·특수요청이
+            #   덮어써서 실제 근무일이 줄어든다(실측: 평일 22일 중 D 는 11일뿐 —
+            #   나머지는 CO·O·연). 기계적 결과로 빼면 그 차이만큼 **과다 차감**되어
+            #   이번엔 반대로 인원 부족이 난다(부족 11건 = 차이 11일과 정확히 일치했다).
+            _fx_roster_pre = _overlay_fixed_roster_with_fixed_wanted(
+                db, _fx_roster_pre, current_user.group_id, req.year, req.month,
+            )
+            _fx_roster_pre = _overlay_fixed_roster_with_special_requests(
+                fixed_roster=_fx_roster_pre,
+                requests=fixed_special_shift_requests,
+                year=req.year,
+                month=req.month,
+            )
+            _days_in_month = calendar.monthrange(req.year, req.month)[1]
+            _base_req = dict(config_dict.get("daily_shift_requirements") or {}) or {
+                "D": int(config_dict.get("day_req") or 0),
+                "E": int(config_dict.get("eve_req") or 0),
+                "N": int(config_dict.get("nig_req") or 0),
+            }
+            _by_day = config_dict.get("daily_shift_requirements_by_day")
+            if not (isinstance(_by_day, list) and len(_by_day) == _days_in_month):
+                _by_day = [dict(_base_req) for _ in range(_days_in_month)]
+            else:
+                _by_day = [dict(dm or {}) for dm in _by_day]
+            # ★★ max(상한) 맵도 같이 내려야 한다. min 만 빼면 솔버는 [min-1, max] 창을
+            #   보게 되고, 상한까지 채운 날에 고정근무자가 얹혀 **설정 max 를 초과**한다.
+            #   실측 성남ICU-RN 2026-10 VER37(min 4/4/4 · max 5/5/5): 6일 D 솔버 5 +
+            #   김은경(고정 D) 1 = 6 > max 5. 초과 1칸이 정확히 이 경로로 났다.
+            _by_day_max = config_dict.get("daily_shift_requirements_max_by_day")
+            _has_max = isinstance(_by_day_max, list) and len(_by_day_max) == _days_in_month
+            _max_active: list[set] = []
+            if _has_max:
+                _by_day_max = [dict(dm or {}) for dm in _by_day_max]
+                # 원래 상한이 걸려 있던 (일, 코드). 엔진은 max 0 을 '상한 없음' 으로 읽으므로
+                # 차감으로 0 이 된 칸을 그냥 두면 상한이 통째로 사라진다. 아래에서 되살핀다.
+                _max_active = [
+                    {_k for _k, _v in dm.items() if int(_v or 0) > 0}
+                    for dm in _by_day_max
+                ]
+            _fx_cut = 0
+            _fx_cut_max = 0
+            for _codes in _fx_roster_pre.values():
+                for _d, _code in enumerate(_codes or []):
+                    if _d >= _days_in_month:
+                        break
+                    _c = str(_code or "").strip().upper()
+                    if _c in _by_day[_d] and int(_by_day[_d][_c] or 0) > 0:
+                        _by_day[_d][_c] = int(_by_day[_d][_c]) - 1
+                        _fx_cut += 1
+                    # max 는 0 = 상한 없음 이므로 양수일 때만 내린다.
+                    if _has_max and int(_by_day_max[_d].get(_c) or 0) > 0:
+                        _by_day_max[_d][_c] = int(_by_day_max[_d][_c]) - 1
+                        _fx_cut_max += 1
+            if _fx_cut:
+                config_dict["daily_shift_requirements_by_day"] = _by_day
+            if _fx_cut_max:
+                # ★ 차감 결과 max 가 0 이 된 칸의 처리.
+                #   · min 도 같이 0 이면 그대로 둔다 — 엔진이 `req_raw == 0` 을 보고
+                #     `m.Add(assigned == 0)` 하드로 막는다(fallback_lex.py:1835
+                #     zero_demand_block_codes). 상한이 새지 않는다.
+                #   · min 이 남아 있는데 max 만 0 이 된 칸은 원설정이 max < min 인 모순이다.
+                #     0 을 그대로 두면 엔진이 '상한 없음' 으로 읽어 초과가 다시 샌다.
+                #     min 까지 되올려 max == min 으로 닫는다.
+                _raised = 0
+                for _d in range(_days_in_month):
+                    for _c in _max_active[_d]:
+                        _mn = int(_by_day[_d].get(_c) or 0)
+                        if int(_by_day_max[_d].get(_c) or 0) < _mn:
+                            _by_day_max[_d][_c] = _mn
+                            _raised += 1
+                config_dict["daily_shift_requirements_max_by_day"] = _by_day_max
+                if _raised:
+                    print(f"[FixedShiftCoverage] max < min 이 된 {_raised}칸을 min 으로 되올림 "
+                          f"(원설정이 max < min 인 칸)")
+            if _fx_cut or _fx_cut_max:
+                print(f"[FixedShiftCoverage] 고정근무자 {len(fixed_nurses)}명 · "
+                      f"요구 차감 min {_fx_cut}셀 / max {_fx_cut_max}셀 — 솔버는 남은 인원만 채운다")
+        except Exception as _fx_exc:
+            # 차감 실패는 생성을 막지 않는다(기존 동작으로 진행). 다만 초과가 남을 수 있다.
+            print(f"[FixedShiftCoverage] 차감 실패(무시): {type(_fx_exc).__name__}: {_fx_exc}")
+
+    # UNDIAGNOSED 탐색 기준의 대체값(첫 시도 스냅샷이 없을 때). 아래 완화 사다리가 config_dict 의
+    # 최상위 키를 누적 갱신(same_shift·isolated_work·n2n_min_gap)하므로 첫 시도 직전 값을 떠 둔다.
+    _first_attempt_cfg: dict | None = None
     if nurses_for_engine:
+        _first_attempt_cfg = {k: v for k, v in config_dict.items() if not str(k).startswith("_sa_")}
         # _debug_log(
         #     "cp_sat_start",
         #     {
@@ -6447,7 +6873,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         # 자연 soft 트리거: 엔진이 실근무를 못 배정한 infeasible-empty 신호(실제 플래그)
         # 를 본다. 과거처럼 휴리스틱이 만든 NO_ASSIGNMENT/grade_max 문자열을 매칭하지 않음.
         _trigger_soft = bool(getattr(roster_system, "_infeasible_empty", False))
-        if _trigger_soft and not bool(config_dict.get("_team_min_soft_retry_attempted")):
+
+        # ── 1차 완화: team_min hard → soft (기존) ────────────────────────────
+        if validation_error and _trigger_soft and not bool(config_dict.get("_team_min_soft_retry_attempted")):
             print("[TeamMinFallback] infeasible 감지 → team_min hard→soft 자동 전환으로 1회 재시도 (grade hard 유지)")
             soft_cfg = dict(config_dict)
             soft_cfg["team_min_soft_fallback"] = True
@@ -6539,14 +6967,238 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 print(f"[TeamMinFallback][AUTO-SOFT][fail] 재시도 실패: {retry_validation_error}")
                 validation_error = retry_validation_error
 
+        # ── 2차 완화: same_shift hard → soft ──────────────────────────────────
+        # ★★ 순서 주의 — **team_min 을 먼저 푼다.** 처음엔 "나중에 얹은 제약부터" 라는
+        #   생각으로 same_shift 를 앞에 뒀는데 실측에서 뒤집혔다: 이 병동의 INFEASIBLE
+        #   원인은 team_min(1/1/1) 이라 same_shift 만 풀면 **1차가 실패**하고, 결국
+        #   team_min 까지 풀리면서 **지킬 수 있었던 same_shift 하드까지 잃었다**
+        #   (같은시프트 4연속 0~1건 → 7건). 원인 아닌 제약을 먼저 풀면 손해만 본다.
+        # 전환 방식: `same_shift_hard_k` 를 0 으로 내린다 → 하드가 사라지고
+        #   기존 `max_same_shift` soft 벌점(D/E/N 4연속 창)이 그대로 이어받는다.
+        #   별도 slack 을 만들지 않는 이유는 그 soft 인프라가 이미 있기 때문이다.
+        # ★ 기본값(3)을 함께 본다 — `same_shift_hard_k` 는 **DB 컬럼이 아니라서**
+        #   `config_dict`(= latest_config.__dict__) 에 키 자체가 없다. 기본값을 빼고
+        #   `.get(...) or 0` 로만 보면 **항상 False** 가 되어 이 완화가 죽는다(실측).
+        _ss_hard_on = int(config_dict.get("same_shift_hard_k", 3) or 0) > 0
+        # ★ `validation_error` 필수 — 1차(team_min)로 이미 살아났으면 여기 들어오면 안 된다.
+        #   빠뜨리면 성공한 해를 버리고 same_shift 까지 푼 해로 덮어쓴다.
+        if (validation_error and _trigger_soft and _ss_hard_on
+                and not bool(config_dict.get("_same_shift_soft_retry_attempted"))):
+            print("[SameShiftFallback] infeasible 감지 → same_shift hard→soft 자동 전환으로 1회 재시도 "
+                  "(team_min·grade hard 유지)")
+            _ss_cfg = dict(config_dict)
+            _ss_cfg["same_shift_hard_k"] = 0
+            _ss_cfg["_same_shift_soft_retry_attempted"] = True
+            try:
+                _ss_generated, _, _ss_rs = _run_cp_sat_basic(
+                    db, current_user, nurses_for_engine, preferences, latest_config, req,
+                    shift_manage_data,
+                    fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                    time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
+                    config_override=_ss_cfg,
+                    _assignments=_assignments,
+                    _inbound_assignments=_inbound_assignments,
+                    _outbound_assignments=_outbound_assignments,
+                )
+                if isinstance(_ss_generated, dict):
+                    _ss_generated.update(fixed_roster)
+                else:
+                    _ss_generated = fixed_roster
+                if _alloff_roster:
+                    if isinstance(_ss_generated, dict):
+                        _ss_generated.update(_alloff_roster)
+                    else:
+                        _ss_generated = dict(_alloff_roster)
+                _ss_err = _validate_generated_roster(
+                    _ss_generated, _ss_rs,
+                    nurses_context=list(nurses_for_engine or []),
+                    config_context=_ss_cfg,
+                    grade_config_context=_fetch_grade_config_dict(
+                        db, current_user.office_id, current_user.group_id),
+                )
+            except Exception as _ss_e:
+                _ss_err = f"same_shift soft 재시도 예외: {type(_ss_e).__name__}: {_ss_e}"
+                _ss_generated = _ss_rs = None
+            if not _ss_err:
+                generated = _ss_generated
+                roster_system = _ss_rs
+                applied_relaxations.append("same_shift_hard_to_soft")
+                if _ctx is not None:
+                    _ctx["relaxed"] = True
+                weekly_off_warnings.append({
+                    "type": "same_shift_hard_to_soft_applied",
+                    "detail": ("같은 시프트 연속 하드 제한이 infeasible 로 자동 soft 전환되어 재생성됐습니다. "
+                               "일부 간호사에게 같은 시프트가 4회 이상 연속될 수 있습니다."),
+                })
+                print("[SameShiftFallback][AUTO-SOFT][success] same_shift hard→soft 자동 전환으로 근무표 생성. "
+                      "applied_relaxations=['same_shift_hard_to_soft']")
+                validation_error = None
+            else:
+                # 실패 → 이후 완화 단계가 **same_shift soft 를 물고** 가도록 남긴다.
+                print(f"[SameShiftFallback][AUTO-SOFT][fail] 재시도 실패: {_ss_err}")
+                config_dict["same_shift_hard_k"] = 0
+                config_dict["_same_shift_soft_retry_attempted"] = True
+
+        # ── 3차 완화: isolated_work hard → soft ───────────────────────────────
+        # 전환 방식: `isolated_work_hard` 를 False 로 내린다 → 하드가 사라지고 기존
+        #   `ISOLATED_WORK_PENALTY`(1500) soft 벌점이 그대로 이어받는다.
+        # ★ 앞 단계(team_min·same_shift)가 풀린 상태를 **물고** 간다 — config_dict 가
+        #   누적 갱신되므로 여기까지 왔다는 건 그것들로도 안 풀렸다는 뜻이다.
+        _iw_hard_on = bool(config_dict.get("isolated_work_hard", True))
+        if (validation_error and _trigger_soft and _iw_hard_on
+                and not bool(config_dict.get("_isolated_work_soft_retry_attempted"))):
+            print("[IsolatedWorkFallback] infeasible 감지 → isolated_work hard→soft 자동 전환으로 "
+                  "1회 재시도")
+            _iw_cfg = dict(config_dict)
+            _iw_cfg["isolated_work_hard"] = False
+            _iw_cfg["_isolated_work_soft_retry_attempted"] = True
+            try:
+                _iw_generated, _, _iw_rs = _run_cp_sat_basic(
+                    db, current_user, nurses_for_engine, preferences, latest_config, req,
+                    shift_manage_data,
+                    fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                    time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
+                    config_override=_iw_cfg,
+                    _assignments=_assignments,
+                    _inbound_assignments=_inbound_assignments,
+                    _outbound_assignments=_outbound_assignments,
+                )
+                if isinstance(_iw_generated, dict):
+                    _iw_generated.update(fixed_roster)
+                else:
+                    _iw_generated = fixed_roster
+                if _alloff_roster:
+                    if isinstance(_iw_generated, dict):
+                        _iw_generated.update(_alloff_roster)
+                    else:
+                        _iw_generated = dict(_alloff_roster)
+                _iw_err = _validate_generated_roster(
+                    _iw_generated, _iw_rs,
+                    nurses_context=list(nurses_for_engine or []),
+                    config_context=_iw_cfg,
+                    grade_config_context=_fetch_grade_config_dict(
+                        db, current_user.office_id, current_user.group_id),
+                )
+            except Exception as _iw_exc:
+                _iw_err = f"isolated_work soft 재시도 예외: {type(_iw_exc).__name__}: {_iw_exc}"
+                _iw_generated = _iw_rs = None
+            if not _iw_err:
+                generated = _iw_generated
+                roster_system = _iw_rs
+                applied_relaxations.append("isolated_work_hard_to_soft")
+                if _ctx is not None:
+                    _ctx["relaxed"] = True
+                weekly_off_warnings.append({
+                    "type": "isolated_work_hard_to_soft_applied",
+                    "detail": ("고립근무 금지가 infeasible 로 자동 soft 전환되어 재생성됐습니다. "
+                               "일부 간호사에게 휴무 사이 단일 근무가 생길 수 있습니다."),
+                })
+                print("[IsolatedWorkFallback][AUTO-SOFT][success] isolated_work hard→soft 자동 전환으로 "
+                      "근무표 생성. applied_relaxations=['isolated_work_hard_to_soft']")
+                validation_error = None
+            else:
+                print(f"[IsolatedWorkFallback][AUTO-SOFT][fail] 재시도 실패: {_iw_err}")
+                config_dict["isolated_work_hard"] = False
+                config_dict["_isolated_work_soft_retry_attempted"] = True
+
+    # ── 4차 완화: n2n 최소 간격 하드 해제 ─────────────────────────────────
+    # ★★ 이 블록은 아래 `if validation_error:` 사다리(team_min → same_shift →
+    #   isolated_work) **밖**에 있고, 그보다 **먼저** 돈다. 둘 다 이유가 있다.
+    #
+    #   (1) 밖에 있는 이유 — n2n 하드가 과하면 stage2 가 UNKNOWN 으로 끝나는데, 그러면
+    #     엔진이 보존해 둔 stage1 해로 복원해 **근무표는 정상 산출된다**. 즉
+    #     `validation_error` 가 None 이라 그 사다리에는 **영원히 도달하지 못한다.**
+    #     실측(2026-09-18 · `n2n_min_gap=15`): 폴백 로그 0줄 · 하드는 조용히 무시
+    #     (gap<15 위반 30건) · 게다가 lex 최적화가 통째로 무효가 되어 간격중앙이
+    #     10~11 → **7** 로 **오히려 나빠졌다**. 제약을 걸고도 품질만 잃는 최악의 조합이다.
+    #     그래서 트리거를 `_infeasible_empty` 가 아니라 `fallback_lex` 가 세우는
+    #     `roster_system._n2n_min_gap_stage2_failed` 로 잡는다.
+    #
+    #   (2) 1~3차 **뒤**에 있어야 하는 이유 — 실측(2026-09-18)에서 성남 중환자실-RN 은
+    #     **첫 생성의 stage1 이 원래 INFEASIBLE** 이라(hard·broad_soft 둘 다) 1차 완화
+    #     team_min 이 재생성을 돌린다. 하드가 실제로 stage2 에 걸리는 것은 **그 재생성**
+    #     이고, 플래그도 그때 세워진다. 1~3차 앞에 두면 아직 None 인 플래그를 읽어
+    #     영원히 발화하지 않는다(실측: DBG 421행 vs 하드 등록 676행).
+    _mg_on = int(config_dict.get("n2n_min_gap", 0) or 0)
+    _mg_failed = bool(getattr(roster_system, "_n2n_min_gap_stage2_failed", False))
+    if (_mg_failed and _mg_on >= 4
+            and not bool(config_dict.get("_n2n_min_gap_retry_attempted"))):
+        print(f"[N2NMinGapFallback] stage2 실패 감지 → n2n_min_gap {_mg_on}→0 해제로 1회 재시도")
+        _mg_cfg = dict(config_dict)
+        _mg_cfg["n2n_min_gap"] = 0
+        _mg_cfg["_n2n_min_gap_retry_attempted"] = True
+        try:
+            _mg_generated, _, _mg_rs = _run_cp_sat_basic(
+                db, current_user, nurses_for_engine, preferences, latest_config, req,
+                shift_manage_data,
+                fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
+                config_override=_mg_cfg,
+                _assignments=_assignments,
+                _inbound_assignments=_inbound_assignments,
+                _outbound_assignments=_outbound_assignments,
+            )
+            if isinstance(_mg_generated, dict):
+                _mg_generated.update(fixed_roster)
+            else:
+                _mg_generated = fixed_roster
+            if _alloff_roster:
+                if isinstance(_mg_generated, dict):
+                    _mg_generated.update(_alloff_roster)
+                else:
+                    _mg_generated = dict(_alloff_roster)
+            _mg_err = _validate_generated_roster(
+                _mg_generated, _mg_rs,
+                nurses_context=list(nurses_for_engine or []),
+                config_context=_mg_cfg,
+                grade_config_context=_fetch_grade_config_dict(
+                    db, current_user.office_id, current_user.group_id),
+            )
+        except Exception as _mg_exc:
+            _mg_err = f"n2n_min_gap 해제 재시도 예외: {type(_mg_exc).__name__}: {_mg_exc}"
+            _mg_generated = _mg_rs = None
+        if not _mg_err:
+            generated = _mg_generated
+            roster_system = _mg_rs
+            applied_relaxations.append("n2n_min_gap_released")
+            if _ctx is not None:
+                _ctx["relaxed"] = True
+            weekly_off_warnings.append({
+                "type": "n2n_min_gap_released_applied",
+                "detail": ("나이트 블록 간 최소 간격 제한이 infeasible 로 자동 해제되어 "
+                           "재생성됐습니다. 회복 휴무 직후 다시 나이트가 배정될 수 있습니다."),
+            })
+            print("[N2NMinGapFallback][AUTO-RELEASE][success] n2n_min_gap 해제로 근무표 생성. "
+                  "applied_relaxations=['n2n_min_gap_released']")
+            validation_error = None
+        else:
+            print(f"[N2NMinGapFallback][AUTO-RELEASE][fail] 재시도 실패: {_mg_err}")
+            config_dict["n2n_min_gap"] = 0
+            config_dict["_n2n_min_gap_retry_attempted"] = True
+
+
+
     if validation_error:
         print(f"[RosterGenerate][UNRECOVERABLE] {validation_error}")
         print(f"[RosterGenerate][UNRECOVERABLE] applied_relaxations={applied_relaxations}")
+        # ★★ 이 커밋이 간호사 ORM 을 **만료시키면 안 된다.** 등급·주말휴무·고정근무(월 as-of)와
+        #   팀은 `__dict__` 오버레이로만 들어가 있어(DB 컬럼은 캐시·NULL), 만료되면 아래 해결책
+        #   탐색·MUS·개별 지목 재계산이 **DB 원래 값으로** 돈다. 실측(2026-09-28 여수 6병동 dev):
+        #   첫 시도 `by_grade {1:[0..5],…}` → 탐색 `by_grade {1:[],2:[],3:[]}` 로 등급이 통째로
+        #   사라져 등급 1/1/1 하드가 무의미해지고, 무엇을 바꿔도 '풀림' → "+1 이면 된다" 헛답.
+        _eoc = db.expire_on_commit
+        db.expire_on_commit = False
+        _overlay_lost = False
         try:
             db.delete(schedule)
             db.commit()
         except Exception:
             db.rollback()
+            # rollback 은 expire_on_commit 과 무관하게 ORM 을 만료시킨다 → 오버레이 소실.
+            #   아래 재계산 진단(해결책 탐색)은 틀린 값으로 돌게 되므로 건너뛴다.
+            _overlay_lost = True
+        finally:
+            db.expire_on_commit = _eoc
         try:
             from services.precheck import build_unrecoverable_payload
             try:
@@ -6678,7 +7330,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 ]
                 _has_actionable = bool(_ui_options_pre) or bool(_ui_causes_fix)
                 _is_undiag = ("UNDIAGNOSED" in _codes_pre) or not _has_actionable
-                if _is_undiag and _os_undiag.getenv("UNDIAG_PROBE_DISABLE") != "1":
+                if _is_undiag and _overlay_lost:
+                    print("[UndiagProbe] 간호사 오버레이 소실(삭제 커밋 rollback) → 재계산 진단 생략")
+                if _is_undiag and not _overlay_lost and _os_undiag.getenv("UNDIAG_PROBE_DISABLE") != "1":
                     from services.cp_sat.undiagnosed_probe import probe_relaxations, to_resolution_options
 
                     _probe_cnt = [0]
@@ -6711,10 +7365,13 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
 
                     # probe base: solve 시점에 박아둔 유효 config 스냅샷(하드규칙+조립분 포함, 충실).
                     # 실패 시점 메모리(config_dict)는 ORM 만료·stale 라 부정확하므로 스냅샷 우선.
+                    #   ★ 스냅샷이 없을 때 지금의 config_dict 를 쓰면 안 된다 — 완화 사다리가 누적
+                    #     갱신한 값이라, 그 위에서 찾은 '해결책' 은 실제 재생성의 첫 시도와 조건이 다르다.
                     _probe_base = getattr(roster_system, "_effective_config_snapshot", None)
+                    print(f"[UndiagProbe] 기준={'첫 시도 스냅샷' if _probe_base else '첫 시도 직전 설정 사본'}")
                     if not _probe_base:
-                        _probe_base = {k: v for k, v in dict(config_dict).items()
-                                       if not str(k).startswith("_sa_")}
+                        _probe_base = _first_attempt_cfg or {
+                            k: v for k, v in dict(config_dict).items() if not str(k).startswith("_sa_")}
                     _probe_base = dict(_probe_base)
                     # 금지근무(banned)×강제OFF 개인모순 진단이 initial_constraints 를 봐야 하므로
                     # 스냅샷에 없으면 merged config 에서 승계(금지·강제OFF 합집합 맵).
@@ -6836,7 +7493,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                                 #   · fix_all_personal(월한도/주말) = 단일 통합 카드
                                 #   · banned/allowed(금지근무 모순) = 대안 2카드(HN 선택)
                                 _oid0 = _cards[0].get("option_id") or ""
-                                if _oid0 == "cause:fix_all_personal":
+                                if _oid0 in ("cause:fix_all_personal", "cause:night_only_over_hard_cap"):
+                                    # night_only_over_hard_cap(야간전담 >15 정정 안내)도 단독 — 안 그러면
+                                    # 그 위에 '상한을 올리라' 는 일반 설명카드가 함께 떠 서로 모순된다.
                                     unrecoverable["infeasibility"]["_sole_option"] = _cards[0]
                                 elif _oid0 in ("cause:banned_release", "cause:allowed_add"):
                                     unrecoverable["infeasibility"]["_sole_option"] = list(_cards)
@@ -6899,7 +7558,11 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                     except NameError:
                         _wk_flags = []
                     _wk_feasible = any(f.get("type") == "weekend_off_load" for f in _wk_flags)
-                    if _wk_feasible:
+                    # 기준 설정이 탐색 재계산에서 풀리면(실패 재현 불가) 1명씩 해제해 봐도 전부 '풀림'
+                    # 이라 지목이 무의미하다. 탐색이 시간 상한에 걸렸으면 여기서 재계산을 더 돌리면
+                    # 상한을 둔 의미가 없다(묶음 1회 + 최대 6명 × 20초). 둘 다 건너뛴다.
+                    _pn_allowed = not (_probe_res.get("baseline_feasible") or _probe_res.get("timed_out"))
+                    if _wk_feasible and _pn_allowed:
                         try:
                             from services.nurse_period_resolver import weekend_off_ids_asof as _wo_ids
                             _wk_cands = sorted(_wo_ids(
@@ -7005,12 +7668,22 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                                     _cflags = (presolve_diag or {}).get("constraint_flags") or []
                                 except NameError:
                                     _cflags = []
+                                # ★ N전담이면 야간 쪽은 **아무것도 바꾸지 않는다** — N전담 15회 고정은 하드락이다
+                                #   (2026-10-02 사용자 지적). 개인 고정을 낮추지도, 병동 상한을 올리지도 않는다. 주말
+                                #   해제만 내되, 이 probe 검증은 월 한도를 안 봐서 야간 충돌이 남을 수 있으므로
+                                #   verified=False 로 낸다(아래 else 분기).
+                                from services.cp_sat.allowed_shift_types import is_n_only_profile as _is_n_only
+                                _culprit_nu = next((n for n in (nurses_for_engine or [])
+                                                    if str(getattr(n, "nurse_id", "")) == _culprit), None)
+                                _culprit_n_only = _is_n_only(getattr(_culprit_nu, "allowed_shifts", None),
+                                                             use_mid=bool((_probe_base or {}).get("use_mid")))
                                 _nflag = next(
                                     (f for f in _cflags
                                      if str(f.get("nurse_id")) == _culprit
                                      and f.get("type") == "night_floor_over_cap"), None)
-                                if _nflag:
-                                    _mn = int(_nflag.get("max_nig") or 0)
+                                if _nflag and not _culprit_n_only:
+                                    from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _HARD_N
+                                    _mn = min(int(_nflag.get("max_nig") or 0), _HARD_N)   # 하드락 #6 안으로
                                     _nf = int(_nflag.get("n_floor") or 0)
                                     _wk_opt = {
                                         "option_id": f"release_weekend_off+lower_night:{_culprit}",
@@ -7052,6 +7725,23 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                                             "config_key": None, "target": {"nurse_id": _culprit},
                                         },
                                     }
+                                    if _nflag:   # N전담 + 야간 고정이 병동 상한을 넘는 충돌 — 야간은 하드락이라 그대로
+                                        # ★ presolve 의 n_floor > max_nig 는 **산술로 확정된 모순**이라 주말만 풀면
+                                        #   반드시 다시 실패한다. 자동 적용하면 주말휴무만 영구로 사라지므로 수동
+                                        #   안내로 내리고 자동 적용 필드를 뺀다(OMC 리뷰 2026-10-02).
+                                        _wk_opt["verified"] = False
+                                        _wk_opt.pop("weekend_off_release", None)
+                                        _wk_opt["changes"] = []          # 자동으로 바꾸는 게 없다
+                                        _wk_opt["fix"]["mode"] = "manual"
+                                        _wk_opt["fix"]["how_ko"] = (
+                                            f"근무 설정의 '한 달 밤 근무 최대 횟수'와 {_nm} 간호사의 나이트 개수를 "
+                                            f"맞춘 뒤 다시 만드세요.")
+                                        _wk_opt["title_ko"] = f"{_nm} 간호사(야간전담) 나이트 설정 확인 필요"
+                                        _wk_opt["trade_off_ko"] = (
+                                            f"{_nm} 간호사(야간전담)의 나이트 개수가 병동 월 야간 상한보다 커서 그대로는 "
+                                            f"다시 만들어도 실패합니다. 근무 설정의 '한 달 밤 근무 최대 횟수'와 근무자의 "
+                                            f"나이트 개수(야간전담 15회 고정 — 하드락)가 맞는지 먼저 확인하세요. 주말 휴무 "
+                                            f"해제는 그다음에 필요하면 하세요.")
                                 # 그룹 전체 끄는 coarse '단독' 옵션(apply 가 weekend_off_only_enable 하나뿐)만
                                 # 개인 지목으로 대체. 콤보(예: weekend_off_only_enable + max_nig 상향)는 유효한
                                 # 대안이므로 남긴다 — 그래야 "개인 낮추기 / config 상한 올리기" 두 갈래가 모두 노출.
@@ -7077,13 +7767,19 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                         o.get("verified") and (o.get("apply") or {}).get("max_nig_per_month") is not None
                         for o in _probe_opts
                     )
-                    if _nc_feasible:
+                    if _nc_feasible and _pn_allowed:
                         try:
                             _cfg_mn = int(_probe_base.get("max_nig_per_month") or 0)
                             # 후보: n_exact 또는 n_max 가 config 야간 상한보다 큰 간호사(그 값을 상한
                             # 이하로 낮추면 충돌 해소). 야간이 상한을 초과할 수 없으니 이들이 병목 후보.
+                            # ★ N전담은 후보에서 뺀다 — N전담 15회 고정은 하드락이라 해결카드가 바꾸는 대상이
+                            #   아니다(2026-10-02 사용자 지적). 낮추면 나머지가 강제 OFF 가 되어 야간 공급도 준다.
+                            from services.cp_sat.allowed_shift_types import is_n_only_profile as _is_n_only
                             _nc_cands = []
                             for _n in (nurses_for_engine or []):
+                                if _is_n_only(getattr(_n, "allowed_shifts", None),
+                                              use_mid=bool(_probe_base.get("use_mid"))):
+                                    continue
                                 for _fld in ("n_exact", "n_max"):
                                     _val = getattr(_n, _fld, None)
                                     if _val is not None and _cfg_mn and int(_val) > _cfg_mn:
@@ -7194,7 +7890,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                     _combo = _probe_res.get("combo")
                     print(f"[UndiagProbe] found={_probe_res.get('found')} "
                           f"resolutions={[r['id'] for r in _probe_res.get('resolutions', [])]} "
-                          f"combo={_combo.get('id') if _combo else None}")
+                          f"combo={_combo.get('id') if _combo else None} "
+                          f"baseline_feasible={_probe_res.get('baseline_feasible')} "
+                          f"timed_out={_probe_res.get('timed_out')} solves={_probe_cnt[0]}")
             except Exception as _undiag_exc:
                 print(f"[UndiagProbe] failed (ignore): {_undiag_exc}")
             # (ontology treatment → resolution_options 는 build_unrecoverable_payload 에서 처리됨)
@@ -7325,6 +8023,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         )
     except Exception as _oncall_exc:
         print(f"[Oncall] 후처리 실패 — 콜 미부여 진행: {_oncall_exc}")
+    # ★ S09 알림은 근무표 저장과 **같은 커밋**에 남긴다(`_persist_entries` 끝의 commit).
+    #   저장 뒤 따로 넣으면 그 사이 죽었을 때 근무표는 있는데 알림 근거가 없다(Codex 2026-10-02).
+    _enqueue_assignment_created_push(db, req, current_user, _assignments, nurses_in_group)
     _persist_entries(db, schedule, generated, req)
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──
@@ -7437,32 +8138,6 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     except Exception as _a1_exc:
         print(f"[A1Probe] failed (ignore): {_a1_exc}")
 
-    # ── assignment 대상자 근무표 생성 알림 (S09) ──
-    try:
-        from utils.utils import send_assignment_roster_created_push
-        from services.assignment_service import _get_group_name
-        _assign_nurse_ids = set()
-        for _a in _assignments:
-            if _a.reason in ("파견", "병동이동") and _a.status != "cancelled":
-                _assign_nurse_ids.add(str(_a.nurse_id))
-        if _assign_nurse_ids:
-            _gname = _get_group_name(db, current_user.group_id) or str(current_user.group_id)
-            _nurse_names = [
-                n.name for n in nurses_in_group if str(n.nurse_id) in _assign_nurse_ids
-            ] or list(_assign_nurse_ids)
-            send_assignment_roster_created_push(
-                nurse_name=", ".join(_nurse_names),
-                group_name=_gname,
-                year=req.year,
-                month=req.month,
-                recipients=list(_assign_nurse_ids),
-                office_code=current_user.office_id,
-                sender_emp_seq_no=current_user.nurse_id,
-                sender_member_id=current_user.account_id,
-            )
-    except Exception as e:
-        print(f"[RosterCreate] assignment 생성 알림 실패: {e}")
-
     # 휴가 자동 부여 요약 — 화면이 생성 결과를 검토할 수 있게 싣는다.
     #   ★ 기능이 꺼져 있거나 대상 코드가 없으면 후처리가 stats 를 안 채우므로 키 자체가
     #     없다. 프론트는 키 유무로 "이번 생성에 적용됐는가" 를 판단하면 된다.
@@ -7532,6 +8207,10 @@ def request_schedule_service(req: RosterRequest, current_user, db: Session):
         # raise Exception("설정값을 입력해주세요")
     if not latest_config or latest_config == None:
         return "noConfigId"
+    # ★ 번호를 읽기 전에 그룹·달 잠금 — 새 버전 저장·복사와 동시에 같은 VER 를 만들지 않게.
+    #   생성 작업은 30초까지 기다린다(409 면 워커가 실패 알림·재시도로 번진다).
+    from services.schedule_versioning import lock_version_numbering
+    lock_version_numbering(db, current_user.group_id, req.year, req.month, timeout_ms=30000)
     latest_version = db.query(func.max(Schedule.version)).filter(
         Schedule.group_id == current_user.group_id,
         Schedule.year == req.year,

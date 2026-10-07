@@ -15,17 +15,33 @@ UNDIAGNOSED(원인 미식별)가 난다. 이 모듈은 assumption 의존 없이 
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Callable
 
+from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH
 from services.cp_sat.fix_location import attach_fix_to_options
+
+
+def _raise_night_cap_delta(c: dict[str, Any]) -> dict[str, Any]:
+    """월 야간 상한 완화 delta — 하드락 #6(15) 안에서만. 올릴 여지가 없으면 빈 delta(=건너뜀).
+
+    ★ 0 이하는 '미설정'이라 엔진이 15 로 본다 → 올릴 게 없다(예전엔 0+8=8 로 오히려 조였다).
+      15 이상이면 '완화' 가 아니라 하향이 되므로 내지 않는다(OMC 리뷰 2026-10-02).
+    """
+    cur = int(c.get("max_nig_per_month") or 0)
+    if cur <= 0 or cur >= HARD_MAX_NIGHTS_PER_MONTH:
+        return {}
+    return {"max_nig_per_month": min(cur + 8, HARD_MAX_NIGHTS_PER_MONTH)}
 
 
 # 결합제약 완화 카탈로그. apply(cfg)->delta(config_dict 키 기준, DB 컬럼명).
 # label_ko 는 사용자 노출용, family 는 그룹핑용. 침습도 낮은(=현실적인) 순서로.
 RELAX_CATALOG: list[dict[str, Any]] = [
+    # ★ 하드락 #6(월 나이트 최대 15)을 넘기지 않는다 — 예전엔 +8·탐색 상한 31 이라 월N 31 까지 제안했다
+    #   (2026-10-02 · 메모리 "카드 하드락 필터 없음"). 이미 15 면 탐색 없이 건너뛴다(lo>hi).
     {"id": "raise_max_night_cap", "family": "night_cap", "label_ko": "월 야간 상한 완화",
-     "apply": lambda c: {"max_nig_per_month": int(c.get("max_nig_per_month") or 0) + 8},
-     "search": {"key": "max_nig_per_month", "dir": "up", "hi": 31}},
+     "apply": lambda c: _raise_night_cap_delta(c),
+     "search": {"key": "max_nig_per_month", "dir": "up", "hi": HARD_MAX_NIGHTS_PER_MONTH}},
     {"id": "disable_2n2off", "family": "night_recovery", "label_ko": "2N→2OFF 회복 규칙 해제",
      "apply": lambda c: {"two_offs_after_two_nig": False}},
     {"id": "disable_3n2off", "family": "night_recovery", "label_ko": "3N→2OFF 회복 규칙 해제",
@@ -152,8 +168,16 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
     opts: list[dict[str, Any]] = []
     for b in (treatment_recommendations or []):
         treatments = b.get("treatments") or []
-        auto = [t for t in treatments if t.get("action_type") != "data_correction_required"]
-        manual = [t for t in treatments if t.get("action_type") == "data_correction_required"]
+
+        def _manual_only(t: dict[str, Any]) -> bool:
+            # ★ 월 야간 상한 처방이 '15(하드락)로도 부족' 판정이면 자동 적용할 게 없다 — 눌러도
+            #   같은 실패이거나(값 없음) 하드락을 넘는다. 수동(증원 필요)으로 내린다(OMC 재리뷰 2026-10-02).
+            return t.get("action_type") == "data_correction_required" or (
+                bool(t.get("sizing_insufficient"))
+                and t.get("config_key") in ("max_nig_per_month", "max_night_shifts_per_month"))
+
+        auto = [t for t in treatments if not _manual_only(t)]
+        manual = [t for t in treatments if _manual_only(t)]
         if not auto:
             continue  # 전부 수동(data_correction_required)이면 자동 적용 불가 → 옵션 제외
         _bid = str(b.get("bundle_id") or "?")
@@ -279,6 +303,12 @@ def _config_ceiling(r: dict[str, Any]) -> int | None:
     return None
 
 
+def _room(r: dict[str, Any]) -> int:
+    """개인 한도를 올릴 수 있는 최대치 = min(못 넘는 천장, 하드락 #6 월 15회)."""
+    hc = _hard_ceiling(r)
+    return min(hc, HARD_MAX_NIGHTS_PER_MONTH) if hc is not None else HARD_MAX_NIGHTS_PER_MONTH
+
+
 def _allocate_night_caps(
     blocked: list[dict[str, Any]], gap: int,
 ) -> list[tuple[dict[str, Any], int]]:
@@ -291,12 +321,12 @@ def _allocate_night_caps(
     ★★ room 은 근무가능일이 아니라 `_hard_ceiling` 이다 — 회복 제약(2N→2OFF)이 더 낮으면
       근무가능일까지 올려봐야 거기서 멈춘다.
     """
-    ordered = sorted(blocked, key=lambda r: _hard_ceiling(r) or 0)
+    ordered = sorted(blocked, key=_room)
     remain, left = gap, len(ordered)
     out: list[tuple[dict[str, Any], int]] = []
     for r in ordered:
         per = -(-remain // left) if left > 0 else 0            # ceil
-        room = _hard_ceiling(r)
+        room = _room(r)
         val = max(1, min(per, room) if room is not None else per)
         cur = r.get("personal_night_cap")
         # 실제 공급량은 **올린 값과 현재 한도 중 큰 쪽** — 상향이 아닌 사람의 기존 공급을
@@ -346,9 +376,12 @@ def personal_night_cap_options_from_issues(
         # ★ 개인 한도가 병목이어도 **못 올리는 축과 동률**이면 대상이 아니다. personal==working
         #   이거나 personal==recovery 면 개인 한도만 올려도 min 이 그대로라 카드를 눌러
         #   재생성해도 같은 INFEASIBLE 이 난다(재생성 몇 분이 헛클릭이 된다).
+        # ★ **N전담은 대상이 아니다**(2026-10-02 사용자 지적). N전담 횟수는 계약·운영으로 정한 값이라
+        #   일괄 상향에 끼면 안 된다. 그들의 현재 공급은 아래 `others` 에 그대로 들어가 부족분에서 빠진다.
         blocked = [r for r in rows
                    if "personal" in _binds(r)
                    and not any(k in _binds(r) for k in _IMMUTABLE_BINDS)
+                   and not r.get("is_night_dedicated")
                    and str(r.get("nurse_id") or "")]
         if not blocked:
             continue
@@ -477,6 +510,7 @@ def _find_combo(
     logger: Callable[[str], None],
     priority_families: list[str] | None = None,
     first_hit: bool = True,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]] | None:
     """단일완화로 못 풀 때: 크기 2부터 max_size 까지 조합 탐색.
     단일이 모두 실패했으므로, 가장 작은 크기에서 feasible 한 조합은 자동으로 irreducible
@@ -499,6 +533,9 @@ def _find_combo(
     for size in range(2, max(2, max_size) + 1):
         feasible_combos: list[tuple[int, tuple]] = []
         for combo in itertools.combinations(cands, size):
+            if should_stop and should_stop():
+                logger(f"[UndiagProbe][combo-{size}] 탐색 시간 상한 도달 → 조합 탐색 중단")
+                return None
             ok, _ = resolve_fn(_apply_set(base, list(combo)))
             logger(f"[UndiagProbe][combo-{size}] {[c['id'] for c in combo]} feasible={ok}")
             if ok:
@@ -572,6 +609,62 @@ def _search_boundary(
         return lo, solves                   # 최소 침습(최대) feasible 값
 
 
+def _probe_budget_sec() -> float:
+    """탐색 전체(기준 확인 포함) 시간 상한(초). 기본 90. AIDE_PROBE_BUDGET_SEC 로 조절, 0 이하는 무제한.
+
+    ★ 재계산 1회 상한(AIDE_PROBE_TIME_LIMIT 20초)만으로는 횟수가 늘면 끝이 없다 —
+      원인 미상 실패 응답을 병원 사용자가 5분 기다렸다(2026-09-28 여수 6병동 11:16→11:21).
+    """
+    try:
+        return float(os.getenv("AIDE_PROBE_BUDGET_SEC", "90"))
+    except ValueError:
+        return 90.0
+
+
+def _budgeted(
+    resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
+    budget_sec: float,
+) -> tuple[Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]], Callable[[], bool]]:
+    """resolve_fn 을 시간 상한으로 감싼다. 넘기면 재계산 없이 (False, skipped) 를 돌린다.
+
+    over() 는 상한 도달 여부(한 번 넘으면 계속 True) — 호출부 루프가 이걸 보고 멈추고,
+    반환값 timed_out 도 이걸로 정한다(마지막 재계산이 상한을 넘겨 끝난 경우까지 잡는다).
+    """
+    t0 = time.monotonic()
+    hit = [False]
+
+    def over() -> bool:
+        if not hit[0] and budget_sec and budget_sec > 0 and time.monotonic() - t0 >= budget_sec:
+            hit[0] = True
+        return hit[0]
+
+    def wrapped(cfg: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        if over():
+            return False, {"skipped": "budget"}
+        return resolve_fn(cfg)
+
+    return wrapped, over
+
+
+def _baseline_reproduces(
+    base_config: dict[str, Any],
+    resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
+    logger: Callable[[str], None],
+) -> bool:
+    """기준 설정을 **그대로** 한 번 푼다. 탐색 재계산에서 풀리면 실패를 재현하지 못한 것이다.
+
+    ★ 이게 없으면 탐색 재계산이 실제 생성보다 느슨할 때(검증 모드·짧은 제한시간 등) 기준값이
+      이미 풀리는데도 `_search_boundary` 가 cur+1 부터 보므로 **무엇이든 '+1 이면 된다'** 가 된다
+      (2026-09-28 여수 6병동: 월 야간 상한 8→9→10→11 을 연달아 '가능', 실제 생성은 전부 실패).
+    """
+    try:
+        ok, info = resolve_fn(dict(base_config))
+    except Exception as exc:
+        ok, info = False, {"error": str(exc)[:120]}
+    logger(f"[UndiagProbe] 기준 설정 그대로 재계산 feasible={ok} {info}")
+    return not ok
+
+
 def probe_relaxations(
     base_config: dict[str, Any],
     resolve_fn: Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]],
@@ -584,9 +677,14 @@ def probe_relaxations(
     priority_families: list[str] | None = None,
     stop_after: int | None = None,
     hard_filter: bool = False,
+    baseline_check: bool = True,
+    budget_sec: float | None = None,
     logger: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """결합제약을 하나씩 완화해 resolve_fn 으로 feasible 여부를 실측.
+
+    baseline_check: 먼저 기준 설정 그대로 풀어 실패가 재현되는지 본다. 풀리면 해결책을 내지 않는다.
+    budget_sec: 탐색 전체 시간 상한(None 이면 AIDE_PROBE_BUDGET_SEC). 넘기면 모은 데까지만 돌린다.
 
     Returns:
         {
@@ -594,8 +692,11 @@ def probe_relaxations(
           "resolutions": [ {id,family,label_ko,delta,info} ... ],  # 푸는 완화들(=원인+해결책)
           "all_probed": [ {..., feasible} ... ],
           "probed_count": int,
+          "baseline_feasible": bool,     # 기준 설정이 탐색 재계산에서 풀림(=실패 재현 불가)
+          "timed_out": bool,             # 시간 상한 도달(기준 확인 1회만으로 넘긴 경우 포함)
         }
     """
+    resolve_fn, _over = _budgeted(resolve_fn, _probe_budget_sec() if budget_sec is None else budget_sec)
     cat = catalog if catalog is not None else RELAX_CATALOG
     # ── 온톨로지 소프트정렬 ──
     #   presolve(max-flow) 가 지목한 병목 완화군(priority_families)을 앞으로 당겨 먼저 검증하고,
@@ -620,7 +721,17 @@ def probe_relaxations(
     _remaining = int(search_budget)
     _hard_combo_done = False
     try:
+        if baseline_check:
+            # 기준 확인도 재계산 1회다 — search_budget(재계산 상한)에서 뺀다.
+            _remaining -= 1
+            if not _baseline_reproduces(base_config, resolve_fn, logger):
+                logger("[UndiagProbe] 기준 설정이 탐색 재계산에서는 풀림 → 실패를 재현하지 못해 해결책 제시 생략")
+                return {"found": False, "resolutions": [], "combo": None, "all_probed": [],
+                        "probed_count": 0, "baseline_feasible": True, "timed_out": _over()}
         for _idx, item in enumerate(cat):
+            if _over():
+                logger(f"[UndiagProbe] 탐색 시간 상한 도달 → 남은 {len(cat) - _idx}개 완화 생략")
+                break
             _feas_so_far = sum(1 for r in all_probed if r.get("feasible"))
             # stop_after: 검증된 해결책이 목표치만큼 모이면 즉시 종료(필요한 만큼만 probe).
             if stop_after and _feas_so_far >= stop_after:
@@ -641,7 +752,8 @@ def probe_relaxations(
                     _hard_combo_done = True
                     _pm = _find_combo(
                         base_config, resolve_fn, cat[:_n_prio], max_size=max_combo,
-                        logger=logger, priority_families=priority_families, first_hit=True)
+                        logger=logger, priority_families=priority_families, first_hit=True,
+                        should_stop=_over)
                     if _pm:
                         combo = _mk_combo(_pm, base_config)
                         logger("[UndiagProbe] 압박군 콤보로 해결 "
@@ -650,6 +762,13 @@ def probe_relaxations(
                     logger("[UndiagProbe] 압박군(단일+콤보) 미해결 "
                            "→ 나머지 완화 전수 폴백(hard-filter)")
             spec = item.get("search")
+            # 완화할 여지가 없는 항목(apply 가 빈 delta — 예: 월 야간 상한이 이미 하드락 15)은
+            #   탐색 없이 건너뛴다(재계산 낭비 방지).
+            try:
+                if item["apply"](base_config) == {}:
+                    continue
+            except Exception:
+                pass
             # ── 단조 노브: 고정 델타 대신 최소침습 feasible 값 이분탐색 ──
             if spec and _remaining > 0:
                 val, used = _search_boundary(
@@ -705,10 +824,10 @@ def probe_relaxations(
         ]
         # 단일완화로 못 풀면 최소조합(black-box MCS) 탐색.
         # combo 가 이미 있으면(hard-filter 우선군 콤보로 해결) 재탐색 생략.
-        if not resolutions and try_combo and combo is None:
+        if not resolutions and try_combo and combo is None and not _over():
             members = _find_combo(
                 base_config, resolve_fn, cat, max_size=max_combo, logger=logger,
-                priority_families=priority_families, first_hit=True,
+                priority_families=priority_families, first_hit=True, should_stop=_over,
             )
             if members:
                 combo = _mk_combo(members, base_config)
@@ -724,4 +843,6 @@ def probe_relaxations(
         "combo": combo,
         "all_probed": all_probed,
         "probed_count": len(all_probed),
+        "baseline_feasible": False,
+        "timed_out": _over(),
     }

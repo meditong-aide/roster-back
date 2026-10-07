@@ -584,6 +584,12 @@ async def query_analyzer(state):
     shift_texts = [s.text for s in want_items]
     shift_comments = [s.comment for s in want_items]
     avoid_texts = [s.text for s in avoid_items] + list(except_ or [])
+    # ★ 기피 사유도 선호와 **같은 축**으로 내보낸다. 예전에는 `avoid_texts` 만 넘겨서
+    #   "10일 나이트는 애가 아파서 부담스러워요" 의 사유가 그래프 경계에서 사라졌다
+    #   (기피는 저장 자리가 있는데 — `banned_wanted_entries.reason` — 실을 값이 없었다).
+    #   레거시 Except 는 문자열 목록이라 사유가 없다 → 길이만 맞춰 None 으로 채운다.
+    #   `avoid_texts` 와 **순서·길이가 반드시 같아야** 한다. 소비하는 쪽이 인덱스로 짝짓는다.
+    avoid_comments = [s.comment for s in avoid_items] + [None] * len(except_ or [])
     print(f"[polarity 분리] want={len(shift_texts)}건, avoid={len(avoid_texts)}건"
           f"{' (레거시 Except ' + str(len(except_)) + '건 흡수)' if except_ else ''}")
 
@@ -593,6 +599,7 @@ async def query_analyzer(state):
         "query_shift_comments": shift_comments,  # 새로 추가: 사유 리스트
         "query_preference": preference,
         "query_except": avoid_texts,
+        "query_except_comments": avoid_comments,  # avoid_texts 와 인덱스가 짝
         "query_others": others,
         "model": models_to_try[0]
     }

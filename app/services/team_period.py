@@ -107,7 +107,10 @@ def resolve_team_for_roster(
             p for p in periods
             if p.valid_from <= m_start and (p.valid_to is None or p.valid_to > m_start)
         ]
-        return _coerce_team_int((covering[0] if covering else periods[0]).team_id)
+        # ★ 월초를 덮는 구간이 여럿이면(겹침 — 원래 없어야 하지만 실측 운영 20쌍) **가장 늦게
+        #   시작한** 것을 쓴다. 화면(`get_team_period_on`·`group_members_in_month`)과 같은 선택이다.
+        #   예전엔 `covering[0]`(가장 먼저 시작)이라 생성기만 다른 팀으로 팀 제약을 걸었다(2026-10-02).
+        return _coerce_team_int((covering[-1] if covering else periods[0]).team_id)
     return _ward_aware_fallback(db, nurse_id, group_id)
 
 
@@ -148,6 +151,158 @@ def resolve_teams_for_month(
     }
 
 
+def sort_team_ids_by_name(team_name_map: dict) -> list:
+    """팀 id 들을 근무표 만들기 화면(team-sort-util.sortTeamGroupsByTeamName)과 동일
+    순서로 정렬한다. 1순위 그룹: 한글(0) < 영문(1) < 숫자(2) < 기타(3). 2순위: 자연
+    정렬(숫자 런은 int 로 비교)+소문자. 3순위: team_id.
+    (활성 실팀만 넘어오므로 미배정/임시팀 분기는 불필요. 엑셀 내보내기·마감본 팀 목록 공용.)
+    """
+    import re as _re
+
+    def _group_rank(name: str) -> int:
+        first = (name or "").strip()[:1]
+        if not first:
+            return 3
+        if "가" <= first <= "힣":
+            return 0
+        if first.isascii() and first.isalpha():
+            return 1
+        if first.isdigit():
+            return 2
+        return 3
+
+    def _natural_key(name: str) -> list:
+        # Intl.Collator({numeric:true}) 근사: 숫자 런은 (0,int), 그 외는 (1,소문자).
+        # 토큰 타입을 앞에 둬 int/str 직접 비교(TypeError)를 원천 차단.
+        out = []
+        for tok in _re.findall(r"\d+|\D+", name or ""):
+            out.append((0, int(tok)) if tok.isdigit() else (1, tok.casefold()))
+        return out
+
+    def _key(tid):
+        name = team_name_map.get(tid) or ""
+        return (_group_rank(name), _natural_key(name), tid)
+
+    return sorted(team_name_map.keys(), key=_key)
+
+
+def active_team_names(db: Session, group_id: str) -> dict[int, str]:
+    """그 병동의 활성 팀 `{team_id: team_name}`.
+
+    ★ `office_id` 는 걸지 않는다 — `group_id` 가 병원을 확정한다. 호출자 병원을 겹쳐 걸면 타 병원
+      관리병동을 마감할 때 0건이 되어 전원 미등록으로 **고정**된다(Codex 2026-10-02 · 발행 라우터의
+      2026-09-01 office_id 제거와 같은 이유). 실측 dev: `(group_id, team_id)` 중복 0 ·
+      `teams.office_id ≠ groups.office_id` 0.
+    """
+    from db.models import Team
+
+    return {
+        int(tid): name
+        for tid, name in db.query(Team.team_id, Team.team_name).filter(
+            Team.group_id == group_id, Team.active == 1,
+        )
+    }
+
+
+def ordered_teams(team_names: dict[int, str]) -> list[dict]:
+    """`[{team_id, team_name}]` 팀명순(PC `sortTeamsByName` 과 같은 순서)."""
+    return [{"team_id": tid, "team_name": team_names[tid]} for tid in sort_team_ids_by_name(team_names)]
+
+
+def month_team_layout(
+    db: Session, group_id: str, year: int, month: int,
+) -> tuple[dict[str, int | None], list[dict]]:
+    """그 달 팀 배치 — 근무자관리 화면과 같은 기준. 반환 `({nurse_id: team_id|None}, 팀 목록)`.
+
+    팀 = `group_members_in_month` 의 `as_of_team`(월초를 덮는 구간 우선, 없으면 이 병동 소속일
+    때만 `nurses.team_id`). 파견 온 사람도 이 병동 구간이 있으면 그 팀이다. 활성 팀이 아니거나
+    그 달 명단에 없는 사람은 None(미등록).
+    ★ PC 마감본 팀별 보기가 쓰던 `/teams`(`resolve_teams_for_month`)는 이 병동 재직자만 세서
+      파견 온 사람을 팀에 넣어 두어도 미등록으로 보였다. 이쪽은 그 경우도 팀으로 묶는다.
+    """
+    from services.assignment_service import group_members_in_month
+
+    # ★ 명단을 **먼저**, 팀 목록을 **나중에** 읽는다. 반대 순서면 그 사이 새 팀을 만들고 사람을
+    #   옮겼을 때 그 사람 팀이 목록에 없어 미등록으로 굳는다(마감은 이 값을 고정한다 — Codex 2026-10-02).
+    #   이 순서면 사이에 만든 팀은 목록에 들어 있고, 사이에 없앤 팀은 미등록이 맞다.
+    # ★ 한계(사용자 결정 2026-10-02 "그대로 둔다"): 두 조회는 같은 시점이 아니다(RCSI 꺼진 READ
+    #   COMMITTED). 마감 처리 도중 몇 ms 사이에 그 병동 팀 편집이 커밋되면 그 사람은 '편집 직전 팀'
+    #   (드물게 미등록)으로 마감에 박힌다 — 다시 마감하면 고쳐진다. 마감 스냅샷의 다른 부분(명단·근무
+    #   행·시프트)도 같은 구조이고, 팀을 바꾸는 경로가 여럿이라 병동 잠금·격리 수준 변경은 하지 않았다.
+    members = group_members_in_month(db, group_id, year, month)["members"]
+    return team_layout_from_members(db, group_id, members, year, month)
+
+
+def team_layout_from_members(
+    db: Session, group_id: str, members: list[dict], year: int, month: int,
+) -> tuple[dict[str, int | None], list[dict]]:
+    """이미 읽은 `group_members_in_month` 명단으로 팀 배치를 만든다(명단을 또 읽지 않게).
+
+    ★ 팀 목록은 명단을 **읽은 뒤에** 읽어야 한다(`month_team_layout` 주석) — 호출자가 명단을 먼저 넘긴다.
+    ★ 월초를 덮는 구간이 **없는** 사람은 그 달 안에서 시작하는 첫 구간의 팀을 쓴다(월중 합류 — 예:
+      9/15 병동이동). 생성기(`resolve_team_for_roster`)와 같은 규칙이라, 그 팀으로 만든 근무표가 그
+      팀으로 보인다. 예전엔 `as_of_team`(월초만)만 봐서 미등록으로 고정됐다(OMC 리뷰 2026-10-02).
+      월초를 덮는 구간이 있는데 팀이 비어 있으면(명시적 미배정) 그대로 둔다.
+    """
+    team_of: dict[str, int | None] = {
+        str(m["nurse_id"]): _coerce_team_int(m.get("as_of_team")) for m in members
+    }
+    # ★ 명단 **전원**에 대해 본다 — `as_of_team` 이 None 인 사람만 보면, 월초 구간이 없어 캐시
+    #   (`nurses.team_id`)가 채워진 소속 간호사의 월중 구간을 놓쳐 생성기와 갈린다(OMC 재리뷰 2026-10-02).
+    #   `_mid_month_teams` 는 월초를 덮는 구간이 있는 사람을 빼므로 명시적 미배정은 그대로다.
+    if team_of:
+        team_of.update(_mid_month_teams(db, group_id, list(team_of), year, month))
+    names = active_team_names(db, group_id)
+    return {nid: (tid if tid in names else None) for nid, tid in team_of.items()}, ordered_teams(names)
+
+
+def _mid_month_teams(db: Session, group_id: str, nurse_ids: list[str], year: int, month: int) -> dict[str, int | None]:
+    """월초를 덮는 구간이 없는 사람의 '그 달 첫 구간' 팀(1쿼리). 덮는 구간이 있으면 담지 않는다."""
+    m_start = date(year, month, 1)
+    m_end = date(year, month, monthrange(year, month)[1])
+    rows = (
+        db.query(NurseTeamPeriod.nurse_id, NurseTeamPeriod.valid_from, NurseTeamPeriod.valid_to, NurseTeamPeriod.team_id)
+        .filter(
+            NurseTeamPeriod.group_id == group_id,
+            NurseTeamPeriod.nurse_id.in_(nurse_ids),
+            NurseTeamPeriod.valid_from <= m_end,
+            or_(NurseTeamPeriod.valid_to.is_(None), NurseTeamPeriod.valid_to > m_start),
+        )
+        .order_by(NurseTeamPeriod.valid_from.asc())
+        .all()
+    )
+    covered = {str(r.nurse_id) for r in rows if r.valid_from <= m_start}
+    out: dict[str, int | None] = {}
+    for r in rows:
+        nid = str(r.nurse_id)
+        if nid not in covered and nid not in out:
+            out[nid] = _coerce_team_int(r.team_id)
+    return out
+
+
+def _lock_team_period(db: Session, nurse_id: str) -> None:
+    """간호사 단위로 팀 구간 쓰기를 트랜잭션 끝까지 직렬화한다(`sp_getapplock`, 트랜잭션 소유).
+
+    ★ 아래 "같은 시작일 조회 → 덮는 구간 조회 → INSERT" 는 한 세션 안의 중복만 막는다. 같은 간호사·
+      시작일로 두 요청이 동시에 들어오면 RCSI 가 꺼진 READ COMMITTED 에서 둘 다 "기존 구간 없음" 으로
+      보고 같은 행을 각각 넣는다(Codex 1회차 MEDIUM). 기존 행이 없어 행 잠금으로는 못 막는다.
+    ★ 키에 병동을 넣지 않는다 — 한 간호사의 모든 병동 구간 쓰기를 줄 세운다(Codex 2회차 MEDIUM).
+    ★ 여러 간호사를 한 트랜잭션에서 고치는 곳은 `lock_team_periods` 로 **nurse_id 순서대로 먼저** 잡는다
+      (순서가 엇갈리면 교착). 같은 트랜잭션에서 다시 잡아도 괜찮다(앱 잠금은 재진입된다).
+    ★ 시간 초과(-1)는 409, 그 밖 음수는 500 + 로그. MSSQL 에서만(테스트용 SQLite 제외).
+    """
+    from services.schedule_versioning import _applock
+
+    _applock(db, f"team_period:{nurse_id}", 10000,
+             "같은 간호사의 팀 변경이 진행 중입니다. 잠시 후 다시 시도해 주세요.")
+
+
+def lock_team_periods(db: Session, nurse_ids) -> None:
+    """여러 간호사의 팀 구간 쓰기를 nurse_id 순서대로 미리 잠근다(교착 방지)."""
+    for nid in sorted({str(n) for n in nurse_ids if n}):
+        _lock_team_period(db, nid)
+
+
 def set_team_period(
     db: Session,
     *,
@@ -169,6 +324,9 @@ def set_team_period(
     #   SessionLocal(autoflush=False)에서 apply_team_ops 가 한 nurse 를 두 번 처리하면
     #   (payload 중복 item / 이동을 두 op 로 표현 등) 두 번째 호출의 same 쿼리가 첫 INSERT 를
     #   못 봐서 동일행을 또 INSERT → 완전중복 행. upsert_period 와 동일하게 flush 로 차단.
+    # ★ 간호사 잠금은 flush **보다 먼저** — 호출부가 바꿔 둔 nurses 행이 flush 로 먼저 잠기면, 팀 잠금을 쥔 채
+    #   nurses 를 읽는 다른 요청(팀 설정 apply_team_ops)과 서로 기다린다(Codex 17회차). 순서: 잠금 → 행.
+    _lock_team_period(db, nurse_id)
     db.flush()
     base = db.query(NurseTeamPeriod).filter(
         NurseTeamPeriod.nurse_id == nurse_id,
@@ -189,11 +347,22 @@ def set_team_period(
                 NurseTeamPeriod.valid_to > valid_from,
             ),
         ).all()
+        # ★ 새 구간의 끝 = 덮던 구간의 끝(분할)과 뒤에 이미 있는 구간의 시작(빈 칸에 열 때) 중
+        #   빠른 날. 예전엔 늘 `valid_to=None` 으로 열어, 10월 팀을 먼저 저장하고 9월 팀을 나중에
+        #   저장하면 [9/1~열림] 이 [10/1~] 을 덮었다(실측 운영 성남 61병동-RN 20쌍 · 그중 2명은
+        #   생성기와 화면 팀이 달랐다 — 2026-10-02 데이터 정리). `upsert_period` 가 같은 버그를 이미
+        #   고친 방식과 같다.
+        from services.nurse_period_resolver import _next_span_start
+
+        ends = [c.valid_to for c in covering if c.valid_to is not None]
+        nxt = _next_span_start(db, NurseTeamPeriod, nurse_id, valid_from, group_id)
+        if nxt is not None:
+            ends.append(nxt)
         for c in covering:
             c.valid_to = valid_from
         row = NurseTeamPeriod(
             nurse_id=nurse_id, group_id=group_id, valid_from=valid_from,
-            valid_to=None, team_id=team_id, source=source, note=note,
+            valid_to=min(ends) if ends else None, team_id=team_id, source=source, note=note,
         )
         db.add(row)
     # 단일 병동 불변식: 한 간호사는 한 시점에 한 병동에만 속한다. 새 구간을 열 때
