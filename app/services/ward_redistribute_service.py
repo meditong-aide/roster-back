@@ -678,7 +678,8 @@ def apply_ward_redistribution(
                     office_id=n.office_id, start_date=effective, reason="병동이동",
                     target_team_id=team, note=_note,
                 )
-                create_assignment(req, db, current_user, notify=False)
+                # 당사자 알림(S06)은 사람마다 create_assignment 가 보낸다(2026-10-07 결정).
+                create_assignment(req, db, current_user)
                 transfers += 1
                 _tp_group = to_g
             elif team is not None and not _same_team(
@@ -707,7 +708,7 @@ def apply_ward_redistribution(
             # 부분 커밋이 없다 → 세션 무효화(rollback) 없이 다음 사람 진행.
             detail = getattr(e, "detail", None) or str(e)
             failed.append({"nurse_id": nid, "reason": str(detail)})
-    # 병동재분배 요약 알림 제외 — assignment 알림 전체 제외 정책에 맞춰 발송 안 함 (주석처리).
+    # 병동재분배 요약 알림(관리자용)은 보내지 않는다 — 배정 알림은 당사자에게만(2026-10-07 결정 · 위에서 사람마다).
     # if transfers or team_changes:
     #     try:
     #         from services.assignment_service import _get_head_nurse_ids

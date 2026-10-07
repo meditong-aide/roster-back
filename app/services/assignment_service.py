@@ -211,6 +211,167 @@ def _collect_assignment_recipients(
     return list(recipients)
 
 
+# ── 당사자 배정 알림 (사용자 결정 2026-10-07) ─────────────────────────────
+# 7-15 에 배정 알림을 전부 껐다(d10862a). 근무 병동이 바뀌는 배정(파견·병동이동)만 **당사자에게** 다시 보낸다.
+# 관리자 알림·휴직·퇴사·프리셉티는 여전히 보내지 않는다. 알림은 배정 저장과 같은 커밋으로 발송 대기열에 넣는다.
+_NOTIFY_REASONS: tuple[str, ...] = ("파견", "병동이동")
+_STATUS_LABEL = {"active": "진행", "completed": "종료", "cancelled": "취소"}
+
+
+def _push_sender(db: Session, current_user, group_id: str | None, nurse) -> tuple[str, str]:
+    """배정 알림 발신자 (사번, 계정). 작업한 사람 → 없으면(스케줄러) 그 병동 그룹관리자·수간호사 → 당사자.
+
+    ★ 앱 알림 목록은 발신자가 그룹웨어 직원이어야 보인다(`Member` 조인) — 빈 값으로 두지 않는다.
+    """
+    nid = str(getattr(current_user, "nurse_id", "") or "")
+    if nid:
+        return nid, str(getattr(current_user, "account_id", "") or nid)
+    group = db.query(Group).filter(Group.group_id == group_id).first() if group_id else None
+    hn_ids = group.hn_id if group is not None and isinstance(group.hn_id, list) else []
+    for cand in [*hn_ids, *_get_head_nurse_ids(db, group_id)]:
+        n = db.query(NurseModel).filter(NurseModel.nurse_id == str(cand)).first()
+        if n is not None:
+            return str(n.nurse_id), str(n.account_id or n.nurse_id)
+    return str(nurse.nurse_id), str(getattr(nurse, "account_id", None) or nurse.nurse_id)
+
+
+def _enqueue_assignment_push(db: Session, send, *, nurse_id, current_user, group_id, build) -> None:
+    """당사자 1명에게 배정 알림을 발송 대기열에 넣는다. 커밋은 호출부(배정 저장과 같은 커밋).
+
+    `build()` 는 본문 인자(병동 이름·기간·guard 등)를 돌려준다 — 알림용 조회를 여기 안에서 하게 미뤄 둔다.
+    ★ 부가 알림이라 **받는 간호사·발신자·병동 이름 조회부터 대기열 등록까지** savepoint 하나로 격리한다 — 알림용 조회가
+      잠금 시간 초과 등으로 실패해도 배정 저장·병동이동 완료는 살린다(Codex 15회차). 대기 중인 업무 변경은
+      호출부가 먼저 flush 해 둔다(savepoint 가 업무 변경의 flush 실패를 알림 실패로 삼키지 않게).
+    """
+    try:
+        with db.begin_nested():
+            nurse = db.query(NurseModel).filter(NurseModel.nurse_id == str(nurse_id)).first()
+            if nurse is None or getattr(nurse, "active", 1) == 0:
+                return
+            sender, member = _push_sender(db, current_user, group_id, nurse)
+            send(db=db, recipient=str(nurse.nurse_id), office_code=str(nurse.office_id),
+                 sender_emp_seq_no=sender, sender_member_id=member, **build())
+    except Exception as e:
+        logger.error("배정 알림 대기열 등록 실패(%s): %s", getattr(send, "__name__", send), e, exc_info=True)
+
+
+#: guard 안의 사유 표기 — push_outbox.guard 는 VARCHAR 라 한글을 넣지 않는다(발송기와 같은 함수를 쓴다).
+_ASSIGNMENT_REASON_CODE = {"파견": "dispatch", "병동이동": "transfer", "휴직": "leave", "퇴사": "resign",
+                           "프리셉티": "preceptee"}
+
+
+def assignment_reason_code(reason: str | None) -> str:
+    """사유 → guard 용 ASCII 코드. 표에 없으면 고정 길이 해시 — 서로 다른 사유가 같은 코드가 되지 않게(Codex 12회차),
+    긴 사유도 guard(VARCHAR 200)를 넘지 않게(13회차 · guard 최대 약 135자)."""
+    import hashlib
+
+    text = str(reason or "")
+    return _ASSIGNMENT_REASON_CODE.get(text) or ("x" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:12])
+
+
+def _assignment_guard(row: NurseAssignment, expect: str) -> str:
+    """발송기가 보내기 직전에 다시 볼 조건 — 그 배정이 아직 이 알림이 말하는 상태인가(`push_outbox_service`).
+
+    expect: `live`(상태·사유·병동·기간이 이 알림 그대로) · `cancelled` · `completed`(이 병동으로 완료).
+    ★ 발송이 실패해 재시도로 밀린 알림이 그 사이의 취소·변경 알림을 추월해 옛 상태를 안내하지 않게
+      (Codex 2026-10-07 5·6회차). 나가는 알림은 언제나 **지금 상태**를 말한다 — 상태가 바뀌었으면 그 변경의
+      알림이 따로 있으므로 옛 알림은 보내지 않는다(바꿨다 되돌린 경우 옛 내용이 지금과 같으면 보내도 맞다).
+    """
+    end = _effective_end_date(row)
+    return (f"assignment_state:{row.id}:{expect}:{row.status}:"
+            f"{assignment_reason_code(row.reason)}:{row.target_group_id or ''}:"
+            f"{row.start_date.isoformat() if row.start_date else ''}:{end.isoformat() if end else ''}")
+
+
+def _assignment_change_parts(db: Session, row: NurseAssignment, *, old_reason, old_status,
+                             old_target, old_window) -> list[str]:
+    """수정 전후에서 당사자가 알아야 할 것(사유·병동·기간·상태) 중 바뀐 부분의 문구."""
+    from utils.utils import assignment_period_label
+
+    new_window = (row.start_date, _effective_end_date(row))
+    parts: list[str] = []
+    if old_reason != row.reason:
+        parts.append(f"사유 {old_reason}→{row.reason}")
+    if old_target != row.target_group_id:
+        parts.append(f"병동 {_get_group_name(db, old_target) or '없음'}"
+                     f"→{_get_group_name(db, row.target_group_id) or '없음'}")
+    if old_window != new_window:
+        parts.append(f"기간 {assignment_period_label(*old_window)}→{assignment_period_label(*new_window)}")
+    if old_status != row.status:
+        parts.append(f"상태 {_STATUS_LABEL.get(old_status, old_status)}→{_STATUS_LABEL.get(row.status, row.status)}")
+    return parts
+
+
+def _notify_assignment_update(db: Session, current_user, row: NurseAssignment, *,
+                              old_reason, old_status, old_target, old_window) -> None:
+    """배정 수정 알림 — 파견·병동이동이 걸려 있으면 진행·종료 상태 모두(취소된 채 고친 것만 제외).
+
+    취소로 바뀌면 취소 문구(S07), 취소에서 되살리면 배정 문구(S06), 그 밖에는 바뀐 부분을 담은 변경 문구(S06).
+    ★ 종료(completed)된 배정도 보낸다 — 병동이동은 발효되면 completed 가 되므로, 진행 중만 보면 발효 뒤
+      날짜·병동 정정이 당사자에게 알려지지 않는다(Codex 2026-10-07).
+    """
+    from utils.utils import (
+        send_assignment_cancelled_push,
+        send_assignment_changed_push,
+        send_assignment_created_push,
+    )
+
+    if old_reason not in _NOTIFY_REASONS and row.reason not in _NOTIFY_REASONS:
+        return
+    if old_status == "cancelled" and row.status == "cancelled":
+        return
+    ctx = dict(nurse_id=row.nurse_id, current_user=current_user, group_id=row.target_group_id or row.source_group_id)
+
+    def _saved(**extra) -> dict:
+        # 본문은 guard 와 같은 '저장 뒤' 값으로 — 취소하면서 병동·기간을 함께 바꾼 요청이면 저장된 것이 바뀐 값이다
+        #   (Codex 9회차). 병동 이름 조회는 savepoint 안(build)에서 한다(15회차).
+        return dict(reason=row.reason,
+                    target_group_name=_get_group_name(db, row.target_group_id) or str(row.target_group_id or ""),
+                    **extra)
+
+    if row.status == "cancelled":
+        _enqueue_assignment_push(db, send_assignment_cancelled_push, **ctx, build=lambda: _saved(
+            start_date=row.start_date, end_date=_effective_end_date(row), guard=_assignment_guard(row, "cancelled")))
+        return
+    if old_status == "cancelled":
+        if row.reason in _NOTIFY_REASONS:
+            _enqueue_assignment_push(db, send_assignment_created_push, **ctx, build=lambda: _saved(
+                start_date=row.start_date, end_date=_effective_end_date(row), guard=_assignment_guard(row, "live")))
+        return
+    new_window = (row.start_date, _effective_end_date(row))
+    if (old_reason, old_status, old_target, old_window) == (row.reason, row.status, row.target_group_id, new_window):
+        return  # 알릴 변경 없음(메모 등) — 조회 없이 값만 비교한다
+    _enqueue_assignment_push(db, send_assignment_changed_push, **ctx, build=lambda: _saved(
+        changes=_assignment_change_parts(db, row, old_reason=old_reason, old_status=old_status,
+                                         old_target=old_target, old_window=old_window),
+        guard=_assignment_guard(row, "live")))
+
+def _lock_assignment_row(db: Session, assignment_id: int) -> NurseAssignment | None:
+    """배정 행을 잠그고(MSSQL UPDLOCK) 최신 값으로 읽는다 — 수정·취소가 이전 상태를 보고 알림을 정하므로.
+
+    ★ 잠그지 않으면 같은 배정을 동시에 취소(취소 API ↔ 수정 API status=cancelled 포함)할 때 둘 다 '진행'을 읽고
+      당사자 취소 알림(S07)을 두 번 남긴다(Codex 2026-10-07). 잠그면 늦게 온 쪽은 앞 커밋 뒤의 '취소'를 읽는다.
+    """
+    return (
+        db.query(NurseAssignment)
+        .with_hint(NurseAssignment, "WITH (UPDLOCK, ROWLOCK)", "mssql")
+        .filter(NurseAssignment.id == assignment_id)
+        .populate_existing()
+        .first()
+    )
+
+
+def _notify_transfer_completed(db: Session, row: NurseAssignment) -> None:
+    """병동이동 완료 알림(S08) — 당사자에게. 스케줄러·레이지 체크라 발신자는 도착 병동 관리자."""
+    from utils.utils import send_transfer_completed_push
+
+    db.flush()
+    _enqueue_assignment_push(db, send_transfer_completed_push, nurse_id=row.nurse_id, current_user=None,
+                             group_id=row.target_group_id, build=lambda: dict(
+                                 target_group_name=_get_group_name(db, row.target_group_id) or str(row.target_group_id),
+                                 start_date=row.start_date, guard=_assignment_guard(row, "completed")))
+
+
 # ── FixedWantedEntry 재배치 헬퍼 ───────────────────────────────────────
 # 정책 B: assignment 기간 내(in-period) 엔트리 소유자는 target_group_id,
 # 기간 외(out-of-period) 소유자는 source_group_id.
@@ -408,7 +569,7 @@ def create_assignment(
 ) -> NurseAssignmentResponse:
     """배정/상태 변경 등록.
 
-    notify=False: 개별 알림(S06) 생략 — 벌크 호출(병동재분배)에서 끝에 요약 1건으로 묶기 위함.
+    notify=False: 당사자 알림(S06) 생략. 병동재분배도 사람마다 보낸다(2026-10-07 결정 — 기본 True).
     """
     _assert_caller_owns_source(current_user, req.source_group_id, db=db)
 
@@ -529,7 +690,20 @@ def create_assignment(
             upsert_period(db, NurseAllowedShiftPeriod, req.nurse_id, req.start_date,
                           "fixed_shift", req.target_fixed_shift, source="transfer",
                           carry_attrs=["allowed_shifts"])
-    db.commit()       # 이벤트 + 팀·속성 구간을 한 번에
+    # 당사자 알림(S06) — 파견·병동이동만, 배정 저장과 같은 커밋으로 발송 대기열에(2026-10-07 결정).
+    if notify and req.reason in _NOTIFY_REASONS:
+        from utils.utils import send_assignment_created_push
+        db.flush()
+        _enqueue_assignment_push(
+            db, send_assignment_created_push, nurse_id=req.nurse_id, current_user=current_user,
+            group_id=req.target_group_id, build=lambda: dict(
+                reason=req.reason,
+                target_group_name=_get_group_name(db, req.target_group_id) or str(req.target_group_id),
+                start_date=req.start_date, end_date=req.expected_end_date,
+                guard=_assignment_guard(row, "live"),
+            ),
+        )
+    db.commit()       # 이벤트 + 팀·속성 구간(+ 당사자 알림)을 한 번에
     db.refresh(row)
 
     logger.info(
@@ -553,27 +727,6 @@ def create_assignment(
             logger.error("FixedWantedEntry 재배치 실패(create): %s", e, exc_info=True)
             db.rollback()
 
-    # 알림 발송 (S06) — assignment 알림 전체 제외 (주석처리).
-    # if notify:
-    #     try:
-    #         from utils.utils import send_assignment_created_push
-    #         _recipients = _collect_assignment_recipients(
-    #             db, req.nurse_id, req.source_group_id, req.target_group_id
-    #         )
-    #         send_assignment_created_push(
-    #             nurse_name=nurse.name,
-    #             reason=req.reason,
-    #             start_date=str(req.start_date),
-    #             end_date=str(req.expected_end_date),
-    #             source_group_name=_get_group_name(db, req.source_group_id) or req.source_group_id,
-    #             target_group_name=_get_group_name(db, req.target_group_id),
-    #             recipients=_recipients,
-    #             office_code=req.office_id,
-    #             sender_emp_seq_no=req.nurse_id,
-    #             sender_member_id=req.nurse_id,
-    #         )
-    #     except Exception as e:
-    #         logger.error("배정 생성 알림 발송 실패: %s", e, exc_info=True)
 
     return _to_response(row, nurse.name)
 
@@ -709,7 +862,7 @@ def update_assignment(
     current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정/상태 변경 수정"""
-    row = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
+    row = _lock_assignment_row(db, assignment_id)
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
@@ -818,6 +971,13 @@ def update_assignment(
     if row.reason == "파견":
         row.target_team_id = None
 
+    # 당사자 알림(S06/S07) — 파견·병동이동의 사유·병동·기간·상태가 바뀐 경우만, 수정과 같은 커밋(2026-10-07 결정).
+    db.flush()
+    _notify_assignment_update(
+        db, current_user, row,
+        old_reason=_old_reason, old_status=_old_status,
+        old_target=_old_target_gid, old_window=_old_window,
+    )
     db.commit()
     db.refresh(row)
 
@@ -852,7 +1012,7 @@ def cancel_assignment(
     current_user: Optional[UserSchema] = None,
 ) -> NurseAssignmentResponse:
     """배정 취소 (status → cancelled)"""
-    row = db.query(NurseAssignment).filter(NurseAssignment.id == assignment_id).first()
+    row = _lock_assignment_row(db, assignment_id)
     if not row:
         raise HTTPException(status_code=404, detail="배정 이력을 찾을 수 없습니다.")
 
@@ -867,6 +1027,19 @@ def cancel_assignment(
     _old_status = row.status
 
     row.status = "cancelled"
+    # 당사자 알림(S07) — 파견·병동이동(이미 취소된 것을 다시 취소한 경우만 제외), 취소와 같은 커밋(2026-10-07 결정).
+    if _old_status != "cancelled" and _old_reason in _NOTIFY_REASONS:
+        from utils.utils import send_assignment_cancelled_push
+        db.flush()
+        _enqueue_assignment_push(
+            db, send_assignment_cancelled_push, nurse_id=row.nurse_id, current_user=current_user,
+            group_id=row.target_group_id or row.source_group_id, build=lambda: dict(
+                reason=_old_reason,
+                target_group_name=_get_group_name(db, row.target_group_id) or str(row.target_group_id or ""),
+                start_date=_old_window[0], end_date=_old_window[1],
+                guard=_assignment_guard(row, "cancelled"),
+            ),
+        )
     db.commit()
     db.refresh(row)
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == row.nurse_id).first()
@@ -890,25 +1063,6 @@ def cancel_assignment(
         except Exception as e:
             logger.error("FixedWantedEntry 재배치 실패(cancel): %s", e, exc_info=True)
             db.rollback()
-
-    # 알림 발송 (S07) — assignment 알림 전체 제외 (주석처리).
-    # try:
-    #     from utils.utils import send_assignment_cancelled_push
-    #     _recipients = _collect_assignment_recipients(
-    #         db, row.nurse_id, row.source_group_id, row.target_group_id
-    #     )
-    #     send_assignment_cancelled_push(
-    #         nurse_name=nurse.name if nurse else str(row.nurse_id),
-    #         reason=row.reason,
-    #         source_group_name=_get_group_name(db, row.source_group_id) or row.source_group_id,
-    #         target_group_name=_get_group_name(db, row.target_group_id),
-    #         recipients=_recipients,
-    #         office_code=row.office_id,
-    #         sender_emp_seq_no=row.nurse_id,
-    #         sender_member_id=row.nurse_id,
-    #     )
-    # except Exception as e:
-    #     logger.error("배정 취소 알림 발송 실패: %s", e, exc_info=True)
 
     return _to_response(row, nurse.name if nurse else None)
 
@@ -1594,6 +1748,38 @@ def _apply_target_profile_reset(
     return int(detached or 0)
 
 
+def _claim_transfer_completion(db: Session, row: NurseAssignment, today: date) -> NurseAssignment | None:
+    """병동이동 active → completed 전환을 원자적으로 확보하고, 확보한 **최신 행**을 돌려준다. 못 하면 None.
+
+    ★ 스케줄러(`flush_all_pending_transfers`)와 레이지 체크(`flush_pending_transfers`)가 같은 행을 동시에
+      읽으면 둘 다 완료 처리하고 당사자 알림(S08)을 두 번 남겼다(Codex 2026-10-07). 조건부 UPDATE 는 행을
+      잠그고 조건을 다시 보므로 늦게 온 쪽은 0행이 된다.
+    ★ 조건은 목록을 고른 조건 전부다(사유·진행·발효일·도착 병동). 목록을 읽은 뒤 수정 API 가 시작일을 미루거나
+      사유를 바꿨으면 확보하지 않는다. 확보한 뒤에는 그 행을 다시 읽어(잠근 상태라 최신) 도착 병동 등
+      **지금 값**으로 적용한다 — 읽어 둔 옛 값으로 다른 병동에 옮기지 않게(Codex 3회차 HIGH).
+    """
+    claimed = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.id == row.id,
+            NurseAssignment.reason == "병동이동",
+            NurseAssignment.status == "active",
+            NurseAssignment.start_date <= today,
+            NurseAssignment.target_group_id.isnot(None),
+        )
+        .update({NurseAssignment.status: "completed", NurseAssignment.end_date: today},
+                synchronize_session=False)
+    )
+    if not claimed:
+        return None
+    return (
+        db.query(NurseAssignment)
+        .filter(NurseAssignment.id == row.id)
+        .populate_existing()
+        .one()
+    )
+
+
 def flush_pending_transfers(db: Session, group_id: str) -> int:
     """병동이동 레이지 체크: start_date <= 오늘인 active 병동이동 레코드 처리
     - nurses.group_id를 target_group_id로 업데이트
@@ -1620,7 +1806,10 @@ def flush_pending_transfers(db: Session, group_id: str) -> int:
         return 0
 
     count = 0
-    for row in rows:
+    for listed in rows:
+        row = _claim_transfer_completion(db, listed, today)
+        if row is None:
+            continue  # 다른 처리가 먼저 완료했거나 읽은 뒤 바뀌었다 — 적용·알림을 하지 않는다
         nurse = (
             db.query(NurseModel)
             .filter(NurseModel.nurse_id == row.nurse_id)
@@ -1634,27 +1823,10 @@ def flush_pending_transfers(db: Session, group_id: str) -> int:
                 "[transfer] nurse_id=%s, %s → %s target overlay applied, preceptees detached=%d",
                 row.nurse_id, row.source_group_id, row.target_group_id, detached,
             )
-        row.status = "completed"
-        row.end_date = today
         count += 1
 
-        # 병동이동 완료 알림(S08) 제외 — 일단 발송 안 함 (주석처리).
-        # try:
-        #     from utils.utils import send_transfer_completed_push
-        #     _tgt_name = _get_group_name(db, row.target_group_id) or str(row.target_group_id)
-        #     _recipients = {str(row.nurse_id)}
-        #     for nid in _get_head_nurse_ids(db, row.target_group_id):
-        #         _recipients.add(nid)
-        #     send_transfer_completed_push(
-        #         nurse_name=nurse.name if nurse else str(row.nurse_id),
-        #         target_group_name=_tgt_name,
-        #         recipients=list(_recipients),
-        #         office_code=row.office_id,
-        #         sender_emp_seq_no=row.nurse_id,
-        #         sender_member_id=row.nurse_id,
-        #     )
-        # except Exception as e:
-        #     logger.error("병동이동 완료 알림 실패: %s", e, exc_info=True)
+        # 당사자 알림(S08) — 이 처리와 같은 커밋(2026-10-07 결정).
+        _notify_transfer_completed(db, row)
 
     if count > 0:
         db.commit()
@@ -1683,7 +1855,10 @@ def flush_all_pending_transfers(db: Session) -> int:
         return 0
 
     count = 0
-    for row in rows:
+    for listed in rows:
+        row = _claim_transfer_completion(db, listed, today)
+        if row is None:
+            continue  # 다른 처리가 먼저 완료했거나 읽은 뒤 바뀌었다 — 적용·알림을 하지 않는다
         nurse = (
             db.query(NurseModel)
             .filter(NurseModel.nurse_id == row.nurse_id)
@@ -1697,27 +1872,10 @@ def flush_all_pending_transfers(db: Session) -> int:
                 "[Scheduler][transfer] nurse_id=%s, %s → %s target overlay applied, preceptees detached=%d",
                 row.nurse_id, row.source_group_id, row.target_group_id, detached,
             )
-        row.status = "completed"
-        row.end_date = today
         count += 1
 
-        # 병동이동 완료 알림(S08) 제외 — 일단 발송 안 함 (주석처리).
-        # try:
-        #     from utils.utils import send_transfer_completed_push
-        #     _tgt_name = _get_group_name(db, row.target_group_id) or str(row.target_group_id)
-        #     _recipients = {str(row.nurse_id)}
-        #     for nid in _get_head_nurse_ids(db, row.target_group_id):
-        #         _recipients.add(nid)
-        #     send_transfer_completed_push(
-        #         nurse_name=nurse.name if nurse else str(row.nurse_id),
-        #         target_group_name=_tgt_name,
-        #         recipients=list(_recipients),
-        #         office_code=row.office_id,
-        #         sender_emp_seq_no=row.nurse_id,
-        #         sender_member_id=row.nurse_id,
-        #     )
-        # except Exception as e:
-        #     logger.error("[Scheduler] 병동이동 완료 알림 실패: %s", e, exc_info=True)
+        # 당사자 알림(S08) — 이 처리와 같은 커밋(2026-10-07 결정).
+        _notify_transfer_completed(db, row)
 
     if count > 0:
         db.commit()

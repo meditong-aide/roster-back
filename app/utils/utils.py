@@ -486,76 +486,89 @@ def send_roster_change_notice_push(
 
 
 # ── assignment 관련 알림 (S06~S12) ──
+# ★ 배정 알림(S06~S08)은 **당사자 간호사에게만** 보낸다(사용자 결정 2026-10-07 — 7-15 전면 미발송을 되돌리되
+#   관리자 알림은 빼고, 파견·병동이동만). 호출부가 사유를 거른다(`assignment_service._NOTIFY_REASONS`).
+# ★ 연결 코드는 비운다 — 앱 알림 목록은 같은 연결 코드를 최신 1건으로 묶어서(`_push_inbox_cte`),
+#   `ROSTER:연:월` 을 달면 그 달 근무표 마감·변경 알림과 합쳐져 한쪽이 가려진다.
 
 _REASON_LABEL = {"파견": "파견", "병동이동": "병동이동", "휴직": "휴직", "프리셉티": "프리셉티"}
 
 
-def send_assignment_created_push(
-    nurse_name: str,
-    reason: str,
-    start_date: str,
-    end_date: str,
-    source_group_name: str,
-    target_group_name: str | None,
-    recipients: List[str],
-    office_code: str,
-    sender_emp_seq_no: str,
-    sender_member_id: str,
-    db=None,
-):
-    """배정 생성 알림 (S06). 대상 간호사 + source/target 관리자."""
-    label = _REASON_LABEL.get(reason, reason)
-    period = f"{start_date}~{end_date}" if end_date else f"{start_date}~"
-    if target_group_name:
-        message = f"{nurse_name} {label} 배정 ({period}, {source_group_name}→{target_group_name})"
-    else:
-        message = f"{nurse_name} {label} 배정 ({period})"
+def assignment_period_label(start, end) -> str:
+    """배정 기간 문구 — `10/12~10/31`, 끝이 없으면 `10/12~`. 날짜가 아니면 그대로 쓴다."""
+    def _md(d) -> str:
+        return f"{d.month}/{d.day}" if hasattr(d, "month") else str(d)
+    return f"{_md(start)}~{_md(end)}" if end else f"{_md(start)}~"
+
+
+def _send_assignment_push(db, *, source: str, sub_code: str, message: str, recipient: str,
+                          office_code: str, sender_emp_seq_no: str, sender_member_id: str,
+                          guard: str | None = None):
+    """`guard` = 보내기 직전에 그 배정이 아직 이 알림이 말하는 상태인지 확인할 조건
+    (`assignment_service._assignment_guard` · 발송기 `push_outbox_service._guard_holds`)."""
     return _send_or_enqueue(
-        db, source="assignment_created", push_code="P30", push_sub_code="S06",
+        db, source=source, push_code="P30", push_sub_code=sub_code,
         office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
-        sender_member_id=sender_member_id, recipients=recipients, message=message,
+        sender_member_id=sender_member_id, recipients=[recipient], message=message, guard=guard,
+    )
+
+
+def send_assignment_created_push(
+    *, reason: str, target_group_name: str, start_date, end_date, recipient: str,
+    office_code: str, sender_emp_seq_no: str, sender_member_id: str, db=None, guard: str | None = None,
+):
+    """배정 생성 알림 (S06) — 당사자에게. 예) 파견 배정: 중환자실-RN (10/12~10/31)"""
+    label = _REASON_LABEL.get(reason, reason)
+    message = f"{label} 배정: {target_group_name} ({assignment_period_label(start_date, end_date)})"
+    return _send_assignment_push(
+        db, source="assignment_created", sub_code="S06", message=message, recipient=recipient,
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no, sender_member_id=sender_member_id,
+        guard=guard,
+    )
+
+
+def send_assignment_changed_push(
+    *, reason: str, target_group_name: str, changes: List[str], recipient: str,
+    office_code: str, sender_emp_seq_no: str, sender_member_id: str, db=None, guard: str | None = None,
+):
+    """배정 변경 알림 (S06) — 당사자에게. 예) 파견 배정 변경: 중환자실-RN · 기간 10/12~10/31→10/12~10/20"""
+    label = _REASON_LABEL.get(reason, reason)
+    message = f"{label} 배정 변경: {target_group_name} · " + " · ".join(changes)
+    return _send_assignment_push(
+        db, source="assignment_changed", sub_code="S06", message=message, recipient=recipient,
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no, sender_member_id=sender_member_id,
+        guard=guard,
     )
 
 
 def send_assignment_cancelled_push(
-    nurse_name: str,
-    reason: str,
-    source_group_name: str,
-    target_group_name: str | None,
-    recipients: List[str],
-    office_code: str,
-    sender_emp_seq_no: str,
-    sender_member_id: str,
-    db=None,
+    *, reason: str, target_group_name: str, start_date, end_date, recipient: str,
+    office_code: str, sender_emp_seq_no: str, sender_member_id: str, db=None, guard: str | None = None,
 ):
-    """배정 취소 알림 (S07). 대상 간호사 + source/target 관리자."""
+    """배정 취소 알림 (S07) — 당사자에게. 예) 파견 배정 취소: 중환자실-RN (10/12~10/31)"""
     label = _REASON_LABEL.get(reason, reason)
-    if target_group_name:
-        message = f"{nurse_name} {label} 배정 취소 ({source_group_name}→{target_group_name})"
-    else:
-        message = f"{nurse_name} {label} 배정 취소"
-    return _send_or_enqueue(
-        db, source="assignment_cancelled", push_code="P30", push_sub_code="S07",
-        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
-        sender_member_id=sender_member_id, recipients=recipients, message=message,
+    message = f"{label} 배정 취소: {target_group_name} ({assignment_period_label(start_date, end_date)})"
+    return _send_assignment_push(
+        db, source="assignment_cancelled", sub_code="S07", message=message, recipient=recipient,
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no, sender_member_id=sender_member_id,
+        guard=guard,
     )
 
 
 def send_transfer_completed_push(
-    nurse_name: str,
-    target_group_name: str,
-    recipients: List[str],
-    office_code: str,
-    sender_emp_seq_no: str,
-    sender_member_id: str,
-    db=None,
+    *, target_group_name: str, start_date, recipient: str,
+    office_code: str, sender_emp_seq_no: str, sender_member_id: str, db=None, guard: str | None = None,
 ):
-    """병동이동 완료 알림 (S08). 대상 간호사 + target 관리자."""
-    message = f"{nurse_name} 병동이동 완료 ({target_group_name} 배속)"
-    return _send_or_enqueue(
-        db, source="transfer_completed", push_code="P30", push_sub_code="S08",
-        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
-        sender_member_id=sender_member_id, recipients=recipients, message=message,
+    """병동이동 완료 알림 (S08) — 당사자에게. 예) 병동이동 완료: 10/7부터 중환자실-RN 소속입니다
+
+    ★ '오늘부터' 로 쓰지 않는다 — 재시도가 자정을 넘으면 날짜가 틀린다(Codex 10회차). 발효일(시작일)을 적는다.
+    """
+    day = f"{start_date.month}/{start_date.day}" if hasattr(start_date, "month") else str(start_date)
+    message = f"병동이동 완료: {day}부터 {target_group_name} 소속입니다"
+    return _send_assignment_push(
+        db, source="transfer_completed", sub_code="S08", message=message, recipient=recipient,
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no, sender_member_id=sender_member_id,
+        guard=guard,
     )
 
 

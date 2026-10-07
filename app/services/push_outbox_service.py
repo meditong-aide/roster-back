@@ -321,8 +321,54 @@ def _guard_holds(cursor, guard: str | None) -> bool:
         )
         found = cursor.fetchone()
         return bool(found) and bool(found[0])
+    if kind == "assignment_state":
+        return _assignment_state_holds(cursor, rest)
     _logger.warning("[PushOutbox] 알 수 없는 guard 종류 — 막지 않음: %s", guard)
     return True
+
+
+def _iso_day(value) -> str:
+    return value.isoformat()[:10] if value else ""
+
+
+def _assignment_state_holds(cursor, rest: str) -> bool:
+    """당사자 배정 알림(S06~S08) — 그 배정이 아직 알림이 말하는 상태인가(`assignment_service._assignment_guard`).
+
+    `rest` = `배정id:expect:상태:사유코드:도착병동:시작일:종료일`. 셋 다 상태·사유·병동·기간이 알림을 만든 때
+    그대로여야 하고, completed(병동이동 완료)는 간호사가 지금도 그 병동 소속이어야 한다.
+    재시도로 밀린 알림이 그 사이의 취소·변경 알림을 추월해 옛 상태를 안내하지 않게(Codex 2026-10-07).
+    배정 행을 UPDLOCK 으로 잡아 확인과 발송 사이에 취소·수정이 끼어들지 못하게 한다.
+    종료일은 `_effective_end_date` 와 같은 규칙(병동이동은 예정 종료일만, 그 밖은 실제 → 예정).
+    """
+    from services.assignment_service import assignment_reason_code
+
+    assignment_id, expect, status, reason_code, target, start, end = rest.split(":", 6)
+    cursor.execute(
+        f"SELECT status, reason, target_group_id, start_date, expected_end_date, end_date, nurse_id "
+        f"FROM {_roster_table('nurse_assignment')} WITH (UPDLOCK, ROWLOCK) WHERE id = %s",
+        (int(assignment_id),),
+    )
+    found = cursor.fetchone()
+    if not found:
+        return False
+    cur_status, reason, cur_target, cur_start, expected_end, end_date, nurse_id = found
+    # 상태(취소·완료 포함)·사유·병동·기간이 알림을 만든 때와 전부 같아야 한다 — 그 사이 정정·취소·되살림이
+    #   있었으면 그 변경의 알림이 따로 있으므로 옛 알림은 막는다(Codex 5·6·8·11회차).
+    cur_end = expected_end if reason == "병동이동" else (end_date or expected_end)
+    if not (cur_status == status and assignment_reason_code(reason) == reason_code
+            and str(cur_target or "") == target
+            and _iso_day(cur_start) == start and _iso_day(cur_end) == end):
+        return False
+    if expect != "completed":
+        return True
+    # ★ 병동이동 완료(S08)는 그 간호사가 **지금도** 그 병동 소속일 때만 — 재시도를 기다리는 사이 다음 이동이
+    #   완료됐으면 'B 소속' 은 틀린 안내다(Codex 7회차). 완료 처리와 같은 순서(배정 → 간호사)로 잠근다.
+    cursor.execute(
+        f"SELECT group_id FROM {_roster_table('nurses')} WITH (UPDLOCK, ROWLOCK) WHERE nurse_id = %s",
+        (str(nurse_id),),
+    )
+    nurse = cursor.fetchone()
+    return bool(nurse) and str(nurse[0] or "") == target
 
 
 def _finish(db: Session, row: PushOutbox, status: str, error: str | None) -> str:
