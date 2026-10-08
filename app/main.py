@@ -661,23 +661,18 @@ app.include_router(ontology_router.router)
 from routers import nurse_period as nurse_period_router
 app.include_router(nurse_period_router.router)
 
-# Agent v2 test chat UI (dev-only — 별도 페이지에서 컨텍스트 수동 선택)
-from agents_v2.test_chat_router import router as agent_test_router
-app.include_router(agent_test_router)
+# Agent v2 라우터 — 마운트는 agents_v2.surface 한 곳에서 env 스위치로 정한다(int-3a, 10-08).
+#   대화 send·reset: AIDE_AGENT_CHAT=1 · 테스트 화면 /agent/test/*: AIDE_AGENT_TEST_ROUTER=1 이고 운영
+#   환경·운영 DB 가 아닐 때(무인증 실 DB 조회 N66) · 사용량 화면: AIDE_AGENT_USAGE_VIEW=1(무인증 /view N57).
+#   whoami 는 늘 붙는다(위젯이 agent_enabled 로 자기를 숨긴다). 기본 설정 = 대화·테스트·사용량 전부 미마운트.
+# import 는 스위치 밖에 둔다 — 이미지 빌드 게이트(`import app.main`)가 기본 설정에서도 이 모듈들의
+# import 깨짐을 잡게 한다. 마운트만 스위치 안이다.
+from agents_v2 import chat_router as _agent_chat_module  # noqa: E402,F401
+from agents_v2 import test_chat_router as _agent_test_module  # noqa: E402,F401
+from agents_v2 import usage_router as _agent_usage_module  # noqa: E402,F401
+from agents_v2.surface import mount_agent_routes  # noqa: E402
 
-# Agent v2 production chat — 인증 사용자 컨텍스트 자동, floating widget 호출용
-from agents_v2.chat_router import router as agent_chat_router
-app.include_router(agent_chat_router)
-
-# Agent 사용량 대시보드 — LLM 토큰/비용 집계. 브랜치 전용 화면이고 `/view` 가 무인증이라(N57)
-# 기본은 마운트하지 않는다(int-0b·M8). 켜기: AIDE_AGENT_USAGE_VIEW=1 — 인증·병원 경계(int-3) 전에는
-# 운영에서 켜지 않는다.
-# import 는 게이트 밖에 둔다 — 이미지 빌드 게이트(`import app.main`)가 기본 설정에서도 이 모듈의
-# import 깨짐을 잡게 한다. 마운트만 게이트 안이다.
-from agents_v2.usage_router import router as agent_usage_router  # noqa: E402
-
-if os.getenv("AIDE_AGENT_USAGE_VIEW") == "1":
-    app.include_router(agent_usage_router)
+mount_agent_routes(app)
 
 import uvicorn
 

@@ -34,12 +34,20 @@ from agents_v2.security import (
 from db.client2 import get_db
 from db.models import Group, Office
 from routers.auth import get_current_user_from_cookie
-from services.group_access import resolve_managed_group_ids
+from agents_v2.surface import chat_enabled
+from services.group_access import caller_is_manager, resolve_managed_group_ids
 from schemas.auth_schema import User
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent/chat", tags=["agent_chat"])
+# whoami 는 대화 스위치(AIDE_AGENT_CHAT)와 무관하게 늘 붙는다 — 위젯은 agent_enabled 로 자기를 숨겨야 한다
+# (프론트 마운트 게이트는 front-1 이 구현, 아직 없음).
+whoami_router = APIRouter(prefix="/api/agent/chat", tags=["agent_chat"])
+
+# 10-08 결정: 일반 간호사에게는 에이전트를 제공하지 않는다(서버 거절 + 위젯 숨김).
+# CloudFront 가 403 을 화면 응답으로 가리므로 거절도 200 안내문으로 돌려준다.
+_NOT_PROVIDED_MSG = "AIDE 에이전트는 수간호사·그룹관리자·관리자만 사용할 수 있습니다."
 
 _store: Optional[ConversationStore] = None
 _agent: Optional[SchedulingAgent] = None
@@ -176,14 +184,30 @@ class WhoAmIResponse(BaseModel):
     group_id: str
     office_id: str
     role: str
+    # 위젯 표시 여부 — 대화가 켜져 있고(AIDE_AGENT_CHAT=1) 호출자가 수간호사·그룹관리자·ADM 일 때만 True.
+    agent_enabled: bool = False
+
+
+def _is_agent_user(db: Session, user: User) -> bool:
+    """에이전트 대상 역할(수간호사·그룹관리자·ADM) 여부 — 토큰이 아니라 DB 로 판정.
+
+    whoami·send·reset 이 모두 이 함수 하나로 판정한다(판정이 갈라지면 위젯은 보이는데 send 만 거절된다).
+    """
+    return caller_is_manager(db, user)
+
+
+def _agent_allowed(db: Session, user: User) -> bool:
+    """위젯 표시 여부 — 대화 스위치가 켜져 있고 대상 역할일 때만."""
+    return chat_enabled() and _is_agent_user(db, user)
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 
-@router.get("/whoami", response_model=WhoAmIResponse)
-async def whoami(
+@whoami_router.get("/whoami", response_model=WhoAmIResponse)
+def whoami(
     current_user: Optional[User] = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
 ):
     """현재 로그인 사용자 컨텍스트 — floating widget 초기화용."""
     if current_user is None:
@@ -197,6 +221,7 @@ async def whoami(
         group_id=current_user.group_id,
         office_id=current_user.office_id,
         role=_resolve_role(current_user),
+        agent_enabled=_agent_allowed(db, current_user),
     )
 
 
@@ -215,6 +240,12 @@ async def send_message(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="로그인이 필요합니다.",
+        )
+
+    if not _is_agent_user(db, current_user):
+        return ChatResponse(
+            answer=_NOT_PROVIDED_MSG,
+            conversation_id=req.conversation_id or str(uuid.uuid4()),
         )
 
     if not req.message or not req.message.strip():
@@ -347,6 +378,8 @@ async def reset_conversation(
     """세션을 강제 리셋 (pending_approval clear). 새 conversation_id 로 시작 권장."""
     if current_user is None:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if not _is_agent_user(db, current_user):
+        return None
     store = _get_store()
     try:
         store.set_pending_approval(

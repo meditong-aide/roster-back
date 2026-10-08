@@ -123,6 +123,7 @@ ruff check app/
 # Run server
 cd roster-back && uvicorn app.main:app --reload --port 8000
 
-# Test chat UI
+# Test chat UI — AIDE_AGENT_TEST_ROUTER=1 일 때만 열린다(운영 환경·운영 DB 면 막힘, app/agents_v2/surface.py)
 # http://localhost:8000/agent/test
+# 에이전트 대화(위젯)는 AIDE_AGENT_CHAT=1 일 때만 열린다
 ```
