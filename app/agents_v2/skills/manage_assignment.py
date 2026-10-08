@@ -21,6 +21,7 @@ from agents_v2.grounding.internal import resolve_date, resolve_group
 from agents_v2.skills.manifest import skill
 from agents_v2.verify import VerifyResult, readback
 from services import assignment_service
+from services.issued_month_guard import preview_guard, state_of_row, transfer_guard_scope
 
 _REASON = "파견"  # 기본(하위호환)
 
@@ -192,7 +193,10 @@ def _humanize_impact(impact: dict, gmap: dict[str, str]) -> dict:
 
 
 def _clean_error(exc: Exception) -> str:
+    """서비스 오류를 사용자 문구로. detail 이 {code, message} 면 message 만(str(dict) 를 그대로 보이지 않게)."""
     detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict) and detail.get("message"):
+        return str(detail["message"])
     return str(detail) if detail else str(exc)
 
 
@@ -309,6 +313,10 @@ def _create(db: Session, params: dict) -> Any:
             )
         except Exception as e:  # noqa: BLE001
             return {"error": _clean_error(e)}
+        # 발행된 달에 걸리면 승인 카드를 만들지 않는다 — 적용 때와 같은 판정이라 '미리보기 OK → 승인 409' 가 없다(dev-7).
+        _guard = impact.get("issued_guard") or {}
+        if _guard.get("blocked"):
+            return {"error": _guard.get("message") or "발행된 근무표 여부를 확인할 수 없어 진행할 수 없습니다."}
         summary = {
             "nurse": nurse.name,
             "reason": reason,
@@ -374,6 +382,10 @@ def _cancel(db: Session, params: dict) -> Any:
     target = dispatches[0]
     preview_only = params.get("preview_only", True)
     if preview_only:
+        # 취소도 쓰기와 같은 판정을 탄다 — 발행된 달에 걸린 병동이동이면 승인 카드 대신 안내(dev-7).
+        _guard = preview_guard(db, transfer_guard_scope(state_of_row(target), None))
+        if _guard["blocked"]:
+            return {"error": _guard["message"]}
         return {
             "preview": True,
             "operation": "cancel",
