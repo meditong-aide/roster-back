@@ -1605,9 +1605,16 @@ def get_my_issued_roster_service(
     home_gid = resolve_home_group_id(db, current_user)
     # ★ `_expand_target_rosters=False` — 관련 병동은 아래 `_load_group_roster` 가 병동당
     #   한 번씩 따로 읽는다. 기본값(True)은 같은 병동들을 재귀로 한 번 더 읽어 버린다.
-    snapshot_data = get_issued_roster_snapshot_service(
-        year=year, month=month, current_user=current_user, db=db,
-        target_group_id=home_gid, _expand_target_rosters=False,
+    # ★ 소속 병동이 없으면(병동을 고르지 않은 ADM 등) 소속 발행본 조회만 건너뛴다 —
+    #   조회 함수가 "대상 그룹이 없습니다" 예외를 던져 월·주·오늘이 모두 500 이 됐다.
+    #   바로 None 을 내지 않는 이유: 다른 병동 발행분은 아래에서 그대로 찾아야
+    #   월 목록(`get_my_issued_months_service`)과 결과가 같다. 없으면 아래 규칙대로 None.
+    snapshot_data = (
+        get_issued_roster_snapshot_service(
+            year=year, month=month, current_user=current_user, db=db,
+            target_group_id=home_gid, _expand_target_rosters=False,
+        )
+        if home_gid else None
     )
 
     roster = (snapshot_data or {}).get("roster") or {}
