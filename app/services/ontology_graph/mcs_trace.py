@@ -217,6 +217,63 @@ FAMILY_PRESENTATION: dict[str, dict[str, Any]] = {
 _FAMILY_KO["night_coverage"] = "야간 커버리지"
 
 
+def night_forced_oversupply_message(targets: list[dict], arithmetic: dict) -> str:
+    """나이트 고정 합 > 그 달 나이트 칸 — 화면 요약 문장(원인 + 어디서 무엇을)."""
+    _m = arithmetic.get("month")
+    _mo = f"{int(_m)}월 " if _m else ""
+    _where = f"근무자 관리 {int(_m)}월" if _m else "근무자 관리"
+    _top = ", ".join(f"{t.get('name') or t.get('nurse_id')} {int(t.get('current') or 0)}개"
+                     for t in targets[:4])
+    _more = f" 외 {len(targets) - 4}명" if len(targets) > 4 else ""
+    return (f"간호사별 {_mo}나이트 고정 개수 합({arithmetic.get('forced_n_sum')}개)이 {_mo}나이트 칸 수"
+            f"({arithmetic.get('n_slots')}칸)보다 {arithmetic.get('excess')}개 많아 근무표를 만들 수 없어요 — "
+            f"{_where}에서 나이트 개수를 합계 {arithmetic.get('n_slots')}개 이하로 줄여 주세요. "
+            f"[{_top}{_more}]")
+
+
+def night_forced_oversupply_card(targets: list[dict], arithmetic: dict) -> dict[str, Any]:
+    """나이트 고정 합 > 그 달 나이트 칸 → **근무자 관리 그 달로 보내는** 안내 카드.
+
+    솔버 전 산술 차단(`roster_create_service` 의 나이트 합계 검사)이 이 카드 하나만 낸다.
+    누구를 몇 개 줄일지는 병동이 정할 일이라 자동 적용하지 않는다(어느 간호사를 줄여도 합만
+    맞으면 된다). 카드를 누르면 화면이 `fix.target` 의 연·월로 근무자 관리를 연다.
+    ★ 하드락을 풀지 않는다 — 개인 나이트 개수(데이터)를 고치는 안내다.
+
+    Args:
+        targets: `detect_night_forced_oversupply` 의 targets(나이트 하한이 있는 간호사, 큰 순).
+        arithmetic: `{forced_n_sum, n_slots, excess, year, month}`.
+    """
+    _y, _m = arithmetic.get("year"), arithmetic.get("month")
+    _forced, _slots = arithmetic.get("forced_n_sum"), arithmetic.get("n_slots")
+    _excess = arithmetic.get("excess")
+    _mo = f"{int(_m)}월 " if _m else ""
+    _ym = f"{int(_y)}년 {int(_m)}월" if (_y and _m) else "해당 월"
+    _names = ", ".join(f"{t.get('name') or t.get('nurse_id')} {int(t.get('current') or 0)}개"
+                       for t in targets[:5])
+    _more = f" 외 {len(targets) - 5}명" if len(targets) > 5 else ""
+    return {
+        "option_id": "cause:night_forced_oversupply",
+        "kind": "manual_fix", "source": "cause", "verified": False,
+        "title_ko": f"{_mo}나이트 고정 개수 합계가 나이트 칸보다 {_excess}개 많습니다 — 근무자 관리에서 조정",
+        "trade_off_ko": (f"간호사별 나이트 고정 개수 합 {_forced}개 > {_mo}나이트 칸 {_slots}칸. "
+                         f"근무자 관리 {_ym}에서 나이트 개수를 합계 {_slots}개 이하로 줄인 뒤 다시 만드세요. "
+                         f"지난달 값이 이어서 적용 중일 수 있어요(그 달 값을 저장하면 이월이 끊깁니다). "
+                         f"[{_names}{_more}]"),
+        "changes": [],
+        "fix": {
+            "mode": "manual_navigate", "where": "nurse.monthly_limit",
+            "where_label_ko": f"근무자 관리 > {_ym} > 나이트 개수",
+            "how_ko": f"나이트 개수 합계를 {_slots}개 이하로 줄여 저장한 뒤 다시 생성하세요.",
+            "config_key": None,
+            "target": {
+                "year": _y, "month": _m,
+                "nurse_ids": [t.get("nurse_id") for t in targets if t.get("nurse_id")],
+                "forced_n_sum": _forced, "n_slots": _slots, "excess": _excess,
+            },
+        },
+    }
+
+
 def cause_to_resolution_options(
     classification: str, top_family: str | None, targets: list[dict] | None,
 ) -> list[dict[str, Any]]:

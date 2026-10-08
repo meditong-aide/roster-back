@@ -471,6 +471,149 @@ def detect_banned_off_conflict(nurses: list, config: dict, num_days: int) -> lis
     return out
 
 
+def _fixed_n_by_day(fixed_cells, nurse_ids: set[str], code2main: dict[str, str],
+                    id_to_main: dict[str, str], num_days: int) -> list[int] | None:
+    """날짜별 고정 N 칸 수(대상 간호사만) — 솔버가 그 칸을 N 으로 고정하는지 **엔진과 같은 순서로** 판정.
+
+    입력은 `[{nurse_id, day_index, shift}]` — 호출부가 엔진 인덱스(`nurse_index`)를 엔진 정렬
+    (`_build_engine_nurse_index_map`)으로 nurse_id 로 바꿔 넘긴다.
+    엔진(`cp_sat_basic`)은 고정 칸 코드를 두 번 바꾼다(Codex 2026-10-08 — 한 번만 따라 하면
+    매핑이 갈리는 코드에서 고정 N 을 놓쳐 정상 생성을 막는다):
+      1) `normalize_shift_code(원코드, id_to_main)` — 표준 코드면 그대로, 아니면 근무코드 정의
+         (`build_shift_normalizer`) 매핑. 결과가 없으면 **원코드를 그대로 둔다**(엔진도 칸을 남긴다).
+      2) `code2main.get(c) or id_to_main.get(c) or c`, OFF·주 → O (`_normalize_fixed_to_main`).
+    ★ 같은 (간호사, 날짜) 에 칸이 여럿이면 **하나라도 N 이면 고정 N 으로 센다.** 엔진은 해석 못 하는
+      칸·지원하지 않는 메인코드 칸은 건너뛰어 앞선 칸을 남기므로(덮어쓰는 순서가 입력·코드에 달림),
+      마지막 칸만 보면 앞선 N 을 놓쳐 상한을 작게 잡는다(Codex 2026-10-08). 크게 세는 쪽은 안전하다.
+    ★ 해석할 수 없는 칸(간호사·날짜 불명)이 하나라도 있으면 None — 0 으로 치면 상한을 작게 잡아
+      정상 생성을 막을 수 있다.
+    """
+    from services.cp_sat.shift_normalizer import normalize_shift_code
+
+    out = [0] * int(num_days)
+    n_cells: set[tuple[str, int]] = set()
+    for cell in fixed_cells or []:
+        if not isinstance(cell, dict):
+            return None
+        nid = str(cell.get("nurse_id") or "")
+        try:
+            d = int(cell.get("day_index"))
+        except (TypeError, ValueError):
+            return None
+        if not nid or not (0 <= d < int(num_days)):
+            return None
+        if nid not in nurse_ids:
+            continue
+        raw = str(cell.get("shift") or "").strip()
+        # 1차 실패 시 엔진은 칸을 지우지 않고 **원코드를 그대로 남겨** 2차에서 다시 해석한다
+        #   (`cp_sat_basic` 정규화 루프의 continue 는 `c['shift']` 갱신만 건너뛴다 — Codex 2026-10-08).
+        s1 = (normalize_shift_code(raw, id_to_main) or raw).upper()
+        if not s1:
+            continue
+        s2 = code2main.get(s1) or id_to_main.get(s1) or s1
+        if s2 in ("OFF", "주"):
+            s2 = "O"
+        if s2 == "N":
+            n_cells.add((nid, d))
+    for _nid, d in n_cells:
+        out[d] += 1
+    return out
+
+
+def _night_slot_cap(config: dict, num_days: int, fixed_counted: list[int]) -> int | None:
+    """대상 간호사들의 그 달 N 배정 수의 **위쪽 한계**. 판정할 수 없으면 None.
+
+    ★ **off_first 이고 일별 최대 인원(N)을 하나도 두지 않은 달만** 판정한다. 이 경우 두 엔진
+      (`cp_sat_basic`·`fallback_lex`) 모두 **모든 단계에서** 그 날 고정 아닌 N ≤ max(0, 필요인원 −
+      고정N) 를 hard 로 건다. 최대 인원이 있는 날은 fallback 의 커버리지 완화(`_relax_coverage`)
+      때 soft 가 되고, off_first 가 아니면 상한이 아예 없을 수 있어 판정하지 않는다.
+    대상 간호사(합계에 넣은 사람)의 그 날 N 은 `max(대상 고정N, 필요인원)` 을 넘지 못한다
+    (전체 고정N ≥ 대상 고정N 이라 `대상고정 + max(0, 필요 − 전체고정) ≤ max(대상고정, 필요)`).
+    그 날 요구표에 N 이 없으면 그 날 N 은 위가 열려 있어 판정하지 않는다.
+    """
+    if not bool(config.get("off_first")):
+        return None
+    by_day = config.get("daily_shift_requirements_by_day")
+    max_by_day = config.get("daily_shift_requirements_max_by_day")
+    flat = config.get("daily_shift_requirements") or {}
+    total = 0
+    for d in range(int(num_days)):
+        need_map = (by_day[d] if isinstance(by_day, list) and d < len(by_day)
+                    and isinstance(by_day[d], dict) else flat)
+        max_map = (max_by_day[d] if isinstance(max_by_day, list) and d < len(max_by_day)
+                   and isinstance(max_by_day[d], dict) else None)
+        if "N" not in (need_map or {}):
+            return None
+        try:
+            raw_max = int((max_map or {}).get("N", 0) or 0)
+            need = max(0, int(need_map.get("N") or 0))
+        except (TypeError, ValueError):
+            return None
+        if raw_max > 0:
+            return None
+        fx = fixed_counted[d] if d < len(fixed_counted) else 0
+        total += max(fx, need)
+    return total
+
+
+def detect_night_forced_oversupply(nurses: list, config: dict, num_days: int, *,
+                                   fixed_cells=None,
+                                   code2main: dict[str, str] | None = None,
+                                   id_to_main: dict[str, str] | None = None) -> dict | None:
+    """간호사별 월 나이트 하한(n_exact/n_min) 합 > 그 달 나이트 칸 상한 합 → 해 없음(산술 증명).
+
+    솔버 **전**에 엔진과 같은 입력(고정근무자 차감 뒤 설정·엔진 간호사·고정 칸)으로 부른다.
+    개인 n_exact/n_min 은 그 달 N 코드 개수의 하한이다(`monthly_limit_constraints` — 고정 칸 포함).
+    실사례: 102598edcd0e 2026-11 — 11월 한도 행이 없어 10월 값(5·5·5·5·5·6=31)이 이월됐는데
+    30일 × 하루 N 1명(off_first) = 30칸. 진단이 개인 단위만 봐서 UNDIAGNOSED·카드 0장이었다.
+    ★ 생성을 막는 판정이라 **틀리면 안 된다** — 모르는 것은 크게 잡거나 판정하지 않는다.
+      · 일별 인원에서 빠지는 칸이 있는 간호사(파견 기간 `coverage_exclude_nurse_days`,
+        프리셉티 — 기간 맵·캐시 둘 다)는 합에서 뺀다(그들의 N 은 칸을 차지하지 않을 수 있다).
+      · 고정 칸은 `_fixed_n_by_day` 로 엔진과 같은 순서로 정규화해 세고(`code2main` = 근무코드
+        목록 `_build_code_to_main_map`, `id_to_main` = 근무코드 정의 `build_shift_normalizer`),
+        해석할 수 없는 칸이 있거나 매핑이 없으면 판정하지 않는다.
+      · **off_first 이고 일별 최대 인원(N)을 두지 않은 달만** 판정한다(`_night_slot_cap`) —
+        그때만 두 엔진이 모든 단계에서 일별 N 상한을 hard 로 건다.
+
+    Returns:
+        `{forced_n_sum, n_slots, excess, targets}` 또는 None(판정 불가·모순 없음).
+        targets = 합에 넣은 간호사(하한 큰 순) `[{nurse_id, name, current, field}]`.
+    """
+    excl = {str(k) for k, v in (config.get("coverage_exclude_nurse_days") or {}).items() if v}
+    pte_map = {str(k) for k, v in (config.get("preceptee_period_by_nurse_id") or {}).items() if v}
+    counted_ids: set[str] = set()
+    forced = 0
+    targets: list[dict] = []
+    for nu in nurses:
+        nid = str(_nurse_attr(nu, "nurse_id") or "")
+        is_pte = nid in pte_map or bool(_nurse_attr(nu, "preceptor_id"))
+        field_name = "n_exact" if _nurse_attr(nu, "n_exact") is not None else "n_min"
+        try:
+            floor = int(_nurse_attr(nu, "n_exact", "n_min") or 0)
+        except (TypeError, ValueError):
+            floor = 0
+        if floor <= 0 or not nid or nid in excl or is_pte:
+            continue
+        counted_ids.add(nid)
+        forced += floor
+        targets.append({"nurse_id": nid, "name": _nurse_attr(nu, "name") or nid,
+                        "current": floor, "field": field_name})
+    if not targets:
+        return None
+    if code2main is None or id_to_main is None:
+        return None                       # 엔진과 같은 정규화를 할 수 없으면 판정하지 않는다
+    c2m = {str(k).strip().upper(): str(v).strip().upper() for k, v in code2main.items()}
+    i2m = {str(k).strip().upper(): str(v).strip().upper() for k, v in id_to_main.items()}
+    fixed_counted = _fixed_n_by_day(fixed_cells, counted_ids, c2m, i2m, num_days)
+    if fixed_counted is None:
+        return None                       # 고정 칸을 해석할 수 없으면 판정하지 않는다
+    slots = _night_slot_cap(config, num_days, fixed_counted)
+    if slots is None or forced <= slots:
+        return None
+    targets.sort(key=lambda t: -t["current"])
+    return {"forced_n_sum": forced, "n_slots": slots, "excess": forced - slots, "targets": targets}
+
+
 def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
                                       *, year: int | None = None, month: int | None = None,
                                       iters: int = 6) -> InfeasibilityExplanation:

@@ -6753,6 +6753,101 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             # 차감 실패는 생성을 막지 않는다(기존 동작으로 진행). 다만 초과가 남을 수 있다.
             print(f"[FixedShiftCoverage] 차감 실패(무시): {type(_fx_exc).__name__}: {_fx_exc}")
 
+    # ── 솔버 전 산술 차단: 간호사별 나이트 하한 합 > 그 달 나이트 칸 ─────────────────
+    # ★ 엔진과 같은 입력(고정근무자 차감 뒤 config_dict · 엔진 간호사 · 고정 칸)으로 판정한다.
+    #   개인 n_exact/n_min 합이 날짜별 N 상한의 합을 넘으면 다른 규칙과 무관하게 배정이 없다.
+    #   솔버를 돌리지 않고 사전검사처럼 바로 막고, 근무자 관리 그 달로 보내는 카드 하나만 낸다.
+    #   실사례(2026-10-08 운영 102598edcd0e 11월): 11월 한도 행이 없어 10월 값(합 31)이 이월,
+    #   30일 × 하루 N 1명 = 30칸 → 솔버 INFEASIBLE 뒤 진단이 원인을 못 찾아 카드 0장이었다.
+    # ★ 판정 실패는 생성을 막지 않는다(기존 흐름대로 솔버 진행). 판정 규칙은 오판이 없도록
+    #   모르는 것을 크게 잡는다(`lagrangian.detect_night_forced_oversupply`).
+    if nurses_for_engine:
+        _nfo = None
+        try:
+            from calendar import monthrange as _mr_nfo
+
+            from services.cp_sat_basic import _build_shift_normalizer
+            from services.ontology_graph.lagrangian import detect_night_forced_oversupply
+
+            # 고정 칸 코드 정규화는 엔진과 **같은 두 매핑**으로 한다(`_fixed_n_by_day` 참조).
+            #   · 근무코드 목록 → `_build_code_to_main_map`(엔진 `code2main` 과 같은 함수)
+            #   · 근무코드 정의 → `_run_cp_sat_basic` 이 `shift_definitions` 를 만드는 방식 그대로
+            _c2m_nfo = _build_code_to_main_map(shift_manage_data)
+            _defs_nfo = [
+                {
+                    "shift_id": getattr(_s, "shift_id", None),
+                    "default_shift": getattr(_s, "default_shift", None) or getattr(_s, "shift_id", None),
+                    "shift_gb": getattr(_s, "shift_gb", None),
+                    "type": getattr(_s, "type", None),
+                    "show_in_preference": getattr(_s, "show_in_preference", None),
+                }
+                for _s in _load_shift_lookup(db, current_user.office_id, current_user.group_id).values()
+            ]
+            _i2m_nfo, _ = _build_shift_normalizer(_defs_nfo)
+            # 엔진 고정 칸은 엔진 인덱스(nurse_index) 형식이다 — 엔진과 같은 정렬로 nurse_id 로 바꾼다.
+            #   못 바꾸는 칸은 nurse_id=None 으로 남겨 판정 쪽이 '모름'으로 건너뛰게 한다.
+            _idx2nid_nfo = {
+                _i: _nid for _nid, _i in _build_engine_nurse_index_map(nurses_for_engine).items()
+            }
+            _fixed_nfo = [
+                {"nurse_id": _idx2nid_nfo.get(_c.get("nurse_index")),
+                 "day_index": _c.get("day_index"), "shift": _c.get("shift")}
+                for _c in (combined_fixed_cells or [])
+            ]
+            _nfo = detect_night_forced_oversupply(
+                nurses_for_engine, config_dict, _mr_nfo(req.year, req.month)[1],
+                fixed_cells=_fixed_nfo, code2main=_c2m_nfo, id_to_main=_i2m_nfo,
+            )
+        except Exception as _nfo_exc:
+            print(f"[NightOversupply] 판정 실패(무시하고 진행): {type(_nfo_exc).__name__}: {_nfo_exc}")
+            _nfo = None
+        if _nfo:
+            from services.ontology_graph.mcs_trace import (
+                night_forced_oversupply_card,
+                night_forced_oversupply_message,
+            )
+            from services.precheck import build_blocking_payload as _bbp_nfo
+            _arith_nfo = {
+                "forced_n_sum": _nfo["forced_n_sum"], "n_slots": _nfo["n_slots"],
+                "excess": _nfo["excess"], "year": req.year, "month": req.month,
+            }
+            _msg_nfo = night_forced_oversupply_message(_nfo["targets"], _arith_nfo)
+            payload = _bbp_nfo({"status": "blocked", "issues": [{
+                "reason_code": "MONTHLY_NIGHT_FORCED_OVERSUPPLY",
+                "severity": "error",
+                "evidence": {**_arith_nfo,
+                             "nurses": [{"nurse_id": t["nurse_id"], "name": t["name"],
+                                         "current": t["current"], "field": t["field"]}
+                                        for t in _nfo["targets"]]},
+            }]})
+            _inf_nfo = payload.setdefault("infeasibility", {})
+            # 이 원인은 산술로 확정이라 이 카드 하나만 낸다(다른 일반 카드와 섞이면 안내가 갈린다).
+            _inf_nfo["resolution_options"] = [
+                night_forced_oversupply_card(_nfo["targets"], _arith_nfo)]
+            _inf_nfo["summary_message_ko"] = _msg_nfo
+            _inf_nfo["fix_suggestions_ko"] = [_msg_nfo]
+            print(f"[NightOversupply][BLOCKING] 나이트 하한 합 {_nfo['forced_n_sum']} > "
+                  f"칸 {_nfo['n_slots']} — 솔버 호출 생략. HTTP 500 응답.")
+            # 사전검사 차단과 같은 기록을 남긴다(프리셋 목록 제외·사후 분석용). 기록 실패는 무시.
+            try:
+                _mark_config_generate_status(
+                    db, latest_config, "blocked",
+                    _build_generate_snapshot(db, latest_config, "blocked",
+                                             req.year, req.month,
+                                             _nurses_dict_for_precheck, precheck_config,
+                                             job_id, _persistent_fix),
+                    req.year, req.month, job_id, _base_intervened)
+                if _ctx is not None:
+                    _ctx["recorded"] = True
+            except Exception as _nfo_rec_exc:
+                print(f"[NightOversupply] 차단 기록 실패(무시): {_nfo_rec_exc}")
+            try:
+                db.delete(schedule)
+                db.commit()
+            except Exception:
+                db.rollback()
+            raise HTTPException(status_code=500, detail=payload)
+
     # UNDIAGNOSED 탐색 기준의 대체값(첫 시도 스냅샷이 없을 때). 아래 완화 사다리가 config_dict 의
     # 최상위 키를 누적 갱신(same_shift·isolated_work·n2n_min_gap)하므로 첫 시도 직전 값을 떠 둔다.
     _first_attempt_cfg: dict | None = None

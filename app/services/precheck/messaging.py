@@ -25,6 +25,14 @@ def _ev(issue: Dict[str, Any], key: str, default: Any = None) -> Any:
 #   각 msg 는 왜 그런지 직관적으로 설명하고, fix 는 '어디서 무엇을' 을 명확히(화면 위치 포함).
 #   위치 표기는 fix_location.py 의 브레드크럼과 정합.
 _MESSAGES: Dict[str, Dict[str, Any]] = {
+    # 솔버 전 산술 차단(roster_create_service) — 간호사별 나이트 하한 합 > 그 달 나이트 칸.
+    "MONTHLY_NIGHT_FORCED_OVERSUPPLY": {
+        "msg": "간호사별로 정한 이달 나이트 개수를 모두 더하면 이달 나이트 칸 수보다 많아, 모두 지킬 수 없습니다.",
+        "fix": [
+            "근무자 관리 > 해당 월 > 나이트 개수에서 합계가 나이트 칸 수 이하가 되도록 줄여 주세요.",
+            "그 달 값을 저장하지 않았다면 지난달 값이 이어서 적용됩니다 — 그 달 값을 저장해 주세요.",
+        ],
+    },
     "MID_REQUIRED_MISSING": {
         "msg": "'중간 근무(M)' 사용은 켜져 있는데, 날짜별 필요 인원에는 중간 근무가 0명으로 되어 있어 두 설정이 서로 맞지 않습니다.",
         "fix": [
