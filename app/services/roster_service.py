@@ -1332,110 +1332,39 @@ CELL_ASSIGNMENT_CONFLICT = "assignment_conflict"
 _SUMMARY_CATEGORY_ORDER = ("D", "E", "N", "O", "M")
 
 
-def get_my_issued_roster_service(
+def _resolve_my_day_owners(
+    db: Session,
+    nurse_id,
+    src_gid: str,
     year: int,
     month: int,
-    current_user,
-    db: Session,
-    include_coworkers: bool = False,
-) -> dict | None:
+    all_assignments: list | None = None,
+) -> tuple[list[dict], list]:
+    """그 달 날짜별 **그 날의 근무 병동**(타임라인)과 정렬된 병동이동 목록.
+
+    ★ 개인 월 조회(`get_my_issued_roster_service`)와 개인 월 목록
+      (`get_my_issued_months_service`)이 **같은 판정**을 쓰게 하려고 뺐다. 둘이 따로 정하면
+      목록에는 있는데 열면 빈 달이 생긴다(Codex 2026-10-08 — 이동 뒤 새 병동이 이전 달을
+      재발행하면 명단에는 들지만 그 달 근무 병동은 이전 병동이다).
+    ★ `all_assignments` 를 주면 조회하지 않는다(월 목록이 여러 달을 볼 때 한 번만 읽는다).
+      줄 때는 본인 것 · status active/completed · reason 파견/병동이동 만 넣어야 한다.
+
+    Returns:
+        `(_owner, _moves)` — `_owner[i]` = (i+1)일의 `{group_id, reason, is_home, asg_id,
+        asg_start, asg_end, conflict}`. `_moves` = 시작일 순 병동이동(이전 병동 라벨용).
     """
-    로그인 사용자 본인의 발행된 근무표만 조회합니다.
-    snapshot의 roster_json에서 nurse_id 기준으로 추출.
-
-    파견/병동이동 구간은 **대상 병동의 발행본으로 교체**한다. 대상을 확인할 수
-    없는 구간은 원 소속 코드를 그대로 두지 않고 비운 뒤(`code=""`)
-    `status` 로 이유를 밝힌다 — 남겨 두면 그 근무가 실제로 서는 것처럼 보인다.
-    """
-    # 토큰 group_id 대신 nurse_id→DB home group 으로 스냅샷 조회(그룹전환/소속변경 안전).
-    from services.group_access import resolve_home_group_id
-
-    home_gid = resolve_home_group_id(db, current_user)
-    snapshot_data = get_issued_roster_snapshot_service(
-        year=year, month=month, current_user=current_user, db=db,
-        target_group_id=home_gid,
-    )
-    if not snapshot_data:
-        return None
-
-    roster = snapshot_data.get("roster") or {}
-    nurse_id = getattr(current_user, "nurse_id", None)
-    if not nurse_id:
-        return None
-
-    roster_nurses = roster.get("nurses") or []
-    my_roster = next(
-        (n for n in roster_nurses if str(n.get("nurse_id")) == str(nurse_id)),
-        None,
-    )
-    if not my_roster:
-        return None
-
     from calendar import monthrange
     from datetime import date
-    from db.models import Group
-    from services.assignment_service import get_active_assignments_for_month
 
     days_in_month = monthrange(year, month)[1]
     m_start = date(year, month, 1)
     m_end = date(year, month, days_in_month)
-    src_gid = home_gid or ""
-    src_group_row = (
-        db.query(Group).filter(Group.group_id == src_gid).first() if src_gid else None
-    )
-    src_group_name = src_group_row.group_name if src_group_row else ""
-
-    shift_colors: dict[str, str] = dict(roster.get("shift_colors") or {})
-    src_cells = my_roster.get("schedule") or []
-    src_ids = my_roster.get("schedule_ids") or []
-
-    def _cell_code(_cell) -> str:
-        if isinstance(_cell, dict):
-            return str(_cell.get("code", "") or "")
-        return str(_cell or "")
-
-    def _cell_color(_cell, _code: str) -> str:
-        if isinstance(_cell, dict) and _cell.get("color"):
-            return str(_cell.get("color") or "")
-        return str(shift_colors.get(_code, "") or "")
-
-    # 일자별 병합 배열 초기화(=source 기준)
-    schedule_days: list[dict] = []
-    for _i in range(days_in_month):
-        _cell = src_cells[_i] if _i < len(src_cells) else None
-        _code = _cell_code(_cell)
-        schedule_days.append({
-            "day": _i + 1,
-            "code": _code,
-            "color": _cell_color(_cell, _code),
-            "schedule_id": (src_ids[_i] if _i < len(src_ids) else None),
-            "group_id": src_gid,
-            "group_name": src_group_name,
-            "is_source": True,
-            "reason": None,
-            # 원 소속 발행본의 값이므로 확정이다. 파견 구간은 아래에서 덮인다.
-            "status": CELL_CONFIRMED,
-            # ★ 화면용 단일 축 — "이 셀에 그릴 근무가 확정돼 있나".
-            #   전체표 셀과 같은 키·같은 규칙이다(`routers/roster.py:ROSTER_CELL_KEYS`).
-            #   무조건 True 로 두면 발행본의 빈 셀이 확정 근무로 읽힌다.
-            "is_issued": bool(_code),
-            # ★ 전체표 셀과 같은 키. 개인표는 본인 기준이라 inbound 가 없고,
-            #   출발 병동은 언제나 원 소속이다.
-            "is_inbound": False,
-            "source_group_id": src_gid,
-            "source_group_name": src_group_name,
-            # ★ 그 날 실제 근무 병동 = 원 소속. 전체표가 배치 없는 날에
-            #   조회 병동을 채우는 것과 같은 규칙이다(비워 두면 화면이
-            #   "null 이면 원 소속" 을 따로 알아야 한다).
-            "target_group_id": src_gid,
-            "target_group_name": src_group_name,
-        })
 
     # 파견/병동이동: target 근무표 overlay (복수 assignment 지원)
     # 본인 nurse_id 기반으로 month 와 overlap 되는 모든 assignment 수집
     # (영구이동 발효 후엔 src_gid 가 변경되므로 source/target group 필터 사용 금지)
     from db.models import NurseAssignment as _NurseAssignment
-    _all_my_asgs = (
+    _all_my_asgs = all_assignments if all_assignments is not None else (
         db.query(_NurseAssignment)
         .filter(
             _NurseAssignment.nurse_id == nurse_id,
@@ -1637,6 +1566,132 @@ def get_my_issued_roster_service(
             # 승자는 규칙으로 정했지만 확정은 아니다.
             "conflict": _dp_conflict or _move_conflict,
         })
+    return _owner, _moves
+
+
+def get_my_issued_roster_service(
+    year: int,
+    month: int,
+    current_user,
+    db: Session,
+    include_coworkers: bool = False,
+) -> dict | None:
+    """
+    로그인 사용자 본인의 발행된 근무표만 조회합니다.
+    snapshot의 roster_json에서 nurse_id 기준으로 추출.
+
+    파견/병동이동 구간은 **대상 병동의 발행본으로 교체**한다. 대상을 확인할 수
+    없는 구간은 원 소속 코드를 그대로 두지 않고 비운 뒤(`code=""`)
+    `status` 로 이유를 밝힌다 — 남겨 두면 그 근무가 실제로 서는 것처럼 보인다.
+
+    ★ 조회 기준은 **로그인 사용자 + 연월** 뿐이다(group_id 를 받지 않는다). 날짜마다
+      그 날 실제 근무 병동(소속·파견·병동이동 이력)을 정하고 **그 병동의 발행본**에서
+      값을 가져온다. 셀의 `group_id`·`target_group_id` 가 그 날 근무 병동이다.
+    ★ 현재 소속 병동이 미발행이거나 거기에 내 행이 없어도 **월 전체를 None 으로 끝내지
+      않는다**(프론트 요청 1008 — 병동이동 뒤 새 병동 미발행이면 이전 병동에서 이미
+      발행된 날까지 사라졌다). 그 날들은 `target_not_issued`/`target_no_row` 로 비운다.
+      발행본에서 온 날이 하루도 없을 때만 None(기존 "근무표 없음" 계약 유지).
+    ★ 출처: 셀 `snapshot_id` = 그 칸 값을 가져온 발행 스냅샷(없으면 None).
+      `groups[]` 에 병동별 `snapshot_id`·`issue_status` 를 싣는다.
+    ★ `home_group_id` = **지금의** 소속 병동(DB 기준 · 토큰 병동 아님 · 발행 여부와 무관).
+      `source_group_id` 는 하위호환으로 같은 값을 그대로 둔다.
+    """
+    # 토큰 group_id 대신 nurse_id→DB home group 으로 스냅샷 조회(그룹전환/소속변경 안전).
+    from services.group_access import resolve_home_group_id
+
+    nurse_id = getattr(current_user, "nurse_id", None)
+    if not nurse_id:
+        return None
+    home_gid = resolve_home_group_id(db, current_user)
+    # ★ `_expand_target_rosters=False` — 관련 병동은 아래 `_load_group_roster` 가 병동당
+    #   한 번씩 따로 읽는다. 기본값(True)은 같은 병동들을 재귀로 한 번 더 읽어 버린다.
+    snapshot_data = get_issued_roster_snapshot_service(
+        year=year, month=month, current_user=current_user, db=db,
+        target_group_id=home_gid, _expand_target_rosters=False,
+    )
+
+    roster = (snapshot_data or {}).get("roster") or {}
+    roster_nurses = roster.get("nurses") or []
+    my_roster = next(
+        (n for n in roster_nurses if str(n.get("nurse_id")) == str(nurse_id)),
+        None,
+    )
+    # 현재 소속 병동 발행본의 상태 — 소속 날 셀의 상태가 이 값을 따른다.
+    home_status = (
+        TARGET_NOT_ISSUED if not snapshot_data
+        else TARGET_ISSUED if my_roster else TARGET_NO_ROW
+    )
+    home_cell_status = {
+        TARGET_ISSUED: CELL_CONFIRMED,
+        TARGET_NO_ROW: CELL_TARGET_NO_ROW,
+        TARGET_NOT_ISSUED: CELL_TARGET_NOT_ISSUED,
+    }[home_status]
+    home_snapshot_id = (snapshot_data or {}).get("snapshot_id") if my_roster else None
+
+    from calendar import monthrange
+    from datetime import date
+    from db.models import Group
+    from services.assignment_service import get_active_assignments_for_month
+
+    days_in_month = monthrange(year, month)[1]
+    src_gid = home_gid or ""
+    src_group_row = (
+        db.query(Group).filter(Group.group_id == src_gid).first() if src_gid else None
+    )
+    src_group_name = src_group_row.group_name if src_group_row else ""
+
+    shift_colors: dict[str, str] = dict(roster.get("shift_colors") or {})
+    src_cells = (my_roster or {}).get("schedule") or []
+    src_ids = (my_roster or {}).get("schedule_ids") or []
+
+    def _cell_code(_cell) -> str:
+        if isinstance(_cell, dict):
+            return str(_cell.get("code", "") or "")
+        return str(_cell or "")
+
+    def _cell_color(_cell, _code: str) -> str:
+        if isinstance(_cell, dict) and _cell.get("color"):
+            return str(_cell.get("color") or "")
+        return str(shift_colors.get(_code, "") or "")
+
+    # 일자별 병합 배열 초기화(=source 기준)
+    schedule_days: list[dict] = []
+    for _i in range(days_in_month):
+        _cell = src_cells[_i] if _i < len(src_cells) else None
+        _code = _cell_code(_cell)
+        schedule_days.append({
+            "day": _i + 1,
+            "code": _code,
+            "color": _cell_color(_cell, _code),
+            "schedule_id": (src_ids[_i] if _i < len(src_ids) else None),
+            "group_id": src_gid,
+            "group_name": src_group_name,
+            "is_source": True,
+            "reason": None,
+            # 원 소속 발행본의 값이면 확정이다. 파견 구간은 아래에서 덮인다.
+            # ★ 소속 병동이 미발행·내 행 없음이면 그 사실을 그대로 싣는다(코드는 빈 값).
+            "status": home_cell_status,
+            # ★ 화면용 단일 축 — "이 셀에 그릴 근무가 확정돼 있나".
+            #   전체표 셀과 같은 키·같은 규칙이다(`routers/roster.py:ROSTER_CELL_KEYS`).
+            #   무조건 True 로 두면 발행본의 빈 셀이 확정 근무로 읽힌다.
+            "is_issued": bool(_code),
+            # 이 칸 값을 가져온 발행 스냅샷. 재마감 알림의 스냅샷과 같은지 가르는 데 쓴다.
+            "snapshot_id": home_snapshot_id,
+            **({"target_status": home_status} if home_status != TARGET_ISSUED else {}),
+            # ★ 전체표 셀과 같은 키. 개인표는 본인 기준이라 inbound 가 없고,
+            #   출발 병동은 언제나 원 소속이다.
+            "is_inbound": False,
+            "source_group_id": src_gid,
+            "source_group_name": src_group_name,
+            # ★ 그 날 실제 근무 병동 = 원 소속. 전체표가 배치 없는 날에
+            #   조회 병동을 채우는 것과 같은 규칙이다(비워 두면 화면이
+            #   "null 이면 원 소속" 을 따로 알아야 한다).
+            "target_group_id": src_gid,
+            "target_group_name": src_group_name,
+        })
+
+    # 날짜별 그 날의 근무 병동(타임라인) — 개인 월 목록과 **같은 함수**로 정한다.
+    _owner, _moves = _resolve_my_day_owners(db, nurse_id, src_gid, year, month)
 
     # ── 관련 병동 스냅샷을 그룹당 한 번만 읽는다 ─────────────────────────────
     # ★ `is_home` 이 아니면(=파견이면) 병동이 현재 home 과 같아도 overlay 대상이다.
@@ -1651,6 +1706,14 @@ def get_my_issued_roster_service(
     gid_to_name = {g.group_id: g.group_name for g in _gname_rows}
 
     _snap_cache: dict[str, tuple[dict | None, str]] = {}
+    # 병동별 발행 출처(`groups[]` 에 싣는다). 현재 소속 병동은 위에서 이미 읽었다.
+    _snap_meta: dict[str, dict] = {}
+    if src_gid:
+        _snap_meta[src_gid] = {
+            "snapshot_id": (snapshot_data or {}).get("snapshot_id"),
+            "issued_at": (snapshot_data or {}).get("created_at"),
+            "issue_status": home_status,
+        }
 
     def _load_group_roster(_gid: str) -> tuple[dict | None, str]:
         """그 병동 발행본의 내 행과 **상태**.
@@ -1681,6 +1744,8 @@ def get_my_issued_roster_service(
             _status = TARGET_ISSUED if _t_my else TARGET_NO_ROW
             if _t_my:
                 _out = {
+                    "snapshot_id": _snap.get("snapshot_id"),
+                    "name": _t_my.get("name"),
                     "schedule": _t_my.get("schedule") or [],
                     "schedule_ids": _t_my.get("schedule_ids") or [],
                     "shift_colors": _t_roster.get("shift_colors") or {},
@@ -1697,6 +1762,11 @@ def get_my_issued_roster_service(
                     "profiles": _snap.get("nurses") or [],
                 }
         _snap_cache[_gid] = (_out, _status)
+        _snap_meta[_gid] = {
+            "snapshot_id": (_snap or {}).get("snapshot_id"),
+            "issued_at": (_snap or {}).get("created_at"),
+            "issue_status": _status,
+        }
         return _out, _status
 
     def _color_from(_cell, _code: str, _palette: dict) -> str:
@@ -1722,7 +1792,7 @@ def get_my_issued_roster_service(
     # 색표는 카탈로그에 코드가 없을 때의 폴백이다.
     _colors_by_group: dict[str, dict] = {src_gid: dict(shift_colors)} if src_gid else {}
     _shifts_by_group: dict[str, list[dict]] = (
-        {src_gid: list(snapshot_data.get("shifts") or [])} if src_gid else {}
+        {src_gid: list((snapshot_data or {}).get("shifts") or [])} if src_gid else {}
     )
     for _gid in sorted(_other_gids):
         _d_roster, _ = _load_group_roster(_gid)
@@ -1761,6 +1831,7 @@ def get_my_issued_roster_service(
                 "code": _code,
                 "color": _color_from(_cell, _code, _d_roster.get("shift_colors")),
                 "schedule_id": (_ids[_i] if _i < len(_ids) else None),
+                "snapshot_id": _d_roster.get("snapshot_id"),
                 "group_id": _gid,
                 "group_name": _gname,
                 "is_source": False,
@@ -1790,6 +1861,7 @@ def get_my_issued_roster_service(
                 "code": "",
                 "color": "",
                 "schedule_id": None,
+                "snapshot_id": None,
                 "group_id": _gid,
                 "group_name": _gname,
                 "is_source": False,
@@ -1811,6 +1883,13 @@ def get_my_issued_roster_service(
                 "target_group_name": _gname,
                 "target_status": _d_status,
             })
+
+    # ★ None("근무표 없음")은 **현재 소속 발행본에 내 행이 없고** 다른 병동 발행분도 하루도
+    #   없을 때뿐이다. 소속 발행본에 내 행이 있으면 예전처럼 항상 돌려준다 — 월 전체가 파견지
+    #   미발행이어도 병동·사유·`target_not_issued` 셀이 그대로 나가야 한다(Codex 2026-10-08).
+    #   ★ 개인 월 목록(`get_my_issued_months_service`)이 같은 기준을 쓴다.
+    if home_status != TARGET_ISSUED and not any(_d.get("snapshot_id") for _d in schedule_days):
+        return None
 
     # ── transfers: 실제로 적용된 연속 구간 단위로 조립 ───────────────────────
     # assignment 단위가 아니라 **화면에 그려질 구간** 단위다. 겹치거나 잘린 배치가
@@ -1966,8 +2045,16 @@ def get_my_issued_roster_service(
             profiles=_profiles_for(_dg or "", _snap_for_day),
         )
 
+    # ★ 병동별 발행 출처. 한 달 응답에 여러 병동이 섞이므로 최상위 단일 번호로는 월 전체를
+    #   대표할 수 없다(프론트 요청 1008). `issue_status` = issued | not_issued | no_row.
     groups_out = [
-        {"group_id": _gid, "group_name": _gname}
+        {
+            "group_id": _gid,
+            "group_name": _gname,
+            "snapshot_id": (_snap_meta.get(_gid) or {}).get("snapshot_id"),
+            "issued_at": (_snap_meta.get(_gid) or {}).get("issued_at"),
+            "issue_status": (_snap_meta.get(_gid) or {}).get("issue_status"),
+        }
         for _gid, _gname in _groups_map.items()
     ]
 
@@ -2054,14 +2141,34 @@ def get_my_issued_roster_service(
         if _counts_by_group.get(_gid)
     ]
 
+    _other_name = next(
+        (_r[0].get("name") for _r in _snap_cache.values() if _r[0] and _r[0].get("name")),
+        None,
+    )
+    # ★ 발행 여부는 `target_status` 로 판정한다 — `status` 는 충돌 날에 `assignment_conflict`
+    #   로 덮여 미발행 사실을 가린다(Codex 2026-10-08). 미발행 날은 소속·파견 모두 이 키를 싣는다.
+    _pending = (TARGET_NOT_ISSUED, TARGET_NO_ROW)
     return {
-        "year": roster.get("year"),
-        "month": roster.get("month"),
-        "nurse_id": my_roster.get("nurse_id"),
-        "name": my_roster.get("name"),
+        "year": year,
+        "month": month,
+        "nurse_id": (my_roster or {}).get("nurse_id") or nurse_id,
+        "name": (
+            (my_roster or {}).get("name") or _other_name
+            or getattr(current_user, "name", None)
+        ),
+        # ★ 지금의 소속 병동(DB 기준 · 발행 여부와 무관). 그 날 근무 병동은 셀을 본다.
+        "home_group_id": src_gid,
+        "home_group_name": src_group_name,
+        # 하위호환 — `home_group_id` 와 같은 값이다(조회 월 기준 소속이 아니다).
         "source_group_id": src_gid,
         "source_group_name": src_group_name,
-        "issued_at": snapshot_data.get("created_at"),
+        # issued = 모든 날의 근무 병동이 발행 · partial = 일부 날이 미발행/내 행 없음
+        "issue_status": (
+            "partial" if any(_d.get("target_status") in _pending for _d in schedule_days)
+            else "issued"
+        ),
+        # 현재 소속 병동 발행 시각(그 병동이 미발행이면 None). 병동별 시각은 `groups[]`.
+        "issued_at": (snapshot_data or {}).get("created_at") if my_roster else None,
         "shift_colors": shift_colors,
         "schedule": schedule_days,
         # ★ 통합 `counts` 는 **그대로 유지**한다(기존 소비처·근무일/휴일 총계).
@@ -2073,6 +2180,128 @@ def get_my_issued_roster_service(
         "provisional_counts": provisional_counts,
         "transfers": transfers_out,
         "groups": groups_out,
+    }
+
+
+def get_my_issued_months_service(current_user, db: Session) -> dict:
+    """본인 발행 근무가 있는 연월 목록과 현재 소속 병동(모바일·PC 개인 월 선택용).
+
+    ★ 현재 병동의 발행 목록(`/roster/issued`)으로 개인 월을 정하지 않는다 — 병동이동 뒤
+      이전 병동에서 발행된 달이 목록에서 사라진다(프론트 요청 1008).
+    ★★ 목록에 든 달은 **월 조회(`get_my_issued_roster_service`)가 데이터를 돌려주는 달과
+      같아야 한다.** 그래서 같은 근거로 세 번 거른다.
+      1) 후보: 현재 소속 + 내 파견·병동이동 이력 병동의 **활성** 발행본 중 명단(`nurses_json`)에
+         내가 있는 (병동, 달). 철회된 달은 활성본이 없어 빠지고, 재마감은 최신 활성본만 본다.
+      2) 타임라인: 그 달 날짜별 근무 병동(`_resolve_my_day_owners` — 월 조회와 같은 함수)에
+         그 병동이 하루라도 있어야 한다. 명단만 보면 이동 뒤 새 병동이 이전 달을 재발행했을 때
+         목록에는 있는데 열면 빈 달이 된다(Codex 2026-10-08). ★ 단 **현재 소속 병동은 예외**
+         — 월 조회는 소속 발행본에 내 행만 있으면 그 달을 돌려준다(월 전체 파견이어도).
+      3) 행: 그 발행본 근무 본문(`roster_json`)에 내 행이 있어야 한다(월 조회가 행 유무로
+         발행/`no_row` 를 가른다). 본문은 1·2 를 통과한 발행본만 읽는다.
+    ★ `home_group_id` 는 토큰이 아니라 DB 기준 지금의 소속이다(발행 여부와 무관).
+
+    Returns:
+        `{home_group_id, home_group_name, months: [{year, month, group_ids}]}` — 최신 달 먼저
+        (`/roster/issued` 와 같은 순서). `group_ids` = 그 달 내 근무가 발행된 병동.
+    """
+    from db.models import NurseAssignment
+    from services.group_access import resolve_home_group_id
+
+    nurse_id = str(_require_nurse_id(current_user))
+    home_gid = resolve_home_group_id(db, current_user) or ""
+    # 본인 파견·병동이동 이력은 한 번만 읽어 여러 달 타임라인에 넘긴다.
+    my_asgs = (
+        db.query(NurseAssignment)
+        .filter(
+            NurseAssignment.nurse_id == nurse_id,
+            NurseAssignment.status.in_(["active", "completed"]),
+            NurseAssignment.reason.in_(["파견", "병동이동"]),
+        )
+        .all()
+    )
+    gids: set[str] = {home_gid} if home_gid else set()
+    for _a in my_asgs:
+        gids.update(g for g in (_a.source_group_id, _a.target_group_id) if g)
+
+    home_name = ""
+    if home_gid:
+        _row = db.query(Group.group_name).filter(Group.group_id == home_gid).first()
+        home_name = (_row[0] if _row else "") or ""
+
+    # 1) 후보 — 명단에 내가 있는 (달 → {병동: 발행본 id})
+    cands: dict[tuple[int, int], dict[str, int]] = {}
+    if gids:
+        _q = db.query(
+            IssuedRosterSnapshot.snapshot_id,
+            IssuedRosterSnapshot.group_id,
+            IssuedRosterSnapshot.meta_json,
+            IssuedRosterSnapshot.nurses_json,
+        ).filter(
+            IssuedRosterSnapshot.group_id.in_(list(gids)),
+            IssuedRosterSnapshot.is_active_issued == True,  # noqa: E712
+        )
+        # ★ 월 조회(`get_issued_roster_snapshot_service`)와 같은 병원 범위 — 토큰 office 가
+        #   있으면 그 병원 발행본만 본다. 다르면 목록에는 있는데 열면 없는 달이 된다(Codex 2026-10-08).
+        _office = getattr(current_user, "office_id", None)
+        if _office:
+            _q = _q.filter(IssuedRosterSnapshot.office_id == _office)
+        # ★ 발행본 선택도 월 조회와 같다 — 연월은 `meta_json` 으로 읽고, (병동, 달)마다
+        #   `created_at` 최신 활성본 **하나만** 본다. 명단부터 거르면 활성본이 둘 남은 달에
+        #   이전 발행본이 되살아나 목록·조회가 어긋난다(Codex 2026-10-08).
+        _seen: set[tuple[str, int, int]] = set()
+        for _sid, _gid, _meta, _nurses in _q.order_by(IssuedRosterSnapshot.created_at.desc()).all():
+            _y, _m = (_meta or {}).get("year"), (_meta or {}).get("month")
+            if not _y or not _m:
+                continue
+            _key = (_gid, int(_y), int(_m))
+            if _key in _seen:
+                continue
+            _seen.add(_key)
+            if any(
+                isinstance(_n, dict) and str(_n.get("nurse_id")) == nurse_id
+                for _n in (_nurses or [])
+            ):
+                cands.setdefault((int(_y), int(_m)), {})[_gid] = _sid
+
+    # 2) 타임라인 — 그 달 실제 근무 병동인 날이 있는 병동만.
+    #    ★ 현재 소속 병동은 예외다. 월 조회는 소속 발행본에 내 행만 있으면 그 달을 돌려준다
+    #      (월 전체가 파견지 미발행이어도 상태를 보여 주려고) — 같은 기준이어야 목록·조회가 맞다.
+    kept: dict[tuple[int, int], dict[str, int]] = {}
+    for (_y, _m), _by_g in cands.items():
+        _owner, _ = _resolve_my_day_owners(
+            db, nurse_id, home_gid, _y, _m, all_assignments=my_asgs
+        )
+        _day_gids = {_o["group_id"] for _o in _owner}
+        _hit = {
+            g: sid for g, sid in _by_g.items() if g == home_gid or g in _day_gids
+        }
+        if _hit:
+            kept[(_y, _m)] = _hit
+
+    # 3) 행 — 근무 본문에 내 행이 있는 발행본만
+    _sids = [sid for _by_g in kept.values() for sid in _by_g.values()]
+    with_row: set[int] = set()
+    if _sids:
+        for _sid, _rj in (
+            db.query(IssuedRosterSnapshot.snapshot_id, IssuedRosterSnapshot.roster_json)
+            .filter(IssuedRosterSnapshot.snapshot_id.in_(_sids))
+            .all()
+        ):
+            if any(
+                isinstance(_r, dict) and str(_r.get("nurse_id")) == nurse_id
+                for _r in ((_rj or {}).get("nurses") or [])
+            ):
+                with_row.add(_sid)
+
+    months: list[dict] = []
+    for (_y, _m), _by_g in sorted(kept.items(), reverse=True):
+        _g = sorted(g for g, sid in _by_g.items() if sid in with_row)
+        if _g:
+            months.append({"year": _y, "month": _m, "group_ids": _g})
+    return {
+        "home_group_id": home_gid,
+        "home_group_name": home_name,
+        "months": months,
     }
 
 
@@ -2163,7 +2392,8 @@ def get_my_issued_week_service(
             "group_id": (cell or {}).get("group_id"),
             "group_name": (cell or {}).get("group_name"),
             "is_today": d == today,
-            "issued": data is not None,
+            # ★ 소속 병동 미발행으로 비운 날은 예전처럼 미발행이다(`_home_day_unissued`).
+            "issued": data is not None and not _home_day_unissued(cell or {}),
             # ★ `issued=True` + `code=None` 은 두 가지다 — 그 날 쉬는 것(미배정)과
             #   **파견지가 아직 발행을 안 해 모르는 것**. 대시보드가 둘을 같은
             #   '미배정' 으로 그리지 않도록 월간 조회가 판정한 셀 상태를 그대로 싣는다.
@@ -2219,6 +2449,21 @@ def _cell_of_day(my_month: dict | None, day: int) -> dict:
         if int(cell.get("day") or 0) == day:
             return cell
     return {}
+
+
+def _home_day_unissued(cell: dict) -> bool:
+    """현재 소속 병동이 그 달 미발행(또는 내 행 없음)이라 비운 **소속 날**인가.
+
+    ★ 월 조회는 이런 달도 다른 병동 발행분이 있으면 돌려준다(예전에는 월 전체가 None).
+      주간·오늘의 `issued` 는 "그 날 내가 볼 수 있는 근무표가 있는가" 라서, 이 날들은
+      예전과 똑같이 False 로 내야 한다. 파견 날의 대상 미발행(`is_source=False`)은 예전부터
+      `issued=True` + `status` 로 구분해 왔으므로 건드리지 않는다.
+    """
+    # ★ `status` 가 아니라 `target_status` 로 본다. 이동 이력 충돌 날은 `status` 가
+    #   `assignment_conflict` 로 덮여 미발행 사실이 가려진다(Codex 2026-10-08).
+    return bool(cell.get("is_source")) and cell.get("target_status") in (
+        TARGET_NOT_ISSUED, TARGET_NO_ROW,
+    )
 
 
 def _shift_meta_by_code(snapshot: dict | None) -> dict[str, dict]:
@@ -2801,7 +3046,8 @@ def get_my_today_service(
     unknown = _cell_is_unknown(cell, meta)
     result = {
         "date": target.isoformat(),
-        "issued": my_month is not None,
+        # ★ 소속 병동 미발행으로 비운 날은 예전처럼 미발행이다(`_home_day_unissued`).
+        "issued": my_month is not None and not _home_day_unissued(cell),
         "group_id": day_gid,
         "group_name": cell.get("group_name") or "",
         # 파견/병동이동이면 사유. `my_shift` 가 비어도 화면이 이유를 말할 수 있다.

@@ -100,6 +100,7 @@ from services.roster_service import (
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
     get_my_issued_roster_service,
+    get_my_issued_months_service,
     get_my_issued_week_service,
     get_my_today_service,
     get_prev_month_tail_service,
@@ -1270,6 +1271,31 @@ def get_my_issued_roster(
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"개인 근무표 조회 실패: {str(e)}"
+        )
+
+
+# [Roster] - 본인 발행 근무가 있는 연월 목록 + 현재 소속 병동
+@router.get("/issued_roster/me/months")
+def get_my_issued_months(
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """개인 월 선택 목록 — 현재 병동 발행 목록과 독립(병동이동 뒤 이전 병동 달도 남는다).
+
+    * 호출방식 : GET /roster/issued_roster/me/months (파라미터 없음 — 본인만)
+    * 리턴값 : `{home_group_id, home_group_name, months: [{year, month, group_ids}]}`
+      - `home_group_id` : 지금의 소속 병동(DB 기준 · 토큰 병동 아님 · 발행 여부와 무관)
+      - `months` : 최신 달 먼저. 본인이 명단에 든 활성 발행본이 하나라도 있는 달
+    ★ 동기 `def` — 안의 SQLAlchemy 가 동기라 `async` 면 이벤트 루프를 막는다.
+    ★ 없을 때도 200 + 빈 `months` 다(404 는 CloudFront 가 index.html 200 으로 바꾼다).
+    """
+    try:
+        return get_my_issued_months_service(current_user=current_user, db=db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"개인 근무 월 목록 조회 실패: {str(e)}"
         )
 
 
