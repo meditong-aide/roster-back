@@ -571,3 +571,161 @@ def test_apply_creates_numbered_teams_and_assigns_for_month(db):
     )
     teams2 = db.query(Team).filter(Team.group_id == "A", Team.active == 1).all()
     assert {t.team_name for t in teams2} == {"1", "2"} and len(teams2) == 2
+
+
+# ── 발행된 달 가드(dev-7) — 미리보기 표시 · 적용 전체 거절 · 사람별 되돌리기 ──────────
+
+
+def _admin_user():
+    """실제 로그인 사용자 모양(UserSchema)의 관리자 — 같은 병원(o1) 병동만 다룬다."""
+    from tests.agent_qa.harness import make_auth_user
+    return make_auth_user("ADM1", "관리자", role="ADM", office_id="o1", group_id="A")
+
+
+def _issue_ward(db, gid, year, month, meta="auto"):
+    from db.models import IssuedRosterSnapshot, Schedule
+    sid = f"ISS{gid}{year % 100:02d}{month:02d}"
+    db.add(Schedule(schedule_id=sid, office_id="o1", group_id=gid, year=year, month=month,
+                    version=1, status="issued", dropped=False))
+    db.add(IssuedRosterSnapshot(office_id="o1", group_id=gid, schedule_id=sid, version=1,
+                                is_active_issued=True, year=year, month=month,
+                                meta_json={"year": year, "month": month} if meta == "auto" else meta))
+    db.flush()
+
+
+def _forced_moves_preview(db):
+    """정원 7:3(허용 0) — A 로 2명이 반드시 옮겨 오는 미리보기."""
+    return preview_ward_redistribution(db, group_ids=["A", "B"], year=2026, month=7,
+                                       capacity_mode="explicit", target_sizes={"A": 7, "B": 3},
+                                       size_tolerance=0)
+
+
+def test_preview_flags_moves_touching_issued_ward(pool):
+    db = pool
+    _issue_ward(db, "A", 2026, 7)
+    pv = _forced_moves_preview(db)
+    assert pv["num_moved"] == 2 and pv["num_blocked"] == 2
+    assert all(m["issued_blocked"] for m in pv["moves"])
+    assert pv["blocked_moves"][0]["months"] == [{"group_id": "A", "year": 2026, "month": 7}]
+    assert any("이미 발행된 병동(A병동)" in w and "2명" in w for w in pv["warnings"]), pv["warnings"]
+
+
+def test_preview_issue_before_target_month_not_flagged(pool):
+    db = pool
+    _issue_ward(db, "A", 2026, 6)
+    pv = _forced_moves_preview(db)
+    assert pv["num_blocked"] == 0 and not any(m["issued_blocked"] for m in pv["moves"])
+    assert not any("발행" in w for w in pv["warnings"])
+
+
+def test_preview_flags_unknown_meta(pool):
+    """연월을 읽을 수 없는 발행본이 있는 병동과 오가는 이동도 막힌 것으로 보인다(fail-closed)."""
+    db = pool
+    _issue_ward(db, "B", 2025, 1, meta=None)
+    pv = _forced_moves_preview(db)
+    assert pv["num_blocked"] == 2
+    assert any("확인이 필요" in w and "B병동" in w for w in pv["warnings"]), pv["warnings"]
+
+
+def test_apply_rejects_whole_batch_when_issued(pool):
+    """발행된 달에 걸리는 이동이 하나라도 있으면 아무것도 쓰지 않고 409 — 조용한 실패 없음."""
+    from fastapi import HTTPException
+    db = pool
+    _issue_ward(db, "B", 2026, 7)
+    with pytest.raises(HTTPException) as ei:
+        apply_ward_redistribution(
+            db, current_user=_admin_user(), group_ids=["A", "B"], year=2026, month=7,
+            assignments=[{"nurse_id": "a0", "to_group_id": "B", "team_label": "새팀"},
+                         {"nurse_id": "a1", "to_group_id": "A", "team_id": 2}],
+        )
+    assert ei.value.status_code == 409
+    assert ei.value.detail["code"] == "ISSUED_ROSTER_BLOCKS_TRANSFER"
+    assert [m["nurse_id"] for m in ei.value.detail["blocked_moves"]] == ["a0"]
+    assert "B병동 2026년 7월" in ei.value.detail["message"]
+    assert db.query(NurseAssignment).count() == 0
+    assert db.query(Team).filter(Team.team_name == "새팀").count() == 0
+
+
+def test_apply_check_failure_503_before_writes(pool, monkeypatch):
+    from fastapi import HTTPException
+    from sqlalchemy import text
+    from services import issued_month_guard
+    db = pool
+    monkeypatch.setattr(issued_month_guard, "_read_active_snapshots",
+                        lambda _db, _gids: _db.execute(text("SELECT x FROM no_such_table")).all())
+    with pytest.raises(HTTPException) as ei:
+        apply_ward_redistribution(db, current_user=_admin_user(), group_ids=["A", "B"], year=2026, month=7,
+                                  assignments=[{"nurse_id": "a0", "to_group_id": "B", "team_label": "새팀"}])
+    assert ei.value.status_code == 503
+    assert db.query(NurseAssignment).count() == 0
+    assert db.query(Team).filter(Team.team_name == "새팀").count() == 0
+
+
+def test_apply_failure_rolls_back_partial(pool, monkeypatch):
+    """한 사람이 flush 뒤(팀 구간 쓰기)에서 실패해도 그 미완성 행이 다음 사람 커밋에 실리지 않는다."""
+    from fastapi import HTTPException
+    from services import team_period
+    db = pool
+    real = team_period.set_team_period
+
+    def _flaky(_db, **kw):
+        if kw["nurse_id"] == "a0":
+            raise HTTPException(status_code=409, detail="같은 간호사의 팀 변경이 진행 중입니다.")
+        return real(_db, **kw)
+
+    monkeypatch.setattr(team_period, "set_team_period", _flaky)  # create_assignment 안의 호출만 바뀐다
+    res = apply_ward_redistribution(
+        db, current_user=_admin_user(), group_ids=["A", "B"], year=2026, month=7,
+        assignments=[{"nurse_id": "a0", "to_group_id": "B", "team_id": 1},
+                     {"nurse_id": "a1", "to_group_id": "B", "team_id": 1}],
+    )
+    assert res["transfers"] == 1 and [f["nurse_id"] for f in res["failed"]] == ["a0"]
+    assert {r.nurse_id for r in db.query(NurseAssignment).all()} == {"a1"}
+
+
+def test_apply_foreign_target_not_judged_or_leaked(pool):
+    """다른 병원 병동으로 가는 이동은 선행 판정에 넣지 않는다 — 그 병원 발행본이 있어도 409·병동 이름 없이
+    사람별 병원 경계 오류(400)로 실패 목록에 담긴다(dev-7 리뷰 · dev-7 전과 같은 결과)."""
+    from db.models import IssuedRosterSnapshot, Schedule
+    db = pool
+    db.add(Office(office_id="o2", office_name="남의병원"))
+    db.add(Group(group_id="X", group_name="타병원비밀병동", office_id="o2"))
+    db.add(Schedule(schedule_id="ISSX2607", office_id="o2", group_id="X", year=2026, month=7,
+                    version=1, status="issued", dropped=False))
+    db.add(IssuedRosterSnapshot(office_id="o2", group_id="X", schedule_id="ISSX2607", version=1,
+                                is_active_issued=True, meta_json={"year": 2026, "month": 7}))
+    db.flush()
+    res = apply_ward_redistribution(db, current_user=_admin_user(), group_ids=["A", "B"], year=2026, month=7,
+                                    assignments=[{"nurse_id": "a0", "to_group_id": "X", "team_id": 1}])
+    assert res["transfers"] == 0 and [f["nurse_id"] for f in res["failed"]] == ["a0"]
+    assert "office 경계 위반" in res["failed"][0]["reason"]
+    assert "타병원비밀병동" not in str(res) and db.query(NurseAssignment).count() == 0
+
+
+def test_apply_takes_month_lock_before_team_creation(pool, monkeypatch):
+    """마감 달 잠금을 0단계 팀 생성(INSERT teams)보다 먼저 잡는다 — 팀 행을 잠근 채 잠금을 기다리면
+    그 잠금을 쥐고 그 병동 팀을 읽는 마감과 교착한다(잠금 → 행)."""
+    from sqlalchemy import event
+    from db.models import Schedule
+    from services import schedule_versioning
+    db = pool
+    db.add(Schedule(schedule_id="SB2607", office_id="o1", group_id="B", year=2026, month=7,
+                    version=1, status="draft", dropped=False))
+    db.flush()
+    events = []
+    monkeypatch.setattr(schedule_versioning, "lock_month_publish",
+                        lambda _db, g, y, m: events.append(("lock", g, y, m)))
+
+    def _spy(conn, cursor, statement, params, context, executemany):
+        if statement.strip().upper().startswith("INSERT INTO TEAMS"):
+            events.append(("INSERT teams",))
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", _spy)
+    try:
+        res = apply_ward_redistribution(db, current_user=_admin_user(), group_ids=["A", "B"], year=2026, month=7,
+                                        assignments=[{"nurse_id": "a0", "to_group_id": "B", "team_label": "새팀"}])
+    finally:
+        event.remove(engine, "before_cursor_execute", _spy)
+    assert res["transfers"] == 1, res
+    assert events[0] == ("lock", "B", 2026, 7) and ("INSERT teams",) in events, events

@@ -21,6 +21,8 @@ from datetime import date
 from math import ceil
 from typing import Optional
 
+from fastapi import HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from db.models import (
@@ -28,6 +30,9 @@ from db.models import (
 )
 from schemas.roster_schema import NurseAssignmentCreate
 from services.assignment_service import create_assignment, create_permanent_change
+from services.issued_month_guard import (
+    GuardScope, IssuedVerdict, judge_issued_months, lock_transfer_months, verdict_detail,
+)
 from services.team_period import resolve_team, set_team_period
 from services.team_auto_assign import NurseInput, auto_assign_teams
 from services.team_classify_service import _build_pool_roster
@@ -328,6 +333,54 @@ def _detect_ward_pairs(
     return pairs
 
 
+def _issued_scope(gids, year: int, month: int) -> GuardScope:
+    """재분배의 발행 가드 범위 — 대상월 1일부터 열린 끝(재분배 병동이동은 종료일이 없다)."""
+    return GuardScope.of(gids, [(date(year, month, 1), None)])
+
+
+def _blocked_moves_of(moves: list[dict], verdict: IssuedVerdict) -> list[dict]:
+    """막힌 이동 목록 — 출발·도착 병동에 걸린 달과 연월을 못 읽은 발행본을 함께 싣는다."""
+    bad = verdict.bad_groups()
+    out: list[dict] = []
+    for m in moves:
+        ends = {m["from"], m["to"]}
+        if not ends & bad:
+            continue
+        out.append({
+            "nurse_id": m["nurse_id"], "name": m.get("name"), "from": m["from"], "to": m["to"],
+            "months": [{"group_id": g, "year": y, "month": mo} for g, y, mo in verdict.blocked if g in ends],
+            "unknown_snapshots": [{"group_id": g, "snapshot_id": s} for g, s in verdict.unknown if g in ends],
+        })
+    return out
+
+
+def _flag_issued_moves(db: Session, ward_ids: list[str], year: int, month: int,
+                       moves: list[dict]) -> list[dict]:
+    """미리보기 — 이동마다 issued_blocked 를 붙이고 막힌 이동 목록을 돌려준다. 조회 실패는 503 으로 올린다."""
+    verdict = judge_issued_months(db, _issued_scope(ward_ids, year, month)) if moves else IssuedVerdict()
+    bad = verdict.bad_groups()
+    for m in moves:
+        m["issued_blocked"] = m["from"] in bad or m["to"] in bad
+    return _blocked_moves_of(moves, verdict)
+
+
+def _issued_warnings(blocked_moves: list[dict], name_map: dict, year: int, month: int) -> list[str]:
+    """막힌 이동 안내 문구(프론트가 warnings 를 그대로 그린다)."""
+    def _names(key: str) -> str:
+        gids = sorted({x["group_id"] for b in blocked_moves for x in b[key]})
+        return ", ".join(name_map.get(g) or g for g in gids)
+
+    out: list[str] = []
+    n_issued = sum(1 for b in blocked_moves if b["months"])
+    if n_issued:
+        out.append(f"{year}년 {month}월 이후 근무표가 이미 발행된 병동({_names('months')})과 오가는 이동 "
+                   f"{n_issued}명이 있어 이대로는 적용할 수 없습니다. 발행을 취소하거나 다른 달로 진행해 주세요.")
+    if any(b["unknown_snapshots"] for b in blocked_moves):
+        out.append(f"발행본 연월을 확인할 수 없는 병동({_names('unknown_snapshots')})이 있어 그 병동과 오가는 "
+                   "이동은 적용할 수 없습니다. 발행본 확인이 필요합니다(철회 뒤 다시 마감하거나 관리자에게 문의).")
+    return out
+
+
 def preview_ward_redistribution(
     db: Session,
     *,
@@ -485,6 +538,10 @@ def preview_ward_redistribution(
                     "to": wid, "to_name": name_map.get(wid),
                 })
 
+    # 발행된 달 가드(dev-7) — 적용 때 거절될 이동을 미리 표시한다(같은 판정 · 잠금 없음 · 조회 1회).
+    blocked_moves = _flag_issued_moves(db, ward_ids, year, month, moves)
+    warnings.extend(_issued_warnings(blocked_moves, name_map, year, month))
+
     # 프리셉터 짝 탐지/경고 — 병동을 넘으면 발효 시 프리셉터십 자동 종료
     nurse_to_ward: dict[str, Optional[str]] = {}
     for wid, w in wards.items():
@@ -544,6 +601,8 @@ def preview_ward_redistribution(
         },
         "moves": moves,
         "num_moved": len(moves),
+        "blocked_moves": blocked_moves,
+        "num_blocked": len(blocked_moves),
         "pairs": pairs,
         "pool_roster": _build_pool_roster(pool, include_group=True, preceptor_asof=_pre_asof_pairs),
         "stats": {
@@ -595,6 +654,127 @@ def _ensure_numbered_teams(
     return out
 
 
+def _planned_transfers(nurses: dict, assignments: list[dict]) -> list[dict]:
+    """적용 요청 중 병동이 바뀌는(= 병동이동이 될) 항목."""
+    out: list[dict] = []
+    for a in assignments:
+        n, to_g = nurses.get(a.get("nurse_id")), a.get("to_group_id")
+        if n is not None and to_g and n.group_id != to_g:
+            out.append({"nurse_id": n.nurse_id, "name": n.name, "from": n.group_id, "to": to_g})
+    return out
+
+
+def _same_office_moves(db: Session, nurses: dict, moves: list[dict]) -> list[dict]:
+    """도착 병동이 간호사와 **같은 병원**인 이동만(create_assignment 의 병원 경계 검사와 같은 기준).
+
+    다른 병원 병동으로 가는 이동은 사람별 적용에서 경계 오류(400)로 실패 목록에 담긴다 — 판정에 넣으면
+    그 병원 병동 이름·발행 월이 409 에 실린다(dev-7 리뷰).
+    """
+    to_gids = sorted({m["to"] for m in moves})
+    office_of = dict(db.query(Group.group_id, Group.office_id).filter(Group.group_id.in_(to_gids)).all())
+    return [m for m in moves
+            if m["to"] in office_of and office_of[m["to"]] == nurses[m["nurse_id"]].office_id]
+
+
+def _reject_issued_moves(db: Session, nurses: dict, assignments: list[dict], year: int, month: int) -> None:
+    """적용 전 선행 판정 — 발행된 달에 걸리는 이동이 하나라도 있으면 **아무것도 쓰지 않고** 409(전체 거절).
+
+    ★ 사람별로 건너뛰면 균형 맞춘 계획의 일부만 적용되고, 화면은 실패 목록(failed)을 읽지 않아
+      '이동 N건 발효 예약' 성공 토스트 뒤에 막힌 사람이 묻힌다(dev-7 ②). 미리보기에서 이미 보여준 것이다.
+    ★ 마감 달 잠금을 **팀 생성(0단계) 등 어떤 쓰기보다 먼저** 잡고 판정한다. 0단계가 만든 팀 행이 flush 로 잠긴 채
+      첫 사람의 가드가 마감 달 잠금을 기다리면, 그 잠금을 쥐고 그 병동 팀을 읽는 마감과 서로 기다린다(잠금 → 행).
+      잠금은 첫 커밋까지 유지되고, 사람마다 create_assignment 가 같은 잠금을 다시 잡고(재진입) 정본 판정을 한다.
+    """
+    moves = _same_office_moves(db, nurses, _planned_transfers(nurses, assignments))
+    if not moves:
+        return
+    scope = _issued_scope({g for m in moves for g in (m["from"], m["to"])}, year, month)
+    lock_transfer_months(db, scope)
+    verdict = judge_issued_months(db, scope)
+    blocked = _blocked_moves_of(moves, verdict)
+    if blocked:
+        raise HTTPException(status_code=409, detail={**verdict_detail(db, verdict), "blocked_moves": blocked})
+
+
+def _resolve_team_choice(a: dict, to_g: Optional[str], label_team_id: dict) -> Optional[int]:
+    """요청 항목의 팀 — 정수 team_id 우선, 없으면 team_label 로 만든 번호 팀, 둘 다 없으면 None('전체')."""
+    team = a.get("team_id")
+    if isinstance(team, int):
+        return team
+    label = str(a.get("team_label") or "").strip()
+    return label_team_id.get((to_g, label)) if label and to_g else None
+
+
+def _apply_one(db: Session, n: NurseModel, to_g: str, team: Optional[int], effective: date,
+               note: str, current_user) -> str:
+    """한 사람 적용 — 'transfer'(병동이동) · 'team_change'(같은 병동 팀변경) · 'skip'(동일)."""
+    cur_g = n.group_id
+    if cur_g != to_g:
+        req = NurseAssignmentCreate(
+            nurse_id=n.nurse_id, source_group_id=cur_g, target_group_id=to_g,
+            office_id=n.office_id, start_date=effective, reason="병동이동",
+            target_team_id=team, note=note,
+        )
+        # 당사자 알림(S06)은 사람마다 create_assignment 가 보낸다(2026-10-07 결정).
+        create_assignment(req, db, current_user)
+        kind, tp_group = "transfer", to_g
+    elif team is not None and not _same_team(resolve_team(db, n.nurse_id, cur_g, effective), team):
+        create_permanent_change(db, nurse_id=n.nurse_id, group_id=cur_g, office_id=n.office_id,
+                                start_date=effective, new_team_id=team, note=note)
+        kind, tp_group = "team_change", cur_g
+    else:
+        return "skip"
+    # [B3] 팀 변경을 시점 테이블(nurse_team_period)에 기록 (close-before-open).
+    #   생성기는 resolve_team_for_roster 로 대상월 시점 팀을 여기서 읽으므로(B2),
+    #   start_date 도래 전(flush 전)에도 미래 월 근무표에 새 팀이 반영된다.
+    #   team 미지정('전체'/None)은 기록하지 않는다(기존 거동 유지).
+    if team is not None:
+        set_team_period(db, nurse_id=n.nurse_id, group_id=tp_group, valid_from=effective,
+                        team_id=team, source="redistribute", note=note)
+    return kind
+
+
+def _discard_attempt(db: Session, attempt) -> None:
+    """실패한 한 사람의 쓰기를 버린다 — savepoint 가 살아 있으면 거기까지, 아니면 전체 rollback.
+
+    savepoint 가 닫혀 있다 = 이 사람 처리 중 커밋이 이미 됐다(create_assignment 는 스스로 커밋한다).
+    그 뒤의 미완성 쓰기만 남아 있으므로 전체 rollback 해도 앞 사람·이 사람의 커밋분은 그대로다.
+    """
+    if attempt.is_active:
+        try:
+            attempt.rollback()
+            return
+        except SQLAlchemyError:
+            logger.warning("[Redistribute] savepoint 되감기 실패 — 전체 rollback", exc_info=True)
+    db.rollback()
+
+
+def _apply_in_savepoint(db: Session, n: NurseModel, to_g: str, team: Optional[int], effective: date,
+                        note: str, current_user) -> str:
+    """한 사람을 savepoint 안에서 적용한다. 실패하면 그 사람의 쓰기만 되돌리고 예외를 다시 낸다.
+
+    ★ 예전 주석의 'create_assignment 는 db.add 전에만 raise → 부분 커밋 없음' 은 틀렸다. flush 뒤에
+      팀·속성 구간을 쓰다 실패할 수 있고, 되돌리지 않으면 그 미완성 행이 **다음 사람의 커밋에 실린다**(dev-7 ③).
+    """
+    attempt = db.begin_nested()
+    try:
+        kind = _apply_one(db, n, to_g, team, effective, note, current_user)
+    except Exception:  # noqa: BLE001 — 되돌린 뒤 그대로 다시 낸다(호출부가 failed 에 담는다)
+        _discard_attempt(db, attempt)
+        raise
+    if attempt.is_active:
+        attempt.commit()   # 쓰기 없이 끝난 경우(skip) savepoint 만 푼다
+    return kind
+
+
+def _failed_entry(nid: Optional[str], exc: Exception) -> dict:
+    """실패 목록 한 건. detail 이 {code, message} 면 사람이 읽는 문구와 code 를 나눠 싣는다."""
+    detail = getattr(exc, "detail", None) or str(exc)
+    if isinstance(detail, dict):
+        return {"nurse_id": nid, "reason": str(detail.get("message") or detail), "code": detail.get("code")}
+    return {"nurse_id": nid, "reason": str(detail)}
+
+
 def apply_ward_redistribution(
     db: Session,
     *,
@@ -617,8 +797,9 @@ def apply_ward_redistribution(
       - 둘 다 동일 → skip.
     Returns: {transfers, team_changes, skipped, failed, effective_date, created_teams}
 
-    per-nurse graceful: 한 명이 기간겹침(409) 등으로 실패해도 그 사람만 건너뛰고
+    per-nurse graceful: 한 명이 기간겹침(409) 등으로 실패해도 그 사람만 되돌리고(savepoint)
     failed 에 사유와 함께 담는다 (배치 전체가 중단되지 않음).
+    ★ 단 **발행된 달**에 걸리는 이동이 하나라도 있으면 아무것도 쓰기 전에 409 로 전체 거절한다(dev-7).
     """
     effective = date(year, month, 1)
     nurses = {
@@ -626,6 +807,7 @@ def apply_ward_redistribution(
         for n in db.query(NurseModel).filter(NurseModel.group_id.in_(group_ids))
     }
     _note = note or f"원티드 병동재분배 {year}-{month:02d}"
+    _reject_issued_moves(db, nurses, assignments, year, month)   # 팀 생성 등 어떤 쓰기보다 먼저
 
     # [옵션B] phase 0 — team_label 로 들어온 배정의 병동에 번호 팀을 생성/재사용(멱등).
     #   team_id(정수)가 직접 온 항목은 라벨 무시. 라벨→실제 team_id 해석 맵을 만든다.
@@ -659,55 +841,19 @@ def apply_ward_redistribution(
     for a in assignments:
         nid = a.get("nurse_id")
         to_g = a.get("to_group_id")
-        team = a.get("team_id")
-        team = team if isinstance(team, int) else None  # '전체'/None 등은 팀 미적용
-        if team is None:
-            _lbl = str(a.get("team_label") or "").strip()
-            if _lbl and to_g:
-                team = _label_team_id.get((to_g, _lbl))
+        team = _resolve_team_choice(a, to_g, _label_team_id)
         n = nurses.get(nid)
         if n is None or not to_g:
             skipped += 1
             continue
-        cur_g = n.group_id
         try:
-            _tp_group: Optional[str] = None
-            if cur_g != to_g:
-                req = NurseAssignmentCreate(
-                    nurse_id=nid, source_group_id=cur_g, target_group_id=to_g,
-                    office_id=n.office_id, start_date=effective, reason="병동이동",
-                    target_team_id=team, note=_note,
-                )
-                # 당사자 알림(S06)은 사람마다 create_assignment 가 보낸다(2026-10-07 결정).
-                create_assignment(req, db, current_user)
-                transfers += 1
-                _tp_group = to_g
-            elif team is not None and not _same_team(
-                resolve_team(db, nid, cur_g, effective), team
-            ):
-                create_permanent_change(
-                    db, nurse_id=nid, group_id=cur_g, office_id=n.office_id,
-                    start_date=effective, new_team_id=team, note=_note,
-                )
-                team_changes += 1
-                _tp_group = cur_g
-            else:
-                skipped += 1
-                continue
-            # [B3] 팀 변경을 시점 테이블(nurse_team_period)에 기록 (close-before-open).
-            #   생성기는 resolve_team_for_roster 로 대상월 시점 팀을 여기서 읽으므로(B2),
-            #   start_date 도래 전(flush 전)에도 미래 월 근무표에 새 팀이 반영된다.
-            #   team 미지정('전체'/None)은 기록하지 않는다(기존 거동 유지).
-            if team is not None and _tp_group is not None:
-                set_team_period(
-                    db, nurse_id=nid, group_id=_tp_group, valid_from=effective,
-                    team_id=team, source="redistribute", note=_note,
-                )
-        except Exception as e:  # 기간겹침(409) 등 — 그 사람만 스킵
-            # create_assignment 의 검증(_raise_if_overlap 등)은 db.add 이전에 raise 하므로
-            # 부분 커밋이 없다 → 세션 무효화(rollback) 없이 다음 사람 진행.
-            detail = getattr(e, "detail", None) or str(e)
-            failed.append({"nurse_id": nid, "reason": str(detail)})
+            kind = _apply_in_savepoint(db, n, to_g, team, effective, _note, current_user)
+        except Exception as e:  # 기간겹침(409) 등 — 그 사람의 쓰기만 되돌리고 건너뛴다
+            failed.append(_failed_entry(nid, e))
+            continue
+        transfers += kind == "transfer"
+        team_changes += kind == "team_change"
+        skipped += kind == "skip"
     # 병동재분배 요약 알림(관리자용)은 보내지 않는다 — 배정 알림은 당사자에게만(2026-10-07 결정 · 위에서 사람마다).
     # if transfers or team_changes:
     #     try:
