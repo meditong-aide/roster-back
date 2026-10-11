@@ -1315,7 +1315,10 @@ def export_schedule_excel_bytes(
     #   보는 곳이라, `D2`·`D1` 같은 하위코드가 `D` 로 접히면 쓸 수가 없다(병동 요청).
     #   ★ 코드 마스터 전체가 아니라 **그 근무표에 실제로 발생한 코드만** 행이 된다 —
     #     안 쓴 코드까지 깔면 0 행이 수십 줄 생긴다.
-    #   ★ 정렬은 base 묶음 순(D 계열 → E → N → O → 그 외)이라 D 하위코드가 붙어 보인다.
+    #   ★ 대표 코드 `D`·`E`·`N` 을 **맨 위**에 둔다(병원 요청 2026-10 — 하루 3교대 인원을
+    #     먼저 본다). 그 아래는 base 묶음 순(D 계열 → E → N → O → 그 외)이라 하위코드끼리 붙는다.
+    #     대표 판정은 "코드 자체가 base 와 같다"(`to_base(c) == c`) — 대표 코드를 `D` 가 아닌
+    #     이름으로 쓰는 병동은 맨 위 행이 비고 기존 묶음 순 그대로다.
     #   ★ **미배정 sentinel `-` 를 뺀다.** 위 base 수집이 `base != '-'` 로 거르는 것과
     #     같은 규약이다. `shifts` 마스터에 없는 값인데 `schedule_entries` 에는 실제로
     #     저장돼 있어(운영·dev 양쪽 실측: `29dba53a16a1` 2026-03), 안 거르면 하단에
@@ -1325,10 +1328,15 @@ def export_schedule_excel_bytes(
         if _c and to_base(_c) != "-"
     }
     _base_rank = {c: i for i, c in enumerate(core_codes)}
-    footer_labels = sorted(
-        used_raw_codes,
-        key=lambda c: (_base_rank.get(to_base(c), len(core_codes)), to_base(c), c),
-    )
+    _den_top = {"D": 0, "E": 1, "N": 2}
+
+    def _footer_key(c: str) -> tuple:
+        _cu = c.strip().upper()  # to_base 와 같은 정규화 — 소문자 대표 코드(`d`)도 맨 위로
+        if _cu in _den_top and to_base(c) == _cu:
+            return (0, _den_top[_cu], "", c)
+        return (1, _base_rank.get(to_base(c), len(core_codes)), to_base(c), c)
+
+    footer_labels = sorted(used_raw_codes, key=_footer_key)
 
     # nurse별 매핑
     by_nurse: dict[str, dict[int, str]] = {}
