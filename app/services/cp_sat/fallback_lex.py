@@ -3719,11 +3719,16 @@ def optimize_fallback_lex_hard_first(
             # 여기서 팀 커버 부족(slack)을 목적함수에 넣어야 실제로 최소화된다(안 그러면 무력).
             # 커버리지(coverage_eq)는 이미 고정 → 팀 스프레드는 동일 커버 내 재배치로 개선.
             # 가중치 TEAM_COVER_LEX_WEIGHT(30만)는 safety(off-quota 10~30만) 상위 co-priority.
-            m.Minimize(
+            _s2_obj = (
                 sum(safety_sum)
                 + TEAM_COVER_LEX_WEIGHT * sum(_tm_cover_slacks)
                 + GRADE_OFF0_LEX_WEIGHT * sum(_grade_off0)
             )
+            # 목적식을 표현식으로 보관한다 — 본 풀이 전 N 간격 위반칸만 따로 최소화한 뒤 이걸로
+            #   되돌린다. proto 를 복사해 되돌리면 OR-Tools 버전마다 객체 종류가 달라 깨진다
+            #   (Lambda 의 새 버전에서 `CopyFrom` TypeError · 2026-10-12 dev 실측).
+            m._stage2_obj_expr = _s2_obj          # type: ignore[attr-defined]
+            m.Minimize(_s2_obj)
             # ── [S6] stage3 목적을 **같은 모델(m2)** 에 지어 lex 패스 8 로 쓴다 ──
             #   (2026-09-11 · `AIDE_S6_PASS8=1` · 기본 off)
             #   ★★ 왜 이 방향인가 — 대안은 lex 목적 6개(off_range·team·n_range·n2n·de·pref)를
@@ -4411,10 +4416,8 @@ def optimize_fallback_lex_hard_first(
         #   0 으로 묶어 종전 하드와 같게 둔다(그러면 종전처럼 UNKNOWN → 해제 재시도 경로).
         _n2n_frozen = 0
         _g2 = list(getattr(m2, "_n2n_gap_slacks", []) or [])
-        if _g2:
-            from ortools.sat import cp_model_pb2 as _pb_n2n
-            _obj_saved = _pb_n2n.CpObjectiveProto()
-            _obj_saved.CopyFrom(m2.Proto().objective)
+        _s2_obj_expr = getattr(m2, "_stage2_obj_expr", None)
+        if _g2 and _s2_obj_expr is not None:
             m2.Minimize(sum(_g2))
             _sA = cp_model.CpSolver()
             _sA.parameters.num_search_workers = 8
@@ -4445,7 +4448,7 @@ def optimize_fallback_lex_hard_first(
             roster_system._n2n_gap_proven = (                   # type: ignore[attr-defined]
                 _stA == cp_model.OPTIMAL and not _sA.parameters.fix_variables_to_their_hinted_value)
             m2.Add(sum(_g2) <= _n2n_frozen)
-            m2.Proto().objective.CopyFrom(_obj_saved)
+            m2.Minimize(_s2_obj_expr)       # stage2 본 목적으로 되돌린다(proto 복사 안 함)
             roster_system._n2n_gap_violations = _n2n_frozen   # type: ignore[attr-defined]
         if _s2_bestn > 1:
             # ★★ best-of-N — **더 좋은 해를 찾는 게 아니라, 동률 최적해 중에서 고르는 것**이다.
