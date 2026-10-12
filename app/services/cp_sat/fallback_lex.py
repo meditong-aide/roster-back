@@ -30,6 +30,8 @@ from typing import Dict, Optional
 import numpy as np
 from ortools.sat.python import cp_model
 
+from services.cp_sat import gen_deadline as _gen_dl
+
 from services.cp_sat.hardcoded_weights import (
     FALLBACK_COVERAGE_SHORT_WEIGHT,
     FALLBACK_EXPERIENCE_SHORT_PENALTY,
@@ -400,6 +402,13 @@ def _solve_traced(solver, model, logger_prefix: str, phase: str):
     """
     from time import perf_counter as _pc
     _apply_trace_params(solver)
+    if _gen_dl.expired():
+        print(f"{logger_prefix} [Deadline] {phase} 건너뜀 — 생성 시간 예산 소진(UNKNOWN 처리)")
+        return cp_model.UNKNOWN
+    # 요청 전체 마감 — 이 파일의 단계 풀이는 모두 여기를 지나므로 이 한 곳에서 묶는다(`gen_deadline`).
+    _capped = _gen_dl.cap_solver(solver)
+    if _capped is not None:
+        print(f"{logger_prefix} [Deadline] {phase} 시간 상한 → {_capped:.0f}초(남은 생성 시간 기준)")
     _t0 = _pc()
     # 정체 조기 종료(기본 off · AIDE_LEX_STALL=1). lex 패스에만 걸린다 — 위 주석 참조.
     st = _solve_with_stall_stop(solver, model, phase)
@@ -426,6 +435,41 @@ def _cp_sat_status_to_text(status: int) -> str:
         cp_model.UNKNOWN: "UNKNOWN",
     }
     return mapping.get(status, f"UNKNOWN({status})")
+
+
+def _off_exact_auto_target(nu, *, is_n_only: bool, is_weekend_off: bool, full_month: bool) -> bool:
+    """OFF 우선 병동에서 OFF 를 월 OFF 수로 정확히 맞출 대상인가.
+
+    3교대 근무자만이다 — N 전담(OFF=가용일-N 항등식)·주말 휴무 고정·월 중간 입퇴사·파견 차단일이
+    있는 사람은 정확값의 근거가 다르고, 수간호사가 개인 OFF 한도(o_*)를 넣었으면 그 값이 이긴다.
+    """
+    if is_n_only or is_weekend_off or not full_month:
+        return False
+    return all(getattr(nu, k, None) is None for k in ("o_min", "o_max", "o_exact"))
+
+
+def effective_n2n_min_gap(cfg_value) -> int:
+    """N 간격 하한의 실제 값. 설정(`roster_config.n2n_min_gap`)이 정본이고 env
+    `AIDE_N2N_MIN_GAP`(A/B 주입구)가 있으면 그쪽이 이긴다. 모델과 전월 꼬리 조회 길이가
+    같은 값을 써야 월경계 금지쌍이 빠지지 않는다(Codex 지적)."""
+    _env = _os_lex.environ.get("AIDE_N2N_MIN_GAP")
+    return int(_env) if _env not in (None, "") else int(cfg_value or 0)
+
+
+def count_n2n_gap_violations(roster_system) -> Optional[int]:
+    """최종 배정(`roster_system.roster`)에서 N 간격 금지쌍을 실제로 어긴 수.
+
+    단위는 build_model `_forbid_n` 의 위반칸과 같다. 금지쌍을 등록하지 않았으면(간격 하한
+    꺼짐) None. stage2 가 실패해 stage1 해로 돌아가면 stage2 에서 고정한 위반 수는 나간
+    근무표와 무관하므로(Codex 지적) 경고는 이 값으로 낸다.
+    """
+    pairs = getattr(roster_system, "_n2n_pair_idx", None)
+    if not pairs:
+        return None
+    ni = int(getattr(roster_system, "_n2n_night_idx"))
+    r = roster_system.roster
+    return sum(1 for n, dk, conds in pairs
+               if r[n, dk, ni] and all(int(r[n, d, ni]) == e for d, e in conds))
 
 
 def _load_off_policy_helpers():
@@ -979,6 +1023,9 @@ def optimize_fallback_lex_hard_first(
         over_le: Optional[int] = None,
         stage2_zero_locks: Optional[Dict[str, list]] = None,
         broad_soft: bool = False,
+        n2n_slack_le: Optional[int] = None,
+        s1_monthly_cap_slack: bool = False,
+        ban_slack_le: Optional[int] = None,
     ):
         # [S0 계측] 재빌드 비용. 단계마다 CpModel 을 새로 만들고 전 제약을 다시 쌓으므로
         #   (stage1 은 2회 시도라 한 생성에서 최대 4벌) 그 파이썬 시간이 얼마인지를
@@ -1833,7 +1880,11 @@ def optimize_fallback_lex_hard_first(
                     over_vars_by_day_code[(d, code)] = ov
                     continue
                 if code in zero_demand_block_codes and req_raw == 0:
-                    m.Add(assigned == 0)
+                    # 최소 0 은 금지, 단 최대가 1 이상이면 '선택'(0~최대)이다.
+                    #   need_max 는 최대 미설정이면 0 이라 기존처럼 금지(assigned ≤ 0)로 남는다.
+                    #   실측(성남 중환자실-AN 2026-11): N 만 있는 날을 D·E 최소 0·최대 1 로 두자
+                    #   전원 OFF 9 + 미달 0 이 됐다(금지일 때 미달 2 가 최적 하한).
+                    m.Add(assigned <= need_max)
                     sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                     short_terms.append(sh)
@@ -1851,10 +1902,13 @@ def optimize_fallback_lex_hard_first(
                 # max 제약: hard (상한 초과 불가), _relax_coverage 시 soft
                 if need_max > 0 and d < D_phys:
                     _fb_daily_assigned_by_code.setdefault(code, []).append((d, assigned, need))
-                if need_max > 0 and not _relax_coverage:
+                # ★ 최대 설정 여부는 원값(req_max_raw)으로 본다. 고정칸이 최대를 다 채우면
+                #   need_max 가 0 이 되는데, 이를 '최대 없음' 으로 읽으면 상한이 통째로 빠져
+                #   엔진이 더 넣는다(실측: AN 7일 E 최대 1 인데 신청 E 1 + 엔진 E 1 = 2).
+                if req_max_raw > 0 and not _relax_coverage:
                     m.Add(assigned <= need_max)
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
-                elif need_max > 0 and _relax_coverage:
+                elif req_max_raw > 0 and _relax_coverage:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                     m.Add(ov >= assigned - need_max)
                 elif _fb_off_first_cfg:
@@ -2205,6 +2259,20 @@ def optimize_fallback_lex_hard_first(
             #   덮어써 여기서 막은 N 을 되살리기 때문이다(모델 제약은 미러 이전 값에만 걸린다).
             #   미러 쪽에서 조건을 다시 판정하면 두 곳이 갈리므로 **실제로 건 셀**을 넘긴다.
             _ban_n_prev_cells: set[tuple[int, int]] = set()
+            # ★ 최소화 모드(`ban_night_minimize` · 자동 완화 마지막 단계가 켠다): 금지 칸마다
+            #   위반칸을 두고 `N == 0` 을 위반칸 0 일 때만 강제한다. 위반칸 합은 stage1 이 커버리지를
+            #   맞춘 뒤 **커버리지를 고정한 채** 따로 최소화해 `ban_slack_le` 로 stage2·3 에 묶는다
+            #   (solve 쪽 '[BanNBeforeFixedOff] 최소화'). 지킬 수 있으면 0 이라 하드와 같다.
+            #   ★ 최소화 모드에서도 금지 칸은 `_ban_n_prev_cells` 에 남긴다 — 프리셉티 미러가 그 칸의
+            #     N 을 OFF 로 눕히는 **휴일 보호**(2026-08-31 결정: 교육 연속성보다 휴일 우선)는 하드
+            #     모드와 같게 유지한다. 프리셉티 근무는 프리셉터 복사라 프리셉티 개인 월 한도는 하드
+            #     모드에서도 복사 단계에서 이미 모델 밖이다(이 변경으로 새로 생기는 경로가 아니다).
+            #     그래서 보고하는 위반 칸 수는 최종 출력보다 클 수 있다(안전한 쪽).
+            _ban_min = bool(getattr(cfg, "ban_night_minimize", False))
+            _ban_slacks = []
+            _ban_slacks_type = []     # 휴가·공가 축(두 축 모두 걸린 칸 포함) — 먼저 최소화
+            _ban_slacks_wanted = []   # 신청 휴무 축만 걸린 칸
+            _ban_pairs = []           # (그 칸의 N 변수, 휴가·공가 축 여부) — 실제 위반 수 계산용
             for n in range(N):
                 T0, T1 = join[n], leave[n]
                 _ban_n_cnt = 0
@@ -2229,7 +2297,14 @@ def optimize_fallback_lex_hard_first(
                         continue
                     if (n, prev_d) in fixed:
                         continue  # 이미 고정된 셀은 변경 불가
-                    m.Add(X(n, prev_d, night_idx) == 0)
+                    if _ban_min:
+                        _bg = m.NewBoolVar(f"banslack_{n}_{prev_d}")
+                        m.Add(X(n, prev_d, night_idx) == 0).OnlyEnforceIf(_bg.Not())
+                        _ban_slacks.append(_bg)
+                        (_ban_slacks_type if _hit_type else _ban_slacks_wanted).append(_bg)
+                        _ban_pairs.append((X(n, prev_d, night_idx), _hit_type))
+                    else:
+                        m.Add(X(n, prev_d, night_idx) == 0)
                     _ban_n_prev_cells.add((n, prev_d))
                     _ban_n_cnt += 1
                     if _hit_wanted and not _hit_type:
@@ -2238,6 +2313,18 @@ def optimize_fallback_lex_hard_first(
                     print(f"{logger_prefix} [BanNBeforeFixedOff] nurse_idx={n}: "
                           f"{_ban_n_cnt}건 N 금지 (그중 확정원티드 O {_ban_n_wanted}건)")
             roster_system._ban_n_prev_cells = _ban_n_prev_cells
+            if _ban_slacks:
+                m._ban_n_slacks = _ban_slacks          # type: ignore[attr-defined]
+                m._ban_n_slacks_type = _ban_slacks_type        # type: ignore[attr-defined]
+                m._ban_n_slacks_wanted = _ban_slacks_wanted    # type: ignore[attr-defined]
+                m._ban_n_pairs = _ban_pairs                    # type: ignore[attr-defined]
+                if ban_slack_le is not None:
+                    # (휴가·공가 축 상한, 신청 휴무 축 상한) — 축별로 따로 묶는다
+                    _le_t, _le_w = ban_slack_le
+                    if _ban_slacks_type:
+                        m.Add(sum(_ban_slacks_type) <= int(_le_t))
+                    if _ban_slacks_wanted:
+                        m.Add(sum(_ban_slacks_wanted) <= int(_le_w))
         else:
             # ★ 두 축이 모두 꺼졌으면 **비워 둔다**. 같은 roster_system 으로 다시 build 할 때
             #   지난 회차의 목록이 남아 있으면, 제약이 없는데도 미러가 그 칸을 OFF 로 눕힌다.
@@ -2946,14 +3033,43 @@ def optimize_fallback_lex_hard_first(
         #   stage2 부터 걸면 커버리지가 이미 등식으로 고정된 뒤라, 충돌은 **명시적 INFEASIBLE**
         #   로 드러난다. 조용한 열화보다 낫다.
         # 설정(`roster_config.n2n_min_gap`) 이 정본이고, env 는 A/B 주입구다(env 가 이긴다).
-        _n2n_env = _os_lex.environ.get("AIDE_N2N_MIN_GAP")
-        _n2n_min_gap = (int(_n2n_env) if _n2n_env not in (None, "")
-                        else int(getattr(cfg, "n2n_min_gap", 0) or 0))
+        _n2n_min_gap = effective_n2n_min_gap(getattr(cfg, "n2n_min_gap", 0))
         # 모델에 실어 보낸다 — solve 쪽은 이 함수의 지역변수를 못 본다(`_grade_cell_spec` 규약).
         m._n2n_min_gap = _n2n_min_gap        # type: ignore[attr-defined]
         if _n2n_min_gap >= 4 and stage >= 2:
             _mg_cnt = 0
+            _mg_cross = 0
+            _n2n_prev_k = getattr(roster_system, "prev_month_last_n_k_by_idx", {}) or {}
+            _n2n_cross_on = _os_lex.environ.get("AIDE_N2N_CROSS_MONTH", "1") != "0"
             _mg_use_mid = bool(getattr(cfg, "use_mid", False))
+            # ★ 위반칸 방식(`AIDE_N2N_SLACK=0` 이면 종전 하드). 금지식마다 위반칸 g 를 두고
+            #   `X == 0` 을 `g=0` 일 때만 강제한다. 위반칸 합은 stage2 본 풀이 **전에** 따로 최소화해
+            #   고정한다(`n2n_slack_le` · stage2 는 solve 쪽에서, stage3 은 인자로). 고정 전에는
+            #   위반칸이 자유라 간격이 무시되므로 **고정 없이 풀면 안 된다** — 실패 시 0 으로 고정해
+            #   종전 하드와 같게 만든다.
+            #   왜: 상한이 빡빡한 병동은 stage2 를 빈손 하드로 풀면 시간 안에 첫 해를 못 찾아
+            #   (실측 성남 중환자실-RN 2026-11 · 3회 중 2회 UNKNOWN) N 간격을 **통째로 해제하고
+            #   처음부터 재생성**했다. 위반칸 방식은 stage1 해를 출발점으로 바로 해를 잡고 위반을
+            #   0 쪽으로 민다. 0 이면 하드와 같고, 0 이 아니면 통째 해제보다 덜 깨진 해다.
+            _n2n_slack_on = _os_lex.environ.get("AIDE_N2N_SLACK", "1") != "0"
+            _gap_slacks = []
+            # 금지쌍 색인 (n, 금지일, ((조건일, N 여부), …)) — 최종 배정의 실제 위반을 세는 데 쓴다
+            #   (`count_n2n_gap_violations`).
+            _pair_idx = []
+
+            def _forbid_n(_n, _dk, _cond_idx):
+                _x = X(_n, _dk, night_idx)
+                _cond = [X(_n, _d, night_idx) if _e else X(_n, _d, night_idx).Not()
+                         for _d, _e in _cond_idx]
+                _pair_idx.append((_n, _dk, tuple(_cond_idx)))
+                if _n2n_slack_on:
+                    _g = m.NewBoolVar(f"n2nslack_{len(_gap_slacks)}")
+                    _gap_slacks.append(_g)
+                    m.Add(_x == 0).OnlyEnforceIf(list(_cond or []) + [_g.Not()])
+                elif _cond:
+                    m.Add(_x == 0).OnlyEnforceIf(list(_cond))
+                else:
+                    m.Add(_x == 0)
             for n in range(N):
                 # ★ N전담(N-only)은 야간이 강제라 간격 하한을 걸면 즉시 INFEASIBLE 이다.
                 #   `_prep_n2n` 이 같은 이유로 제외하는 것과 같은 규약.
@@ -2967,18 +3083,48 @@ def optimize_fallback_lex_hard_first(
                     # d 가 N 블록의 마지막 날 = `X(d)=1 AND X(d+1)=0`.
                     #   그때 d+2 … d+(gap-1) 에 N 을 금지하면 다음 블록은 d+gap 이후로 밀린다.
                     #   (d+1 은 블록 끝 정의상 이미 0 이라 뺀다)
-                    _mg_end = [X(n, d, night_idx), X(n, d + 1, night_idx).Not()]
                     for _k in range(2, _n2n_min_gap):
                         _dk = d + _k
                         if _dk > T1:
                             break
                         if fixed.get((n, d)) == night_idx and fixed.get((n, _dk)) == night_idx:
                             continue
-                        m.Add(X(n, _dk, night_idx) == 0).OnlyEnforceIf(_mg_end)
+                        _forbid_n(n, _dk, ((d, 1), (d + 1, 0)))
                         _mg_cnt += 1
+                # ★ 월경계 — 전월 마지막 N 블록 끝에서도 같은 간격을 잰다. 없으면 10월 말 블록
+                #   직후 11월 초에 다시 N 이 붙는다(실측 성남 중환자실-RN 2026-11: 왕서영·이주원
+                #   간격 <5). 전월 마지막 N 이 말일에서 k 일 전이면 블록 끝 e = -1-k 이고,
+                #   금지 구간은 월 안과 같은 e+2 … e+(gap-1) 이다.
+                #   · k ≥ 1 : 전월 안에서 블록이 이미 끝났다 → 무조건 금지
+                #   · k == 0: 전월 말일이 N → 당월 1일도 N 이면 블록이 이어져 끝이 당월로
+                #             넘어오므로(그 끝은 위 월 안 루프가 잰다) 1일이 N 이 아닐 때만 금지
+                #   · 당월 칸이 고정 N(신청)이면 양끝이 모두 고정이라 건너뛴다(월 안 규약과 같다)
+                #   · 당월 중간 합류(T0 > 0)는 전월 꼬리와 이어지지 않아 대상 밖
+                #   · `AIDE_N2N_CROSS_MONTH=0` 이면 종전(월 안만)
+                _k_prev = _n2n_prev_k.get(n) if (T0 == 0 and _n2n_cross_on) else None
+                if _k_prev is not None:
+                    _e_prev = -1 - int(_k_prev)
+                    for _dk in range(max(T0, _e_prev + 2), _e_prev + _n2n_min_gap):
+                        if _dk > T1:
+                            break
+                        if fixed.get((n, _dk)) == night_idx:
+                            continue
+                        if int(_k_prev) == 0:
+                            _forbid_n(n, _dk, ((T0, 0),))
+                        else:
+                            _forbid_n(n, _dk, ())
+                        _mg_cross += 1
+            if stage == 2:
+                roster_system._n2n_pair_idx = _pair_idx      # type: ignore[attr-defined]
+                roster_system._n2n_night_idx = night_idx     # type: ignore[attr-defined]
+            if _gap_slacks:
+                m._n2n_gap_slacks = _gap_slacks      # type: ignore[attr-defined]
+                if n2n_slack_le is not None:
+                    m.Add(sum(_gap_slacks) <= int(n2n_slack_le))
             if stage == 2:
                 print(f"{logger_prefix} [N2N-MinGap] gap>={_n2n_min_gap} 하드 {_mg_cnt}건 "
-                      f"(stage1 제외 — 커버리지 우선)")
+                      f"+ 월경계 {_mg_cross}건 (stage1 제외 — 커버리지 우선"
+                      + (", 위반칸 방식" if _gap_slacks else "") + ")")
 
         # 금지 패턴 N-O-D/E
         if getattr(cfg, "nod_noe", True):
@@ -3183,6 +3329,13 @@ def optimize_fallback_lex_hard_first(
                         f"id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
                         f"cap_semantics={off_cap_semantics}, target_O={target_o}, weekly_off_target={weekly_target}"
                     )
+            # ★ OFF 정확 맞춤(OFF 우선 대상자) — 아래 OFF 상한의 1일 여유를 없앤다(`_off_exact_auto`).
+            _oe_auto_on = (not bool(getattr(cfg, "off_first", False))
+                           and not bool(getattr(cfg, "off_exact_auto_released", False))
+                           and _os_lex.environ.get("AIDE_OFF_EXACT_AUTO", "1") != "0")
+            _oe_auto_n = 0
+            roster_system._off_exact_auto_n = 0      # type: ignore[attr-defined]
+            roster_system._off_exact_over_fixed = []      # type: ignore[attr-defined]
             for n in range(N):
                 if _is_preceptee_at(n):
                     continue
@@ -3356,6 +3509,25 @@ def optimize_fallback_lex_hard_first(
                     else:
                         _slack_max = 1
                         _slack_weight = 100000
+                    # ★ OFF 우선 대상자는 여유 없이 **정확히** 맞춘다(2026-10-12 사용자 결정 · 손으로
+                    #   넣던 o_exact 를 자동화). 1일 여유(벌점 10만)는 고립 OFF(30만)에 져서 OFF 가
+                    #   월 OFF 수 +1 로 밀렸다(실측 성남 중환자실-RN 11월). 대상은 3교대·한 달 전체·
+                    #   수기 o_* 없음 — 하한(위)과 같은 값이 상한이 된다. INFEASIBLE 이면 완화 사다리가
+                    #   `off_exact_auto_released` 로 여유를 되살린다.
+                    #   ★ 정확값은 `max(월 OFF 수, 본인 고정·신청 OFF 수)` 다. 고정 OFF 가 더 많으면
+                    #     월 OFF 수로 묶는 순간 해가 없고(1일 여유로도 2개 이상 차이는 못 푼다), 기존
+                    #     상한 보정(`per_nurse_off_cap_override`)으로 두면 정확값이 조용히 풀린다
+                    #     (Codex 지적). 그 수로 정확히 맞추고 누구인지 남겨 경고한다.
+                    if _oe_auto_on and min_off_required > 0 and _off_exact_auto_target(
+                            nu, is_n_only=is_n_only, is_weekend_off=is_weekend_off,
+                            full_month=(T0 == 0 and T1 >= D_phys - 1 and _n_blocked == 0)):
+                        _slack_max = 0
+                        total_cap_effective = max(min_off_required, structural_cnt)
+                        if structural_cnt > min_off_required:
+                            roster_system._off_exact_over_fixed.append(   # type: ignore[attr-defined]
+                                (str(nurse_name), int(structural_cnt), int(min_off_required)))
+                        _oe_auto_n += 1
+                        roster_system._off_exact_auto_n = _oe_auto_n      # type: ignore[attr-defined]
                     if _slack_max > 0:
                         cap_slack = m.NewIntVar(0, _slack_max, f"off_cap_slack_{n}")
                         weighted = m.NewIntVar(
@@ -3489,9 +3661,20 @@ def optimize_fallback_lex_hard_first(
             from services.constraints.monthly_limit_constraints import (
                 add_monthly_limit_constraints,
             )
-            _ml_added = add_monthly_limit_constraints(m, roster_system, X, join, leave)
+            # ★ stage1 **초과칸 재시도**에서만 상한을 '초과칸 최소화' 로 건다(`cap_slack` · 아래
+            #   시도 계획 참조). 초과칸은 stage1 목적의 최우선 항이고 0 이 아닌 해는 버린다 —
+            #   하드 의미 불변. stage2·3 은 종전대로 하드다. 근거는 monthly_limit_constraints docstring.
+            #   ★ 인자 이름을 `cap_slack` 으로 두면 이 함수 안의 OFF 상한 슬랙 지역변수
+            #     (`cap_slack = m.NewIntVar(...)`)가 덮어써 `Literal` 을 bool 로 평가하다 예외가
+            #     나고, 아래 except 가 삼켜 **stage1 월 한도가 통째로 빠졌다**(2026-10-12 실측 —
+            #     stage2 실패 시 stage1 해가 그대로 나가 개인 N 한도 위반 17명).
+            _ml_cap_slack = stage == 1 and bool(s1_monthly_cap_slack)
+            _ml_added = add_monthly_limit_constraints(
+                m, roster_system, X, join, leave, upper_slack=_ml_cap_slack)
             if _ml_added:
-                print(f"{logger_prefix} [MonthlyLimit][stage{stage}] {_ml_added}건 hard 제약 추가")
+                _ml_ns = len(getattr(m, "_monthly_cap_slacks", []) or [])
+                print(f"{logger_prefix} [MonthlyLimit][stage{stage}] {_ml_added}건 hard 제약 추가"
+                      + (f" (상한 {_ml_ns}건은 초과칸 최소화)" if _ml_ns else ""))
         except Exception as _ml_exc:
             print(f"{logger_prefix} [MonthlyLimit][stage{stage}] 제약 추가 실패(무시): {_ml_exc}")
 
@@ -3507,6 +3690,11 @@ def optimize_fallback_lex_hard_first(
             #   반면 생성 시간은 303.8s → 268.6s 로 **11.6% 느려졌다**(7병동 중 6곳).
             #   목적을 달성하지 못하면서 모델만 키우므로 제거했다. 다시 시도한다면
             #   stage1(커버리지 확정) 이 아니라 lex off_range 패스 쪽을 손대는 게 맞다.
+            # 월 한도 상한 초과칸(있으면)은 **최우선** — 나머지 항 전체의 상한보다 크게 둔다.
+            #   부족 변수 상한이 N 이라 부족항 최대는 WEIGHT·N·len(short), 과잉·OFF 항도 그 아래다.
+            _cap_slacks1 = list(getattr(m, "_monthly_cap_slacks", []) or [])
+            _cap_big = (FALLBACK_COVERAGE_SHORT_WEIGHT * (N * len(short_terms) + 1)
+                        + N * len(over_terms) + OFF_PENALTY * N * 32)
             m.Minimize(
             FALLBACK_COVERAGE_SHORT_WEIGHT * sum(short_terms)
             + sum(over_terms)
@@ -3517,6 +3705,7 @@ def optimize_fallback_lex_hard_first(
                 if (n, d) not in structural_off_cells
                 and (n, d) not in vacation_off_cells
                 )
+            + (_cap_big * sum(_cap_slacks1) if _cap_slacks1 else 0)
             )
         elif stage == 2:
             if coverage_eq is not None:
@@ -3880,7 +4069,26 @@ def optimize_fallback_lex_hard_first(
         except Exception as exc:
             print(f"{logger_prefix} [최종 커버리지 로깅 실패]: {exc}")
 
-    for broad_soft, attempt_label in attempt_specs:
+    _s1_cap_tight = False   # stage1 첫 풀이에서 월 상한 초과칸이 남았는가(= 상한이 빡빡한 병동)
+    # ★ 초과칸 재시도 계획 — 각 시도(hard·broad_soft)를 **종전 그대로 먼저** 풀고, 해를 하나도
+    #   못 찾았을 때(UNKNOWN)만 월 상한을 초과칸 방식으로 바꿔 한 번 더 푼다(`AIDE_S1_CAP_SLACK=0`
+    #   이면 끔). 처음부터 초과칸 방식으로 풀면 잘 풀리던 병동의 stage1 해가 바뀌어 품질이
+    #   흔들렸다(A/B: 시화중환1 고립OFF 0~1 → 1~3). INFEASIBLE 은 상한이 실제로 불가능한
+    #   것이라 재시도해도 초과칸이 남으므로 건너뛴다.
+    from services.constraints.monthly_limit_constraints import has_upper_caps
+    _cap_retry_on = (_os_lex.environ.get("AIDE_S1_CAP_SLACK", "1") != "0"
+                     and has_upper_caps(roster_system))
+    _attempt_plan = []
+    for _bs, _lb in attempt_specs:
+        _attempt_plan.append((_bs, _lb, False))
+        if _cap_retry_on:
+            _attempt_plan.append((_bs, _lb + "+capslack", True))
+    _hard_unknown: dict = {}
+    for broad_soft, attempt_label, _use_cap in _attempt_plan:
+        if _use_cap and not _hard_unknown.get(broad_soft):
+            continue
+        if _use_cap:
+            _s1_cap_tight = True
         with timer_cls(f"폴백 1단계: 커버리지 부족 최소화 ({attempt_label})"):
             (
                 m1,
@@ -3895,7 +4103,7 @@ def optimize_fallback_lex_hard_first(
                 _,
                 _,
             ) = build_model(
-                stage=1, broad_soft=broad_soft
+                stage=1, broad_soft=broad_soft, s1_monthly_cap_slack=_use_cap
             )
             s1 = cp_model.CpSolver()
             s1.parameters.max_time_in_seconds = time_per_attempt
@@ -3946,6 +4154,72 @@ def optimize_fallback_lex_hard_first(
                 f"{logger_prefix} 폴백1 결과: attempt={attempt_label}, "
                 f"status={_cp_sat_status_to_text(st)}"
             )
+            if not _use_cap:
+                _hard_unknown[broad_soft] = st == cp_model.UNKNOWN
+            # 월 한도 상한 초과칸이 남은 해는 하드 위반이다 → 이 시도는 해를 못 찾은 것으로 본다.
+            #   ★ 바로 버리지 않고 그 해를 힌트로 **이어 푼다**(연장 · `AIDE_S1_CAP_EXTEND` 초,
+            #     기본 60). 실측(성남 중환자실-RN 2026-11): 시도당 13초면 초과가 1~3칸에서
+            #     멈추고, 같은 모델을 이어 풀면 수 초~십수 초에 0 이 된다. 연장에서는 상대 간격
+            #     기준을 0 으로 둔다 — 0.15 면 LP 하한이 초과 1칸 근처에 붙어 거기서 '최적' 으로
+            #     멈출 수 있다.
+            _cap_sl1 = list(getattr(m1, "_monthly_cap_slacks", []) or [])
+            if st in (cp_model.OPTIMAL, cp_model.FEASIBLE) and _cap_sl1:
+                _cap_over = int(sum(s1.Value(v) for v in _cap_sl1))
+                _s1_cap_tight = _s1_cap_tight or _cap_over > 0
+                # 요청 전체 마감 안에서만 연장한다(뒤 단계·저장 몫 90초를 남긴다 · `gen_deadline`).
+                _cap_ext_left = min(float(_os_lex.environ.get("AIDE_S1_CAP_EXTEND", "60") or 0),
+                                    max(0.0, _gen_dl.left() - 90.0))
+                from time import perf_counter as _pc_cap
+                while _cap_over > 0 and _cap_ext_left >= 5:
+                    m1.ClearHints()
+                    for n in range(N):
+                        for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                            for s in range(S):
+                                m1.AddHint(X1(n, d, s), int(s1.Value(X1(n, d, s))))
+                    s1.parameters.max_time_in_seconds = min(_cap_ext_left, max(10.0, float(time_per_attempt)))
+                    s1.parameters.relative_gap_limit = 0.0
+                    _cap_t0 = _pc_cap()
+                    _st_ext = _solve_traced(s1, m1, logger_prefix, f"stage1[{attempt_label}]:capext")
+                    _cap_ext_left -= _pc_cap() - _cap_t0
+                    if _st_ext not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                        st = _st_ext
+                        break
+                    st = _st_ext
+                    _cap_new = int(sum(s1.Value(v) for v in _cap_sl1))
+                    print(f"{logger_prefix} [MonthlyLimit][CapSlack] attempt={attempt_label} 연장: "
+                          f"초과 {_cap_over}→{_cap_new}칸 (남은 연장 {_cap_ext_left:.0f}초, "
+                          f"{_cp_sat_status_to_text(_st_ext)})")
+                    _cap_over = _cap_new
+                    if _st_ext == cp_model.OPTIMAL:
+                        break  # 간격 0 으로 증명까지 끝났다 — 남은 초과는 실제로 못 없앤다
+                if st == cp_model.FEASIBLE and _cap_over == 0 and _cap_ext_left >= 5:
+                    # ★ 초과 0 이어도 최적 증명 없이(FEASIBLE) 끝났으면 커버리지가 덜 다듬어진 채
+                    #   stage2 로 넘어간다(초과 0 에 닿자마자 멈춘 연장도 같다)
+                    #   (실측: 미달 1 로 동결 — 같은 입력의 다른 회차는 0). 남은 연장 시간으로
+                    #   종전 stage1 기준(상대 간격)까지 한 번 더 푼다. **별도 솔버**로 풀어
+                    #   실패해도 지금 해(s1)를 잃지 않는다.
+                    m1.ClearHints()
+                    for n in range(N):
+                        for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                            for s in range(S):
+                                m1.AddHint(X1(n, d, s), int(s1.Value(X1(n, d, s))))
+                    _s1p = cp_model.CpSolver()
+                    _s1p.parameters.num_search_workers = 8
+                    _s1p.parameters.relative_gap_limit = _s1_relgap
+                    _s1p.parameters.max_time_in_seconds = min(_cap_ext_left, max(10.0, float(time_per_attempt)))
+                    _cap_t0 = _pc_cap()
+                    _st_p = _solve_traced(_s1p, m1, logger_prefix, f"stage1[{attempt_label}]:polish")
+                    _cap_ext_left -= _pc_cap() - _cap_t0
+                    if (_st_p in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+                            and int(sum(_s1p.Value(v) for v in _cap_sl1)) == 0):
+                        print(f"{logger_prefix} [MonthlyLimit][CapSlack] attempt={attempt_label} 다듬기: "
+                              f"부족 {int(s1.Value(sum(short1)))}→{int(_s1p.Value(sum(short1)))} "
+                              f"({_cp_sat_status_to_text(_st_p)})")
+                        s1, st = _s1p, _st_p
+                if st in (cp_model.OPTIMAL, cp_model.FEASIBLE) and _cap_over > 0:
+                    print(f"{logger_prefix} [MonthlyLimit][CapSlack] attempt={attempt_label} "
+                          f"월 상한 초과 {_cap_over}칸 남음 → 하드 위반이라 이 시도는 실패로 처리")
+                    st = cp_model.UNKNOWN
             if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 _log_off_slack_used(f"stage1:{attempt_label}", s1, m1)
                 best_short = int(s1.Value(sum(short1)))
@@ -3990,6 +4264,52 @@ def optimize_fallback_lex_hard_first(
         print(f"{logger_prefix} 폴백 중단: 1단계 해를 찾지 못함")
         return False
 
+    # ── 전날 N 금지 최소화(최소화 모드일 때만 · build_model 의 `_ban_min` 주석) ──
+    #   커버리지(부족·과잉)를 stage1 값으로 고정한 채 위반칸 합만 최소화하고, 그 값을 stage2·3 의
+    #   상한(`ban_slack_le`)으로 묶는다. 커버리지가 먼저인 이유: 병동 인원 미달이 전날 N 몇 칸보다
+    #   위험하고, stage1 자체가 커버리지 확정 단계다. 이 풀이가 해를 못 내면 stage1 해의 위반 수로 묶는다.
+    _ban_frozen = None
+    _bs1 = list(getattr(m1, "_ban_n_slacks", []) or [])
+    if _bs1:
+        m1.ClearHints()
+        for n in range(N):
+            for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                for s in range(S):
+                    m1.AddHint(X1(n, d, s), int(s1.Value(X1(n, d, s))))
+        m1.Add(sum(short1) == best_short)
+        m1.Add(sum(over1) <= best_over)
+        _cs_ban = list(getattr(m1, "_monthly_cap_slacks", []) or [])
+        if _cs_ban:
+            m1.Add(sum(_cs_ban) == 0)
+        _bt = list(getattr(m1, "_ban_n_slacks_type", []) or [])
+        _bw = list(getattr(m1, "_ban_n_slacks_wanted", []) or [])
+        _ban_before = int(sum(s1.Value(v) for v in _bs1))
+        # ★ 휴가·공가 축을 **먼저**(그 축 1칸이 신청 휴무 축 전부보다 무겁다) — 휴가 전날 금지는
+        #   단독으로는 대개 지켜지는데 한 합계로 최소화하면 그쪽을 양보했다(실측 2026-10-12
+        #   성남 중환자실-RN: 6칸 중 1칸이 휴가 전날). 이 풀이 안의 축 순서일 뿐 다른 목표와는
+        #   경쟁하지 않는다(커버리지는 위에서 고정).
+        m1.Minimize((len(_bw) + 1) * sum(_bt) + sum(_bw) if _bt else sum(_bw))
+        _sB = cp_model.CpSolver()
+        _sB.parameters.num_search_workers = 8
+        _sB.parameters.max_time_in_seconds = _gen_dl.clamp(max(10, tl1), reserve=60.0)
+        _stB = _solve_traced(_sB, m1, logger_prefix, "stage1:전날N금지최소화")
+        _sol = _sB if _stB in (cp_model.OPTIMAL, cp_model.FEASIBLE) else s1
+        if _sol is _sB:
+            s1 = _sB
+        # ★ 위반 수는 위반칸 변수가 아니라 **실제 배정**(금지 칸에 N 이 들어갔는가)으로 센다.
+        #   stage1 본 풀이에서는 위반칸이 목적에 없어 아무 값이나 가질 수 있다 — 최소화가 실패해
+        #   stage1 해로 돌아가면 위반칸 합(실측 31)은 실제 위반과 무관하다(Codex 지적).
+        #   상한도 이 값으로 묶는다 — 그 해의 위반칸을 N 값과 같게 두면 늘 만족한다.
+        _pairs = list(getattr(m1, "_ban_n_pairs", []) or [])
+        _ban_frozen = (int(sum(_sol.Value(x) for x, _t in _pairs if _t)),
+                       int(sum(_sol.Value(x) for x, _t in _pairs if not _t)))
+        roster_system._ban_night_violations = _ban_frozen   # type: ignore[attr-defined]
+        # 최적 증명 여부 — 아니면 '가능한 최소' 가 아니라 '시간 안에 줄인 값' 으로 안내한다.
+        roster_system._ban_night_proven = _stB == cp_model.OPTIMAL   # type: ignore[attr-defined]
+        print(f"{logger_prefix} [BanNBeforeFixedOff] 최소화: 위반 {_ban_before}→{sum(_ban_frozen)}칸 "
+              f"(휴가·공가 전날 {_ban_frozen[0]} · 신청 휴무 전날 {_ban_frozen[1]} · "
+              f"{_cp_sat_status_to_text(_stB)}) → stage2·3 축별 상한으로 고정")
+
     # ───── 2단계: 안전/법규 ─────
     with timer_cls("폴백 2단계: 안전/법규 위반 최소화"):
         (
@@ -4009,6 +4329,7 @@ def optimize_fallback_lex_hard_first(
             coverage_eq=best_short,
             over_le=best_over,
             broad_soft=used_broad_soft,
+            ban_slack_le=_ban_frozen,
         )
         s2 = cp_model.CpSolver()
         # ── [6c 실험] stage2 편차가 **시간 부족**인가 **국소해**인가 · 2026-09-10 ──────
@@ -4067,6 +4388,65 @@ def optimize_fallback_lex_hard_first(
         _reg_s2 = getattr(m2, "_cpsat_assumption_registry", None)
         if _reg_s2 is not None:
             _reg_s2.attach_to_model()
+        # ★ stage1 해를 출발점(힌트)으로 준다 — `AIDE_S2_HINT_S1=0` 이면 종전처럼 빈손.
+        #   stage2 는 stage1 의 하드(월 상한 등)에 N 간격 하한이 더해진 모델이라, 상한이 빡빡하면
+        #   빈손으로는 첫 해를 못 찾는다(실측 성남 중환자실-RN 2026-11: stage1 은 초과칸 최소화로
+        #   풀렸는데 stage2 UNKNOWN → N 간격 해제 재시도로 밀렸다). stage1 해는 커버리지 등식을
+        #   이미 만족하고 간격만 일부 어긋나 있어 좋은 출발점이다. 힌트는 탐색 순서만 바꾼다.
+        #   ★ **필요한 병동에만** 준다 — stage1 에서 상한이 빡빡했거나(초과칸이 남았던 경우)
+        #     N 간격 위반칸 단계가 있을 때. 그 밖의 병동에 주면 안전위반을 덜 다듬은 stage1 해
+        #     쪽으로 탐색이 끌려 stage2 가 더 나쁜 해에 머물 수 있다(A/B 1회: 시화중환1
+        #     30만→90만 · 시화중환2 660만→1170만 — 둘 다 상한·간격과 무관한 병동).
+        _s2_hinted = False
+        if (_os_tl3.environ.get("AIDE_S2_HINT_S1", "1") != "0" and s1 is not None
+                and (_s1_cap_tight or getattr(m2, "_n2n_gap_slacks", None)
+                     or getattr(m2, "_ban_n_slacks", None))):
+            _s2_hinted = True
+            for n in range(N):
+                for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                    for s in range(S):
+                        m2.AddHint(X2(n, d, s), int(s1.Value(X1(n, d, s))))
+        # ★ N 간격 위반칸 고정(위반칸 방식일 때 · build_model 의 `_forbid_n` 주석 참조).
+        #   본 풀이 전에 위반칸 합만 최소화해 `<= 최소값` 으로 묶는다. 이 풀이가 해를 못 내면
+        #   0 으로 묶어 종전 하드와 같게 둔다(그러면 종전처럼 UNKNOWN → 해제 재시도 경로).
+        _n2n_frozen = 0
+        _g2 = list(getattr(m2, "_n2n_gap_slacks", []) or [])
+        if _g2:
+            from ortools.sat import cp_model_pb2 as _pb_n2n
+            _obj_saved = _pb_n2n.CpObjectiveProto()
+            _obj_saved.CopyFrom(m2.Proto().objective)
+            m2.Minimize(sum(_g2))
+            _sA = cp_model.CpSolver()
+            _sA.parameters.num_search_workers = 8
+            _sA.parameters.max_time_in_seconds = _gen_dl.clamp(max(5, min(
+                tl2, int(_os_lex.environ.get("AIDE_N2N_SLACK_TL", "20") or 20))), reserve=45.0)
+            _stA = _solve_traced(_sA, m2, logger_prefix, "stage2:n2n위반칸")
+            if _stA not in (cp_model.OPTIMAL, cp_model.FEASIBLE) and _s2_hinted:
+                # ★ 시간 안에 못 풀었으면(실측: CPU 경합 중 20초 UNKNOWN) 힌트로 준 stage1 해를
+                #   **근무칸 고정**으로 다시 풀어 그 해의 위반칸 수를 센다. 근무가 고정이라 즉시
+                #   끝나고, 그 값으로 묶으면 stage2 가 늘 출발점 해를 가진다 — 0 으로 묶어
+                #   통째 해제·재생성으로 가는 것보다 덜 깨진다.
+                _sA = cp_model.CpSolver()
+                _sA.parameters.num_search_workers = 8
+                _sA.parameters.fix_variables_to_their_hinted_value = True
+                _sA.parameters.max_time_in_seconds = 10.0
+                _stA = _solve_traced(_sA, m2, logger_prefix, "stage2:n2n위반칸(stage1해 고정)")
+            if _stA in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                _n2n_frozen = int(_sA.Value(sum(_g2)))
+                m2.ClearHints()
+                for n in range(N):
+                    for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
+                        for s in range(S):
+                            m2.AddHint(X2(n, d, s), int(_sA.Value(X2(n, d, s))))
+            print(f"{logger_prefix} [N2N-MinGap] stage2 위반칸 최소 {_n2n_frozen} "
+                  f"({_cp_sat_status_to_text(_stA)}) → 이 값으로 고정")
+            # 최적 증명 여부 — stage1 해 고정 재풀이의 OPTIMAL 은 '그 배정의 위반 수' 증명일 뿐이라
+            #   전체 최소가 아니다(Codex 지적). 자유 풀이가 OPTIMAL 일 때만 '가능한 최소' 로 안내한다.
+            roster_system._n2n_gap_proven = (                   # type: ignore[attr-defined]
+                _stA == cp_model.OPTIMAL and not _sA.parameters.fix_variables_to_their_hinted_value)
+            m2.Add(sum(_g2) <= _n2n_frozen)
+            m2.Proto().objective.CopyFrom(_obj_saved)
+            roster_system._n2n_gap_violations = _n2n_frozen   # type: ignore[attr-defined]
         if _s2_bestn > 1:
             # ★★ best-of-N — **더 좋은 해를 찾는 게 아니라, 동률 최적해 중에서 고르는 것**이다.
             #   실측(2026-09-11 · 9A): stage2 본 solve 가 **0.7~1.0초에 OPTIMAL** 로 끝나고
@@ -5029,6 +5409,8 @@ def optimize_fallback_lex_hard_first(
             over_le=best_over,
             stage2_zero_locks=stage2_zero_locks,
             broad_soft=used_broad_soft,
+            n2n_slack_le=_n2n_frozen,
+            ban_slack_le=_ban_frozen,
         )
         # ★ 아래 else 의 `sum(safety3[k]) == sum(safety2[k])` 는 오래 **빈 제약**이었다
         #   (2026-09-07 proto 로 확정). 양변이 모두 변수식이고 m2·m3 가 같은 순서로
@@ -5164,7 +5546,8 @@ def optimize_fallback_lex_hard_first(
                 # m3 에는 이미 stage2 해가 힌트로 들어가 있다(위 AddHint 루프).
                 # 그 힌트를 값으로 고정하면 "stage2 해가 m3 에서 성립하는가" 를 직접 묻는다.
                 _sd.parameters.fix_variables_to_their_hinted_value = True
-                _std = _sd.Solve(m3)
+                _gen_dl.cap_solver(_sd)
+                _std = cp_model.UNKNOWN if _gen_dl.expired() else _sd.Solve(m3)
                 print(f"{logger_prefix} [DiagS3] stage2해 고정 재solve: "
                       f"{_cp_sat_status_to_text(_std)} "
                       f"→ {'m3 가 stage2 해를 거부한다(m3≠m2 확정)' if _std == cp_model.INFEASIBLE else 'stage2 해는 m3 에서 성립 — 원인은 목적/시간 쪽'}")

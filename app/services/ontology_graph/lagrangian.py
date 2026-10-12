@@ -42,7 +42,9 @@ def estimate_multipliers(
         s = cp_model.CpSolver()
         s.parameters.max_time_in_seconds = time_per_solve
         s.parameters.num_search_workers = 1
-        st = s.Solve(m)
+        from services.cp_sat import gen_deadline as _gen_dl
+        _gen_dl.cap_solver(s)   # 요청 전체 마감 안에서(실패 후 진단)
+        st = cp_model.UNKNOWN if _gen_dl.expired() else s.Solve(m)
         if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             break
         alpha = alpha0 / (1.0 + t)            # 감소 스텝(수렴)

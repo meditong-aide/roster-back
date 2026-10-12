@@ -621,6 +621,9 @@ class CPSATBasicEngine:
             same_shift_hard_k=int(config_data.get("same_shift_hard_k", 3) or 0),
             # 고립근무 하드 금지(기본 True). INFEASIBLE 시 호출부가 False 로 내려 재생성한다.
             isolated_work_hard=bool(config_data.get("isolated_work_hard", True)),
+            # 전날 N 금지 최소화 모드(DB 컬럼 아님 · 자동 완화 마지막 단계가 켠다)
+            ban_night_minimize=bool(config_data.get("ban_night_minimize", False)),
+            off_exact_auto_released=bool(config_data.get("off_exact_auto_released", False)),
             # 4O 연속 휴무 hard 제약 (디폴트 False = 해제)
             enforce_4o_hard=bool(config_data.get("enforce_4o_hard", False)),
             # N 블록 간 간격 soft (목표 10일, 한쪽 페널티: 10일 미만만 벌점)
@@ -1357,6 +1360,17 @@ class CPSATBasicEngine:
                 if oacnt > 0:
                     prev_n_offs_after_by_idx[n_idx] = oacnt
             roster_system.prev_month_n_offs_after_by_idx = prev_n_offs_after_by_idx
+            # 전월 꼬리에서 마지막 N 이후 지난 날수(마지막 날 N = 0) — N 블록 간격 하한의 월경계용
+            prev_last_n_k_by_idx: dict[int, int] = {}
+            for dbid, k_raw in (config_data.get("prev_month_last_n_k") or {}).items():
+                n_idx = _get_nurse_idx(dbid)
+                if n_idx is None:
+                    continue
+                try:
+                    prev_last_n_k_by_idx[n_idx] = int(k_raw)
+                except (TypeError, ValueError):
+                    continue
+            roster_system.prev_month_last_n_k_by_idx = prev_last_n_k_by_idx
             # 전월 꼬리 연속 OFF 카운트 (4O 월경계 제약용)
             prev_off_tail_raw = config_data.get("prev_month_off_tail") or {}
             prev_off_tail_by_idx: dict[int, int] = {}
@@ -2297,6 +2311,8 @@ class CPSATBasicEngine:
             solver.parameters.max_time_in_seconds=tl
             solver.parameters.num_search_workers=4
             solver.parameters.relative_gap_limit = 0.1
+            from services.cp_sat import gen_deadline as _gen_dl_p
+            _gen_dl_p.cap_solver(solver)   # 요청 전체 마감 안에서
             stat=solver.Solve(model)
             print('stat', stat)
             # [ProbeInstrument] clean CP-SAT full-model 결과를 rs에 stash (additive, 솔버 무영향).
@@ -3349,7 +3365,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     continue
                 # max coverage 있으면 아래 일반 하드 로직으로 처리
             if code in zero_demand_block_codes and req_raw == 0:
-                m.Add(assigned == 0)
+                # 최소 0 은 금지, 최대가 1 이상이면 '선택'(0~최대) — fallback_lex 와 같은 규약.
+                m.Add(assigned <= need_max)
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 continue
@@ -3374,13 +3391,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     )
                 else:
                     m.Add(_cov_min_expr)
-            # max 제약: hard (상한 초과 불가)
-            if need_max > 0:
+            # max 제약: hard (상한 초과 불가). 최대 설정 여부는 원값으로 본다 —
+            #   고정칸이 최대를 다 채워 need_max 가 0 이 돼도 상한은 남아야 한다(fallback_lex 와 같음).
+            if req_max_raw > 0:
                 m.Add(assigned <= need_max)
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 # 일자별 커버리지 균등화용 수집 (물리일만)
-                if d < D_phys:
+                if d < D_phys and need_max > 0:
                     daily_assigned_by_code.setdefault(code, []).append((d, assigned, need, need_max))
             elif _off_first_cfg:
                 # off_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
@@ -4979,7 +4997,9 @@ def _solve_neighbourhood(
     solver.parameters.max_time_in_seconds=tl
     solver.parameters.num_search_workers = 10
     solver.parameters.relative_gap_limit = 0.1
-    st = solver.Solve(model)
+    from services.cp_sat import gen_deadline as _gen_dl_r
+    _gen_dl_r.cap_solver(solver)   # 요청 전체 마감 안에서
+    st = cp_model.UNKNOWN if _gen_dl_r.expired() else solver.Solve(model)
     status_text = _cp_sat_status_to_text(st)
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         if not bool(getattr(rs, "_infeasible_n_diag_logged", False)):

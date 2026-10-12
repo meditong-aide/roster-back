@@ -70,6 +70,15 @@ class NurseRosterConfig:
     #   (roster_create_service 가 False 로 내려 재생성 → 위 soft 벌점이 이어받는다).
     #   N 단독(O-N-O)은 하드락 7(1N 금지)이 별도 관리하므로 여기서 제외한다.
     isolated_work_hard: bool = True
+    # 고정 OFF·휴가 전날 N 금지(`ban_night_before_fixed_wanted_off`·`ban_night_before_fixed_off`)를
+    # **위반 칸 최소화 후 고정**으로 건다. DB 컬럼이 아니다 — 하드로 INFEASIBLE 일 때 자동 완화
+    # 사다리 마지막 단계(roster_create_service)가 True 로 올려 재생성한다. 지킬 수 있으면 위반 0 이라
+    # 하드와 같고, 못 지키면 가능한 최소 칸만 어긴다(벌점 가중치 경쟁이 아니라 lex 고정).
+    ban_night_minimize: bool = False
+    # OFF 우선(off_first=False)에서 대상자(3교대·한 달 전체·수기 o_* 없음)의 OFF 를 월 OFF 수로
+    # **정확히** 맞추던 하드를 풀고 종전 1일 여유(벌점)로 되돌린다. DB 컬럼이 아니다 — 정확 맞춤이
+    # INFEASIBLE 일 때 자동 완화 사다리(roster_create_service)가 True 로 올려 재생성한다.
+    off_exact_auto_released: bool = False
     # 4O 연속 휴무 hard 제약(당월 내 + 월경계). True면 4연속 OFF 금지. False면 제약 제거.
     # 디폴트는 False(해제): 운영 검증 결과 자연 발생률 ~10-13%로 무리 없는 수준.
     enforce_4o_hard: bool = False
