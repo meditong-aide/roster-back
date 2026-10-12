@@ -2147,7 +2147,7 @@ def optimize_fallback_lex_hard_first(
                 if mid_idx is not None:
                     # M 은 전날이 D 또는 O 일 때만 — 즉 `D→M` · `O→M` 만 허용한다.
                     #   (전날이 M 이면 둘 다 0 이라 **연속 M 도 여기서 이미 막힌다**)
-                    m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx))
+                    m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx) + X(n, d - 1, mid_idx))
                     # ★★ 역방향 `M→D` 금지 (2026-09-16). 위 식은 **M 의 앞만** 보고 뒤는 안 봐서
                     #   `M→D` 가 그대로 나왔다(실측 성남 61병동-AN 2026-10 v6 에서 **12건** —
                     #   이 병동의 M 코드는 `D2` 다. 같은 판 `D→M` 14건은 정상이라 그대로 둔다).
