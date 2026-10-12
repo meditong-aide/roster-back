@@ -4255,8 +4255,10 @@ def _extract_unrecoverable_violated_constraints(
     return out[:50]
 
 
-def _ban_plan_key(rs) -> tuple[int, int, int]:
-    """전날 N 금지 최소화 결과의 비교 키 — (휴가·공가 전날 N, N 간격 위반, 신청 휴무 전날 N). 작을수록 낫다."""
+def _ban_plan_key(rs, released: int = 0) -> tuple[int, int, int, int]:
+    """전날 N 금지 최소화 결과의 비교 키 — (휴가·공가 전날 N, N 간격 위반, 하드락 해제 여부,
+    신청 휴무 전날 N). 작을수록 낫다. `released` 는 앞 단계에서 풀린 같은 근무 연속·고립 근무를
+    그대로 쓴 시도면 1 — 신청 휴무 전날 N 몇 칸을 위해 하드락 성격의 규칙을 풀지 않게 한다."""
     _t, _w = getattr(rs, "_ban_night_violations", None) or (0, 0)
     _n2n = None
     try:
@@ -4266,7 +4268,7 @@ def _ban_plan_key(rs) -> tuple[int, int, int]:
         print(f"[BanNightFallback] N 간격 위반 계산 실패(고정값 사용): {_exc}")
     if _n2n is None:
         _n2n = int(getattr(rs, "_n2n_gap_violations", 0) or 0)
-    return int(_t), int(_n2n), int(_w)
+    return int(_t), int(_n2n), int(released), int(_w)
 
 
 def _carried_hardlock_relaxations(final_cfg, ss_orig_on: bool, iw_orig_on: bool,
@@ -7140,10 +7142,11 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 ("누적 해제", _bn_base)]
             _bn_err = "시도 없음"
             _bn_generated = _bn_rs = None
-            # ★ 하드 복구 결과에 휴가 전날 N 이나 N 간격 위반이 남으면 누적 해제도 돌려 더 나은 쪽을
-            #   쓴다(2026-10-12 사용자 결정 · `_ban_plan_key` 순서). 실측 성남 중환자실-RN 11월:
-            #   하드 복구 = 같은 근무 4연속 0 · N 간격 위반 11 · 휴가 전날 N 1 / 누적 해제 = 17 · 0 · 0.
-            #   비기면 앞(하드 복구)을 쓴다 — 같은 근무 연속·고립 근무까지 지킨 쪽이다.
+            # ★ 하드 복구 결과에 **휴가 전날 N** 이 남을 때만 누적 해제도 돌려 더 나은 쪽을 쓴다
+            #   (2026-10-12 사용자 결정 · 비교 키 `_ban_plan_key` = 휴가 전날 N → N 간격 위반 →
+            #   하드락 해제 여부 → 신청 휴무 전날 N). 처음엔 N 간격 위반만 남아도 돌렸는데, dev Lambda
+            #   (CPU 2.3개)에서 한 번에 300초씩 두 번 돌아 518초가 걸렸고, 누적 해제가 신청 휴무 전날 N
+            #   1칸을 줄이는 대가로 같은 근무 4연속 0→26 을 낸 쪽이 이겼다. 비기면 하드 복구를 쓴다.
             _bn_done = []
             for _bn_i, (_bn_label, _bn_cfg) in enumerate(_bn_plans):
                 print(f"[BanNightFallback] infeasible 감지 → 신청 휴무·휴가 전날 N 금지를 "
@@ -7153,10 +7156,13 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                     _bn_err = _e
                     print(f"[BanNightFallback][AUTO-MIN][fail] {_bn_label} 실패: {_e}")
                     continue
-                _k = _ban_plan_key(_rs)
-                print(f"[BanNightFallback] {_bn_label} 결과 (휴가 전날 N, N 간격 위반, 신청 휴무 전날 N) = {_k}")
+                # 누적 해제 시도는 앞 단계에서 풀린 하드락(같은 근무 연속·고립 근무)을 그대로 쓴다.
+                _released = 1 if (_bn_label == "누적 해제" and _bn_restore) else 0
+                _k = _ban_plan_key(_rs, _released)
+                print(f"[BanNightFallback] {_bn_label} 결과 "
+                      f"(휴가 전날 N, N 간격 위반, 하드락 해제, 신청 휴무 전날 N) = {_k}")
                 _bn_done.append((_k, _bn_i, _bn_label, _g, _rs))
-                if _k[0] == 0 and _k[1] == 0:
+                if _k[0] == 0:
                     break
             if _bn_done:
                 _bn_err = None
