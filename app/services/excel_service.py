@@ -1153,7 +1153,7 @@ def export_schedule_excel_bytes(
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
     from openpyxl.utils import get_column_letter
-    from db.models import Schedule, ScheduleEntry, Nurse, Shift, RosterConfig, ShiftManage
+    from db.models import Schedule, ScheduleEntry, Nurse, Shift, RosterConfig
     import calendar
 
     # ───────── 1) 데이터 로드 ─────────
@@ -1289,83 +1289,6 @@ def export_schedule_excel_bytes(
 
     entries = db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
 
-    # alias_map 생성
-    alias_map: dict[str, str] = {}
-    sm_rows = db.query(ShiftManage).filter(
-        ShiftManage.office_id == current_user.office_id,
-        ShiftManage.group_id == target_group_id,
-    ).all()
-    for row in sm_rows:
-        if not row.main_code:
-            continue
-        base = row.main_code.upper()
-        alias_map[base] = base
-        if row.codes:
-            for c in row.codes:
-                alias_map[str(c).upper()] = base
-    alias_map.setdefault('OFF', 'O')
-    alias_map.setdefault('O', 'O')
-
-    def to_base(code: str) -> str:
-        # ★ 정규화는 **여기 한 곳에서만** 한다(strip + upper). 예전엔 strip 이 없어
-        #   `' - '` 처럼 공백이 붙은 값이 base 로 그대로 남았다. 그러면 하단 집계
-        #   (`footer_labels`)는 strip 후 sentinel 로 걸러 내는데 우측 요약 열
-        #   (`used_codes`)은 못 걸러, **하단엔 없는 하이픈 열이 우측에만 생긴다.**
-        #   실데이터는 dev·prod 모두 0건이지만, 두 축이 같은 함수를 쓰는 이상
-        #   정규화가 한 곳에 모여 있어야 어긋나지 않는다.
-        u = str(code or "").strip().upper()
-        if not u:
-            return '-'
-        if u in alias_map:
-            return alias_map[u]
-        if u.startswith('D'): return 'D'
-        if u.startswith('E'): return 'E'
-        if u.startswith('N'): return 'N'
-        if u in ('O', 'OFF'): return 'O'
-        return u
-
-    # ───────── 2) 실제 사용된 모든 base 코드 수집 ─────────
-    used_codes = set()
-    for e in entries:
-        if e.shift_id:
-            base = to_base(e.shift_id)
-            if base != '-':
-                used_codes.add(base)
-
-    core_codes = ['D', 'E', 'N', 'O']
-    extra_codes = sorted(used_codes - set(core_codes))
-    tail_labels = core_codes + extra_codes
-    summary_cols = len(tail_labels)
-
-    # ───────── 2-a) 하단 「일일 근무 현황」용 — **세부 코드 그대로** ─────────
-    #   우측 요약 열(`tail_labels`)은 base 로 접어 1인당 D/E/N/O 합을 보여주는 자리라
-    #   그대로 둔다. 반면 하단 일일 집계는 병동이 **그 날 어떤 코드가 몇 개 나갔는지**를
-    #   보는 곳이라, `D2`·`D1` 같은 하위코드가 `D` 로 접히면 쓸 수가 없다(병동 요청).
-    #   ★ 코드 마스터 전체가 아니라 **그 근무표에 실제로 발생한 코드만** 행이 된다 —
-    #     안 쓴 코드까지 깔면 0 행이 수십 줄 생긴다.
-    #   ★ 대표 코드 `D`·`E`·`N` 을 **맨 위**에 둔다(병원 요청 2026-10 — 하루 3교대 인원을
-    #     먼저 본다). 그 아래는 base 묶음 순(D 계열 → E → N → O → 그 외)이라 하위코드끼리 붙는다.
-    #     대표 판정은 "코드 자체가 base 와 같다"(`to_base(c) == c`) — 대표 코드를 `D` 가 아닌
-    #     이름으로 쓰는 병동은 맨 위 행이 비고 기존 묶음 순 그대로다.
-    #   ★ **미배정 sentinel `-` 를 뺀다.** 위 base 수집이 `base != '-'` 로 거르는 것과
-    #     같은 규약이다. `shifts` 마스터에 없는 값인데 `schedule_entries` 에는 실제로
-    #     저장돼 있어(운영·dev 양쪽 실측: `29dba53a16a1` 2026-03), 안 거르면 하단에
-    #     `-` 행이 생겨 **미배정 칸이 근무 인원으로 읽힌다**.
-    used_raw_codes = {
-        _c for _c in (str(e.shift_id or "").strip() for e in entries)
-        if _c and to_base(_c) != "-"
-    }
-    _base_rank = {c: i for i, c in enumerate(core_codes)}
-    _den_top = {"D": 0, "E": 1, "N": 2}
-
-    def _footer_key(c: str) -> tuple:
-        _cu = c.strip().upper()  # to_base 와 같은 정규화 — 소문자 대표 코드(`d`)도 맨 위로
-        if _cu in _den_top and to_base(c) == _cu:
-            return (0, _den_top[_cu], "", c)
-        return (1, _base_rank.get(to_base(c), len(core_codes)), to_base(c), c)
-
-    footer_labels = sorted(used_raw_codes, key=_footer_key)
-
     # nurse별 매핑
     by_nurse: dict[str, dict[int, str]] = {}
     for e in entries:
@@ -1418,6 +1341,8 @@ def export_schedule_excel_bytes(
     #:   연차는 교육·공가 같은 '기타 특수코드' 가 아니라 자체 축이고, 원본 근무표 관례상
     #:   원티드로 받은 휴가는 빨간 글자로 나타낸다.
     leave_unit_codes: set = set()
+    #: 연차 코드 → 차감 단위(대표 행 기준). 엑셀 `사용` 수식의 계수다.
+    leave_unit_by_code: Dict[str, float] = {}
     _seen_code: set = set()
     for _s in _shift_rows:
         _code = str(_s.shift_id or "").strip()
@@ -1456,10 +1381,74 @@ def export_schedule_excel_bytes(
             off_axis_codes.add(_code)
         if getattr(_s, "annual_leave_unit", None) is not None:
             leave_unit_codes.add(_code)
+            leave_unit_by_code[_code] = float(_s.annual_leave_unit)
         # ★ `_swap` 을 조건에서 뺐다 — 위 `code_bg` 주석 참조. OFF 축과 배경이 한 코드에
         #   겹치지 않게 한다. 연차는 `leave_unit_codes` 로 남는다.
         if _axis in ("D", "E", "N") or _code in leave_unit_codes:
             fill_codes.add(_code)
+
+    # ───────── 2-d) 집계 칸 구성 — D / E / N / (M) / O / 연차 / 기타 ─────────
+    #   우측 요약·하단 일일 현황 **모두** 이 칸으로 집계한다(2026-10-12 사용자 결정). 코드별 열을
+    #   늘어놓으면 엑셀에서 그 달에 안 쓴 코드로 고쳤을 때 열이 없어 집계에서 사라진다 —
+    #   칸을 고정하고 '기타' 로 나머지를 다 받으면 합계가 빠지지 않는다.
+    #   · D/E/N/M/O — **근무표 화면과 같은 묶음**(roster_front `shift-util.ts`): `shifts.default_shift`
+    #     (서브코드 `주` 제외), 없으면 코드가 D/E/N/M/O 일 때 그 코드. 셀 해석도 화면 순서 그대로 —
+    #     ① 근무 코드 정확 일치(첫 행) ② 어떤 근무의 default_shift 값과 일치 ③ 첫 글자(D/E/N/O/M).
+    #     그래서 OF(default O)는 O, DA·DD(default 없음)는 기타다.
+    #   · M — **MID 사용 설정 병동만** 칸을 둔다. 아니면 M 근무는 기타로 간다.
+    #   · 연차 — `annual_leave_unit` 이 있는 코드의 **차감 단위 합**(Y 1 · 반차 0.5 · 반반차 0.25).
+    #     단위가 없는 병동의 연차 코드는 기타로 간다(단위를 채우면 연차로 잡힌다).
+    #   · 기타 — 위 어디에도 안 드는 모든 코드의 **칸 수**(`-`·빈칸 제외). 마스터에 없는 코드 포함.
+    #   ★ 한계(의도) — 화면은 셀에 저장된 근무 정의 id(`schedule_ids`)로 먼저 해석하지만 엑셀 수식은
+    #     셀의 코드 문자열만 본다. 차이는 같은 코드의 정의끼리 대표 근무가 다를 때뿐인데, 실측
+    #     (2026-10-12 dev·운영 shifts 1,977행) 1건(`M` — 화면도 같은 M 묶음)이라 들이지 않았다.
+    _SUB_CODES = {"주"}
+    _cfg_row = None
+    if schedule.config_id is not None:
+        _cfg_row = db.query(RosterConfig).filter(RosterConfig.config_id == schedule.config_id).first()
+    if _cfg_row is None:
+        _cfg_row = (db.query(RosterConfig).filter(RosterConfig.group_id == target_group_id)
+                    .order_by(RosterConfig.config_id.desc()).first())
+    _use_mid = bool(getattr(_cfg_row, "use_mid", False))
+
+    def _main_of(_r) -> Optional[str]:
+        _ds = str(_r.default_shift or "").strip()
+        if _ds and _ds not in _SUB_CODES:
+            return _ds
+        _sid = str(_r.shift_id or "").strip()
+        return _sid if _sid in ("D", "E", "N", "M", "O") else None
+
+    def _gkey(_r) -> tuple:
+        _mn = _main_of(_r)
+        return ("main", _mn) if _mn else ("code", str(_r.shift_id or "").strip())
+
+    _first_by_code: Dict[str, Any] = {}
+    _by_default: Dict[str, list] = {}
+    for _r in _shift_rows:                      # sequence·id 순
+        _sid = str(_r.shift_id or "").strip()
+        if _sid and _sid not in _first_by_code:
+            _first_by_code[_sid] = _r
+        _ds = str(_r.default_shift or "").strip()
+        if _ds:
+            _by_default.setdefault(_ds, []).append(_r)
+    #: 묶음별 해석되는 셀 값(①·② 단계 · 대소문자 구분)
+    _codes_of_group: Dict[tuple, set] = {}
+    for _c, _r in _first_by_code.items():
+        _codes_of_group.setdefault(_gkey(_r), set()).add(_c)
+    for _ds, _rows in _by_default.items():
+        if _ds not in _first_by_code:
+            _codes_of_group.setdefault(_gkey(_rows[0]), set()).add(_ds)
+    #: ③ 첫 글자 대체에서 빼야 할 값 = ①·② 로 이미 해석되는 값 전부
+    _known_cells = set(_first_by_code) | set(_by_default)
+    #: 대표 근무로 안 묶이는 연차 코드 → 차감 단위(연차 칸). 대표로 묶이는 코드는 그 칸이 우선이다.
+    _leave_units = {
+        _c: _u for _c, _u in leave_unit_by_code.items()
+        if _c not in _first_by_code or _gkey(_first_by_code[_c])[0] != "main"
+    }
+    _main_cols = ["D", "E", "N"] + (["M"] if _use_mid else []) + ["O"]
+    tail_groups = [("main", _m) for _m in _main_cols] + [("leave", None), ("etc", None)]
+    tail_labels = _main_cols + ["연차", "기타"]
+    summary_cols = len(tail_labels)
 
     # 고정근무 — **그 사람의 그 칸은 배경을 칠하지 않는다.** 상시 근무라 한 줄이 통째로
     #   같은 색이 되고, 정작 봐야 할 글자색 표시가 묻힌다.
@@ -1617,7 +1606,6 @@ def export_schedule_excel_bytes(
     #:   구분할 수 없다 — 조용한 실패가 성공처럼 보이는 것이 가장 나쁘다.
     leave_opening: Dict[str, Any] = {}
     leave_stale = False
-    leave_used: Optional[Dict[str, Any]] = {}   # None = 계산 못 함(빈 dict 와 구분한다)
     leave_error: Optional[str] = None
     try:
         from db.models import NurseAnnualLeaveBalance
@@ -1638,23 +1626,39 @@ def export_schedule_excel_bytes(
             if schedule.status == "issued":
                 if _b.used is None or str(_b.source_schedule_id or "") != str(schedule_id):
                     leave_stale = True
+        # ★ 그 달 장부 행은 **그 달이 마감될 때** 전월 `closing` 을 이어받아 생긴다
+        #   (`rebuild_leave_balance_from`). 그래서 마감 전 초안을 내려받으면 행이 없어 3열이
+        #   통째로 빠졌다(실측 2026-10-12 성남 중환자실-RN 11월 초안 — 장부는 10월분만).
+        #   초안에서도 "이대로 마감하면 잔여가 얼마" 가 보여야 하므로, 그 달 행이 없는 **간호사별로**
+        #   전월 `closing` 을 전월잔여로 쓴다 — 마감 때 장부가 만들 값과 같은 규칙이다(그 함수도
+        #   간호사별로 시드 행은 두고 없는 사람만 전월에서 만든다).
+        _py, _pm = (year, month - 1) if month > 1 else (year - 1, 12)
+        _filled_prev = 0
+        for _b in (
+            db.query(NurseAnnualLeaveBalance)
+            .filter(
+                NurseAnnualLeaveBalance.group_id == target_group_id,
+                NurseAnnualLeaveBalance.year == _py,
+                NurseAnnualLeaveBalance.month == _pm,
+                NurseAnnualLeaveBalance.closing.isnot(None),
+            )
+            .all()
+        ):
+            if str(_b.nurse_id) not in leave_opening:
+                leave_opening[str(_b.nurse_id)] = _b.closing
+                _filled_prev += 1
+        if _filled_prev and schedule.status == "issued":
+            leave_stale = True   # 마감본인데 그 달 행이 없는 사람이 있다 = 재계산이 빠졌다
     except Exception as _lv_exc:  # noqa: BLE001
         # 장부 자체를 못 읽었다 → 열을 낼 근거가 없다. 대신 **경고를 남긴다.**
         print(f"[Excel] 연차 장부 조회 실패: {_lv_exc}")
         leave_opening = {}
         leave_error = "연차 장부를 읽지 못했습니다"
 
-    if leave_opening:
-        try:
-            from services.leave.annual_leave_service import compute_leave_used
-
-            leave_used = compute_leave_used(db, schedule)
-        except Exception as _lu_exc:  # noqa: BLE001
-            # ★ 계산만 실패했다 → **열은 유지**하고 `사용`·`당월잔여` 만 비운다.
-            #   `전월잔여` 는 장부에서 읽은 확정값이라 그대로 보여줄 수 있다.
-            print(f"[Excel] 연차 사용량 계산 실패(사용/당월잔여 생략): {_lu_exc}")
-            leave_used = None
-            leave_error = "연차 사용량을 계산하지 못했습니다"
+    # ★ `사용`·`당월잔여` 는 **엑셀 수식**이다(아래 본문). 병동이 엑셀에서 코드를 고치면
+    #   그대로 다시 집계된다. 계수는 코드별 대표 행의 `annual_leave_unit` —
+    #   `compute_leave_used` 의 코드 폴백(②)과 같다. 그 함수의 ①(셀이 가리키는 마스터 행)과
+    #   달라지는 건 같은 코드에 단위가 다른 중복 행이 있을 때뿐인데, 현재 연차 코드에는 없다.
 
     #: 연차 열은 **장부가 있는 병동에서만** 낸다(성남시의료원 중환자실 선제공).
     leave_labels = ["전월잔여", "사용", "당월잔여"] if leave_opening else []
@@ -1805,13 +1809,70 @@ def export_schedule_excel_bytes(
 
     # ───────── 6) 본문 ─────────
     start_row = header_row + 1
-    # 하단 일일 집계는 **세부 코드** 축(`footer_labels`)이다. 우측 요약 열의 base 축
-    #   (`row_counts` / `tail_labels`)과 축이 다르므로 같은 dict 를 쓰면 안 된다.
-    daily_counts = {d: {code: 0 for code in footer_labels}
-                    for d in range(1, days_in_month + 1)}
+    last_row = start_row + len(nurses) - 1
+    # ── 집계는 **엑셀 수식**이다 ──────────────────────────────────────────────
+    #   병동이 내려받은 엑셀에서 코드를 고치면 우측 요약·하단 일일 현황·연차가 그대로 다시
+    #   집계돼야 한다(병원 요청 2026-10). 값으로 박으면 고친 뒤에도 옛 숫자가 남는다.
+    #   ★ 축별 규약:
+    #     · 우측 요약 — **근무표 화면과 같은 묶음**(2-d · `_f_group`). 화면의 셀 해석 순서
+    #       (정확 일치 → default_shift 값 → 첫 글자)를 그대로 수식으로 옮겼다. 그래서 D 를
+    #       D9(마스터에 없음)로 고쳐도 D 묶음에 남고, DA 로 고치면 DA 열로 옮겨 간다.
+    #     · 하단 일일 현황(세부 코드 축) — **대소문자 구분·완전 일치**(`EXACT`).
+    #     · 셋 다 앞뒤 공백 무시 — 파이썬 쪽이 strip 해서 셌고 화면도 trim 한다.
+    #   ★ `COUNTIF` 를 쓰지 않는 이유: 대소문자를 못 가리고 `*`·`?`·`~` 를 와일드카드로 읽는다.
+    #   ★ openpyxl 은 계산값을 같이 저장하지 못한다 — 엑셀·구글시트는 열 때 계산하지만
+    #     메신저 미리보기 같은 뷰어는 빈칸으로 보일 수 있다(`fullCalcOnLoad` 로 엑셀 재계산은 강제).
+    _day_rng = lambda r: (f"{get_column_letter(static_cols + 1)}{r}:"     # noqa: E731
+                          f"{get_column_letter(static_cols + days_in_month)}{r}")
+    _xq = lambda c: '"' + str(c).replace('"', '""') + '"'               # noqa: E731
+    # 셀 정규화 = 파이썬 strip 대응. 엑셀 TRIM 은 내부 연속 공백도 하나로 접고 탭·NBSP 는 못
+    #   지우므로 CLEAN(0~31)·SUBSTITUTE(NBSP)를 먼저 하고, **비교할 코드도 같은 식으로** 정규화한다
+    #   (`_xl_norm`). 실측(2026-10-12): dev·운영 근무코드 272종 중 이 정규화와 strip 이 다른 코드 0건.
+    _xn = lambda rng: f'TRIM(SUBSTITUTE(CLEAN({rng}),CHAR(160)," "))'    # noqa: E731
+
+    def _xl_norm(code) -> str:
+        _s = "".join(ch for ch in str(code) if ord(ch) >= 32).replace("\xa0", " ")
+        return re.sub(" +", " ", _s).strip(" ")
+
+    def _group_terms(x: str, gkey: tuple) -> list:
+        """묶음 `gkey`(2-d)로 해석되는 셀이면 1 인 항 목록 — 화면의 해석 순서 그대로:
+        ①·② 정확 일치(대소문자 구분) + ③ 첫 글자 대체(①·② 로 해석되는 값은 뺀다)."""
+        _t = [f"EXACT({x},{_xq(_xl_norm(c))})" for c in sorted(_codes_of_group.get(gkey, ()))]
+        _h = gkey[1] if gkey[0] == "main" else None
+        if _h in ("D", "E", "N", "O", "M") and _h in _by_default and _gkey(_by_default[_h][0]) == gkey:
+            _t.append(f"(LEFT({x},1)={_xq(_h)})")          # 화면도 첫 글자를 대문자로 본다
+            _t += [f"-EXACT({x},{_xq(_xl_norm(k))})"
+                   for k in sorted(_known_cells) if k[:1].upper() == _h]
+        return _t
+
+    def _sum(_t: list) -> str:
+        return "(" + "+".join(_t).replace("+-", "-") + ")" if _t else "0"
+
+    def _f_cell(rng: str, gkey: tuple) -> str:
+        """집계 한 칸(우측은 한 사람의 한 달, 하단은 하루의 전원) — 칸 종류별 수식(2-d)."""
+        _x = _xn(rng)
+        if gkey[0] == "main":
+            _t = _group_terms(_x, gkey)
+            return f"=SUMPRODUCT({_sum(_t)}*1)" if _t else "=0"
+        if gkey[0] == "leave":
+            if not _leave_units:
+                return "=0"
+            return "=SUMPRODUCT(" + "+".join(
+                f"EXACT({_x},{_xq(_xl_norm(c))})*{u:g}" for c, u in sorted(_leave_units.items())) + ")"
+        # 기타 = 코드가 있는 칸 − 화면에 둔 대표 근무 칸 − 연차 칸(칸 수)
+        _minus = [_sum(_group_terms(_x, ("main", _m))) for _m in _main_cols]
+        _minus.append(_sum([f"EXACT({_x},{_xq(_xl_norm(c))})" for c in sorted(_leave_units)]))
+        return (f'=SUMPRODUCT((({_x}<>"")*({_x}<>"-")-' + "-".join(_minus) + ")*1)")
+
+    def _f_leave_used(rng: str) -> str:
+        if not leave_unit_by_code:
+            return "=0"
+        return "=SUMPRODUCT(" + "+".join(
+            f"EXACT({_xn(rng)},{_xq(_xl_norm(c))})*{u:g}"
+            for c, u in sorted(leave_unit_by_code.items())) + ")"
 
     def write_nurse_row(n, r: int, idx: int):
-        """간호사 1명을 r 행에 작성하고 daily_counts 를 누적한다."""
+        """간호사 1명을 r 행에 작성한다(우측 요약·연차는 수식)."""
         is_current_user = (str(n.nurse_id) == str(current_user.nurse_id))
 
         ws.cell(row=r, column=idx_col, value=idx)
@@ -1830,7 +1891,6 @@ def export_schedule_excel_bytes(
             if is_current_user:
                 cell.fill = highlight_fill
 
-        row_counts = {code: 0 for code in tail_labels}
         schedule_map = by_nurse.get(n.nurse_id, {})
         #: 이 사람의 **날짜별** 고정근무 코드 — 그 칸만 배경을 뺀다.
         #:   코드 단위로 빼면 남의 D 까지 지워지고, 날짜를 안 보면 월 중 고정근무가
@@ -1903,20 +1963,10 @@ def export_schedule_excel_bytes(
             ):
                 cell.font = Font(color=_C_SPECIAL)
 
-            # 우측 요약 열은 base 축, 하단 일일 집계는 세부 코드 축 — 따로 센다.
-            base = to_base(shift_code)
-            if base in row_counts:
-                row_counts[base] += 1
-            #   `footer_labels` 와 **같은 정규화**를 써야 키가 어긋나지 않는다(양쪽 strip).
-            _raw = str(shift_code or "").strip()
-            if _raw in daily_counts[d]:
-                daily_counts[d][_raw] += 1
-
-        # 요약 열: 0도 그대로 표시 (빈칸 → 0)
-        for i, lab in enumerate(tail_labels):
+        # 요약 열: D/E/N/(M)/O/연차/기타 수식(2-d · `_f_cell`)
+        for i, _gk in enumerate(tail_groups):
             col = tail_start_col + i
-            value = row_counts[lab]
-            cell = ws.cell(row=r, column=col, value=value)  # ← 변경: value 그대로
+            cell = ws.cell(row=r, column=col, value=_f_cell(_day_rng(r), _gk))
             cell.alignment = center
             cell.border = border_all
             if is_current_user:
@@ -1929,15 +1979,13 @@ def export_schedule_excel_bytes(
         #     "연차가 없다" 로 오해된다.
         if leave_labels:
             _op = leave_opening.get(str(n.nurse_id))
-            _us = leave_used.get(str(n.nurse_id)) if leave_used is not None else None
             if _op is None:
                 _vals = [None, None, None]
-            elif leave_used is None:
-                # 계산 실패 — 전월잔여(확정값)만 보여주고 나머지는 비운다.
-                _vals = [float(_op), None, None]
             else:
-                _u = _us if _us is not None else 0
-                _vals = [float(_op), float(_u), float(_op) - float(_u)]
+                # 전월잔여는 장부 확정값, 사용·당월잔여는 수식 — 엑셀에서 코드를 고치면 따라간다.
+                _op_ref = f"{get_column_letter(leave_start_col)}{r}"
+                _us_ref = f"{get_column_letter(leave_start_col + 1)}{r}"
+                _vals = [float(_op), _f_leave_used(_day_rng(r)), f"={_op_ref}-{_us_ref}"]
             for i, v in enumerate(_vals):
                 cell = ws.cell(row=r, column=leave_start_col + i, value=v)
                 cell.alignment = center
@@ -1949,7 +1997,6 @@ def export_schedule_excel_bytes(
     # 작성하면서 같은 팀 라벨의 연속 행 구간을 모아 컬럼2를 세로 병합한다.
     for idx, n in enumerate(nurses, start=1):
         write_nurse_row(n, start_row + idx - 1, idx)
-    last_row = start_row + len(nurses) - 1
 
     if team_view and nurses:
         # 정렬된 nurses 를 순회하며 같은 team_id 의 연속 구간(첫행~끝행)을 모아 컬럼1을
@@ -1978,7 +2025,7 @@ def export_schedule_excel_bytes(
     footer_start = last_row + 2
     ws.cell(row=footer_start, column=name_col, value="일일 근무 현황").font = header_font
 
-    def write_footer_row(label: str, values: list[int], row_idx: int):
+    def write_footer_row(label: str, gkey: tuple, row_idx: int):
         lab_cell = ws.cell(row=row_idx, column=role_col, value=label)
         lab_cell.font = header_font
         lab_cell.alignment = center
@@ -1991,8 +2038,10 @@ def export_schedule_excel_bytes(
             ws.cell(row=row_idx, column=c).border = border_all
 
         for d in range(1, days_in_month + 1):
-            val = values[d - 1]
-            cell = ws.cell(row=row_idx, column=static_cols + d, value=val)  # ← 변경: val 그대로 (0도 표시)
+            # 그 날 전원의 칸 종류별 수(우측 요약과 같은 `_f_cell` · 2-d)
+            _col = get_column_letter(static_cols + d)
+            cell = ws.cell(row=row_idx, column=static_cols + d,
+                           value=_f_cell(f"{_col}{start_row}:{_col}{last_row}", gkey))
             cell.alignment = center
             cell.border = border_all
 
@@ -2000,16 +2049,14 @@ def export_schedule_excel_bytes(
             col = static_cols + days_in_month + 1 + i
             ws.cell(row=row_idx, column=col).border = border_all
 
-    for i, lab in enumerate(footer_labels):
-        row_idx = footer_start + 1 + i
-        vals = [daily_counts[d][lab] for d in range(1, days_in_month + 1)]
-        write_footer_row(lab, vals, row_idx)
+    for i, (lab, _gk) in enumerate(zip(tail_labels, tail_groups)):
+        write_footer_row(lab, _gk, footer_start + 1 + i)
 
     # ───────── 8) 테두리 보정 ─────────
     #   가로 끝은 우측 요약 열 기준(`tail_labels`), 세로 끝은 하단 집계 행 수
-    #   기준(`footer_labels`)이다 — 축이 서로 다르다.
+    #   기준(`tail_labels` — 하단도 같은 칸 구성)이다.
     max_col = tail_start_col + len(tail_labels) + leave_cols - 1
-    for row in ws.iter_rows(min_row=wd_row, max_row=footer_start + len(footer_labels) + 1,
+    for row in ws.iter_rows(min_row=wd_row, max_row=footer_start + len(tail_labels) + 1,
                             min_col=1, max_col=max_col):
         for cell in row:
             if cell.value is not None and (cell.border is None or cell.border.left.style is None):
@@ -2031,6 +2078,8 @@ def export_schedule_excel_bytes(
         print(f"[Excel] {schedule_id} {_warn_msg}")
 
     # ───────── 저장 ─────────
+    # 집계가 수식이라 열 때 전체 재계산을 강제한다(openpyxl 은 계산값을 저장하지 못한다).
+    wb.calculation.fullCalcOnLoad = True
     bio = BytesIO()
     wb.save(bio)
     bio.seek(0)
