@@ -20,6 +20,8 @@ from typing import Any, Callable
 
 from ortools.sat.python import cp_model
 
+from services.cp_sat import gen_deadline
+
 
 @dataclass
 class MCSResult:
@@ -53,6 +55,9 @@ def find_mcs(
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit
         solver.parameters.num_search_workers = 8
+        gen_deadline.cap_solver(solver)   # 실패 후 진단도 요청 전체 마감 안에서
+        if gen_deadline.expired():
+            return cp_model.UNKNOWN, solver
         return solver.Solve(model), solver
 
     relaxed: set[str] = set()

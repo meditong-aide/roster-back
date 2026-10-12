@@ -100,7 +100,9 @@ def compile_cpsat_assumptions(ir: RosterConstraintIR, time_limit: float = 5.0) -
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
     solver.parameters.num_search_workers = 1
-    st = solver.Solve(m)
+    from services.cp_sat import gen_deadline as _gen_dl
+    _gen_dl.cap_solver(solver)   # 요청 전체 마감 안에서(실패 후 진단)
+    st = cp_model.UNKNOWN if _gen_dl.expired() else solver.Solve(m)
     if st in (cp_model.FEASIBLE, cp_model.OPTIMAL):
         return CoreResult(True)
     if st != cp_model.INFEASIBLE:

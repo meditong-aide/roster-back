@@ -2236,6 +2236,7 @@ def _calc_tail_metrics(seq: list[str]) -> dict:
             'consecutive_off_tail': 0,
             'last_day_shift': None,
             'offs_after_tail_nights': 0,
+            'night_last_k': None,
         }
     last = seq[-1]
     # 연속 근무 꼬리 (D/E/N/M = 메인코드, WK = shift_gb·type 미설정 근무 폴백)
@@ -2267,12 +2268,21 @@ def _calc_tail_metrics(seq: list[str]) -> dict:
     while i >= 0 and seq[i] == 'N':
         cons_n += 1
         i -= 1
+    # 꼬리에서 마지막 N 이후 지난 날수(마지막 날이 N 이면 0) — N 블록 간격 하한의 월경계용.
+    #   `offs_after_tail_nights` 는 'N 뒤가 전부 OFF' 일 때만 세고 2 로 잘려서
+    #   `N N O E` 같은 꼬리의 블록 끝 위치를 복원할 수 없다.
+    night_last_k = None
+    for _k, c in enumerate(reversed(seq)):
+        if c == 'N':
+            night_last_k = _k
+            break
     return {
         'consecutive_work_tail': cons_work,
         'consecutive_night_tail': cons_n,
         'consecutive_off_tail': cons_off_tail,
         'last_day_shift': last,
         'offs_after_tail_nights': min(2, offs_after_n),
+        'night_last_k': night_last_k,
     }
 
 def build_cross_month_constraints(db: Session, req: RosterRequest, current_user, shift_manage_data, config_dict: dict, nurse_ids: list[str]) -> dict:
@@ -2351,7 +2361,14 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         print("[ERR] _query_prev_month_schedule_id:", e)
         raise
     try:
-        last_map = _get_last_days_map(db, prev_sid, lookback, code2main, nurse_ids) if prev_sid else {}
+        # ★ N 간격 하한(월경계)은 전월 마지막 N 까지의 거리가 필요한데, 간격이 조회일수보다
+        #   길면 그 N 이 꼬리 밖에 있어 월경계 제약이 조용히 빠진다(Codex 지적 · gap 8+).
+        #   조회는 둘 중 긴 쪽으로 한 번 하고, 기존 지표에는 아래에서 **마지막 lookback 일만**
+        #   잘라 넘긴다 — 연속근무·OFF 꼬리 등 기존 판정은 그대로다.
+        #   간격은 모델과 같은 유효값(env 주입 포함)으로 잰다(Codex 지적).
+        from services.cp_sat.fallback_lex import effective_n2n_min_gap
+        _ext_lookback = max(lookback, effective_n2n_min_gap(config_dict.get("n2n_min_gap", 0)))
+        last_map = _get_last_days_map(db, prev_sid, _ext_lookback, code2main, nurse_ids) if prev_sid else {}
         print(f"[CrossMonth] 이전 달 꼬리 패턴 조회 완료: {len(last_map)}명")
     except Exception as e:
         print("[ERR] _get_last_days_map:", e)
@@ -2368,7 +2385,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
             for src_gid, nids in _src_groups.items():
                 _src_sid = _query_prev_month_schedule_id(db, src_gid, req.year, req.month)
                 if _src_sid:
-                    _src_map = _get_last_days_map(db, _src_sid, lookback, code2main, nids)
+                    _src_map = _get_last_days_map(db, _src_sid, _ext_lookback, code2main, nids)
                     for nid, seq in _src_map.items():
                         last_map[nid] = seq
                     print(
@@ -2378,10 +2395,15 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
                 else:
                     print(f"[CrossMonth][Inbound] source({src_gid}) 전월 schedule 없음, tail 생략")
 
+    # 기존 지표는 마지막 lookback 일만 본다(위 확장 조회 주석). 긴 꼬리는 N 간격 거리에만 쓴다.
+    last_map_ext = last_map
+    last_map = {k: list(v)[-lookback:] for k, v in last_map_ext.items()}
+
     prev_month_last_main: dict[str, str | None] = {}
     prev_month_last_is_off: dict[str, bool] = {}
     prev_month_n_tail: dict[str, int] = {}
     prev_month_n_offs_after: dict[str, int] = {}  # N tail 뒤 이미 소비된 OFF 수
+    prev_month_last_n_k: dict[str, int] = {}  # 꼬리에서 마지막 N 이후 지난 날수(N 간격 하한 월경계용)
     prev_month_off_tail: dict[str, int] = {}
     off_window_constraints: dict[str, list[list[int]]] = {}
     for nurse_id, seq in last_map.items():
@@ -2487,6 +2509,9 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         prev_month_n_tail[nurse_id] = int(cons_n or 0)
         if cons_n > 0:
             prev_month_n_offs_after[nurse_id] = int(offs_after or 0)
+        _nk = _calc_tail_metrics(last_map_ext.get(nurse_id, [])).get('night_last_k')
+        if _nk is not None:
+            prev_month_last_n_k[nurse_id] = int(_nk)
         
         # 디버깅: 이전 달 꼬리 패턴과 계산된 메트릭 출력 (강제 OFF가 생성되는 경우만)
         forced_off_before = len(forced_off.get(nurse_id, []))
@@ -2633,6 +2658,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         'prev_month_last_is_off': prev_month_last_is_off,
         'prev_month_n_tail': prev_month_n_tail,
         'prev_month_n_offs_after': prev_month_n_offs_after,
+        'prev_month_last_n_k': prev_month_last_n_k,
         'prev_month_off_tail': prev_month_off_tail,
         'off_window_constraints': off_window_constraints,
         'day0_n_fixed_nurse_ids': day0_n_fixed_nurse_ids,
@@ -3389,6 +3415,10 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
 
         # 호출자가 구성한 config_dict(게이지 반영 등)이 있으면 이를 사용
         config_dict = (config_override.copy() if config_override is not None else (latest_config.__dict__.copy() if latest_config else {}))
+        # 근무 우선(off_first=True)은 월 OFF 수를 하드로 보지 않는 모드라 개인 OFF 한도(o_*)도
+        #   읽지 않는다(2026-10-12 사용자 결정). 사본으로 바꿔 간호사 객체(재시도가 공유)는 그대로 둔다.
+        if bool(config_dict.get("off_first", False)):
+            nurses_dict = [{**nd, "o_min": None, "o_max": None, "o_exact": None} for nd in nurses_dict]
         # ShiftManage 요구인원은 호출부에서 주입한다
 
         # teams.min_shift → config_dict["team_min_by_team"] 로 주입
@@ -3530,6 +3560,9 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
     prev_month_n_offs_after = cross_month_constraints.get("prev_month_n_offs_after") or {}
     if prev_month_n_offs_after:
         config_dict["prev_month_n_offs_after"] = prev_month_n_offs_after
+    prev_month_last_n_k = cross_month_constraints.get("prev_month_last_n_k") or {}
+    if prev_month_last_n_k:
+        config_dict["prev_month_last_n_k"] = prev_month_last_n_k
     prev_month_off_tail = cross_month_constraints.get("prev_month_off_tail") or {}
     if prev_month_off_tail:
         config_dict["prev_month_off_tail"] = prev_month_off_tail
@@ -4220,6 +4253,52 @@ def _extract_unrecoverable_violated_constraints(
         pass
 
     return out[:50]
+
+
+def _ban_plan_key(rs) -> tuple[int, int, int]:
+    """전날 N 금지 최소화 결과의 비교 키 — (휴가·공가 전날 N, N 간격 위반, 신청 휴무 전날 N). 작을수록 낫다."""
+    _t, _w = getattr(rs, "_ban_night_violations", None) or (0, 0)
+    _n2n = None
+    try:
+        from services.cp_sat.fallback_lex import count_n2n_gap_violations
+        _n2n = count_n2n_gap_violations(rs)
+    except Exception as _exc:
+        print(f"[BanNightFallback] N 간격 위반 계산 실패(고정값 사용): {_exc}")
+    if _n2n is None:
+        _n2n = int(getattr(rs, "_n2n_gap_violations", 0) or 0)
+    return int(_t), int(_n2n), int(_w)
+
+
+def _carried_hardlock_relaxations(final_cfg, ss_orig_on: bool, iw_orig_on: bool,
+                                  oe_orig_released: bool = True) -> list[tuple[str, dict]]:
+    """완화 사다리가 실패하며 누적한 하드락 해제 중 최종 채택 설정에 남은 것 — (완화 키, 경고).
+
+    same_shift·isolated_work 재시도가 실패하면 그 해제가 config_dict 에 남아 뒤 단계(전날 N
+    최소화·N 간격 해제)가 물고 간다. 뒤 단계는 자기 완화만 알리므로 앞 해제가 경고 없이 나갔다
+    (Codex 지적 · 실측 성남 중환자실-RN 2026-11 VER31: 같은 근무 4연속 17곳).
+    """
+    out: list[tuple[str, dict]] = []
+    if final_cfg is None:
+        return out
+    if ss_orig_on and int(getattr(final_cfg, "same_shift_hard_k", 0) or 0) == 0:
+        out.append(("same_shift_hard_to_soft", {
+            "type": "same_shift_hard_to_soft_applied",
+            "detail": ("같은 시프트 연속 하드 제한이 infeasible 로 자동 soft 전환되어 재생성됐습니다. "
+                       "일부 간호사에게 같은 시프트가 4회 이상 연속될 수 있습니다."),
+        }))
+    if iw_orig_on and not bool(getattr(final_cfg, "isolated_work_hard", True)):
+        out.append(("isolated_work_hard_to_soft", {
+            "type": "isolated_work_hard_to_soft_applied",
+            "detail": ("고립근무 금지가 infeasible 로 자동 soft 전환되어 재생성됐습니다. "
+                       "일부 간호사에게 휴무 사이 단일 근무가 생길 수 있습니다."),
+        }))
+    if not oe_orig_released and bool(getattr(final_cfg, "off_exact_auto_released", False)):
+        out.append(("off_exact_auto_released", {
+            "type": "off_exact_auto_released_applied",
+            "detail": ("OFF 를 월 OFF 수에 정확히 맞출 수 없어 1일 여유를 두고 생성했습니다. "
+                       "일부 간호사의 OFF 가 월 OFF 수보다 1개 많을 수 있습니다."),
+        }))
+    return out
 
 
 def _validate_generated_roster(
@@ -5050,6 +5129,9 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     자연히 걸러진다 — 그건 "이 설정으로 생성이 안 된다" 가 아니기 때문이다.
     """
     _ctx: dict = {}
+    # 요청 전체 실행 마감(사다리 재시도·엔진 추가 풀이가 공유) — `services.cp_sat.gen_deadline`.
+    from services.cp_sat import gen_deadline
+    _dl_token = gen_deadline.start()
     try:
         return _generate_roster_service_impl(
             req, current_user, db, treatment_ids, config_override,
@@ -5071,6 +5153,8 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         if not _ctx.get("recorded"):
             _record_unclassified_failure(db, req, job_id, _ctx)
         raise
+    finally:
+        gen_deadline.reset(_dl_token)
 
 
 
@@ -6749,13 +6833,61 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         grade_config_context=_fetch_grade_config_dict(db, current_user.office_id, current_user.group_id),
     )
     applied_relaxations: list[str] = []
+    # 사다리가 config_dict 에 누적하는 하드락 해제를 최종 결과 기준으로 알리려고 원래 값을 잡아 둔다
+    #   (`_carried_hardlock_relaxations`).
+    _ss_orig_k = int(config_dict.get("same_shift_hard_k", 3) or 0)
+    _ss_orig_on = _ss_orig_k > 0
+    _iw_orig_on = bool(config_dict.get("isolated_work_hard", True))
+    _oe_orig_released = bool(config_dict.get("off_exact_auto_released", False))
+
+    def _ladder_time_ok(_what: str) -> bool:
+        """재시도 1회분 시간이 남았는가 — 없으면 건너뛰어 Lambda 제한 안에서 결과·실패를 낸다."""
+        import os as _os_dl
+        from services.cp_sat import gen_deadline
+        _need = float(_os_dl.environ.get("ROSTER_LADDER_MIN_LEFT_SEC", "150") or 150)
+        _left = gen_deadline.left()
+        if _left >= _need:
+            return True
+        print(f"[RosterGenerate][Deadline] {_what} 재시도 생략 — 남은 {_left:.0f}초 < {_need:.0f}초")
+        return False
+
+    def _ladder_retry(_cfg: dict, _what: str):
+        """완화 사다리 재시도 1회 — (생성 결과, roster_system, 검증 오류). 다른 단계와 같은 후처리."""
+        if not _ladder_time_ok(_what):
+            return None, None, f"{_what} 재시도 생략(생성 시간 예산 부족)"
+        try:
+            _g, _, _rs = _run_cp_sat_basic(
+                db, current_user, nurses_for_engine, preferences, latest_config, req,
+                shift_manage_data,
+                fixed_cells=combined_fixed_cells if combined_fixed_cells else None,
+                time_limit_seconds=180 if bool(getattr(req, "advanced_inference", False)) else 60,
+                config_override=_cfg,
+                _assignments=_assignments,
+                _inbound_assignments=_inbound_assignments,
+                _outbound_assignments=_outbound_assignments,
+            )
+            _g = dict(_g) if isinstance(_g, dict) else {}
+            _g.update(fixed_roster or {})
+            _g.update(_alloff_roster or {})
+            _e = _validate_generated_roster(
+                _g, _rs,
+                nurses_context=list(nurses_for_engine or []),
+                config_context=_cfg,
+                grade_config_context=_fetch_grade_config_dict(
+                    db, current_user.office_id, current_user.group_id),
+            )
+            return _g, _rs, _e
+        except Exception as _exc:
+            return None, None, f"{_what} 재시도 예외: {type(_exc).__name__}: {_exc}"
+
     if validation_error:
         # 자연 soft 트리거: 엔진이 실근무를 못 배정한 infeasible-empty 신호(실제 플래그)
         # 를 본다. 과거처럼 휴리스틱이 만든 NO_ASSIGNMENT/grade_max 문자열을 매칭하지 않음.
         _trigger_soft = bool(getattr(roster_system, "_infeasible_empty", False))
 
         # ── 1차 완화: team_min hard → soft (기존) ────────────────────────────
-        if validation_error and _trigger_soft and not bool(config_dict.get("_team_min_soft_retry_attempted")):
+        if (validation_error and _trigger_soft and not bool(config_dict.get("_team_min_soft_retry_attempted"))
+                and _ladder_time_ok("team_min soft")):
             print("[TeamMinFallback] infeasible 감지 → team_min hard→soft 자동 전환으로 1회 재시도 (grade hard 유지)")
             soft_cfg = dict(config_dict)
             soft_cfg["team_min_soft_fallback"] = True
@@ -6863,7 +6995,8 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         # ★ `validation_error` 필수 — 1차(team_min)로 이미 살아났으면 여기 들어오면 안 된다.
         #   빠뜨리면 성공한 해를 버리고 same_shift 까지 푼 해로 덮어쓴다.
         if (validation_error and _trigger_soft and _ss_hard_on
-                and not bool(config_dict.get("_same_shift_soft_retry_attempted"))):
+                and not bool(config_dict.get("_same_shift_soft_retry_attempted"))
+                and _ladder_time_ok("same_shift soft")):
             print("[SameShiftFallback] infeasible 감지 → same_shift hard→soft 자동 전환으로 1회 재시도 "
                   "(team_min·grade hard 유지)")
             _ss_cfg = dict(config_dict)
@@ -6926,7 +7059,8 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         #   누적 갱신되므로 여기까지 왔다는 건 그것들로도 안 풀렸다는 뜻이다.
         _iw_hard_on = bool(config_dict.get("isolated_work_hard", True))
         if (validation_error and _trigger_soft and _iw_hard_on
-                and not bool(config_dict.get("_isolated_work_soft_retry_attempted"))):
+                and not bool(config_dict.get("_isolated_work_soft_retry_attempted"))
+                and _ladder_time_ok("isolated_work soft")):
             print("[IsolatedWorkFallback] infeasible 감지 → isolated_work hard→soft 자동 전환으로 "
                   "1회 재시도")
             _iw_cfg = dict(config_dict)
@@ -6981,6 +7115,91 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 config_dict["isolated_work_hard"] = False
                 config_dict["_isolated_work_soft_retry_attempted"] = True
 
+        # ── 4차 완화: 신청 휴무·휴가 전날 N 금지 → 위반 칸 최소화 후 고정 ───────────
+        # 순서는 하드락 완화들 **뒤**다(2026-10-12 사용자 결정: 팀 최소를 먼저 양보하고, 원티드·휴가 앞
+        #   N 금지는 끝까지 지킨다). OFF 정확 해제(5차)만 이 뒤에 온다 — 월 OFF 수는 병원 요구라
+        #   전날 N 최소화보다 늦게 양보한다. 단순 벌점이 아니라 커버리지를 고정한 채 위반 칸 수를 최소화해
+        #   묶으므로(fallback_lex '[BanNBeforeFixedOff] 최소화'), 지킬 수 있으면 위반 0 = 하드와 같다.
+        # ★ 앞 단계가 실패하며 남긴 같은 근무 연속·고립 근무 해제는 **먼저 되돌려** 시도하고,
+        #   안 될 때만 누적 해제 상태로 다시 시도한다(2026-10-12 사용자 결정). 누적 해제로만 돌면
+        #   전날 N 은 줄지만 그 대가가 하드락 해제로 나간다 — 실측 성남 중환자실-RN 11월 VER31:
+        #   신청 휴무 전날 N 3칸인 대신 같은 근무 4연속 17곳.
+        _ban_on = (bool(config_dict.get("ban_night_before_fixed_wanted_off"))
+                   or bool(config_dict.get("ban_night_before_fixed_off")))
+        if (validation_error and _trigger_soft and _ban_on
+                and not bool(config_dict.get("_ban_night_minimize_retry_attempted"))):
+            _bn_base = dict(config_dict)
+            _bn_base["ban_night_minimize"] = True
+            _bn_base["_ban_night_minimize_retry_attempted"] = True
+            _bn_restore = {}
+            if _ss_orig_k > 0 and int(config_dict.get("same_shift_hard_k", 3) or 0) == 0:
+                _bn_restore["same_shift_hard_k"] = _ss_orig_k
+            if _iw_orig_on and not bool(config_dict.get("isolated_work_hard", True)):
+                _bn_restore["isolated_work_hard"] = True
+            _bn_plans =([("하드 복구", {**_bn_base, **_bn_restore})] if _bn_restore else []) + [
+                ("누적 해제", _bn_base)]
+            _bn_err = "시도 없음"
+            _bn_generated = _bn_rs = None
+            # ★ 하드 복구 결과에 휴가 전날 N 이나 N 간격 위반이 남으면 누적 해제도 돌려 더 나은 쪽을
+            #   쓴다(2026-10-12 사용자 결정 · `_ban_plan_key` 순서). 실측 성남 중환자실-RN 11월:
+            #   하드 복구 = 같은 근무 4연속 0 · N 간격 위반 11 · 휴가 전날 N 1 / 누적 해제 = 17 · 0 · 0.
+            #   비기면 앞(하드 복구)을 쓴다 — 같은 근무 연속·고립 근무까지 지킨 쪽이다.
+            _bn_done = []
+            for _bn_i, (_bn_label, _bn_cfg) in enumerate(_bn_plans):
+                print(f"[BanNightFallback] infeasible 감지 → 신청 휴무·휴가 전날 N 금지를 "
+                      f"위반 칸 최소화 모드로 재시도({_bn_label} · 되돌림 {sorted(_bn_restore)})")
+                _g, _rs, _e = _ladder_retry(_bn_cfg, "전날 N 금지 최소화")
+                if _e:
+                    _bn_err = _e
+                    print(f"[BanNightFallback][AUTO-MIN][fail] {_bn_label} 실패: {_e}")
+                    continue
+                _k = _ban_plan_key(_rs)
+                print(f"[BanNightFallback] {_bn_label} 결과 (휴가 전날 N, N 간격 위반, 신청 휴무 전날 N) = {_k}")
+                _bn_done.append((_k, _bn_i, _bn_label, _g, _rs))
+                if _k[0] == 0 and _k[1] == 0:
+                    break
+            if _bn_done:
+                _bn_err = None
+                _, _, _bn_label, _bn_generated, _bn_rs = min(_bn_done, key=lambda x: (x[0], x[1]))
+                generated = _bn_generated
+                roster_system = _bn_rs
+                # 안내·완화 이력은 아래 **공통 종료 경로**에서 최종 채택된 결과 기준으로 만든다
+                #   (이 단계가 실패해도 설정이 누적돼 뒤 재시도의 결과에 최소화가 들어갈 수 있다).
+                _bn_t, _bn_w = getattr(_bn_rs, "_ban_night_violations", None) or (0, 0)
+                _bn_viol = int(_bn_t) + int(_bn_w)
+                print(f"[BanNightFallback][AUTO-MIN][success] 위반 {_bn_viol}칸으로 근무표 생성({_bn_label}). "
+                      "applied_relaxations=['ban_night_before_off_minimized']")
+                validation_error = None
+            else:
+                print(f"[BanNightFallback][AUTO-MIN][fail] 재시도 실패: {_bn_err}")
+                config_dict["ban_night_minimize"] = True
+                config_dict["_ban_night_minimize_retry_attempted"] = True
+
+        # ── 5차 완화: OFF 정확 맞춤 → 종전 1일 여유 ───────────────────────────
+        # OFF 우선 병동 대상자의 OFF 를 월 OFF 수로 정확히 맞추는 하드(fallback_lex
+        #   `_off_exact_auto_target`)가 원인일 수 있으니 여유를 되살려 본다. 엔진이 대상자를
+        #   한 명이라도 세웠을 때만 돈다(`_off_exact_auto_n`) — 아니면 같은 모델을 또 푸는 셈이다.
+        # ★ 전날 N 최소화(4차) **뒤**다. 앞에 두면 그 해제가 4차 '누적 해제' 시도에 실려 OFF 가
+        #   월 OFF 수 +1 로 밀린다(실측 성남 중환자실-RN 11월: 26명 중 11명 OFF 10).
+        if (validation_error and _trigger_soft and not _oe_orig_released
+                and int(getattr(roster_system, "_off_exact_auto_n", 0) or 0) > 0
+                and not bool(config_dict.get("_off_exact_release_retry_attempted"))):
+            print("[OffExactFallback] infeasible 감지 → OFF 정확 맞춤을 1일 여유로 되돌려 1회 재시도")
+            _oe_cfg = dict(config_dict)
+            _oe_cfg["off_exact_auto_released"] = True
+            _oe_cfg["_off_exact_release_retry_attempted"] = True
+            _oe_generated, _oe_rs, _oe_err = _ladder_retry(_oe_cfg, "OFF 정확 해제")
+            if not _oe_err:
+                generated = _oe_generated
+                roster_system = _oe_rs
+                # 안내는 공통 종료 경로(`_carried_hardlock_relaxations`)가 최종 설정 기준으로 만든다.
+                print("[OffExactFallback][AUTO-RELEASE][success] OFF 1일 여유로 근무표 생성")
+                validation_error = None
+            else:
+                print(f"[OffExactFallback][AUTO-RELEASE][fail] 재시도 실패: {_oe_err}")
+                config_dict["off_exact_auto_released"] = True
+                config_dict["_off_exact_release_retry_attempted"] = True
+
     # ── 4차 완화: n2n 최소 간격 하드 해제 ─────────────────────────────────
     # ★★ 이 블록은 아래 `if validation_error:` 사다리(team_min → same_shift →
     #   isolated_work) **밖**에 있고, 그보다 **먼저** 돈다. 둘 다 이유가 있다.
@@ -7002,7 +7221,8 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     _mg_on = int(config_dict.get("n2n_min_gap", 0) or 0)
     _mg_failed = bool(getattr(roster_system, "_n2n_min_gap_stage2_failed", False))
     if (_mg_failed and _mg_on >= 4
-            and not bool(config_dict.get("_n2n_min_gap_retry_attempted"))):
+            and not bool(config_dict.get("_n2n_min_gap_retry_attempted"))
+            and _ladder_time_ok("n2n_min_gap 해제")):
         print(f"[N2NMinGapFallback] stage2 실패 감지 → n2n_min_gap {_mg_on}→0 해제로 1회 재시도")
         _mg_cfg = dict(config_dict)
         _mg_cfg["n2n_min_gap"] = 0
@@ -7057,6 +7277,84 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             config_dict["_n2n_min_gap_retry_attempted"] = True
 
 
+
+    # ── 앞 단계 실패로 누적된 하드락 해제 — 최종 채택 설정 기준으로 빠진 경고를 채운다 ──
+    if not validation_error:
+        for _rk, _rw in _carried_hardlock_relaxations(
+                getattr(roster_system, "config", None), _ss_orig_on, _iw_orig_on, _oe_orig_released):
+            if _rk in applied_relaxations:
+                continue
+            applied_relaxations.append(_rk)
+            weekly_off_warnings.append(_rw)
+            if _ctx is not None:
+                _ctx["relaxed"] = True
+            print(f"[RelaxCarry] 앞 단계에서 넘어온 해제 보고: {_rk}")
+        # OFF 정확 맞춤 대상인데 본인 고정·신청 OFF 가 월 OFF 수보다 많아 그 수로 맞춘 사람.
+        _oe_over = list(getattr(roster_system, "_off_exact_over_fixed", None) or [])
+        if _oe_over and not bool(getattr(getattr(roster_system, "config", None),
+                                         "off_exact_auto_released", False)):
+            weekly_off_warnings.append({
+                "type": "off_exact_fixed_over",
+                "detail": ("신청·고정 OFF 가 월 OFF 수보다 많아 그 수만큼 OFF 로 맞춘 간호사가 있습니다: "
+                           + ", ".join(f"{_nm} {_c}개(월 {_t}개)" for _nm, _c, _t in _oe_over)),
+            })
+            print(f"[OffExact] 고정 OFF 가 월 OFF 수보다 많은 대상자 {len(_oe_over)}명: {_oe_over}")
+
+    # ── 전날 N 금지 최소화 적용(fallback_lex `_ban_night_violations`) ──
+    #   어느 경로로 성공했든 **최종 채택된 결과**에 최소화가 들어갔으면 알린다. 최소화 단계가
+    #   실패해도 설정이 누적돼 뒤의 N 간격 해제 재시도에 실려 갈 수 있기 때문이다(Codex 지적).
+    _bn_final = getattr(roster_system, "_ban_night_violations", None)
+    if not validation_error and _bn_final is not None:
+        _bn_t, _bn_w = _bn_final
+        _bn_viol = int(_bn_t) + int(_bn_w)
+        applied_relaxations.append("ban_night_before_off_minimized")
+        if _ctx is not None:
+            _ctx["relaxed"] = True
+        _bn_proven = bool(getattr(roster_system, "_ban_night_proven", False))
+        weekly_off_warnings.append({
+            "type": "ban_night_before_off_minimized_applied",
+            "detail": ((f"신청 휴무·휴가 전날 나이트 금지를 모두 지킬 수 없어 {_bn_viol}칸"
+                        f"(휴가·공가 전날 {int(_bn_t)} · 신청 휴무 전날 {int(_bn_w)})은 전날에 "
+                        "나이트가 배정됐습니다(인원을 맞춘 상태에서 가능한 최소)."
+                        if _bn_proven else
+                        f"생성 시간 안에 신청 휴무·휴가 전날 나이트 금지를 다 맞추지 못해 {_bn_viol}칸"
+                        f"(휴가·공가 전날 {int(_bn_t)} · 신청 휴무 전날 {int(_bn_w)})은 전날에 "
+                        "나이트가 배정됐습니다(더 줄일 여지가 있을 수 있습니다).")
+                       if _bn_viol else
+                       "신청 휴무·휴가 전날 나이트 금지는 모두 지켰습니다(다른 제약 조정으로 생성)."),
+        })
+        print(f"[BanNightFallback][FINAL] 위반 {_bn_viol}칸(휴가 {_bn_t}·신청휴무 {_bn_w}, "
+              f"증명={_bn_proven}) — applied_relaxations=['ban_night_before_off_minimized']")
+
+    # ── N 간격 하한 일부 미충족(위반칸 방식 · fallback_lex `_n2n_gap_violations`) ──
+    #   통째 해제(위 4차)까지 가지 않고 위반 칸 수를 최소화해 묶은 경우다. 하드를 다 지키지
+    #   못한 것이므로 다른 완화와 같은 경로로 알린다.
+    #   ★ 개수는 **나간 배정에서 센다.** stage2 가 실패해 stage1 해로 돌아가고 위 해제 재시도도
+    #     실패하면, stage2 에서 고정한 값(대개 0)은 나간 근무표와 무관해 위반이 경고 없이
+    #     나간다(Codex 지적). 셀 수 없으면(금지쌍 미등록) 고정값을 쓴다.
+    _n2n_viol = None
+    try:
+        from services.cp_sat.fallback_lex import count_n2n_gap_violations
+        _n2n_viol = count_n2n_gap_violations(roster_system)
+    except Exception as _n2n_cnt_exc:
+        print(f"[N2NMinGap] 최종 배정 위반 계산 실패(고정값 사용): {_n2n_cnt_exc}")
+    if _n2n_viol is None:
+        _n2n_viol = int(getattr(roster_system, "_n2n_gap_violations", 0) or 0)
+    if not validation_error and _n2n_viol > 0 and "n2n_min_gap_released" not in applied_relaxations:
+        applied_relaxations.append("n2n_min_gap_partial")
+        if _ctx is not None:
+            _ctx["relaxed"] = True
+        # stage1 해로 돌아간 결과는 최소화를 거치지 않았으므로 '가능한 최소' 로 안내하지 않는다.
+        _n2n_proven = (bool(getattr(roster_system, "_n2n_gap_proven", False))
+                       and not bool(getattr(roster_system, "_n2n_min_gap_stage2_failed", False)))
+        weekly_off_warnings.append({
+            "type": "n2n_min_gap_partial_applied",
+            "detail": (f"나이트 블록 간 최소 간격을 모두 지킬 수 없어 {_n2n_viol}곳은 간격이 짧게 "
+                       "배정됐습니다(가능한 최소로 줄인 값)." if _n2n_proven else
+                       f"생성 시간 안에 나이트 블록 간 최소 간격을 다 맞추지 못해 {_n2n_viol}곳은 간격이 "
+                       "짧게 배정됐습니다(더 줄일 여지가 있을 수 있습니다)."),
+        })
+        print(f"[N2NMinGap][PARTIAL] 위반칸 {_n2n_viol} — applied_relaxations=['n2n_min_gap_partial']")
 
     if validation_error:
         print(f"[RosterGenerate][UNRECOVERABLE] {validation_error}")

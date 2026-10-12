@@ -64,14 +64,31 @@ def collect_single_n_allowed_nurse_indices(rs: RosterSystem) -> set[int]:
     return out
 
 
+def has_upper_caps(rs: RosterSystem) -> bool:
+    """정확값이 아닌 월 상한(`*_max`)이 하나라도 있는가 — stage1 초과칸 재시도의 대상 판정."""
+    for nu in rs.nurses:
+        for prefix, _code in _SHIFT_PREFIX_TO_CODE:
+            if getattr(nu, f"{prefix}_max", None) is not None and getattr(nu, f"{prefix}_exact", None) is None:
+                return True
+    return False
+
+
 def add_monthly_limit_constraints(
     m,
     rs: RosterSystem,
     X,
     join: list[int],
     leave: list[int],
+    upper_slack: bool = False,
 ) -> int:
     """nurse별 월간 D/E/N/O 한도 hard 제약 추가.
+
+    upper_slack=True 면 정확값이 아닌 **상한**(`*_max`)만 `합 <= 상한 + 초과칸` 으로 걸고
+    초과칸 변수를 `m._monthly_cap_slacks` 에 모은다. 호출 측(fallback_lex stage1)이 초과칸을
+    최우선으로 최소화하고 **0 이 아니면 그 해를 버린다** — 하드 의미는 그대로다.
+    ★ 왜 필요한가: 상한이 빡빡하면(성남 중환자실-RN 2026-11 · N 6~7 · OFF 정확히 9)
+      하드로는 첫 해까지 53~82초가 걸려 60초 생성의 stage1 시도(13초)가 늘 UNKNOWN 이었다.
+      같은 모델을 초과칸 최소화로 바꾸면 3초 안에 초과 0 인 최적해가 나온다(실측).
 
     Returns:
         추가된 (nurse × shift) 제약 개수.
@@ -150,7 +167,13 @@ def add_monthly_limit_constraints(
             else:
                 if mn is not None:
                     m.Add(sumv >= mn)
-                if mx is not None:
+                if mx is not None and upper_slack and ex_raw is None:
+                    _cap_slack = m.NewIntVar(0, len(phys_range), f"capslack_{n_idx}_{code_upper}")
+                    m.Add(sumv <= mx + _cap_slack)
+                    if not hasattr(m, "_monthly_cap_slacks"):
+                        m._monthly_cap_slacks = []
+                    m._monthly_cap_slacks.append(_cap_slack)
+                elif mx is not None:
                     m.Add(sumv <= mx)
             added += 1
     return added
