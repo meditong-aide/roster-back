@@ -623,7 +623,6 @@ class CPSATBasicEngine:
             isolated_work_hard=bool(config_data.get("isolated_work_hard", True)),
             # 전날 N 금지 최소화 모드(DB 컬럼 아님 · 자동 완화 마지막 단계가 켠다)
             ban_night_minimize=bool(config_data.get("ban_night_minimize", False)),
-            off_exact_auto_released=bool(config_data.get("off_exact_auto_released", False)),
             # 4O 연속 휴무 hard 제약 (디폴트 False = 해제)
             enforce_4o_hard=bool(config_data.get("enforce_4o_hard", False)),
             # N 블록 간 간격 soft (목표 10일, 한쪽 페널티: 10일 미만만 벌점)

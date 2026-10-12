@@ -4385,8 +4385,7 @@ def _ban_plan_key(rs, released: int = 0) -> tuple[int, int, int, int]:
     return int(_t), int(_n2n), int(released), int(_w)
 
 
-def _carried_hardlock_relaxations(final_cfg, ss_orig_on: bool, iw_orig_on: bool,
-                                  oe_orig_released: bool = True) -> list[tuple[str, dict]]:
+def _carried_hardlock_relaxations(final_cfg, ss_orig_on: bool, iw_orig_on: bool) -> list[tuple[str, dict]]:
     """완화 사다리가 실패하며 누적한 하드락 해제 중 최종 채택 설정에 남은 것 — (완화 키, 경고).
 
     same_shift·isolated_work 재시도가 실패하면 그 해제가 config_dict 에 남아 뒤 단계(전날 N
@@ -4407,12 +4406,6 @@ def _carried_hardlock_relaxations(final_cfg, ss_orig_on: bool, iw_orig_on: bool,
             "type": "isolated_work_hard_to_soft_applied",
             "detail": ("고립근무 금지가 infeasible 로 자동 soft 전환되어 재생성됐습니다. "
                        "일부 간호사에게 휴무 사이 단일 근무가 생길 수 있습니다."),
-        }))
-    if not oe_orig_released and bool(getattr(final_cfg, "off_exact_auto_released", False)):
-        out.append(("off_exact_auto_released", {
-            "type": "off_exact_auto_released_applied",
-            "detail": ("OFF 를 월 OFF 수에 정확히 맞출 수 없어 1일 여유를 두고 생성했습니다. "
-                       "일부 간호사의 OFF 가 월 OFF 수보다 1개 많을 수 있습니다."),
         }))
     return out
 
@@ -7055,7 +7048,6 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     _ss_orig_k = int(config_dict.get("same_shift_hard_k", 3) or 0)
     _ss_orig_on = _ss_orig_k > 0
     _iw_orig_on = bool(config_dict.get("isolated_work_hard", True))
-    _oe_orig_released = bool(config_dict.get("off_exact_auto_released", False))
 
     def _ladder_time_ok(_what: str) -> bool:
         """재시도 1회분 시간이 남았는가 — 없으면 건너뛰어 Lambda 제한 안에서 결과·실패를 낸다."""
@@ -7334,8 +7326,7 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
 
         # ── 4차 완화: 신청 휴무·휴가 전날 N 금지 → 위반 칸 최소화 후 고정 ───────────
         # 순서는 하드락 완화들 **뒤**다(2026-10-12 사용자 결정: 팀 최소를 먼저 양보하고, 원티드·휴가 앞
-        #   N 금지는 끝까지 지킨다). OFF 정확 해제(5차)만 이 뒤에 온다 — 월 OFF 수는 병원 요구라
-        #   전날 N 최소화보다 늦게 양보한다. 단순 벌점이 아니라 커버리지를 고정한 채 위반 칸 수를 최소화해
+        #   N 금지는 끝까지 지킨다). 단순 벌점이 아니라 커버리지를 고정한 채 위반 칸 수를 최소화해
         #   묶으므로(fallback_lex '[BanNBeforeFixedOff] 최소화'), 지킬 수 있으면 위반 0 = 하드와 같다.
         # ★ 앞 단계가 실패하며 남긴 같은 근무 연속·고립 근무 해제는 **먼저 되돌려** 시도하고,
         #   안 될 때만 누적 해제 상태로 다시 시도한다(2026-10-12 사용자 결정). 누적 해제로만 돌면
@@ -7395,31 +7386,6 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 print(f"[BanNightFallback][AUTO-MIN][fail] 재시도 실패: {_bn_err}")
                 config_dict["ban_night_minimize"] = True
                 config_dict["_ban_night_minimize_retry_attempted"] = True
-
-        # ── 5차 완화: OFF 정확 맞춤 → 종전 1일 여유 ───────────────────────────
-        # OFF 우선 병동 대상자의 OFF 를 월 OFF 수로 정확히 맞추는 하드(fallback_lex
-        #   `_off_exact_auto_target`)가 원인일 수 있으니 여유를 되살려 본다. 엔진이 대상자를
-        #   한 명이라도 세웠을 때만 돈다(`_off_exact_auto_n`) — 아니면 같은 모델을 또 푸는 셈이다.
-        # ★ 전날 N 최소화(4차) **뒤**다. 앞에 두면 그 해제가 4차 '누적 해제' 시도에 실려 OFF 가
-        #   월 OFF 수 +1 로 밀린다(실측 성남 중환자실-RN 11월: 26명 중 11명 OFF 10).
-        if (validation_error and _trigger_soft and not _oe_orig_released
-                and int(getattr(roster_system, "_off_exact_auto_n", 0) or 0) > 0
-                and not bool(config_dict.get("_off_exact_release_retry_attempted"))):
-            print("[OffExactFallback] infeasible 감지 → OFF 정확 맞춤을 1일 여유로 되돌려 1회 재시도")
-            _oe_cfg = dict(config_dict)
-            _oe_cfg["off_exact_auto_released"] = True
-            _oe_cfg["_off_exact_release_retry_attempted"] = True
-            _oe_generated, _oe_rs, _oe_err = _ladder_retry(_oe_cfg, "OFF 정확 해제")
-            if not _oe_err:
-                generated = _oe_generated
-                roster_system = _oe_rs
-                # 안내는 공통 종료 경로(`_carried_hardlock_relaxations`)가 최종 설정 기준으로 만든다.
-                print("[OffExactFallback][AUTO-RELEASE][success] OFF 1일 여유로 근무표 생성")
-                validation_error = None
-            else:
-                print(f"[OffExactFallback][AUTO-RELEASE][fail] 재시도 실패: {_oe_err}")
-                config_dict["off_exact_auto_released"] = True
-                config_dict["_off_exact_release_retry_attempted"] = True
 
     # ── 4차 완화: n2n 최소 간격 하드 해제 ─────────────────────────────────
     # ★★ 이 블록은 아래 `if validation_error:` 사다리(team_min → same_shift →
@@ -7502,7 +7468,7 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     # ── 앞 단계 실패로 누적된 하드락 해제 — 최종 채택 설정 기준으로 빠진 경고를 채운다 ──
     if not validation_error:
         for _rk, _rw in _carried_hardlock_relaxations(
-                getattr(roster_system, "config", None), _ss_orig_on, _iw_orig_on, _oe_orig_released):
+                getattr(roster_system, "config", None), _ss_orig_on, _iw_orig_on):
             if _rk in applied_relaxations:
                 continue
             applied_relaxations.append(_rk)
@@ -7510,16 +7476,6 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             if _ctx is not None:
                 _ctx["relaxed"] = True
             print(f"[RelaxCarry] 앞 단계에서 넘어온 해제 보고: {_rk}")
-        # OFF 정확 맞춤 대상인데 본인 고정·신청 OFF 가 월 OFF 수보다 많아 그 수로 맞춘 사람.
-        _oe_over = list(getattr(roster_system, "_off_exact_over_fixed", None) or [])
-        if _oe_over and not bool(getattr(getattr(roster_system, "config", None),
-                                         "off_exact_auto_released", False)):
-            weekly_off_warnings.append({
-                "type": "off_exact_fixed_over",
-                "detail": ("신청·고정 OFF 가 월 OFF 수보다 많아 그 수만큼 OFF 로 맞춘 간호사가 있습니다: "
-                           + ", ".join(f"{_nm} {_c}개(월 {_t}개)" for _nm, _c, _t in _oe_over)),
-            })
-            print(f"[OffExact] 고정 OFF 가 월 OFF 수보다 많은 대상자 {len(_oe_over)}명: {_oe_over}")
 
     # ── 전날 N 금지 최소화 적용(fallback_lex `_ban_night_violations`) ──
     #   어느 경로로 성공했든 **최종 채택된 결과**에 최소화가 들어갔으면 알린다. 최소화 단계가
