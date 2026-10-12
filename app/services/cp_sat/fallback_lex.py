@@ -437,17 +437,6 @@ def _cp_sat_status_to_text(status: int) -> str:
     return mapping.get(status, f"UNKNOWN({status})")
 
 
-def _off_exact_auto_target(nu, *, is_n_only: bool, is_weekend_off: bool, full_month: bool) -> bool:
-    """OFF 우선 병동에서 OFF 를 월 OFF 수로 정확히 맞출 대상인가.
-
-    3교대 근무자만이다 — N 전담(OFF=가용일-N 항등식)·주말 휴무 고정·월 중간 입퇴사·파견 차단일이
-    있는 사람은 정확값의 근거가 다르고, 수간호사가 개인 OFF 한도(o_*)를 넣었으면 그 값이 이긴다.
-    """
-    if is_n_only or is_weekend_off or not full_month:
-        return False
-    return all(getattr(nu, k, None) is None for k in ("o_min", "o_max", "o_exact"))
-
-
 def effective_n2n_min_gap(cfg_value) -> int:
     """N 간격 하한의 실제 값. 설정(`roster_config.n2n_min_gap`)이 정본이고 env
     `AIDE_N2N_MIN_GAP`(A/B 주입구)가 있으면 그쪽이 이긴다. 모델과 전월 꼬리 조회 길이가
@@ -3329,13 +3318,6 @@ def optimize_fallback_lex_hard_first(
                         f"id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
                         f"cap_semantics={off_cap_semantics}, target_O={target_o}, weekly_off_target={weekly_target}"
                     )
-            # ★ OFF 정확 맞춤(OFF 우선 대상자) — 아래 OFF 상한의 1일 여유를 없앤다(`_off_exact_auto`).
-            _oe_auto_on = (not bool(getattr(cfg, "off_first", False))
-                           and not bool(getattr(cfg, "off_exact_auto_released", False))
-                           and _os_lex.environ.get("AIDE_OFF_EXACT_AUTO", "1") != "0")
-            _oe_auto_n = 0
-            roster_system._off_exact_auto_n = 0      # type: ignore[attr-defined]
-            roster_system._off_exact_over_fixed = []      # type: ignore[attr-defined]
             for n in range(N):
                 if _is_preceptee_at(n):
                     continue
@@ -3509,25 +3491,6 @@ def optimize_fallback_lex_hard_first(
                     else:
                         _slack_max = 1
                         _slack_weight = 100000
-                    # ★ OFF 우선 대상자는 여유 없이 **정확히** 맞춘다(2026-10-12 사용자 결정 · 손으로
-                    #   넣던 o_exact 를 자동화). 1일 여유(벌점 10만)는 고립 OFF(30만)에 져서 OFF 가
-                    #   월 OFF 수 +1 로 밀렸다(실측 성남 중환자실-RN 11월). 대상은 3교대·한 달 전체·
-                    #   수기 o_* 없음 — 하한(위)과 같은 값이 상한이 된다. INFEASIBLE 이면 완화 사다리가
-                    #   `off_exact_auto_released` 로 여유를 되살린다.
-                    #   ★ 정확값은 `max(월 OFF 수, 본인 고정·신청 OFF 수)` 다. 고정 OFF 가 더 많으면
-                    #     월 OFF 수로 묶는 순간 해가 없고(1일 여유로도 2개 이상 차이는 못 푼다), 기존
-                    #     상한 보정(`per_nurse_off_cap_override`)으로 두면 정확값이 조용히 풀린다
-                    #     (Codex 지적). 그 수로 정확히 맞추고 누구인지 남겨 경고한다.
-                    if _oe_auto_on and min_off_required > 0 and _off_exact_auto_target(
-                            nu, is_n_only=is_n_only, is_weekend_off=is_weekend_off,
-                            full_month=(T0 == 0 and T1 >= D_phys - 1 and _n_blocked == 0)):
-                        _slack_max = 0
-                        total_cap_effective = max(min_off_required, structural_cnt)
-                        if structural_cnt > min_off_required:
-                            roster_system._off_exact_over_fixed.append(   # type: ignore[attr-defined]
-                                (str(nurse_name), int(structural_cnt), int(min_off_required)))
-                        _oe_auto_n += 1
-                        roster_system._off_exact_auto_n = _oe_auto_n      # type: ignore[attr-defined]
                     if _slack_max > 0:
                         cap_slack = m.NewIntVar(0, _slack_max, f"off_cap_slack_{n}")
                         weighted = m.NewIntVar(
