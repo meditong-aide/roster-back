@@ -4766,14 +4766,24 @@ def optimize_fallback_lex_hard_first(
                     #   ★ 변수 생성이 prep 안에 있는 것이 중요하다 — 그 패스 차례가 와야
                     #     모델에 변수가 붙으므로, 쓰이지 않는 순서에서는 모델이 커지지 않는다.
                     def _prep_off():
+                        # ★★ 신청 휴가·공가 칸은 세지 않는다 — 솔버에선 `O` 로 고정돼 있어
+                        #   그대로 세면 휴가 많은 한 사람이 max 를 묶어 이 패스가 무력해진다
+                        #   (성남 61-RN 2026-11: 백지수 휴가 10 → range 11 고정, 남는 OFF 의
+                        #   연차 전환이 1인 0~5칸으로 흩어짐. 빼면 range 3 · 1~4칸).
+                        #   휴가 판정은 OFF 상·하한(`vacation_off_cells`)과 같게 예외 휴가칸도 본다.
+                        #   ★ 남는 날이 없는(한 달 내내 휴가) 사람은 뺀다 — 상수 0 이 min 을 묶는다.
                         _cnts = []
                         for _n in range(N):
                             if leave[_n] < join[_n] or _n in range_excluded_idx:
                                 continue
-                            _cnts.append(sum(
-                                X2(_n, _d, off_idx)
-                                for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse)
-                            ))
+                            _days = [
+                                _d for _d in iter_nurse_days(_n, join, leave, blocked_by_nurse)
+                                if fixed_type_by_cell.get((_n, _d)) not in ("휴가", "공가")
+                                and (_n, _d) not in off_exception_vacation_cells
+                            ]
+                            if not _days:
+                                continue
+                            _cnts.append(sum(X2(_n, _d, off_idx) for _d in _days))
                         if not _cnts:
                             return None
                         _mx = m2.NewIntVar(0, D, "lex_max_off")
