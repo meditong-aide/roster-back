@@ -3,6 +3,8 @@
 `roster_config.off_swap_enabled=True` 일 때 동작.
 월 OFF 수 baseline(`off_days`) 초과분을 `shifts.off_swap_target=True` 로 등록된
 코드로 변환한다. 보호 4종(회복 OFF / fixed_wanted / '주' / N전담)은 후보에서 제외.
+주2OFF(`two_offs_per_week`)를 켠 병동은 주별 휴일 하한을 깨야 하는 몫은 바꾸지 않고
+O 로 남긴다(`_pick_keeping_week_off`) — 그 병동은 초과분이 전부 바뀌지 않을 수 있다.
 
 호출 위치: `roster_create_service._persist_entries` 직전.
 """
@@ -103,15 +105,15 @@ def postprocess_off_swap(
         print(f"[OffSwap] inbound 전입 간호사 보충 로드: {_missing_nids}")
     use_mid = bool(getattr(latest_config, "use_mid", False))
     # ★ 주별 O 하한을 고려한 선택은 병동이 **주2OFF 를 켠 경우에만** 쓴다. 안 켠 병동은
-    #   지킬 하한이 없으므로 기존 순서(월말부터) 그대로 간다. 어느 쪽이든 **변환 개수는
-    #   같다** — 고르는 칸만 달라진다.
+    #   지킬 하한이 없으므로 기존 순서(월말부터) 초과분을 전부 바꾼다. 켠 병동은 하한을
+    #   깨야 하는 몫을 바꾸지 않고 O 로 남긴다(`_pick_keeping_week_off`).
     #   DB 컬럼명은 `two_offs_per_week` 다(엔진 dataclass 의 `enforce_two_offs_per_week`
     #   와 이름이 다르다). NULL(미설정)은 False 로 떨어진다.
     two_offs_on = bool(getattr(latest_config, "two_offs_per_week", False))
 
     converted_total = 0
     skipped_n_only = 0
-    below_min = 0      # 주별 O 하한(2)을 못 지킨 전환 수
+    kept_for_floor = 0  # 주별 O 하한 때문에 연차로 못 바꾸고 O 로 남긴 수
     print(f"[OffSwap] generated nurses={len(generated)}")
 
     for nurse_id, shifts_seq in generated.items():
@@ -156,18 +158,17 @@ def postprocess_off_swap(
         if to_convert_count <= 0:
             continue
 
-        # ★★ 주별 O 하한(2개)을 **최대한** 지키게 고르는 순서만 바꾼다.
-        #   ★ 변환 **총량은 줄이지 않는다** — `to_convert_count` 는 그대로 채운다.
-        #     초과 OFF 를 안 바꾸고 남기면 연차가 덜 나가는 것이라 일괄 변환 취지가 깨진다.
+        # ★★ 주2OFF 를 켠 병동은 주별 O 하한을 깨지 않는 칸만 바꾼다 — 모자란 몫은 O 로
+        #   남는다(2026-10-14 사용자 결정 · 근거는 `_pick_keeping_week_off`).
         #   기존은 `sorted(reverse=True)` 로 **월말부터** 훑어 마지막 주 O 를 통째로
         #   연차로 바꿨다(실측 중환자실2 2026-07: 전환 33셀이 O<2 주를 10개 만들었다).
         pool = sorted(eligible, reverse=True)      # 기존 선택 순서(월말부터)
         picked: list[int] = []
         if two_offs_on:
-            picked, below = _pick_keeping_week_off(
-                pool, shifts_seq, o_only_codes, to_convert_count
+            picked, kept = _pick_keeping_week_off(
+                pool, shifts_seq, all_off_codes, to_convert_count
             )
-            below_min += below
+            kept_for_floor += kept
         else:
             picked = pool[:to_convert_count]
 
@@ -179,7 +180,7 @@ def postprocess_off_swap(
         f"[OffSwap][DONE] schedule={schedule.schedule_id} converted={converted_total} "
         f"baseline={baseline} target_shift={target.shift_id} "
         f"skipped_n_only={skipped_n_only} "
-        f"week_off_below_min={below_min} (two_offs_per_week={two_offs_on})"
+        f"kept_off_for_week_floor={kept_for_floor} (two_offs_per_week={two_offs_on})"
     )
     return generated
 
@@ -187,73 +188,62 @@ def postprocess_off_swap(
 # ─────────────────────────── 내부 헬퍼 ───────────────────────────
 
 def _pick_keeping_week_off(
-    pool: list[int], shifts_seq: list, o_only_codes: set[str],
+    pool: list[int], shifts_seq: list, off_codes: set[str],
     need: int, keep: int = 2,
 ) -> tuple[list[int], int]:
-    """`pool` 에서 `need` 개를 고르되, 주별 O 하한(`keep`)을 **최대한** 지킨다.
+    """`pool` 에서 최대 `need` 개를 고르되, 주별 휴일(`off_codes`) 하한을 **깨지 않는** 칸만 고른다.
 
-    ★★ 개수는 반드시 채운다. 하한을 못 지키더라도 `need` 만큼 고른다 —
-      일괄 변환이 취지이고, 안 바꾸면 초과 OFF 가 연차로 안 나간다.
-
-    2단계로 고른다.
-      ① 주별 **여유분**(그 주 O − keep) 안에서만 먼저 가져간다. 순서는 기존 그대로.
-      ② 그래도 모자라면 남은 칸으로 채우되, **이미 여유가 적은 주부터 몰아서** 쓴다.
-         여러 주를 조금씩 깎으면 하한이 깨지는 주가 그만큼 늘어난다 — 한 주를
-         희생하는 편이 2O 를 지키는 주가 많다.
-         (예: A주 O3 · B주 O3 에서 4칸을 빼야 할 때, 고루 빼면 A2·B2 에서 다시
-          A1·B1 이 되어 두 주 다 깨진다. A 에 몰면 A0·B2 로 한 주만 깨진다.)
+    ★★ 하한을 깨야만 채울 수 있는 몫은 **바꾸지 않고 O 로 남긴다**(2026-10-14 사용자 결정).
+      종전엔 개수를 반드시 채우려고 여유가 적은 주부터 몰아서 깼다. 그래서 주2OFF 를 켠
+      병동에서도 전환이 하한을 깼다(성남 61-RN 2026-11 재현: 전환 전 O<2 주 2 → 후 8).
+      연차는 근무일 대신 쓰는 것이라, O 가 2개뿐인 주의 O 를 바꾸면 쉬는 날에 연차를
+      쓰는 셈이다. 대가로 남긴 사람은 O 가 baseline 을 넘는다(같은 재현 9칸·6명).
+    ★ 하한은 온전한 주 `keep`, 월말 자투리는 일수 비례(`round(keep*일수/7)` → 2~3일 1 ·
+      1일 0). 자투리(최대 3일)는 다음 달로 이어지는 주의 일부라 솔버도 안 본다
+      (`fallback_lex` `weeks = D // 7`). 2 를 지키게 하면 자투리 이틀이 통째로 묶여
+      남기는 칸만 는다(같은 재현 11 → 9).
+    순서는 `pool` 그대로(월말부터) 가져간다. `pool` 은 호출부가 O 만 넣는다.
 
     Returns:
-        (고른 일 인덱스 목록, 하한을 못 지킨 전환 수)
+        (고른 일 인덱스 목록, 하한 때문에 못 바꾸고 남긴 수)
     """
-    remain = _week_off_budget(shifts_seq, o_only_codes, keep=0)   # 주별 O 원본 개수
+    remain = _week_off_budget(shifts_seq, off_codes, keep=0)   # 주별 휴일 원본 개수
+    full_weeks = len(shifts_seq) // 7
+    tail_floor = round(keep * (len(shifts_seq) - full_weeks * 7) / 7)
     picked: list[int] = []
-    rest: list[int] = []
-
-    for d_idx in pool:                                   # ① 여유분 안에서
+    for d_idx in pool:
+        if len(picked) >= need:
+            break
         w = d_idx // 7
-        if len(picked) < need and remain.get(w, 0) > keep:
+        floor = keep if w < full_weeks else tail_floor
+        if remain.get(w, 0) > floor:
             remain[w] -= 1
             picked.append(d_idx)
-        else:
-            rest.append(d_idx)
-
-    below = 0
-    if len(picked) < need:                               # ② 모자란 만큼 몰아서
-        by_week: dict[int, list[int]] = {}
-        for d_idx in rest:
-            by_week.setdefault(d_idx // 7, []).append(d_idx)
-        for w in sorted(by_week, key=lambda x: remain.get(x, 0)):
-            for d_idx in by_week[w]:
-                if len(picked) >= need:
-                    break
-                picked.append(d_idx)
-                remain[w] = remain.get(w, 0) - 1
-                below += 1
-            if len(picked) >= need:
-                break
-    return picked, below
+    return picked, need - len(picked)
 
 
-def _week_off_budget(shifts_seq: list, o_only_codes: set[str],
+def _week_off_budget(shifts_seq: list, off_codes: set[str],
                      keep: int = 2) -> dict[int, int]:
-    """주별로 연차 전환을 허용할 O 개수 = `max(0, 그 주 O 수 - keep)`.
-    `keep=0` 이면 그 주 O 원본 개수를 그대로 준다.
+    """주별로 연차 전환을 허용할 휴일 개수 = `max(0, 그 주 휴일 수 - keep)`.
+    `keep=0` 이면 그 주 휴일 원본 개수를 그대로 준다.
 
     ★ 주 경계는 솔버의 `enforce_two_offs_per_week` 와 **같은 7일 블록**이다
       (`fallback_lex`: `d0, d1 = w*7, min(w*7+7, D)` → `d_idx // 7`).
       달력 주(월~일)로 잡으면 보호하는 대상과 제약이 세는 대상이 어긋난다.
-    ★ 다만 솔버는 `weeks = D // 7` 이라 **월말 자투리(최대 6일)를 안 본다.**
-      여기서는 자투리도 같은 규칙으로 막는다 — off_swap 이 `sorted(reverse=True)` 로
-      **월말부터** 가져가므로 자투리를 풀어 두면 보호가 사실상 무력해진다.
-    ★ `주`(weekly_off)는 세지 않는다. 솔버의 `week_off_missing` 이 `off_idx`(=O)만
-      세므로 기준을 맞춘다.
+    ★ 다만 솔버는 `weeks = D // 7` 이라 **월말 자투리(최대 3일)를 안 본다.**
+      자투리도 블록 하나로 세어 돌려준다 — off_swap 이 `sorted(reverse=True)` 로
+      **월말부터** 가져가므로 자투리를 풀어 두면 통째로 연차가 된다. 자투리 하한은
+      호출부(`_pick_keeping_week_off`)가 따로 정한다.
+    ★ `주`(weekly_off)도 휴일로 **센다**(호출부가 O+주 를 넘긴다). 솔버는 '주' 를 O 로
+      바꿔 넣고(`fallback_lex._normalize_fixed_to_main` · 주휴 고정칸 `shift='O'`)
+      주2OFF 도 O 로 센다. 종전엔 O 만 셌는데, 하한을 깨는 몫을 남기게 된 뒤로는 이 차이가
+      남기는 수를 늘려 '주+O+O' 주를 휴일 2개로 잘못 보았다(2026-10-14 리뷰).
     ★ 확정 원티드로 굳은 O 는 **센다.** 그 주에 실제로 있는 휴일이라 하한을 채운다
       (전환 후보에서 빠지는 것과, 하한 계산에 세는 것은 별개다).
     """
     per: dict[int, int] = {}
     for d_idx, code in enumerate(shifts_seq):
-        if str(code).strip().upper() in o_only_codes:
+        if str(code).strip().upper() in off_codes:
             per[d_idx // 7] = per.get(d_idx // 7, 0) + 1
     return {w: max(0, c - keep) for w, c in per.items()}
 
