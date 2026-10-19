@@ -386,6 +386,8 @@ def get_config_by_version(
     """설정 불러오기 — 선택자 우선순위로 config 조회.
 
     1) schedule_id 제공 시: 그 근무표가 생성에 사용한 roster_config 반환(이전 설정 불러오기).
+       권한 밖 근무표 403 · 연결 설정 없음 404 `{code: NO_LINKED_CONFIG}` ·
+       연결 행 없음 404 `{code: LINKED_CONFIG_MISSING}`.
     2) config_version 이 정수면: 대상 그룹의 해당 version 프리셋 반환(저장한 설정 불러오기).
     3) 그 외(sentinel, 예: 'latest'): 대상 그룹 최신 config, 없으면 DEFAULT 생성 후 반환.
     """
@@ -399,22 +401,35 @@ def get_config_by_version(
 
     # ── 선택자 우선순위: schedule_id → version(정수) → (sentinel) 최신/DEFAULT ──
     if schedule_id:
-        sched = (
-            db.query(Schedule)
-            .filter(Schedule.schedule_id == schedule_id)
-            .first()
+        # ★ 권한은 근무표 행의 group_id 로 본다. 예전엔 확인이 없어 근무표 번호만 알면
+        #   다른 병동·병원 근무표의 설정도 읽혔다. 삭제(드롭)된 근무표는 예전처럼 조회한다.
+        sched = _load_schedule_for_caller(
+            db, current_user, schedule_id, include_dropped=True,
+            not_found_detail="해당 근무표를 찾을 수 없습니다.",
         )
-        if not sched or sched.config_id is None:
-            raise HTTPException(
-                status_code=404, detail="해당 근무표의 설정을 찾을 수 없습니다."
-            )
+        # 그룹 없는 근무표는 assert_caller_can_access_group 이 그냥 통과시키므로 여기서 막는다
+        #   (운영·dev 0건이지만 schedules.group_id 는 NULL 허용).
+        if not sched.group_id:
+            raise HTTPException(status_code=403, detail="병동이 지정되지 않은 근무표입니다.")
+        # ★ 연결 설정이 없는 두 경우를 code 로 가른다 — 프론트 규칙 검사가 '조회 실패(재시도·경고)'
+        #   와 '원래 검사할 설정이 없음' 을 구분하도록. 운영 실측(2026-10-15):
+        #   NO_LINKED_CONFIG 25건 = 엑셀·수기 이관 마감본(생성 없이 만들어 config_id 가 NULL)
+        #   LINKED_CONFIG_MISSING 3건 = 시화 6월 마감본(config_id 행이 없음, 이관 흔적)
+        if sched.config_id is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NO_LINKED_CONFIG",
+                "message": "이 근무표는 생성 없이 만든 근무표(엑셀·수기 이관본)라 연결된 설정이 없습니다.",
+            })
         sconf = (
             db.query(RosterConfigModel)
             .filter(RosterConfigModel.config_id == sched.config_id)
             .first()
         )
         if not sconf:
-            raise HTTPException(status_code=404, detail="Config not found")
+            raise HTTPException(status_code=404, detail={
+                "code": "LINKED_CONFIG_MISSING",
+                "message": "이 근무표에 연결된 설정을 찾을 수 없습니다.",
+            })
         return _roster_config_to_dict(sconf)
 
     # config_version 이 정수면 해당 프리셋(version) 로드, 아니면(sentinel) 아래 최신/DEFAULT
