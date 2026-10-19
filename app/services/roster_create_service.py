@@ -789,6 +789,9 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
             "allow_soft_fallback": True,
             "constraints_json": _ensure_grade1_default({}),
             "constraints_max_json": {},
+            # 병원이 직접 넣은 등급 최소(기본 floor 적용 전). 엔진은 쓰지 않고, 생성 결과의
+            #   등급 최소 미달 보고(constraint_impact `_evaluate_grade`)가 이것만 센다.
+            "configured_constraints_json": {},
         }
 
     def _safe_json_obj(raw, field_name: str) -> dict:
@@ -837,14 +840,16 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
     if not row:
         return _default()
 
+    configured_min = _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json")
     return {
         "use_dynamic_scaling": bool(getattr(row, "use_dynamic_scaling", True)),
         "allow_soft_fallback": bool(getattr(row, "allow_soft_fallback", False)),
         # [GRADE_DEFAULT_111] 등록 config 에도 grade-1 D/E/N 각 1 floor 를 보장.
-        "constraints_json": _ensure_grade1_default(
-            _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json")
-        ),
+        "constraints_json": _ensure_grade1_default(configured_min),
         "constraints_max_json": _safe_json_obj(getattr(row, "constraints_max_json_text", None), "constraints_max_json"),
+        # floor 적용 전 원본 — 미달 보고용(_default 주석 참고). 병원이 1등급을 0으로 둔
+        #   병동에서 floor 미달까지 '하드 위반' 으로 알리던 것을 막는다.
+        "configured_constraints_json": configured_min,
     }
 
 
@@ -4684,6 +4689,17 @@ def _compute_coverage_gaps(roster_system) -> list[dict]:
         return []
 
 
+def _violation_counts_by_family(violations) -> dict[str, int]:
+    """위반 목록 → {family prefix: 건수}. family 구분은 품질 알림과 같은 함수로 한다."""
+    from utils.roster_quality import _family_label
+
+    counts: dict[str, int] = {}
+    for v in violations or []:
+        fam, _ = _family_label(getattr(v, "node_id", None))
+        counts[fam] = counts.get(fam, 0) + 1
+    return counts
+
+
 def _build_constraint_impact_payload(roster_system, req) -> dict:
     """생성 완료된 roster_system 기준 constraint-impact 요약을 생성한다."""
     started = time.perf_counter()
@@ -4784,6 +4800,9 @@ def _build_constraint_impact_payload(roster_system, req) -> dict:
             "preceptee_atom_count": analysis.preceptee_atom_count,
             "coverage_excluded_atom_count": analysis.coverage_excluded_atom_count,
             "hard_violation_count": analysis.hard_violation_count,
+            # violated_constraints 는 50건에서 자른다 → 종류별 건수는 자르기 전 전체로 따로 싣는다
+            #   (품질 알림 `roster_quality._ontology_violations` 가 이걸로 센다).
+            "violated_counts_by_family": _violation_counts_by_family(analysis.violated_constraints),
             "risky_constraint_count": analysis.risky_constraint_count,
             "constraint_mode_summary": analysis.constraint_mode_summary,
             "preflight_alerts": analysis.preflight_alerts,

@@ -268,6 +268,16 @@ def _ontology_violations(roster_data: dict) -> dict:
             ex = _fmt_example(family, v.get("details") or {})
             if ex:
                 examples[label] = ex
+    # violated_constraints 는 50건에서 잘려 온다. 자르기 전 종류별 건수가 있으면 그걸로 센다
+    #   (없던 시절 payload 는 목록 기준 그대로). 예시는 잘린 목록에서 고른다.
+    full = ci.get("violated_counts_by_family")
+    if isinstance(full, dict) and full:
+        by_family = {}
+        for fam, cnt in full.items():
+            _, label = _family_label(fam)
+            if label is None:
+                continue
+            by_family[label] = by_family.get(label, 0) + int(cnt or 0)
     return {
         "available": available,
         "by_family": by_family,
