@@ -4415,7 +4415,72 @@ def _carried_hardlock_relaxations(final_cfg, ss_orig_on: bool, iw_orig_on: bool)
     return out
 
 
+# 엔진 1단계 시간 초과(해 없음 미증명) — 첫 생성이면 일시 실패(TimeoutError)로 올린다.
+_STAGE1_UNKNOWN_CODE = "STAGE1_UNKNOWN"
+
+
 def _validate_generated_roster(
+    generated: dict[str, list[str]] | None,
+    roster_system,
+    nurses_context: list | None = None,
+    config_context: dict | None = None,
+    grade_config_context: dict | None = None,
+) -> str | None:
+    """엔진 결과 검증 — 기존 검증(`_validate_generated_roster_core`)을 **먼저** 돌리고, 그게 놓친
+    '엔진 1단계 해 없음'만 더 잡는다(순수 추가 · 기존 검증이 잡은 경우의 문구·원인 탐색은 그대로).
+
+    ★ 놓치는 경우: 확정 원티드 등 고정 칸이 남아 '실근무 0건'·'하루 0명' 증상에 안 걸린다
+      (성남 61-AN 2026-11 지정 1N + 1N 금지 → 빈 근무 116칸이 '성공' 저장 · 운영 2026-07~10
+      61-RN 25건). 엔진 표시(`fallback_lex` `_fallback_stage1_no_solution`)를 직접 본다.
+    """
+    msg = _validate_generated_roster_core(
+        generated, roster_system, nurses_context=nurses_context,
+        config_context=config_context, grade_config_context=grade_config_context,
+    )
+    if msg:
+        return msg
+
+    def _with_ontology(m: str) -> str:
+        if roster_system is not None:
+            try:
+                setattr(roster_system, "_ontology_last_reason",
+                        attach_reason_code_ontology(message=m, severity="hard"))
+            except Exception:
+                pass
+        return m
+
+    _s1_none = getattr(roster_system, "_fallback_stage1_no_solution", None)
+    if _s1_none == "unknown":
+        # 엔진 1단계가 시간 안에 해를 못 찾았다(해 없음은 증명 안 됨). 빈 배정은 실패로 돌리되
+        # 완화 사다리 신호(`_infeasible_empty`)는 세우지 않는다 — 다시 돌리면 풀릴 수 있다.
+        # 첫 생성이면 호출부가 TimeoutError 로 올려 워커가 재시도하고(`_STAGE1_UNKNOWN_CODE`),
+        # 완화 재시도·진단 중이면 '그 시도 실패' 로만 쓰인다.
+        return _with_ontology(
+            f"[reason_code={_STAGE1_UNKNOWN_CODE}] 엔진 1단계가 제한 시간 안에 해를 찾지 못했습니다"
+            "(해 없음 미증명)."
+        )
+    if _s1_none == "infeasible":
+        # 엔진 1단계가 해 없음을 증명했다(하드 제약끼리 충돌). 확정 원티드 등 고정 칸이 남아
+        # 기존 검증의 '실근무 0건'·'하루 0명' 증상에 안 걸리는 경우라 엔진 표시를 직접 본다.
+        # 신호·문구는 실근무 0건과 같게 둔다 — 완화 사다리·구조진단·해결 카드가 그대로 이어받는다.
+        try:
+            setattr(roster_system, "_infeasible_empty", True)
+        except Exception:
+            pass
+        ev = getattr(roster_system, "_validator_evidence", None) or {}
+        ev_brief = {
+            "total_failed_cells": ev.get("total_failed_cells"),
+            "required_minus_assigned_total": ev.get("required_minus_assigned_total"),
+            "fixed_forbidden_count": ev.get("fixed_forbidden_count"),
+        }
+        return _with_ontology(
+            "[reason_code=NO_ASSIGNMENT] 엔진 배정 0건(1단계 해 없음 — 고정 칸만 남음 · 증상). "
+            f"원인은 구조진단에서 결정. evidence={ev_brief}"
+        )
+    return None
+
+
+def _validate_generated_roster_core(
     generated: dict[str, list[str]] | None,
     roster_system,
     nurses_context: list | None = None,
@@ -7061,6 +7126,14 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         config_context=config_dict,
         grade_config_context=_fetch_grade_config_dict(db, current_user.office_id, current_user.group_id),
     )
+    if validation_error and f"reason_code={_STAGE1_UNKNOWN_CODE}" in validation_error:
+        # 1단계가 시간 안에 해를 못 찾았는데(해 없음 미증명) 기존 검증은 아무것도 못 잡았다 —
+        # 예전엔 빈 배정이 '성공' 저장되던 경우다. 저장하지도, 확정 실패(완화 사다리·해결 카드·
+        # 워커 ack)로 보내지도 않는다. TimeoutError 는 워커가 일시 장애로 보고 재시도하고
+        # (`worker._is_transient`), draft 는 바깥 래퍼가 지운다(`_record_unclassified_failure`).
+        # ★ 기존 검증이 '실근무 0건'·'하루 0명' 을 잡은 경우는 여기 안 온다 — 예전처럼 완화
+        #   사다리로 간다(그 경로로 성공하던 작업을 막지 않는다 · Codex 8회차).
+        raise TimeoutError(f"{validation_error} 일시 실패로 다시 시도합니다.")
     applied_relaxations: list[str] = []
     # 사다리가 config_dict 에 누적하는 하드락 해제를 최종 결과 기준으로 알리려고 원래 값을 잡아 둔다
     #   (`_carried_hardlock_relaxations`).
