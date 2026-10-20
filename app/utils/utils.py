@@ -6,6 +6,7 @@ import re
 import shutil
 import time
 import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Literal, Tuple, Dict, Union
 
@@ -222,11 +223,70 @@ def groupware_write_enabled() -> bool:
     return os.getenv("EUN_DB_NAME", "").strip().lower() == _PUSH_PRODUCTION_ROSTER_DB
 
 
+# 그룹웨어(eun_gw) 알림 테이블 읽기·쓰기 상한(초). 공용 서버라 남의 락에 물리면 이 프로세스가
+# 함께 멈춘다 — 발송기 스레드가 무한 대기하지 않게 건다(client2.get_connection 도크스트링 참조).
+_GW_TIMEOUT_SEC = 30
+
+
+@contextmanager
+def gw_transaction():
+    """그룹웨어 연결 하나·트랜잭션 하나의 커서. 블록이 정상으로 끝나면 커밋, 예외면 되돌린다.
+
+    ★ 알림 3종(원본·알림함 수신자·단말 큐)을 **한 트랜잭션**에 쓰려고 쓴다. 예전처럼 단계마다
+      따로 커밋하면 중간에 죽었을 때 반쪽만 남고, 다시 보내면 앞 단계가 두 번 들어간다.
+    """
+    with msdb_manager.connection(charset="UTF-8", timeout=_GW_TIMEOUT_SEC) as conn:
+        cursor = conn.cursor()
+        try:
+            yield cursor
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception as rollback_exc:  # 끊긴 연결이면 닫힐 때 서버가 되돌린다
+                print(f"[push] 그룹웨어 rollback 실패(연결 종료로 되돌림): {rollback_exc!r}")
+            raise
+        conn.commit()
+
+
+def gw_write_push(cursor, *, push_code: str, push_sub_code: str, office_code: str,
+                  sender_emp_seq_no: str, sender_member_id: str, recipients: list[str],
+                  message: str, org_message: str, link_url: str, link_code: str) -> tuple[int, int]:
+    """그룹웨어 알림 3종을 `cursor` 의 트랜잭션 안에서 쓴다. **커밋은 호출부**(`gw_transaction`).
+
+    1) 알림 원본(TB_Mobile_Push_History_Master) — Idx 는 같은 배치의 SCOPE_IDENTITY
+    2) 알림함 수신자(TB_Mobile_Push_History_User) — 앱 알림함은 이 행을 읽는다
+    3) 단말 푸시 큐(TB_FCM) — m_status 'N' 을 그룹웨어 발송기가 집어 휴대폰으로 보낸다.
+       기기 키 제외 규칙은 `Common.get_user_device_key` 참조.
+    돌려주는 값: (알림 원본 Idx, 단말 푸시를 넣은 기기 수).
+    """
+    cursor.execute(Common.set_push_master(), (
+        org_message, office_code, sender_emp_seq_no, sender_member_id,
+        push_code, push_sub_code, link_url, link_code,
+    ))
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        raise RuntimeError("알림 원본 번호(Idx)를 받지 못했습니다.")
+    master_idx = int(row[0])
+    cursor.executemany(Common.set_push_receiver(), [(master_idx, office_code, r) for r in recipients])
+    cursor.execute(Common.get_user_device_key(len(recipients)), tuple(recipients))
+    device_keys = [key_row[0] for key_row in cursor.fetchall()]
+    if device_keys:
+        cursor.executemany(Common.set_push_message(), [
+            (sender_emp_seq_no, office_code, message, key, master_idx, push_code, push_sub_code, "N")
+            for key in device_keys
+        ])
+    return master_idx, len(device_keys)
+
+
 def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
                  sendEmpSeqNo: str, sendMemberId: str, receiveEmpSeqNo: str,
                  pushMessage: str, orgPushMessage: str, linkUrl: str, linkCode: str):
     """
-    앱 푸시 보내기, receiveEmpSeqNo는 콤마(,)로 구분하여 여러명에게 보낼 수 있음
+    앱 푸시를 **바로** 보낸다. receiveEmpSeqNo 는 콤마(,)로 구분한 사번.
+
+    ★ 업무 알림은 이 함수를 직접 부르지 않는다 — `send_*_push(..., db=db)` 로 발송 대기열
+      (push_outbox)에 넣고 발송기가 보낸다(재시도·유실 방지). 이 함수는 테스트 발송과
+      `db` 없이 부르는 예전 호출만 쓴다.
     """
     # [env-gate] 운영에서만 실제 발송. 개발/스테이징은 단말로 안 나가게 스킵(로그만).
     if not push_enabled():
@@ -241,51 +301,47 @@ def set_app_push(pushCode: str, pushSubCode: str, officeCode: str,
         return {"result" : "fail", "message": "officeCode가 없습니다."}
     if not sendMemberId:
         return {"result" : "fail", "message": "sendMemberId가 없습니다."}
-    if not receiveEmpSeqNo:
+    recipients = [r for r in (receiveEmpSeqNo or "").split(",") if r]
+    if not recipients:
         return {"result" : "fail", "message": "receiveEmpSeqNo가 없습니다."}
 
-    # master에 정보 저장
-    params = (orgPushMessage, officeCode, sendEmpSeqNo, sendMemberId, pushCode, pushSubCode, linkUrl, linkCode)
-    push_master_result = msdb_manager.execute(Common.set_push_master(), params=params)
+    with gw_transaction() as cursor:
+        _, device_count = gw_write_push(
+            cursor, push_code=pushCode, push_sub_code=pushSubCode, office_code=officeCode,
+            sender_emp_seq_no=sendEmpSeqNo, sender_member_id=sendMemberId, recipients=recipients,
+            message=pushMessage, org_message=orgPushMessage, link_url=linkUrl, link_code=linkCode,
+        )
+    if not device_count:
+        return {"result": "success", "message": "푸시 발송 대상이 없습니다."}
+    return {"result": "success", "message": "push 발송 완료"}
 
-    if not push_master_result:
-        return {"result": "fail", "message": "master 입력 오류"}
-    else:
-        # 입력된 max idx 값 가져오기
-        max_idx = msdb_manager.fetch_one(Common.get_push_max_id())
 
-        receive_empseq_no = receiveEmpSeqNo.split(',')
+def _send_or_enqueue(db, *, source: str, push_code: str, push_sub_code: str, office_code: str,
+                     sender_emp_seq_no: str, sender_member_id: str, recipients: list[str],
+                     message: str, org_message: str | None = None, link_url: str = "",
+                     link_code: str = "", guard: str | None = None):
+    """`db` 가 있으면 발송 대기열에 넣고(커밋은 호출부), 없으면 예전처럼 바로 보낸다.
 
-        push_user_params = [
-            (max_idx, officeCode, emp_seq_no)
-            for emp_seq_no in receive_empseq_no
-        ]
-
-        if push_user_params:
-            push_user_result = msdb_manager.bulk_execute(Common.set_push_receiver(), params=push_user_params)
-            if not push_user_result:
-                return {"result": "fail", "message": "user 입력 오류 (bulk)"}
-
-        user_device_key = msdb_manager.fetch_all(Common.get_user_device_key(receiveEmpSeqNo))
-
-        # 4. 푸시 메시지 벌크 전송
-        if user_device_key:
-            m_status = 'N'
-            push_message_params = [
-                (sendEmpSeqNo, officeCode, pushMessage, gcm_id['DeviceKey'], max_idx, pushCode, pushSubCode, m_status)
-                for gcm_id in user_device_key
-            ]
-
-            # print("aa : ", push_message_params)
-            if push_message_params:
-                set_push_result = msdb_manager.bulk_execute(Common.set_push_message(), params=push_message_params)
-                if not set_push_result:
-                    return {"result": "fail", "message": "push 입력 오류 (bulk)"}
-                else:
-                    return {"result": "success", "message": "push 발송 완료"}
-
-    return {"result": "success", "message": "푸시 발송 대상이 없습니다."}
-
+    ★ 업무 알림은 `db` 를 넘겨 **업무 저장과 같은 트랜잭션**에 남긴다 — 저장은 됐는데 알림만
+      빠지는 일이 없다. 실제 발송·재시도는 `services.push_outbox_service` 의 발송기가 한다.
+    """
+    if not recipients:
+        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+    if db is not None:
+        from services.push_outbox_service import enqueue_push
+        enqueue_push(
+            db, source=source, push_code=push_code, push_sub_code=push_sub_code,
+            office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+            sender_member_id=sender_member_id, recipients=recipients, message=message,
+            org_message=org_message, link_url=link_url, link_code=link_code, guard=guard,
+        )
+        return {"result": "queued", "message": "발송 대기열에 넣었습니다."}
+    return set_app_push(
+        pushCode=push_code, pushSubCode=push_sub_code, officeCode=office_code,
+        sendEmpSeqNo=sender_emp_seq_no, sendMemberId=sender_member_id,
+        receiveEmpSeqNo=",".join(map(str, recipients)), pushMessage=message,
+        orgPushMessage=org_message or message, linkUrl=link_url, linkCode=link_code,
+    )
 
 
 def send_roster_publish_push(
@@ -296,38 +352,15 @@ def send_roster_publish_push(
     sender_emp_seq_no: str,
     sender_member_id: str,
     test_prefix: str = "[Test발송]",
+    db=None,
 ):
-    """
-    근무표 발행 시 공용 푸시 메시지를 전송합니다.
-
-    - 인자: year(int, 예: 2024), month(int, 예: 5), recipients(List[str]), office_code(str),
-      sender_emp_seq_no(str), sender_member_id(str), test_prefix(str)
-    - 반환: set_app_push 결과 딕셔너리
-    - 예외: 없음
-    - 예시: send_roster_publish_push(2024, 5, ["11", "22"], "OFF01", "900", "admin01")
-    """
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
-
-    receive_emp_seq_no = ",".join(map(str, recipients))
-    push_code = "P30"
-    push_sub_code = "S01"
-    push_message = (
-        f"{year}년 {month}월 근무표 마감"
-    )
-    org_push_message = f"{year}년 {month}월 근무표 마감"
-
-    return set_app_push(
-        pushCode=push_code,
-        pushSubCode=push_sub_code,
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=receive_emp_seq_no,
-        pushMessage=push_message,
-        orgPushMessage=org_push_message,
-        linkUrl="",
-        linkCode=f"ROSTER:{year}:{month:02d}",
+    """근무표 발행 알림 (P30 / S01). `db` 를 주면 발송 대기열에 넣는다(`_send_or_enqueue`)."""
+    message = f"{year}년 {month}월 근무표 마감"
+    return _send_or_enqueue(
+        db, source="roster_publish", push_code="P30", push_sub_code="S01",
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+        sender_member_id=sender_member_id, recipients=recipients, message=message,
+        link_code=f"ROSTER:{year}:{month:02d}",
     )
 
 
@@ -340,48 +373,18 @@ def send_wanted_request_push(
     sender_member_id: str,
     deadline: datetime.datetime | None = None,
     test_prefix: str = "[Test발송]",
+    db=None,
 ):
-    """
-    근무 희망(원티드) 작성 요청 발생 시 공용 푸시 메시지를 전송합니다.
-
-    - 인자: year(int, 예: 2024), month(int, 예: 9), recipients(List[str]), office_code(str),
-      sender_emp_seq_no(str), sender_member_id(str), deadline(datetime|None), test_prefix(str)
-    - 반환: set_app_push 결과 딕셔너리
-    - 예외: 없음
-    - 예시: send_wanted_request_push(2024, 9, ["11", "22"], "OFF01", "900", "admin01")
-    """
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
-
+    """원티드 작성 요청 알림 (P30 / S02). `db` 를 주면 발송 대기열에 넣는다."""
     if deadline:
-        deadline_text = f" (마감 {deadline.strftime('%Y-%m-%d')})"
         deadline_part = f"{deadline.strftime('%m')}월 {deadline.strftime('%d')}일 까지"
     else:
-        deadline_text = ""
         deadline_part = "마감일 없음"
-
-    print('deadline : ', deadline)
-    
-    receive_emp_seq_no = ",".join(map(str, recipients))
-    push_code = "P30"
-    push_sub_code = "S02"
-    
-    push_message = (
-        f"{year}년 {month}월 원티드 요청 ({deadline_part})"
-    )
-    org_push_message = push_message
-
-    return set_app_push(
-        pushCode=push_code,
-        pushSubCode=push_sub_code,
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=receive_emp_seq_no,
-        pushMessage=push_message,
-        orgPushMessage=org_push_message,
-        linkUrl="",
-        linkCode="",
+    message = f"{year}년 {month}월 원티드 요청 ({deadline_part})"
+    return _send_or_enqueue(
+        db, source="wanted_request", push_code="P30", push_sub_code="S02",
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+        sender_member_id=sender_member_id, recipients=recipients, message=message,
     )
 
 
@@ -393,31 +396,15 @@ def send_wanted_deadline_update_push(
     sender_emp_seq_no: str,
     sender_member_id: str,
     deadline: datetime.datetime | None = None,
+    db=None,
 ):
-    """
-    원티드 마감일 변경 시 공용 푸시 메시지를 전송합니다.
-
-    - 푸시 코드: P30 / S05
-    - 메시지: "{year}년 {month}월 원티드 마감일 변경 ({마감일})"
-    """
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
-
+    """원티드 마감일 변경 알림 (P30 / S05). `db` 를 주면 발송 대기열에 넣는다."""
     deadline_part = f"{deadline.strftime('%m')}월 {deadline.strftime('%d')}일 까지" if deadline else "마감일 없음"
-    receive_emp_seq_no = ",".join(map(str, recipients))
-    push_message = f"{year}년 {month}월 원티드 마감일 변경 ({deadline_part})"
-
-    return set_app_push(
-        pushCode="P30",
-        pushSubCode="S05",
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=receive_emp_seq_no,
-        pushMessage=push_message,
-        orgPushMessage=push_message,
-        linkUrl="",
-        linkCode="",
+    message = f"{year}년 {month}월 원티드 마감일 변경 ({deadline_part})"
+    return _send_or_enqueue(
+        db, source="wanted_deadline", push_code="P30", push_sub_code="S05",
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+        sender_member_id=sender_member_id, recipients=recipients, message=message,
     )
 
 
@@ -428,30 +415,20 @@ def send_wanted_close_push(
     office_code: str,
     sender_emp_seq_no: str,
     sender_member_id: str,
+    db=None,
+    guard: str | None = None,
+    source: str = "wanted_close",
 ):
+    """원티드 마감 알림 (P30 / S03). `db` 를 주면 발송 대기열에 넣는다.
+
+    `guard` 는 발송기가 보내기 직전에 다시 확인할 조건이다 — 그 사이 마감일 연장으로 다시
+    열렸으면 보내지 않는다(`push_outbox_service._guard_ok`).
     """
-    원티드 마감 시 공용 푸시 메시지를 전송합니다.
-
-    - 푸시 코드: P30 / S03
-    - 메시지: "{year}년 {month}월 원티드 마감"
-    """
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
-
-    receive_emp_seq_no = ",".join(map(str, recipients))
-    push_message = f"{year}년 {month}월 원티드 마감"
-
-    return set_app_push(
-        pushCode="P30",
-        pushSubCode="S03",
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=receive_emp_seq_no,
-        pushMessage=push_message,
-        orgPushMessage=push_message,
-        linkUrl="",
-        linkCode="",
+    message = f"{year}년 {month}월 원티드 마감"
+    return _send_or_enqueue(
+        db, source=source, push_code="P30", push_sub_code="S03",
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+        sender_member_id=sender_member_id, recipients=recipients, message=message, guard=guard,
     )
 
 
@@ -462,119 +439,136 @@ def send_roster_republish_push(
     office_code: str,
     sender_emp_seq_no: str,
     sender_member_id: str,
+    db=None,
 ):
-    """
-    근무표 마감 철회 후 재마감 시 공용 푸시 메시지를 전송합니다.
-
-    - 푸시 코드: P30 / S04
-    - 메시지: "{year}년 {month}월 근무표 재마감"
-    """
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
-
-    receive_emp_seq_no = ",".join(map(str, recipients))
-    push_message = f"{year}년 {month}월 근무표 재마감"
-
-    return set_app_push(
-        pushCode="P30",
-        pushSubCode="S04",
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=receive_emp_seq_no,
-        pushMessage=push_message,
-        orgPushMessage=push_message,
-        linkUrl="",
-        linkCode=f"ROSTER:{year}:{month:02d}",
+    """근무표 재마감 알림 (P30 / S04). `db` 를 주면 발송 대기열에 넣는다."""
+    message = f"{year}년 {month}월 근무표 재마감"
+    return _send_or_enqueue(
+        db, source="roster_republish", push_code="P30", push_sub_code="S04",
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+        sender_member_id=sender_member_id, recipients=recipients, message=message,
+        link_code=f"ROSTER:{year}:{month:02d}",
     )
 
 
+def send_roster_change_notice_push(
+    year: int,
+    month: int,
+    notice: dict,
+    office_code: str,
+    sender_emp_seq_no: str,
+    sender_member_id: str,
+    db=None,
+):
+    """재마감 변경 알림 (P30 / S04) — 확인 대상자에게, 내 칸이 바뀐 사람과 나머지 문구를 나눠 보낸다.
+
+    `notice` 는 `roster_change_notice_service.record_change_notice` 의 반환값.
+    연결 코드는 재마감과 같은 `ROSTER:연:월` — 앱이 이미 그 달 근무표로 보낸다. 앱은 홈 배너
+    (`/roster/change-notices/pending/me`)로 확인 화면을 띄운다(로그인 후 항상 홈으로 가기 때문).
+    """
+    by_message: dict[str, list[str]] = {}
+    for nurse_id in notice.get("targets") or []:
+        mine = int((notice.get("my_changed") or {}).get(nurse_id, 0))
+        message = (f"{month}월 근무표 변경 — 내 근무 {mine}건 변경, 확인해 주세요" if mine
+                   else f"{month}월 근무표 변경({notice.get('total_cells', 0)}건), 확인해 주세요")
+        by_message.setdefault(message, []).append(nurse_id)
+    results = []
+    for message, recipients in by_message.items():
+        results.append(_send_or_enqueue(
+            db, source="roster_change_notice", push_code="P30", push_sub_code="S04",
+            office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+            sender_member_id=sender_member_id, recipients=recipients, message=message,
+            link_code=f"ROSTER:{year}:{month:02d}",
+            # 보내기 전에 그 마감본이 아직 활성인지 확인 — 그 사이 철회·재마감됐으면 보내지 않는다.
+            guard=f"roster_snapshot_active:{notice['notice_id']}",
+        ))
+    return results
+
+
 # ── assignment 관련 알림 (S06~S12) ──
+# ★ 배정 알림(S06~S08)은 **당사자 간호사에게만** 보낸다(사용자 결정 2026-10-07 — 7-15 전면 미발송을 되돌리되
+#   관리자 알림은 빼고, 파견·병동이동만). 호출부가 사유를 거른다(`assignment_service._NOTIFY_REASONS`).
+# ★ 연결 코드는 비운다 — 앱 알림 목록은 같은 연결 코드를 최신 1건으로 묶어서(`_push_inbox_cte`),
+#   `ROSTER:연:월` 을 달면 그 달 근무표 마감·변경 알림과 합쳐져 한쪽이 가려진다.
 
 _REASON_LABEL = {"파견": "파견", "병동이동": "병동이동", "휴직": "휴직", "프리셉티": "프리셉티"}
 
 
+def assignment_period_label(start, end) -> str:
+    """배정 기간 문구 — `10/12~10/31`, 끝이 없으면 `10/12~`. 날짜가 아니면 그대로 쓴다."""
+    def _md(d) -> str:
+        return f"{d.month}/{d.day}" if hasattr(d, "month") else str(d)
+    return f"{_md(start)}~{_md(end)}" if end else f"{_md(start)}~"
+
+
+def _send_assignment_push(db, *, source: str, sub_code: str, message: str, recipient: str,
+                          office_code: str, sender_emp_seq_no: str, sender_member_id: str,
+                          guard: str | None = None):
+    """`guard` = 보내기 직전에 그 배정이 아직 이 알림이 말하는 상태인지 확인할 조건
+    (`assignment_service._assignment_guard` · 발송기 `push_outbox_service._guard_holds`)."""
+    return _send_or_enqueue(
+        db, source=source, push_code="P30", push_sub_code=sub_code,
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+        sender_member_id=sender_member_id, recipients=[recipient], message=message, guard=guard,
+    )
+
+
 def send_assignment_created_push(
-    nurse_name: str,
-    reason: str,
-    start_date: str,
-    end_date: str,
-    source_group_name: str,
-    target_group_name: str | None,
-    recipients: List[str],
-    office_code: str,
-    sender_emp_seq_no: str,
-    sender_member_id: str,
+    *, reason: str, target_group_name: str, start_date, end_date, recipient: str,
+    office_code: str, sender_emp_seq_no: str, sender_member_id: str, db=None, guard: str | None = None,
 ):
-    """배정 생성 알림 (S06). 대상 간호사 + source/target 관리자."""
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+    """배정 생성 알림 (S06) — 당사자에게. 예) 파견 배정: 중환자실-RN (10/12~10/31)"""
     label = _REASON_LABEL.get(reason, reason)
-    period = f"{start_date}~{end_date}" if end_date else f"{start_date}~"
-    if target_group_name:
-        push_message = f"{nurse_name} {label} 배정 ({period}, {source_group_name}→{target_group_name})"
-    else:
-        push_message = f"{nurse_name} {label} 배정 ({period})"
-    return set_app_push(
-        pushCode="P30", pushSubCode="S06",
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=",".join(map(str, recipients)),
-        pushMessage=push_message, orgPushMessage=push_message,
-        linkUrl="", linkCode="",
+    message = f"{label} 배정: {target_group_name} ({assignment_period_label(start_date, end_date)})"
+    return _send_assignment_push(
+        db, source="assignment_created", sub_code="S06", message=message, recipient=recipient,
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no, sender_member_id=sender_member_id,
+        guard=guard,
+    )
+
+
+def send_assignment_changed_push(
+    *, reason: str, target_group_name: str, changes: List[str], recipient: str,
+    office_code: str, sender_emp_seq_no: str, sender_member_id: str, db=None, guard: str | None = None,
+):
+    """배정 변경 알림 (S06) — 당사자에게. 예) 파견 배정 변경: 중환자실-RN · 기간 10/12~10/31→10/12~10/20"""
+    label = _REASON_LABEL.get(reason, reason)
+    message = f"{label} 배정 변경: {target_group_name} · " + " · ".join(changes)
+    return _send_assignment_push(
+        db, source="assignment_changed", sub_code="S06", message=message, recipient=recipient,
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no, sender_member_id=sender_member_id,
+        guard=guard,
     )
 
 
 def send_assignment_cancelled_push(
-    nurse_name: str,
-    reason: str,
-    source_group_name: str,
-    target_group_name: str | None,
-    recipients: List[str],
-    office_code: str,
-    sender_emp_seq_no: str,
-    sender_member_id: str,
+    *, reason: str, target_group_name: str, start_date, end_date, recipient: str,
+    office_code: str, sender_emp_seq_no: str, sender_member_id: str, db=None, guard: str | None = None,
 ):
-    """배정 취소 알림 (S07). 대상 간호사 + source/target 관리자."""
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
+    """배정 취소 알림 (S07) — 당사자에게. 예) 파견 배정 취소: 중환자실-RN (10/12~10/31)"""
     label = _REASON_LABEL.get(reason, reason)
-    if target_group_name:
-        push_message = f"{nurse_name} {label} 배정 취소 ({source_group_name}→{target_group_name})"
-    else:
-        push_message = f"{nurse_name} {label} 배정 취소"
-    return set_app_push(
-        pushCode="P30", pushSubCode="S07",
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=",".join(map(str, recipients)),
-        pushMessage=push_message, orgPushMessage=push_message,
-        linkUrl="", linkCode="",
+    message = f"{label} 배정 취소: {target_group_name} ({assignment_period_label(start_date, end_date)})"
+    return _send_assignment_push(
+        db, source="assignment_cancelled", sub_code="S07", message=message, recipient=recipient,
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no, sender_member_id=sender_member_id,
+        guard=guard,
     )
 
 
 def send_transfer_completed_push(
-    nurse_name: str,
-    target_group_name: str,
-    recipients: List[str],
-    office_code: str,
-    sender_emp_seq_no: str,
-    sender_member_id: str,
+    *, target_group_name: str, start_date, recipient: str,
+    office_code: str, sender_emp_seq_no: str, sender_member_id: str, db=None, guard: str | None = None,
 ):
-    """병동이동 완료 알림 (S08). 대상 간호사 + target 관리자."""
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
-    push_message = f"{nurse_name} 병동이동 완료 ({target_group_name} 배속)"
-    return set_app_push(
-        pushCode="P30", pushSubCode="S08",
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=",".join(map(str, recipients)),
-        pushMessage=push_message, orgPushMessage=push_message,
-        linkUrl="", linkCode="",
+    """병동이동 완료 알림 (S08) — 당사자에게. 예) 병동이동 완료: 10/7부터 중환자실-RN 소속입니다
+
+    ★ '오늘부터' 로 쓰지 않는다 — 재시도가 자정을 넘으면 날짜가 틀린다(Codex 10회차). 발효일(시작일)을 적는다.
+    """
+    day = f"{start_date.month}/{start_date.day}" if hasattr(start_date, "month") else str(start_date)
+    message = f"병동이동 완료: {day}부터 {target_group_name} 소속입니다"
+    return _send_assignment_push(
+        db, source="transfer_completed", sub_code="S08", message=message, recipient=recipient,
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no, sender_member_id=sender_member_id,
+        guard=guard,
     )
 
 
@@ -587,19 +581,15 @@ def send_assignment_roster_created_push(
     office_code: str,
     sender_emp_seq_no: str,
     sender_member_id: str,
+    db=None,
 ):
     """근무표 생성 알림 — assignment 대상자용 (S09/S10 공용)."""
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
-    push_message = f"{group_name} {year}년 {month}월 근무표 생성 (배정 근무자: {nurse_name})"
-    return set_app_push(
-        pushCode="P30", pushSubCode="S09",
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=",".join(map(str, recipients)),
-        pushMessage=push_message, orgPushMessage=push_message,
-        linkUrl="", linkCode=f"ROSTER:{year}:{month:02d}",
+    message = f"{group_name} {year}년 {month}월 근무표 생성 (배정 근무자: {nurse_name})"
+    return _send_or_enqueue(
+        db, source="assignment_roster_created", push_code="P30", push_sub_code="S09",
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+        sender_member_id=sender_member_id, recipients=recipients, message=message,
+        link_code=f"ROSTER:{year}:{month:02d}",
     )
 
 
@@ -612,24 +602,20 @@ def send_assignment_roster_published_push(
     sender_emp_seq_no: str,
     sender_member_id: str,
     is_source: bool = True,
+    db=None,
 ):
     """근무표 마감 알림 — 상대 그룹 관리자 + 대상 간호사용 (S11/S12).
 
     is_source=True: source 마감 → target 관리자에게 (S11)
     is_source=False: target 마감 → source 관리자에게 (S12)
     """
-    if not recipients:
-        return {"result": "fail", "message": "receiveEmpSeqNo가 없습니다."}
-    sub_code = "S11" if is_source else "S12"
-    push_message = f"{group_name} {year}년 {month}월 근무표 마감 (배정 근무자 포함)"
-    return set_app_push(
-        pushCode="P30", pushSubCode=sub_code,
-        officeCode=office_code,
-        sendEmpSeqNo=sender_emp_seq_no,
-        sendMemberId=sender_member_id,
-        receiveEmpSeqNo=",".join(map(str, recipients)),
-        pushMessage=push_message, orgPushMessage=push_message,
-        linkUrl="", linkCode=f"ROSTER:{year}:{month:02d}",
+    message = f"{group_name} {year}년 {month}월 근무표 마감 (배정 근무자 포함)"
+    return _send_or_enqueue(
+        db, source="assignment_roster_published", push_code="P30",
+        push_sub_code="S11" if is_source else "S12",
+        office_code=office_code, sender_emp_seq_no=sender_emp_seq_no,
+        sender_member_id=sender_member_id, recipients=recipients, message=message,
+        link_code=f"ROSTER:{year}:{month:02d}",
     )
 
 

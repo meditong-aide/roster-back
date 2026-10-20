@@ -61,7 +61,7 @@ from schemas.roster_schema import (
     ScheduleShareAutoCreateRequest,
     ScheduleShareCaptureCreateRequest,
 )
-from schemas.roster_schema import RosterConfigCreate, RosterConfig, PublishRequest, WantedInvokeRequest, WantedInvokeResponse, RosterRequest
+from schemas.roster_schema import RosterConfigCreate, RosterConfig, PublishRequest, WantedInvokeRequest, WantedInvokeResponse, RosterRequest, SaveAsRequest
 from schemas.replacement_schema import ReplacementRecommendRequest, ReplacementRecommendResponse
 from routers.auth import get_current_user_from_cookie
 from schemas.auth_schema import User
@@ -82,8 +82,11 @@ from db.models import (
     ShiftManage,
     DailyShift,
     NurseAssignment,
+    ScheduleLineage,
 )
 from sqlalchemy import func, and_, or_
+from sqlalchemy.exc import SQLAlchemyError
+import logging as _logging
 from routers.utils import get_days_in_month
 from db.nurse_config import Nurse as NurseEngine
 from services.roster_system import RosterSystem
@@ -93,20 +96,24 @@ from services.roster_service import (
     get_latest_schedule_service,
     get_issued_schedules_service,
     get_schedule_status_service,
+    attach_team_to_synth_rows,
     create_issued_roster_snapshot,
     get_issued_roster_snapshot_service,
     get_my_issued_roster_service,
+    get_my_issued_months_service,
     get_my_issued_week_service,
     get_my_today_service,
     get_prev_month_tail_service,
 )
 from services.replacement_recommend_service import recommend_replacement_candidates
-from services.group_access import resolve_effective_group, resolve_home_group_id, caller_is_head_nurse, assert_caller_can_access_group
+from services.group_access import resolve_effective_group, resolve_home_group_id, caller_is_head_nurse, assert_caller_can_access_group, can_caller_access_nurse
 from services.weekly_off_service import get_nurses_weekly_off_service
 from services.assignment_service import transfer_shifts_on_publish, get_transfer_logs, get_transferred_wanted
 from utils.utils import send_roster_publish_push, send_roster_republish_push
 import uuid
 import pprint
+
+_roster_logger = _logging.getLogger(__name__)
 
 router = APIRouter(prefix="/roster", tags=["roster"])
 templates = Jinja2Templates(directory="app/templates")
@@ -379,6 +386,8 @@ def get_config_by_version(
     """설정 불러오기 — 선택자 우선순위로 config 조회.
 
     1) schedule_id 제공 시: 그 근무표가 생성에 사용한 roster_config 반환(이전 설정 불러오기).
+       권한 밖 근무표 403 · 연결 설정 없음 404 `{code: NO_LINKED_CONFIG}` ·
+       연결 행 없음 404 `{code: LINKED_CONFIG_MISSING}`.
     2) config_version 이 정수면: 대상 그룹의 해당 version 프리셋 반환(저장한 설정 불러오기).
     3) 그 외(sentinel, 예: 'latest'): 대상 그룹 최신 config, 없으면 DEFAULT 생성 후 반환.
     """
@@ -392,22 +401,35 @@ def get_config_by_version(
 
     # ── 선택자 우선순위: schedule_id → version(정수) → (sentinel) 최신/DEFAULT ──
     if schedule_id:
-        sched = (
-            db.query(Schedule)
-            .filter(Schedule.schedule_id == schedule_id)
-            .first()
+        # ★ 권한은 근무표 행의 group_id 로 본다. 예전엔 확인이 없어 근무표 번호만 알면
+        #   다른 병동·병원 근무표의 설정도 읽혔다. 삭제(드롭)된 근무표는 예전처럼 조회한다.
+        sched = _load_schedule_for_caller(
+            db, current_user, schedule_id, include_dropped=True,
+            not_found_detail="해당 근무표를 찾을 수 없습니다.",
         )
-        if not sched or sched.config_id is None:
-            raise HTTPException(
-                status_code=404, detail="해당 근무표의 설정을 찾을 수 없습니다."
-            )
+        # 그룹 없는 근무표는 assert_caller_can_access_group 이 그냥 통과시키므로 여기서 막는다
+        #   (운영·dev 0건이지만 schedules.group_id 는 NULL 허용).
+        if not sched.group_id:
+            raise HTTPException(status_code=403, detail="병동이 지정되지 않은 근무표입니다.")
+        # ★ 연결 설정이 없는 두 경우를 code 로 가른다 — 프론트 규칙 검사가 '조회 실패(재시도·경고)'
+        #   와 '원래 검사할 설정이 없음' 을 구분하도록. 운영 실측(2026-10-15):
+        #   NO_LINKED_CONFIG 25건 = 엑셀·수기 이관 마감본(생성 없이 만들어 config_id 가 NULL)
+        #   LINKED_CONFIG_MISSING 3건 = 시화 6월 마감본(config_id 행이 없음, 이관 흔적)
+        if sched.config_id is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NO_LINKED_CONFIG",
+                "message": "이 근무표는 생성 없이 만든 근무표(엑셀·수기 이관본)라 연결된 설정이 없습니다.",
+            })
         sconf = (
             db.query(RosterConfigModel)
             .filter(RosterConfigModel.config_id == sched.config_id)
             .first()
         )
         if not sconf:
-            raise HTTPException(status_code=404, detail="Config not found")
+            raise HTTPException(status_code=404, detail={
+                "code": "LINKED_CONFIG_MISSING",
+                "message": "이 근무표에 연결된 설정을 찾을 수 없습니다.",
+            })
         return _roster_config_to_dict(sconf)
 
     # config_version 이 정수면 해당 프리셋(version) 로드, 아니면(sentinel) 아래 최신/DEFAULT
@@ -737,6 +759,8 @@ def get_issued_roster_snapshot(
             #   ※ 발행 뒤 파견으로 행을 지어내면 읽는 병동 수가 늘 수 있어, 이 절감이
             #     그 증가분을 상쇄한다.
             _expand_target_rosters=False,
+            # 팀별 보기(성남 ① · PC·모바일 공용) — 이 EP 만 싣는다.
+            with_teams=True,
         )
         # ★ 발행본이 없을 때 404 를 쓰지 않는다 — CloudFront 가 `/api/*` 의 404 를
         #   `index.html` **200(text/html)** 으로 바꿔 보내고, 그 HTML 을 **URL 단위로
@@ -902,6 +926,8 @@ def get_issued_roster_snapshot(
                         "counts": {},
                     })
                     _synth_nids.add(_mnid)
+                if _synth_nids:
+                    attach_team_to_synth_rows(db, snapshot, _synth_nids, year, month)
 
             for _nurse in (_roster.get("nurses") or []):
                 _nid = str(_nurse.get("nurse_id", ""))
@@ -1263,6 +1289,31 @@ def get_my_issued_roster(
         )
 
 
+# [Roster] - 본인 발행 근무가 있는 연월 목록 + 현재 소속 병동
+@router.get("/issued_roster/me/months")
+def get_my_issued_months(
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """개인 월 선택 목록 — 현재 병동 발행 목록과 독립(병동이동 뒤 이전 병동 달도 남는다).
+
+    * 호출방식 : GET /roster/issued_roster/me/months (파라미터 없음 — 본인만)
+    * 리턴값 : `{home_group_id, home_group_name, months: [{year, month, group_ids}]}`
+      - `home_group_id` : 지금의 소속 병동(DB 기준 · 토큰 병동 아님 · 발행 여부와 무관)
+      - `months` : 최신 달 먼저. 본인이 명단에 든 활성 발행본이 하나라도 있는 달
+    ★ 동기 `def` — 안의 SQLAlchemy 가 동기라 `async` 면 이벤트 루프를 막는다.
+    ★ 없을 때도 200 + 빈 `months` 다(404 는 CloudFront 가 index.html 200 으로 바꾼다).
+    """
+    try:
+        return get_my_issued_months_service(current_user=current_user, db=db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"개인 근무 월 목록 조회 실패: {str(e)}"
+        )
+
+
 # [Roster] - 본인 발행 근무표 · 기준일이 속한 주(일~토)
 @router.get("/issued_roster/me/week")
 def get_my_issued_week(
@@ -1426,7 +1477,7 @@ def _load_schedule_for_caller(
     그룹 스코프의 진실은 '스케줄 행의 group_id'다(schedule_id 가 그룹을 이미 확정).
     호출자-resolve group 을 쿼리 필터로 쓰면, 비-home 관리병동(HN multi-group)의
     스케줄이 group_id 미전송 시 home 으로 해석돼 404 로 숨는다 — 스코프는 행에서 가져오고
-    권한은 assert_caller_can_access_group 으로 별도 검증한다.
+    권한은 assert_caller_can_access_group 으로 별도 검증한다(관리자도 자기 병원 근무표만).
     """
     q = db.query(Schedule).filter(Schedule.schedule_id == schedule_id)
     if not include_dropped:
@@ -1848,6 +1899,32 @@ def get_schedule_versions(
         .order_by(Schedule.version.desc())
         .all()
     )
+    # ★ 만든 사람 이름·출처는 **관리자에게만** 채운다. 일반 간호사도 이 목록을 부르는데, 수정 이력
+    #   (`/schedule/{id}/history`)이 관리자 전용인 것과 같은 이유로 누가 몇 칸 고쳤는지는 숨긴다.
+    is_manager = caller_is_head_nurse(db, current_user) or bool(getattr(current_user, "is_master_admin", False))
+    origins = _schedule_origins(db, [s.schedule_id for s in schedules]) if is_manager else {}
+    # 근무표·출처 모두 만든 사람을 account_id 로 남긴다.
+    accounts = ({s.created_by for s in schedules if s.created_by}
+                | {o.created_by for o in origins.values() if o.created_by}) if is_manager else set()
+    by_account = dict(
+        db.query(Nurse.account_id, Nurse.name).filter(Nurse.account_id.in_(list(accounts))).all()
+    ) if accounts else {}
+
+    def _origin(schedule_id: str) -> Optional[dict]:
+        o = origins.get(schedule_id)
+        if o is None:
+            return None
+        return {
+            "kind": o.kind,
+            "source_schedule_id": o.source_schedule_id,
+            "source_version": o.source_version,
+            "changed_cells": o.changed_cells,
+            "added_nurses": o.added_nurses,
+            "removed_nurses": o.removed_nurses,
+            "created_by": o.created_by,
+            "created_by_name": by_account.get(o.created_by),
+            "created_at": o.created_at.isoformat() if o.created_at else None,
+        }
 
     return [
         {
@@ -1858,13 +1935,44 @@ def get_schedule_versions(
             if schedule.created_at
             else None,
             "created_by": schedule.created_by,
+            "created_by_name": by_account.get(schedule.created_by),
             "updated_at": schedule.updated_at.isoformat()
             if schedule.updated_at
             else None,
             "name": schedule.name,
+            # [새 버전으로 저장]으로 만든 버전이면 어느 버전에서 왔는지(아니면·관리자 아니면 null)
+            "origin": _origin(schedule.schedule_id),
         }
         for schedule in schedules
     ]
+
+
+def _schedule_origins(db: Session, schedule_ids: list[str]) -> dict:
+    """버전 목록용 출처(`schedule_lineage`). schedule_id → 행.
+
+    ★ 테이블이 아직 없으면(DDL 전 배포) 출처만 비우고 목록은 그대로 돌려준다 — 버전 목록은
+      근무표 화면마다 불러서, 부가 정보 때문에 화면 전체가 멈추면 안 된다. SAVEPOINT 로 감싸
+      실패해도 바깥 트랜잭션은 살린다.
+    """
+    if not schedule_ids:
+        return {}
+    try:
+        with db.begin_nested():
+            rows = (
+                db.query(ScheduleLineage)
+                .filter(ScheduleLineage.schedule_id.in_(schedule_ids))
+                .all()
+            )
+    except SQLAlchemyError as exc:
+        # 208 = 테이블 없음(DDL 전) — 예상된 상태라 조용히. 그 밖(잠금 대기 초과·collation 등)은
+        #   진짜 장애라 남긴다 — 둘 다 "출처 없음" 으로 보이면 원인이 영영 묻힌다.
+        code = (getattr(getattr(exc, "orig", None), "args", None) or [None])[0]
+        if code == 208:
+            _roster_logger.info("[ScheduleLineage] 테이블 없음(DDL 전) — 출처 생략")
+        else:
+            _roster_logger.error("[ScheduleLineage] 출처 조회 실패(출처 생략): %s", exc, exc_info=True)
+        return {}
+    return {r.schedule_id: r for r in rows}
 
 
 # [Roster] - 특정 월의 근무표 조회
@@ -2017,6 +2125,13 @@ def publish_roster(
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    # ★ 관리자(수간호사·ADM)만 — `/unpublish` 와 같은 판정. 예전엔 같은 병동 소속이면 일반 간호사도
+    #   마감돼 병동 전원에게 마감 알림이 나갔다(2026-10-02 실측: 일반 간호사 호출 200).
+    if not (
+        caller_is_head_nurse(db, current_user)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
 
     # 그룹은 스케줄 행에서, 권한은 별도 검증(HN 비-home 관리병동 발행 404 방지).
     schedule = _load_schedule_for_caller(
@@ -2024,7 +2139,26 @@ def publish_roster(
         not_found_detail="해당 스케줄을 찾을 수 없습니다.",
     )
     target_group_id = schedule.group_id
-    office_id = current_user.office_id
+    # ★ 병원은 호출자가 아니라 **대상 병동의 병원**이다 — 마감 기록·스냅샷·푸시(office_code)가 다 이 값을 쓴다.
+    #   호출자 값을 쓰면 타 병원 관리병동을 마감할 때 남의 병원으로 기록되고 푸시가 엉뚱한 병원으로 간다(Codex 2026-10-02).
+    office_id = (
+        db.query(Group.office_id).filter(Group.group_id == target_group_id).scalar()
+        or current_user.office_id
+    )
+    # ★ 병동·달 마감 잠금을 **아무것도 바꾸기 전에** 잡는다. 같은 달 두 마감(또는 마감·철회)이 동시에 오면
+    #   둘 다 같은 직전 스냅샷을 비교 기준으로 읽어 활성 마감본·변경 알림이 둘 생긴다(Codex 2회차 HIGH).
+    #   잡은 뒤 근무표를 다시 읽는다 — 기다리는 사이 앞 요청이 지웠거나 바꿨을 수 있다.
+    from services.schedule_versioning import lock_month_publish
+    lock_month_publish(db, target_group_id, schedule.year, schedule.month)
+    # ★ 마감할 근무표 행도 선점한다(UPDLOCK) — 칸을 읽어 스냅샷을 만드는 사이 `/roster/save` 가 칸을
+    #   전량 교체·커밋하면 마감본(issued)과 스냅샷·변경 알림이 서로 다른 근무표를 가리킨다(Codex 9회차).
+    #   저장이 먼저면 그 커밋을 기다렸다 읽고, 마감이 먼저면 저장이 기다렸다 마감본이라 409 를 받는다.
+    #   저장은 앱 잠금을 쓰지 않으므로 잠금 순서(마감 잠금 → 근무표 행)가 엇갈리지 않는다.
+    db.query(Schedule.schedule_id).with_hint(Schedule, "WITH (UPDLOCK, ROWLOCK)", "mssql").filter(
+        Schedule.schedule_id == schedule.schedule_id).one()
+    db.refresh(schedule)
+    if schedule.dropped:
+        raise HTTPException(status_code=404, detail="해당 스케줄을 찾을 수 없습니다.")
 
     # Check if this is the first publication
     #   ★ office_id 는 걸지 않는다 (2026-09-01 제거). group_id 가 office 를 확정하는데
@@ -2072,6 +2206,12 @@ def publish_roster(
         issue_cmmt=req.issue_comment if not is_first_issue else "첫 발행",
         schedule_id=req.schedule_id,
     )
+
+    # ② 재마감 변경 확인의 비교 기준 — 새 스냅샷을 넣기 **전에** 그 달 가장 최근 스냅샷을 잡는다
+    #   (철회돼 비활성이어도 간호사들이 마지막으로 본 마감본이다).
+    #   ★ 병동·달 마감 잠금은 함수 첫머리에서 잡았다(그 뒤에 읽어야 앞 마감이 커밋한 스냅샷이 기준).
+    from services.roster_change_notice_service import latest_snapshot_before
+    prev_snapshot = latest_snapshot_before(db, target_group_id, schedule.year, schedule.month)
 
     # 발행 시점 스냅샷 레코드 생성
     snapshot = create_issued_roster_snapshot(
@@ -2134,15 +2274,47 @@ def publish_roster(
             rebuild_leave_balance_from(db, target_group_id, schedule.year, schedule.month)
     except Exception as _lb_exc:
         print(f"[LeaveBalance] 발행 후 차감 실패(무시): {_lb_exc}")
+    # ── ② 재마감 변경 알림(바뀐 칸·확인 대상자) ──
+    #   ★ 직전 마감본 대비 바뀐 칸이 있으면 알림·칸·대상자를 남기고 문구를 바꾼 푸시를 보낸다.
+    #     바뀐 칸 0·첫 마감이면 None → 아래 기존 마감/재마감 푸시.
+    #   ★ 기록이 실패하면 **마감 전체를 되돌린다**(커밋하지 않고 500). 삼키고 마감만 살리면 바뀐 근무표는
+    #     나가는데 확인 대상·비교 기준이 영영 빠지고 다시 만들 길도 없다(Codex 1회차 HIGH). 테이블은
+    #     dev·운영에 미리 만들어 두었다(`migrations/2026_10_02_add_roster_change_ack.sql`).
+    from services.roster_change_notice_service import record_change_notice
+    try:
+        change_notice = record_change_notice(
+            db, group_id=target_group_id, year=schedule.year, month=schedule.month,
+            new_snapshot=snapshot, prev_snapshot=prev_snapshot,
+            publisher_id=getattr(current_user, "nurse_id", None),
+        )
+    except HTTPException:
+        raise
+    except Exception as _cn_exc:
+        _roster_logger.error("[ChangeNotice] 변경 알림 기록 실패 — 마감을 되돌림: %s", _cn_exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="변경 확인 기록을 남기지 못해 마감하지 않았습니다. 잠시 후 다시 시도해 주세요.",
+        ) from _cn_exc
     # NOTE: ShiftTransferLog 기반 전달은 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
-    db.commit()
-    nurses_in_group = (
-        db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
-    )
-    print("[DEBUG] [roster.py - publish_roster] nurses_in_group", nurses_in_group)
-    receive_emp_seq_no = [nurse.nurse_id for nurse in nurses_in_group]
+    # ★ 알림은 커밋 **전에** 발송 대기열(push_outbox)에 넣는다 — 마감 저장과 한 트랜잭션이라
+    #   저장은 됐는데 알림만 빠지는 일이 없다. 실제 발송·재시도는 서버 안 발송기가 한다.
+    # ★ 수신자 = 그 달 소속(파견 들어온 사람 포함) − 휴직·퇴사(변경 확인 대상과 같은 기준, 설계 9-28).
+    #   예전엔 nurses.group_id 전원이라 비활성·퇴사자에게도 가고 파견 온 사람은 빠졌다.
+    from services.roster_change_notice_service import confirm_targets
+    receive_emp_seq_no = confirm_targets(db, target_group_id, schedule.year, schedule.month, None)
 
-    if is_republish:
+    if change_notice:
+        from utils.utils import send_roster_change_notice_push
+        send_roster_change_notice_push(
+            year=schedule.year,
+            month=schedule.month,
+            notice=change_notice,
+            office_code=office_id,
+            sender_emp_seq_no=current_user.nurse_id,
+            sender_member_id=current_user.account_id,
+            db=db,
+        )
+    elif is_republish:
         send_roster_republish_push(
             year=schedule.year,
             month=schedule.month,
@@ -2150,6 +2322,7 @@ def publish_roster(
             office_code=office_id,
             sender_emp_seq_no=current_user.nurse_id,
             sender_member_id=current_user.account_id,
+            db=db,
         )
     else:
         send_roster_publish_push(
@@ -2159,49 +2332,60 @@ def publish_roster(
             office_code=office_id,
             sender_emp_seq_no=current_user.nurse_id,
             sender_member_id=current_user.account_id,
+            db=db,
         )
 
     # ── assignment 대상자 + 상대 그룹 관리자 알림 (S11/S12) ──
+    #   ★ 부가 알림이라 실패해도 마감은 살린다 — SAVEPOINT 로 격리(실패 시 이 부분만 되돌림).
     try:
-        from services.assignment_service import get_active_assignments_for_month
-        from utils.utils import send_assignment_roster_published_push
-        _assigns = get_active_assignments_for_month(db, target_group_id, schedule.year, schedule.month)
-        _notified: set[str] = set()
-        for _a in _assigns:
-            if _a.reason not in ("파견", "병동이동"):
-                continue
-            if _a.status == "cancelled":
-                continue
-            _is_source = (_a.source_group_id == target_group_id)
-            _other_gid = _a.target_group_id if _is_source else _a.source_group_id
-            # 수신자: 대상 간호사 + 상대 그룹 관리자
-            _recip: set[str] = {str(_a.nurse_id)}
-            if _other_gid:
-                from services.assignment_service import _get_head_nurse_ids
-                for _hn in _get_head_nurse_ids(db, _other_gid):
-                    _recip.add(_hn)
-            _new = _recip - _notified
-            if _new:
-                from services.assignment_service import _get_group_name
-                _gname = _get_group_name(db, target_group_id) or str(target_group_id)
-                send_assignment_roster_published_push(
-                    group_name=_gname,
-                    year=schedule.year,
-                    month=schedule.month,
-                    recipients=list(_new),
-                    office_code=office_id,
-                    sender_emp_seq_no=current_user.nurse_id,
-                    sender_member_id=current_user.account_id,
-                    is_source=_is_source,
-                )
-                _notified.update(_new)
+        with db.begin_nested():
+            from services.assignment_service import get_active_assignments_for_month
+            from utils.utils import send_assignment_roster_published_push
+            _assigns = get_active_assignments_for_month(db, target_group_id, schedule.year, schedule.month)
+            _notified: set[str] = set()
+            for _a in _assigns:
+                if _a.reason not in ("파견", "병동이동"):
+                    continue
+                if _a.status == "cancelled":
+                    continue
+                _is_source = (_a.source_group_id == target_group_id)
+                _other_gid = _a.target_group_id if _is_source else _a.source_group_id
+                # 수신자: 대상 간호사 + 상대 그룹 관리자
+                _recip: set[str] = {str(_a.nurse_id)}
+                if _other_gid:
+                    from services.assignment_service import _get_head_nurse_ids
+                    for _hn in _get_head_nurse_ids(db, _other_gid):
+                        _recip.add(_hn)
+                _new = _recip - _notified
+                if _new:
+                    from services.assignment_service import _get_group_name
+                    _gname = _get_group_name(db, target_group_id) or str(target_group_id)
+                    send_assignment_roster_published_push(
+                        group_name=_gname,
+                        year=schedule.year,
+                        month=schedule.month,
+                        recipients=list(_new),
+                        office_code=office_id,
+                        sender_emp_seq_no=current_user.nurse_id,
+                        sender_member_id=current_user.account_id,
+                        is_source=_is_source,
+                        db=db,
+                    )
+                    _notified.update(_new)
     except Exception as e:
         print(f"[Publish] assignment 마감 알림 실패: {e}")
+    db.commit()
 
     return {
         "message": "근무표가 성공적으로 발행되었습니다.",
         # "seq_no": issued_roster.seq_no,
         "is_first_issue": is_first_issue,
+        # 재마감으로 바뀐 칸이 있으면 변경 알림 요약(없으면 null)
+        "change_notice": {
+            k: change_notice[k] for k in (
+                "notice_id", "base_snapshot_id", "changed_cells", "affected_nurses", "added_nurses",
+                "removed_nurses", "target_count", "total_cells")
+        } if change_notice else None,
     }
 
 
@@ -2232,6 +2416,10 @@ def unpublish_roster(
         db, current_user, schedule_id,
         not_found_detail="해당 스케줄을 찾을 수 없습니다.",
     )
+    # ★ 마감과 같은 병동·달 잠금 — 마감과 겹친 철회가 반쯤 끝난 상태를 읽지 않게(재마감 변경 확인 기준).
+    from services.schedule_versioning import lock_month_publish
+    lock_month_publish(db, schedule.group_id, schedule.year, schedule.month)
+    db.refresh(schedule)
     target_group_id = schedule.group_id
 
     if schedule.status != "issued":
@@ -2286,19 +2474,112 @@ def unpublish_roster(
     }
 
 
+def _reject_issued_overwrite(db: Session, schedule: Schedule) -> None:
+    """마감본은 덮어쓰지 않는다 — 철회 후 저장하거나 [새 버전으로 저장](성남 ③ 결정 10-02).
+
+    ★ 근무표 행 잠금을 잡은 **뒤에** 부른다. 잠금 전 값은 그 사이 끝난 마감을 못 본다 —
+      화면에서 연 뒤 다른 창에서 마감하면 낡은 draft 로 보고 마감본을 덮어쓴다.
+      잠금을 기다린 뒤 다시 읽으면 먼저 커밋된 마감이 보인다.
+    """
+    db.refresh(schedule, attribute_names=["status"])
+    if str(schedule.status or "") == "issued":
+        raise HTTPException(
+            status_code=409,
+            detail="마감된 근무표는 덮어쓸 수 없습니다. 마감 철회 후 저장하거나 [새 버전으로 저장]을 이용해 주세요.",
+        )
+
+
+def _roster_payload_cells(
+    db: Session, group_id: str, year: int, month: int, roster: list,
+) -> list[tuple[Any, date, str, Optional[int]]]:
+    """화면이 보낸 근무표 전체를 저장할 칸 `(nurse_id, 날짜, 근무코드, shifts.id)` 로 바꾼다.
+
+    `/roster/save` 와 `/roster/save-as` 가 같이 쓴다 — 코드 정규화·id 검증이 갈리면
+    같은 화면에서 저장한 두 버전의 칸이 서로 다르게 박힌다.
+    """
+    # ★ office_id 는 걸지 않는다 (2026-09-01 제거). group_id 가 이미 office 를 확정하므로
+    #   중복 조건인데, **호출자의** office 를 겹쳐 걸면 대상 그룹이 다른 병원일 때
+    #   조회가 0건이 된다. 그러면 아래 valid_* 가 전부 비어 클라이언트가 보낸 정상
+    #   `schedule_ids` 가 무효 판정을 받고 **셀의 id 가 전량 NULL 로 저장된다** —
+    #   에러 없이 200 이라 조용히 망가진다(실측: 589칸 소실).
+    #   (당시엔 ADM 이 assert_caller_can_access_group 에서 office 무관하게 통과해 실제로 도달했다 —
+    #   10-06 부터 ADM 도 자기 병원만.) 그룹 접근 권한은 호출부의 `_load_schedule_for_caller` 가 본다.
+    # ★ 대표 행은 목록 조회와 같은 (sequence ASC, id ASC) **첫 행**이다
+    #   (정본 `shift_service_mssql.SHIFT_LIST_ORDER`). 정렬 없이 dict 로 접으면
+    #   중복 행 중 마지막이 이겨, 저장되는 `schedule_entries.id` 가 화면과 갈린다.
+    shifts_for_group = (
+        db.query(Shift)
+        .filter(Shift.group_id == group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
+        .all()
+    )
+    valid_shift_ids = {s.shift_id for s in shifts_for_group}
+    shift_id_to_int_id: dict = {}
+    for _s in shifts_for_group:
+        shift_id_to_int_id.setdefault(_s.shift_id, _s.id)
+    # 클라이언트가 보낸 schedule_ids 검증용.
+    # ★★ 예전엔 "그 그룹에 실재하는 shifts.id" 만 봤는데, 그러면 **다른 근무코드의 id** 도 통과한다. 그러면 한 셀에
+    #   `shift_id='D'` 인데 `id` 는 'N' 행을 가리키는 상태로 저장되고, 이력·발행본이
+    #   그걸 그대로 물려받아 "그때 무슨 근무였나" 가 영영 어긋난다.
+    #   코드별로 허용 id 집합을 만들어 **그 코드의 행인지까지** 본다.
+    #   (같은 코드의 중복 행끼리는 그대로 둔다 — 어느 쪽이 맞는지는 중복 정리에서
+    #    병원이 정할 문제이지, 저장 경로가 조용히 바꿔칠 일이 아니다.)
+    ids_by_shift_id: dict = {}
+    for _s in shifts_for_group:
+        if _s.id is not None:
+            ids_by_shift_id.setdefault(_s.shift_id, set()).add(_s.id)
+    code_by_int_id = {_s.id: _s.shift_id for _s in shifts_for_group if _s.id is not None}
+
+    def _normalize_shift_id_for_save_router(raw_shift: str) -> str:
+        if raw_shift in valid_shift_ids:
+            return raw_shift
+        upper = raw_shift.upper()
+        if upper in valid_shift_ids:
+            return upper
+        match = next(
+            (sid for sid in valid_shift_ids if sid.upper() == upper), raw_shift
+        )
+        return match
+
+    cells: list[tuple[Any, date, str, Optional[int]]] = []
+    for nurse in roster:
+        nurse_id = nurse.get("nurse_id") or nurse.get("id")  # 둘 다 체크
+        if not nurse_id:
+            continue  # nurse_id가 없으면 건너뛰기
+
+        schedule_data = nurse.get("schedule", [])
+        schedule_ids = nurse.get("schedule_ids", [])
+        for day_index, shift_id in enumerate(schedule_data):
+            if shift_id and str(shift_id).strip() and str(shift_id).strip() != '-':
+                work_date = date(year, month, day_index + 1)
+                norm_shift = _normalize_shift_id_for_save_router(str(shift_id))
+                # 기존 schedule_ids 값 우선 사용, 없으면(수동 수정 셀) shift_id로 lookup
+                int_id = schedule_ids[day_index] if day_index < len(schedule_ids) else None
+                # ★ 이 병동에 없는 옛 이름 코드(같은 id 에서 이름만 바뀐 근무)면 id 가 가리키는 행의 지금 코드로
+                #   저장한다 — 화면은 그 행으로 보여 줬다(프론트 해석). 그대로 두면 아래 검증이 id 를 버려 옛 이름만
+                #   남고, 손대지 않은 칸도 저장 한 번에 화면이 지금 코드 → 옛 이름으로 바뀐다.
+                if norm_shift not in valid_shift_ids and int_id in code_by_int_id:
+                    norm_shift = code_by_int_id[int_id]
+                # ★ 클라이언트가 보낸 값이므로 **그 그룹의 유효한 shifts.id 인지** 확인한다.
+                #   낡거나 조작된 값을 그대로 쓰면 근무표에 남을 뿐 아니라 이력에도
+                #   그대로 박혀 나중에 "그때 무슨 근무였나" 를 영원히 잘못 가리킨다.
+                #   ★ 그룹 소속만이 아니라 **이 코드의 행인지**까지 본다.
+                #     아니면 버리고 대표 행으로 되돌린다.
+                if int_id is not None and int_id not in ids_by_shift_id.get(norm_shift, ()):
+                    int_id = None
+                if int_id is None:
+                    int_id = shift_id_to_int_id.get(norm_shift)
+                cells.append((nurse_id, work_date, norm_shift, int_id))
+    return cells
+
+
 # [Roster] - 근무표 저장
 @router.post("/save")
-#   ★ 동기 def 로 바꾸지 말 것 (2026-09-01 되돌림).
-#     이 핸들러는 안이 전부 동기 SQLAlchemy 라 def 로 두면 threadpool 에서 도는데,
-#     그러면 **이벤트 루프에서 도는 다른 핸들러와 진짜 병렬로 실행된다.** 아래 N 연번
-#     재계산(`rebuild_night_cycle_from`)은 **그룹 전체** 범위라, 같은 그룹의 다른 근무표를
-#     고치는 publish/unpublish/drop 과 겹치면 서로의 낡은 상태를 읽어 공유 앵커
-#     (`NurseNightCycle`)를 덮어쓴다. 이 엔드포인트가 ScheduleEntry 를 전량 삭제 후
-#     재삽입하는 탓에, 그 중간을 읽은 쪽은 "근무표가 텅 빈" 스냅샷(0행)을 만든다.
-#     예외는 아래에서 삼켜지므로 **조용히 어긋난 채 커밋된다.**
-#     운영은 uvicorn 워커 1개(EC2 단일 프로세스, ECS 는 미사용)라 호출자 5곳이 전부
-#     async 인 동안에는 루프 하나에서 직렬화돼 이 결함에 도달하지 않는다.
-#     성능 때문에 def 로 돌리려면 **먼저** 5곳 전부에 그룹 단위 잠금을 넣어야 한다.
+#   ★ (2026-10-02) 마감본 저장을 막으면서 이 핸들러의 N 연번 재계산(그룹 전체 범위)을 없앴다.
+#     예전 주석은 그 재계산이 publish/unpublish/drop 과 병렬로 겹칠 위험 때문에 async 를 고집했는데,
+#     지금 남은 그룹 범위 재계산은 그 세 곳뿐이다(서로 겹칠 위험은 그쪽 몫).
+#     ★ 이 핸들러는 ScheduleEntry 를 전량 삭제 후 재삽입한다 — 같은 근무표 동시 저장은
+#     아래 근무표 행 잠금(updated_at flush)으로 직렬화한다.
 def save_roster(
     roster_data: dict,
     group_id: Optional[str] = None,
@@ -2341,6 +2622,7 @@ def save_roster(
     #     생략해 잠금이 안 걸린다. 저장 시각 갱신은 의미상으로도 맞다.
     schedule.updated_at = datetime.now()
     db.flush()
+    _reject_issued_overwrite(db, schedule)
 
     # ── 수정 이력용 스냅샷 ──
     #   ★ 이 엔드포인트는 근무표 **전체**를 받아 전량 교체한다. 즉 서버는 무엇이 바뀌었는지
@@ -2373,6 +2655,7 @@ def save_roster(
         #   근무표를 잃는 것은 다른 문제다). 위와 같은 방식으로 재획득한다.
         schedule.updated_at = datetime.now()
         db.flush()
+        _reject_issued_overwrite(db, schedule)
     _hist_after: dict = {}
 
     # Clear existing roster entries
@@ -2380,83 +2663,20 @@ def save_roster(
         ScheduleEntry.schedule_id == schedule.schedule_id
     ).delete()
 
-    # Save new roster entries (케이스 보존을 위해 유효 shift_id 기반 정규화)
-    #   ★ office_id 는 걸지 않는다 (2026-09-01 제거). group_id 가 이미 office 를 확정하므로
-    #     중복 조건인데, **호출자의** office 를 겹쳐 걸면 대상 그룹이 다른 병원일 때
-    #     조회가 0건이 된다. 그러면 아래 valid_* 가 전부 비어 클라이언트가 보낸 정상
-    #     `schedule_ids` 가 무효 판정을 받고 **셀의 id 가 전량 NULL 로 저장된다** —
-    #     에러 없이 200 이라 조용히 망가진다(실측: 589칸 소실).
-    #     ADM 은 assert_caller_can_access_group 에서 office 무관하게 통과하므로 실제로
-    #     도달 가능한 경로다. 그룹 접근 권한은 위 `_load_schedule_for_caller` 가 이미 본다.
-    # ★ 대표 행은 목록 조회와 같은 (sequence ASC, id ASC) **첫 행**이다
-    #   (정본 `shift_service_mssql.SHIFT_LIST_ORDER`). 정렬 없이 dict 로 접으면
-    #   중복 행 중 마지막이 이겨, 저장되는 `schedule_entries.id` 가 화면과 갈린다.
-    shifts_for_group = (
-        db.query(Shift)
-        .filter(Shift.group_id == target_group_id)
-        .order_by(Shift.sequence.asc(), Shift.id.asc())
-        .all()
-    )
-    valid_shift_ids = {s.shift_id for s in shifts_for_group}
-    shift_id_to_int_id: dict = {}
-    for _s in shifts_for_group:
-        shift_id_to_int_id.setdefault(_s.shift_id, _s.id)
-    # 클라이언트가 보낸 schedule_ids 검증용.
-    # ★★ 예전엔 "그 그룹에 실재하는 shifts.id" 만 봤는데, 그러면 **다른 근무코드의 id** 도 통과한다. 그러면 한 셀에
-    #   `shift_id='D'` 인데 `id` 는 'N' 행을 가리키는 상태로 저장되고, 이력·발행본이
-    #   그걸 그대로 물려받아 "그때 무슨 근무였나" 가 영영 어긋난다.
-    #   코드별로 허용 id 집합을 만들어 **그 코드의 행인지까지** 본다.
-    #   (같은 코드의 중복 행끼리는 그대로 둔다 — 어느 쪽이 맞는지는 중복 정리에서
-    #    병원이 정할 문제이지, 저장 경로가 조용히 바꿔칠 일이 아니다.)
-    ids_by_shift_id: dict = {}
-    for _s in shifts_for_group:
-        if _s.id is not None:
-            ids_by_shift_id.setdefault(_s.shift_id, set()).add(_s.id)
-
-    def _normalize_shift_id_for_save_router(raw_shift: str) -> str:
-        if raw_shift in valid_shift_ids:
-            return raw_shift
-        upper = raw_shift.upper()
-        if upper in valid_shift_ids:
-            return upper
-        match = next(
-            (sid for sid in valid_shift_ids if sid.upper() == upper), raw_shift
-        )
-        return match
-
-    for nurse in roster:
-        nurse_id = nurse.get("nurse_id") or nurse.get("id")  # 둘 다 체크
-        if not nurse_id:
-            continue  # nurse_id가 없으면 건너뛰기
-
-        schedule_data = nurse.get("schedule", [])
-        schedule_ids = nurse.get("schedule_ids", [])
-        for day_index, shift_id in enumerate(schedule_data):
-            if shift_id and str(shift_id).strip() and str(shift_id).strip() != '-':
-                work_date = date(year, month, day_index + 1)
-                norm_shift = _normalize_shift_id_for_save_router(str(shift_id))
-                # 기존 schedule_ids 값 우선 사용, 없으면(수동 수정 셀) shift_id로 lookup
-                int_id = schedule_ids[day_index] if day_index < len(schedule_ids) else None
-                # ★ 클라이언트가 보낸 값이므로 **그 그룹의 유효한 shifts.id 인지** 확인한다.
-                #   낡거나 조작된 값을 그대로 쓰면 근무표에 남을 뿐 아니라 이력에도
-                #   그대로 박혀 나중에 "그때 무슨 근무였나" 를 영원히 잘못 가리킨다.
-                #   ★ 그룹 소속만이 아니라 **이 코드의 행인지**까지 본다.
-                #     아니면 버리고 대표 행으로 되돌린다.
-                if int_id is not None and int_id not in ids_by_shift_id.get(norm_shift, ()):
-                    int_id = None
-                if int_id is None:
-                    int_id = shift_id_to_int_id.get(norm_shift)
-                entry = ScheduleEntry(
-                    entry_id=str(uuid.uuid4().hex)[:16],
-                    schedule_id=schedule.schedule_id,
-                    nurse_id=nurse_id,
-                    work_date=work_date,
-                    shift_id=norm_shift,
-                    id=int_id,
-                )
-                db.add(entry)
-                if _hist_before is not None:
-                    _hist_after[(str(nurse_id), work_date)] = (norm_shift, int_id)
+    # Save new roster entries (케이스 보존을 위해 유효 shift_id 기반 정규화 — `_roster_payload_cells`)
+    for nurse_id, work_date, norm_shift, int_id in _roster_payload_cells(
+        db, target_group_id, year, month, roster,
+    ):
+        db.add(ScheduleEntry(
+            entry_id=str(uuid.uuid4().hex)[:16],
+            schedule_id=schedule.schedule_id,
+            nurse_id=nurse_id,
+            work_date=work_date,
+            shift_id=norm_shift,
+            id=int_id,
+        ))
+        if _hist_before is not None:
+            _hist_after[(str(nurse_id), work_date)] = (norm_shift, int_id)
 
     # ── 수정 이력 적재 ──
     #   ★ 같은 트랜잭션에 넣는다. 따로 커밋하면 근무표는 바뀌었는데 이력이 없거나
@@ -2486,37 +2706,219 @@ def save_roster(
             # savepoint 만 롤백됐고 바깥 트랜잭션(근무표 저장)은 살아 있다.
             print(f"[ScheduleHistory] 적재 실패(저장은 계속): {_hist_exc}")
 
-    # ── N 연번 앵커 재계산 (마감본이 수정된 경우만) ──
-    #   ★ 이 엔드포인트는 ScheduleEntry 를 전량 삭제 후 재삽입한다. 마감(issued) 근무표를
-    #     고치면 그 달 N 배치가 바뀌므로 앵커도 다시 잡아야 하고, 앵커는 전월을 이어받으니
-    #     **이후 달까지 연쇄로** 재계산해야 정합이 유지된다.
-    #   ★ draft 저장은 대상이 아니다 — 확정이 아닌 것을 앵커에 반영하면 안 된다.
-    if str(getattr(schedule, "status", "") or "") == "issued":
-        # ★★ flush 가 반드시 먼저다 (autoflush=False 세션).
-        #   위 `query(...).delete()` 는 bulk 라 **즉시 DB 에서 지워지지만**,
-        #   재삽입한 `db.add()` 는 flush 전까지 세션에만 있다. 그 상태로 재계산하면
-        #   compute_snapshot 이 "근무표가 텅 빈" DB 를 읽어 조용히 0행을 돌려준다
-        #   (실측: 훅은 정상 진입·무예외인데 앵커가 안 생겼다).
-        #   ★ 훅 **밖에서** 한다 — 여기 실패는 근무표 저장 자체의 오류다.
-        db.flush()
-        try:
-            with db.begin_nested():
-                from services.leave.night_cycle_service import rebuild_night_cycle_from
-                rebuild_night_cycle_from(db, target_group_id, schedule.year, schedule.month)
-        except Exception as _nc_exc:
-            print(f"[NightCycle] 마감본 수정 후 재계산 실패(무시): {_nc_exc}")
-        # 마감본의 셀이 바뀌었으면 연차 사용량도 바뀐다 — 같은 자리에서 다시 센다.
-        #   ★ 위 flush 가 선행돼야 한다. bulk delete 는 즉시 반영되지만 재삽입한
-        #     `db.add()` 는 flush 전까지 세션에만 있어, 안 하면 텅 빈 근무표를 읽는다.
-        try:
-            # ★★ savepoint — 위 발행 경로와 같은 이유.
-            with db.begin_nested():
-                from services.leave.annual_leave_service import rebuild_leave_balance_from
-                rebuild_leave_balance_from(db, target_group_id, schedule.year, schedule.month)
-        except Exception as _lb_exc:
-            print(f"[LeaveBalance] 마감본 수정 후 재계산 실패(무시): {_lb_exc}")
+    # ★ 마감본은 여기까지 오지 않는다(`_reject_issued_overwrite`). 예전엔 마감본 저장 뒤 N 연번·
+    #   연차 장부를 다시 계산했는데, 그 재계산은 마감·철회·삭제가 각각 한다.
     db.commit()
     return {"message": "Roster saved successfully"}
+
+
+#: 근무표 이름 컬럼 길이(`schedules.name nvarchar(50)`) — 넘기면 저장이 통째로 실패한다.
+_SCHEDULE_NAME_MAX = 50
+
+
+def _save_as_name(requested: Optional[str], source: Schedule) -> str:
+    """새 버전 이름 — 비우면 '원본이름 수정본'. 컬럼 길이를 넘기지 않게 자른다.
+
+    ★ 기본 이름은 **원본 이름 쪽을** 잘라 ' 수정본' 꼬리를 지킨다 — 끝을 자르면 '…가 수' 처럼
+      무엇인지 모를 이름이 된다(48자 원본 실측).
+    """
+    name = (requested or "").strip()
+    if name:
+        return name[:_SCHEDULE_NAME_MAX]
+    suffix = " 수정본"
+    base = (source.name or f"{source.month}월 근무표 VER{source.version}").strip()
+    return base[:_SCHEDULE_NAME_MAX - len(suffix)] + suffix
+
+
+def _new_version_row(db: Session, source: Schedule, req: SaveAsRequest, current_user: UserSchema) -> Schedule:
+    """원본과 같은 병동·달·설정의 새 draft 버전 행(번호는 그룹·달 잠금 뒤 최대+1)."""
+    new_schedule = Schedule(
+        schedule_id=str(uuid.uuid4().hex)[:12],
+        office_id=source.office_id,
+        group_id=source.group_id,
+        year=source.year,
+        month=source.month,
+        version=_get_next_version(db, source.group_id, source.year, source.month),
+        config_id=source.config_id,
+        created_by=current_user.account_id,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        status="draft",
+        dropped=False,
+        name=_save_as_name(req.name, source),
+        memo=req.memo if req.memo is not None else source.memo,
+    )
+    db.add(new_schedule)
+    return new_schedule
+
+
+def _record_save_as(
+    db: Session, source: Schedule, new_schedule: Schedule, before: dict, after: dict,
+    current_user: UserSchema,
+):
+    """원본 대비 바뀐 칸을 새 버전의 이력(source='save_as')으로, 요약을 출처로 남긴다.
+
+    ★ 이력은 `/roster/compare` 의 바뀐 칸과 **같은 칸만** 넘긴다(근무코드 기준 · 양쪽 명단에 다 있는
+      간호사). `log_manual_changes` 는 (코드, shifts.id) 쌍으로 비교해서, 원본 칸의 id 가 비었거나
+      낡았으면 화면이 대표 id 로 채운 그대로인 칸까지 "D→D 수정" 으로 남는다. 명단에서 통째로
+      빠지거나 생긴 사람은 칸 수십 개가 이력에 쌓이므로 출처의 명단 변경 수로만 남긴다.
+    ★ 새 버전이라 꺾을 직전 이력이 없다 — `reset_latest=False` 로 쓸모없는 UPDATE 를 건너뛴다.
+    """
+    from services.schedule_compare_service import diff_cell_maps
+    from services.schedule_history_service import log_manual_changes
+
+    diff = diff_cell_maps(before, after)
+    code_changed = {(n, d) for n, d, _, _ in diff.changed}
+    log_manual_changes(
+        db, schedule_id=new_schedule.schedule_id, group_id=source.group_id,
+        before={c: before[c] for c in code_changed if c in before},
+        after={c: after[c] for c in code_changed if c in after},
+        changed_by=getattr(current_user, "nurse_id", None),
+        source="save_as", reset_latest=False,
+    )
+    db.add(ScheduleLineage(
+        schedule_id=new_schedule.schedule_id,
+        source_schedule_id=source.schedule_id,
+        source_version=source.version,
+        kind="save_as",
+        changed_cells=len(diff.changed),
+        added_nurses=len(diff.added_nurses),
+        removed_nurses=len(diff.removed_nurses),
+        created_by=current_user.account_id,
+        created_at=datetime.now(),
+    ))
+    return diff
+
+
+# [Roster] - 새 버전으로 저장
+@router.post("/save-as")
+def save_roster_as_new_version(
+    req: SaveAsRequest,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """[새 버전으로 저장] — 편집한 근무표를 원본은 그대로 두고 새 버전(draft)으로 저장한다(성남 ③).
+
+    ★ 새 버전 생성과 칸 저장을 **한 트랜잭션**으로 한다. 복사 후 저장을 따로 부르면 중간에
+      실패했을 때 반쪽 버전이 남는다.
+    ★ 원본이 마감본이어도 된다 — 철회 없이 다음 수정본을 준비할 수 있다(10-02 결정).
+    ★ 원본 대비 바뀐 칸은 새 버전의 수정 이력(`source='save_as'`)으로, 요약은
+      `schedule_lineage` 로 남긴다. 둘 다 같은 커밋이다 — 따로 커밋하면 출처 없는 버전이 생긴다.
+    ★ 비교 기준은 **저장 시점 원본의 DB 상태**다. 편집하는 동안 다른 사람이 원본(draft)을 저장했으면
+      그 수정이 빠진 것까지 바뀐 칸으로 잡힌다. 화면이 가리는 칸(파견 나간 날)이 빠지는 것도
+      `/roster/save` 의 전량 교체와 같은 성질이다.
+    응답: `{new_schedule_id, new_version, new_name, status, source_schedule_id, source_version,
+    changed_cells, added_nurses, removed_nurses, entries_saved}` — 바뀐 칸·명단 변경은
+    `/roster/compare` 의 summary 와 같은 기준.
+    """
+    if not (
+        caller_is_head_nurse(db, current_user)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    if not req.roster:
+        raise HTTPException(status_code=400, detail="저장할 근무표(roster)가 비어 있습니다.")
+    source = _load_schedule_for_caller(
+        db, current_user, req.source_schedule_id,
+        not_found_detail="원본 근무표를 찾을 수 없습니다.",
+    )
+    if (int(req.year), int(req.month)) != (int(source.year), int(source.month)):
+        raise HTTPException(status_code=400, detail="원본 근무표와 같은 연/월로만 저장할 수 있습니다.")
+
+    # ★ 원본 행을 먼저 잠근다(UPDLOCK) — 원본 칸을 읽은 직후 다른 `/roster/save` 가 원본을 바꾸고 커밋하면,
+    #   출처의 바뀐 칸 수·save_as 이력은 옛 원본 기준인데 이후 `/roster/compare` 는 새 원본 기준이 된다
+    #   (Codex 1회차 MEDIUM). `/roster/save` 는 원본 행을 갱신(flush)해 잠그므로 둘이 차례로 선다.
+    db.query(Schedule.schedule_id).with_hint(Schedule, "WITH (UPDLOCK, ROWLOCK)", "mssql").filter(
+        Schedule.schedule_id == source.schedule_id).one()
+    # 잠금을 기다리는 사이 원본이 삭제됐을 수 있다 — 다시 읽어 확인한다(Codex 11회차).
+    db.refresh(source)
+    if source.dropped:
+        raise HTTPException(status_code=404, detail="원본 근무표를 찾을 수 없습니다.")
+    # ★ 원본 읽기·칸 변환을 먼저 끝내고 버전 번호(그룹·달 잠금)는 마지막에 잡는다 — 잠금을 쥔 채
+    #   원본 읽기에서 기다리면 같은 달의 복사·생성까지 줄줄이 기다린다.
+    # 화면에 보이는 칸으로 센다(간호사 행 있는 사람만 · 코드는 id 기준) — `/roster/compare`·버전 변경 조회와
+    # 같은 기준(출처 요약 숫자가 같게).
+    from services.schedule_compare_service import schedule_cells
+    before = schedule_cells(db, source)
+    cells = _roster_payload_cells(db, source.group_id, source.year, source.month, req.roster)
+    new_schedule = _new_version_row(db, source, req, current_user)
+    after: dict = {}
+    for nurse_id, work_date, code, int_id in cells:
+        db.add(ScheduleEntry(
+            entry_id=str(uuid.uuid4().hex)[:16], schedule_id=new_schedule.schedule_id,
+            nurse_id=nurse_id, work_date=work_date, shift_id=code, id=int_id,
+        ))
+        after[(str(nurse_id), work_date)] = (code, int_id)
+    db.flush()
+    diff = _record_save_as(db, source, new_schedule, before, after, current_user)
+    db.commit()
+    return {
+        "message": "새 버전으로 저장했습니다.",
+        "new_schedule_id": new_schedule.schedule_id,
+        "new_version": new_schedule.version,
+        "new_name": new_schedule.name,
+        "status": "draft",
+        "source_schedule_id": source.schedule_id,
+        "source_version": source.version,
+        "changed_cells": len(diff.changed),
+        "added_nurses": len(diff.added_nurses),
+        "removed_nurses": len(diff.removed_nurses),
+        "entries_saved": len(after),
+    }
+
+
+# [Roster] - 두 버전 비교
+@router.get("/compare")
+def compare_schedule_versions(
+    from_schedule_id: str = Query(..., alias="from", description="기준(이전) 버전 schedule_id"),
+    to_schedule_id: str = Query(..., alias="to", description="비교(이후) 버전 schedule_id"),
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """두 버전의 **현재 칸**을 비교한다 — 다른 칸·영향 인원·명단 변경·간호사별 코드 개수(성남 ③).
+
+    ★ 같은 병동·같은 달끼리만. 날짜 칸이 기준이라 다른 달이면 전부 다르게 나온다.
+    ★ 관리자 전용 — 버전(초안) 칸은 근무표 열기(`/roster/schedule/{id}`)와 같은 기준으로 막는다.
+    응답 모양은 `services.schedule_compare_service.compare_schedules`.
+    """
+    if not (
+        caller_is_head_nurse(db, current_user)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    src = _load_schedule_for_caller(db, current_user, from_schedule_id,
+                                    not_found_detail="비교할 근무표(from)를 찾을 수 없습니다.")
+    dst = _load_schedule_for_caller(db, current_user, to_schedule_id,
+                                    not_found_detail="비교할 근무표(to)를 찾을 수 없습니다.")
+    if (src.group_id, int(src.year), int(src.month)) != (dst.group_id, int(dst.year), int(dst.month)):
+        raise HTTPException(status_code=400, detail="같은 병동·같은 달 근무표끼리만 비교할 수 있습니다.")
+    from services.schedule_compare_service import compare_schedules
+    return compare_schedules(db, src, dst)
+
+
+# [Roster] - 이 버전이 기준 대비 무엇이 바뀌었는지
+@router.get("/schedule/{schedule_id}/changes")
+def get_schedule_changes(
+    schedule_id: str,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """이 버전의 **기준 대비** 바뀐 칸(성남 ③ — 사용자 결정 10-06).
+
+    기준 = 지금 마감 중인 버전이면 그 달 직전 마감본 → 이 버전의 최근 마감본(마감 → 철회 → 수정한 경우)
+    → 없으면 [새 버전으로 저장]의 출처 버전 → 없으면 없음.
+    응답 칸 모양은 ② 변경 알림과 같다. 자세한 규칙은 `services.schedule_compare_service.schedule_changes`.
+    ★ 관리자 전용 — 초안 버전 칸을 보므로 `/roster/compare`·수정 이력과 같은 기준으로 막는다.
+    """
+    if not (
+        caller_is_head_nurse(db, current_user)
+        or getattr(current_user, "is_master_admin", False)
+    ):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    schedule = _load_schedule_for_caller(db, current_user, schedule_id,
+                                         not_found_detail="근무표를 찾을 수 없습니다.")
+    from services.schedule_compare_service import schedule_changes
+    return schedule_changes(db, schedule)
 
 
 # [Roster] - 근무표 수정 이력
@@ -3131,7 +3533,13 @@ def _get_target_group_id(
 
 
 def _get_next_version(db: Session, group_id: str, year: int, month: int) -> int:
-    """같은 연/월 내 최대 version + 1"""
+    """같은 연/월 내 최대 version + 1.
+
+    ★ 그룹·달 잠금을 잡은 뒤 읽는다 — 동시에 두 번 만들면 같은 VER 가 둘 생긴다
+      (`services.schedule_versioning`). 잠금은 이 트랜잭션이 끝날 때까지 유지된다.
+    """
+    from services.schedule_versioning import lock_version_numbering
+    lock_version_numbering(db, group_id, year, month)
     max_ver = (
         db.query(func.max(Schedule.version))
         .filter(
@@ -3902,11 +4310,18 @@ def get_shift_transfers(
     month: int,
     group_id: Optional[str] = None,
     nurse_id: Optional[str] = None,
-    user: User = Depends(get_current_user_from_cookie),
+    user: User = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
-    """전달 이력 조회 (운영자: group_id / 당사자: nurse_id)"""
-    _group = group_id or resolve_home_group_id(db, user)
+    """전달 이력 조회 (운영자: group_id / 당사자: nurse_id)
+
+    ★권한: 간호사를 지정하면 그 간호사를 볼 수 있어야 하고(``can_caller_access_nurse``),
+      그룹은 접근 가능한 그룹으로만 해석한다(``resolve_effective_group``). 예전엔 그룹이
+      비면 **필터 없이 전 병원 이력**이 나갔다.
+    """
+    if nurse_id and not can_caller_access_nurse(db, user, nurse_id):
+        raise HTTPException(status_code=403, detail="해당 간호사에 대한 접근 권한이 없습니다.")
+    _group = resolve_effective_group(db, user, group_id)
     _nurse = nurse_id or None
     logs = get_transfer_logs(db, year=year, month=month, group_id=_group, nurse_id=_nurse)
     return {"transfers": logs}
@@ -3917,8 +4332,13 @@ def get_transferred_wanted_api(
     nurse_id: str,
     year: int,
     month: int,
-    user: User = Depends(get_current_user_from_cookie),
+    user: User = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
-    """파견/병동이동 간호사의 원티드를 target group shift로 변환 조회"""
+    """파견/병동이동 간호사의 원티드를 target group shift로 변환 조회
+
+    ★권한: 그 간호사를 볼 수 있는 사람만(원티드 사유·수간호사 메모가 실린다).
+    """
+    if not can_caller_access_nurse(db, user, nurse_id):
+        raise HTTPException(status_code=403, detail="해당 간호사에 대한 접근 권한이 없습니다.")
     return get_transferred_wanted(db, nurse_id=nurse_id, year=year, month=month)

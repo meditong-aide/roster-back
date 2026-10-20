@@ -43,11 +43,29 @@ def _needed_max_nig(need: int, caps: List[int]) -> Optional[int]:
     caps = [int(c) for c in caps if c is not None and int(c) >= 0]
     if need is None or need <= 0 or not caps:
         return None
-    max_cap = max(caps)
+    # ★ 하드락 #6(월 나이트 최대 15)을 넘는 값은 제안하지 않는다 — 15 로도 못 채우면 None(증원 필요).
+    from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH
+
+    max_cap = min(max(caps), HARD_MAX_NIGHTS_PER_MONTH)
     for m in range(1, max_cap + 1):
         if sum(min(c, m) for c in caps) >= need:
             return m
     return None
+
+
+def _night_cap_ceiling(row: dict[str, Any]) -> int | None:
+    """병동 공통 월 야간 상한을 올렸을 때 이 사람이 낼 수 있는 야간의 한계.
+
+    ★ N전담은 개인 한도(계약 횟수)에서 멈춘다 — 해결카드가 그 한도를 바꾸지 않으므로(2026-10-02)
+      공통 상한을 아무리 올려도 거기까지다. 근무가능일로 세면 목표값이 작게 나와 카드를 눌러도
+      다시 INFEASIBLE 이 난다(OMC 리뷰 2026-10-02). 그 외는 기존대로 근무가능일.
+    """
+    if row.get("is_night_dedicated"):
+        axis = row.get("cap_by_axis") or {}
+        fixed = [int(v) for k, v in axis.items() if k != "config" and v is not None]
+        if fixed:
+            return min(fixed)
+    return row.get("capacity_days")
 
 
 def _size_from_cause_details(
@@ -63,7 +81,7 @@ def _size_from_cause_details(
     if config_key == "max_nig_per_month":
         need = details.get("n_required") or details.get("monthly_N_need")
         caps = [
-            c.get("capacity_days")
+            _night_cap_ceiling(c)
             for c in (details.get("night_capable_nurses") or [])
             if isinstance(c, dict)
         ]
@@ -73,7 +91,7 @@ def _size_from_cause_details(
             return {
                 "config_key": config_key, "target_value": None, "insufficient": True,
                 "reason_ko": (
-                    f"개인 월 야간 상한을 최대로 올려도 월 요구 {need} 를 채울 수 없습니다 "
+                    f"월 야간 상한을 최대(1인 15회 — 하드락)로 올려도 월 요구 {need} 를 채울 수 없습니다 "
                     f"(야간 가능 {n_capable}명). 야간 가능 인원 증원이 필요합니다."
                 ),
             }

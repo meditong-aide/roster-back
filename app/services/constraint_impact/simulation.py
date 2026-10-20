@@ -169,34 +169,95 @@ def _evaluate_team_min(snapshot: SemanticsSnapshot, atoms_by_key: dict[tuple[int
     return evaluations
 
 
+def _grade_min_members(grade: int, grade_values: list[int], by_grade: dict[int, list[int]]) -> tuple[list[int], list[int]]:
+    """grade 최소 요구를 채우는 인원(nurse_index)과 그 등급 목록 — 엔진 cascade off0 와 같은 범위.
+
+    엔진(`grade_constraints._add_minimum_constraints`)은 요구 등급 g 를 'g 이하(더 시니어) 누적'
+    으로 센다. 정의역에 g 이상 등급이 없거나 cascade 가 꺼져 있으면 g 자체만 센다(엔진 동일).
+    """
+    from services.constraints import grade_constraints as _gc
+
+    ceilings = [c for c in grade_values if c >= grade] if _gc._GRADE_CASCADE_ENABLED else []
+    counted = [j for j in grade_values if j <= ceilings[0]] if ceilings else [grade]
+    return [n for j in counted for n in by_grade.get(j, [])], counted
+
+
 def _evaluate_grade(snapshot: SemanticsSnapshot, atoms_by_key: dict[tuple[int, int], AssignmentAtom], changed_days: set[int]) -> list[ConstraintEvaluation]:
+    """grade 최소 미달 — 엔진과 같은 목표·인원으로 세고, 병원이 넣은 등급만 보고한다.
+
+    - 목표: 엔진 `_compute_targets`(동적 축소·리더 보장·필요인원 상한) 그대로.
+    - 인원: 요구 등급 이하 누적(`_grade_min_members`). 정확히 그 등급만 세면 '고년차 1명' 을
+      두 등급에 나눠 둔 병동에서 다른 등급 고년차가 선 근무까지 미달로 잡힌다.
+    - 보고: `configured_constraints_json`(병원 원본)에 값이 있는 (시프트, 등급)만. 엔진이 채우는
+      1등급 기본 floor(`_ensure_grade1_default`)는 병원 요구가 아니다. 원본 키가 없는 설정
+      (구 스냅샷·직접 조립한 config)은 전부 병원 값으로 본다.
+    (성남 61병동-RN 2026-11: 알림 66건 = floor 1등급 27 + 2등급만 센 39 · 고년차 빈 근무는 1)
+    """
+    from types import SimpleNamespace
+
+    from services.constraints import grade_constraints as _gc
+
     strategy = snapshot.config_payload.get("grade_strategy")
     grade_cfg = snapshot.config_payload.get("grade_config") or {}
-    constraints_map = (grade_cfg or {}).get("constraints") or (grade_cfg or {}).get("constraints_json") or {}
-    if strategy not in {"GRADE", "COMBINED"} or not constraints_map:
+    if strategy not in {"GRADE", "COMBINED"} or not isinstance(grade_cfg, dict):
         return []
-    evals: list[ConstraintEvaluation] = []
-    nurses_by_grade: dict[int, set[int]] = {}
+    constraints_map, max_map, scaling = _gc._parse_grade_config(grade_cfg)
+    if not isinstance(constraints_map, dict) or not constraints_map:
+        return []
+    # 엔진과 같은 cascade 이양(인원 0 인 등급 → 다음 등급). 보고 대상 원본에도 똑같이 적용한다.
+    pop = SimpleNamespace(nurses=[SimpleNamespace(grade=n.grade) for n in snapshot.nurses])
+    constraints_map = _gc._cascade_constraints_to_existing_grades(pop, constraints_map)
+    grade_values = _gc._extract_grade_values_from_constraints(constraints_map, max_map)
+    if not grade_values:
+        return []
+    # 보고 대상 {원본 키: 병원이 양수로 넣은 등급}. 엔진은 'd'·'D' 처럼 대소문자만 다른 키를
+    #   각각 적용하므로 키를 합치지 않고 같은 키끼리 짝짓는다 — 합치면 한쪽 키의 병원 값이 다른
+    #   키에 붙은 floor 까지 보고 대상으로 만들어 같은 칸이 두 번 잡힌다.
+    reported_by_key: dict[str, set[int]] | None = None
+    configured = grade_cfg.get("configured_constraints_json")
+    if isinstance(configured, dict):
+        reported_by_key = {
+            k: {g for g, c in _gc._parse_base_min(v, grade_values).items() if c > 0}
+            for k, v in _gc._cascade_constraints_to_existing_grades(pop, configured).items()
+        }
+    by_grade: dict[int, list[int]] = {g: [] for g in grade_values}
     for nurse in snapshot.nurses:
-        if nurse.grade is not None:
-            nurses_by_grade.setdefault(int(nurse.grade), set()).add(nurse.nurse_index)
+        if nurse.grade in by_grade:
+            by_grade[nurse.grade].append(nurse.nurse_index)
+    evals: list[ConstraintEvaluation] = []
     for d in sorted(changed_days):
         req_map, _ = _requirements_for_day(snapshot, d)
-        for shift_code, grade_map in constraints_map.items():
+        for shift_key, base in constraints_map.items():
+            shift_code = str(shift_key or "").upper()
             if shift_code not in {"D", "E", "N", "M"}:
                 continue
             need = int((req_map or {}).get(shift_code, 0) or 0)
-            for grade_key, ratio_or_val in (grade_map or {}).items():
-                try:
-                    grade = int(grade_key)
-                except Exception:
+            if need <= 0:
+                continue
+            base_min = _gc._parse_base_min(base, grade_values)
+            if sum(base_min.values()) <= 0:
+                continue
+            target = _gc._compute_targets(
+                base_min=base_min,
+                req=need,
+                grade_values=grade_values,
+                use_dynamic_scaling=scaling["use_dynamic_scaling"],
+                min_ratio_floor=scaling["min_ratio_floor"],
+                min_leader_keep=scaling["min_leader_keep"],
+                by_grade=by_grade,
+            )
+            reported = None if reported_by_key is None else reported_by_key.get(shift_key, set())
+            for grade, t in target.items():
+                t = int(t)
+                if t <= 0 or (reported is not None and grade not in reported):
                     continue
-                target = int(ratio_or_val or 0)
-                if target <= 0 or need <= 0:
+                members, counted = _grade_min_members(grade, grade_values, by_grade)
+                if not members and _gc._GRADE_CASCADE_ENABLED:
+                    # cascade 는 대상 인원이 없으면 제약을 걸지 않는다(레거시 경로는 0>=t 로 건다)
                     continue
-                assigned = sum(1 for n in nurses_by_grade.get(grade, set()) if (n, d) in atoms_by_key and atoms_by_key[(n, d)].shift_code == shift_code)
-                slack = assigned - target
-                evals.append(ConstraintEvaluation(node_id=f"grade_min:{grade}:{d}:{shift_code}", valid=slack >= 0, slack=slack, pressure=max(0, -slack), details={"day": d + 1, "grade": grade, "shift": shift_code, "need": target, "assigned": assigned}))
+                assigned = sum(1 for n in members if (n, d) in atoms_by_key and atoms_by_key[(n, d)].shift_code == shift_code)
+                slack = assigned - t
+                evals.append(ConstraintEvaluation(node_id=f"grade_min:{grade}:{d}:{shift_code}", valid=slack >= 0, slack=slack, pressure=max(0, -slack), details={"day": d + 1, "grade": grade, "shift": shift_code, "need": t, "assigned": assigned, "counted_grades": counted}))
     return evals
 
 

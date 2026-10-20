@@ -571,10 +571,49 @@ class ScheduleEntry(Base):
     id = Column(INTEGER, nullable=True)  # shifts.id (stable key)
 
 
+class PushOutbox(Base):
+    """앱 알림 발송 대기열 — 업무 저장과 같은 트랜잭션에 '보낼 알림'을 남기고 발송기가 따로 보낸다.
+
+    ★ 예전엔 커밋 뒤 그룹웨어에 바로 썼다. 그 사이 프로세스가 죽거나 그룹웨어가 잠깐 느리면
+      알림이 영영 빠졌고 다시 보낼 근거도 없었다. 이제 이 행이 남으므로 재시도할 수 있다.
+    ★ 그룹웨어 쓰기와 'sent' 표시는 한 트랜잭션이다(`push_outbox_service._deliver`).
+    상태: pending → sending → sent | skipped(운영 외) | failed(재시도 소진·24시간 경과)
+          | cancelled(guard 불충족).
+    DDL: `migrations/2026_10_02_add_push_outbox.sql`.
+    """
+
+    __tablename__ = "push_outbox"
+
+    id = Column(BIGINT, primary_key=True, autoincrement=True)
+    source = Column(VARCHAR(50), nullable=False)
+    push_code = Column(VARCHAR(10), nullable=False)
+    push_sub_code = Column(VARCHAR(10), nullable=False)
+    office_code = Column(VARCHAR(50), nullable=False)
+    sender_emp_seq_no = Column(VARCHAR(50), nullable=False)
+    sender_member_id = Column(VARCHAR(100), nullable=False)
+    recipients = Column(TEXT, nullable=False)        # 콤마 구분 사번(varchar(max))
+    recipient_count = Column(INTEGER, nullable=False)
+    message = Column(NVARCHAR(1000), nullable=False)
+    org_message = Column(NVARCHAR(2000), nullable=False)
+    link_url = Column(NVARCHAR(500), nullable=False, default="")
+    link_code = Column(NVARCHAR(100), nullable=False, default="")
+    guard = Column(VARCHAR(200), nullable=True)
+    status = Column(NVARCHAR(20), nullable=False, default="pending")  # nvarchar 인 이유는 DDL 주석
+    attempts = Column(INTEGER, nullable=False, default=0)
+    next_attempt_at = Column(DATETIME, nullable=False)
+    claimed_at = Column(DATETIME, nullable=True)
+    master_idx = Column(BIGINT, nullable=True)
+    device_count = Column(INTEGER, nullable=True)
+    last_error = Column(NVARCHAR(1000), nullable=True)
+    created_at = Column(DATETIME, nullable=False)
+    sent_at = Column(DATETIME, nullable=True)
+
+
 class ScheduleEntryLog(Base):
     """근무표 셀 **수동 수정** 이력. `schedule_entries` 는 현재 상태만 유지하고 이력은 여기 쌓인다.
 
-    ★ 대상은 `/roster/save`(사람이 화면에서 고친 것)뿐이다. 생성·재생성은 남기지 않는다 —
+    ★ 대상은 사람이 화면에서 고친 것 — `/roster/save`(source='manual')와 `/roster/save-as`
+      (source='save_as', 원본 버전 대비 바뀐 칸)뿐이다. 생성·재생성은 남기지 않는다 —
       한 번에 수백 행이 바뀌어 로그가 금세 커지고, 사용자가 보려는 "내가 고친 이력"과 성격이 다르다.
       나중에 방침이 바뀌어도 `source` 로 구분만 하면 되도록 컬럼은 미리 뒀다.
 
@@ -605,13 +644,53 @@ class ScheduleEntryLog(Base):
 
     group_id = Column(VARCHAR(50), nullable=True)       # (group_id, shifts.id) 라야 shift 가 유일
     action = Column(VARCHAR(10), nullable=False)        # 'update' | 'insert' | 'delete'
-    source = Column(VARCHAR(10), nullable=False)        # 'manual' | 'generate'
+    source = Column(VARCHAR(10), nullable=False)        # 'manual' | 'save_as' ('generate' 는 예약)
     changed_by = Column(VARCHAR(50), nullable=True)
     changed_at = Column(DATETIME, nullable=False)
     #: 그 셀의 **마지막 변경 기록**인가. 셀당 1행만 True 여야 한다.
     #: ★ "현재값" 과 다르다 — 재생성되면 근무표는 바뀌지만 이 로그는 그대로다.
     #:   현재값의 정본은 언제나 `schedule_entries` 다.
     is_latest = Column(BOOLEAN, nullable=False, default=True)
+
+
+class ScheduleLineage(Base):
+    """근무표 버전 출처 — [새 버전으로 저장]으로 만든 버전 1개 = 1행.
+
+    ★ `schedules` 에 컬럼을 더하지 않고 따로 둔다. 모델 컬럼이면 모든 근무표 조회가 읽어서
+      DDL 없이 배포되면 근무표 화면 전체가 멈춘다(`migrations/2026_10_02_add_schedule_lineage.sql`).
+    ★ 원본 대비 바뀐 칸 자체는 `schedule_entry_log`(source='save_as')에 있다. 여기는 요약만.
+    """
+
+    __tablename__ = "schedule_lineage"
+
+    schedule_id = Column(VARCHAR(50), primary_key=True)        # 새로 만든 버전
+    source_schedule_id = Column(VARCHAR(50), nullable=False)   # 원본 버전
+    source_version = Column(BIGINT, nullable=True)             # 저장 시점 원본 VER
+    kind = Column(VARCHAR(10), nullable=False)                 # 'save_as'
+    # 원본 대비 요약 — `/roster/compare` 의 summary 와 같은 기준(근무코드·명단 분리)
+    changed_cells = Column(INTEGER, nullable=False)            # 양쪽 명단에 다 있는 간호사의 바뀐 칸 수
+    added_nurses = Column(INTEGER, nullable=False)             # 새 버전에만 있는 간호사 수
+    removed_nurses = Column(INTEGER, nullable=False)           # 원본에만 있던 간호사 수
+    created_by = Column(VARCHAR(50), nullable=True)            # 저장한 사람 account_id(`schedules.created_by` 와 같은 기준)
+    created_at = Column(DATETIME, nullable=False)
+
+
+class RosterChangeAck(Base):
+    """재마감 변경 확인 — 확인 대상자 1명 = 1행(성남 ②). `migrations/2026_10_02_add_roster_change_ack.sql`.
+
+    ★ 알림 자체는 따로 두지 않는다. 알림 = 바뀐 칸이 있는 재마감의 **마감 스냅샷**이다
+      (`issued_roster_snapshot.meta_json.change` 에 비교 기준·요약). 바뀐 칸은 두 스냅샷을 비교해
+      그때그때 계산한다 — 스냅샷이 이미 남아 있어 같은 정보를 한 번 더 저장할 이유가 없다.
+    ★ 재마감 시점에 대상자 행을 미리 만든다 — "N명 중 M명" 과 미확인자 목록이 바로 나온다.
+    """
+
+    __tablename__ = "roster_change_ack"
+
+    snapshot_id = Column(INTEGER, primary_key=True)      # issued_roster_snapshot.snapshot_id (= 알림 번호)
+    nurse_id = Column(VARCHAR(50), primary_key=True)
+    my_changed_cells = Column(INTEGER, nullable=False)   # 이 사람 칸이 바뀐 수(명단 변경 포함)
+    acked_at = Column(DATETIME, nullable=True)           # 미확인이면 None
+    ack_via = Column(VARCHAR(10), nullable=True)         # app | web
 
 
 class Shift(Base):

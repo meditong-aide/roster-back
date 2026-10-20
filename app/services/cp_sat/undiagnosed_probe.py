@@ -18,15 +18,30 @@ import os
 import time
 from typing import Any, Callable
 
+from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH
 from services.cp_sat.fix_location import attach_fix_to_options
+
+
+def _raise_night_cap_delta(c: dict[str, Any]) -> dict[str, Any]:
+    """월 야간 상한 완화 delta — 하드락 #6(15) 안에서만. 올릴 여지가 없으면 빈 delta(=건너뜀).
+
+    ★ 0 이하는 '미설정'이라 엔진이 15 로 본다 → 올릴 게 없다(예전엔 0+8=8 로 오히려 조였다).
+      15 이상이면 '완화' 가 아니라 하향이 되므로 내지 않는다(OMC 리뷰 2026-10-02).
+    """
+    cur = int(c.get("max_nig_per_month") or 0)
+    if cur <= 0 or cur >= HARD_MAX_NIGHTS_PER_MONTH:
+        return {}
+    return {"max_nig_per_month": min(cur + 8, HARD_MAX_NIGHTS_PER_MONTH)}
 
 
 # 결합제약 완화 카탈로그. apply(cfg)->delta(config_dict 키 기준, DB 컬럼명).
 # label_ko 는 사용자 노출용, family 는 그룹핑용. 침습도 낮은(=현실적인) 순서로.
 RELAX_CATALOG: list[dict[str, Any]] = [
+    # ★ 하드락 #6(월 나이트 최대 15)을 넘기지 않는다 — 예전엔 +8·탐색 상한 31 이라 월N 31 까지 제안했다
+    #   (2026-10-02 · 메모리 "카드 하드락 필터 없음"). 이미 15 면 탐색 없이 건너뛴다(lo>hi).
     {"id": "raise_max_night_cap", "family": "night_cap", "label_ko": "월 야간 상한 완화",
-     "apply": lambda c: {"max_nig_per_month": int(c.get("max_nig_per_month") or 0) + 8},
-     "search": {"key": "max_nig_per_month", "dir": "up", "hi": 31}},
+     "apply": lambda c: _raise_night_cap_delta(c),
+     "search": {"key": "max_nig_per_month", "dir": "up", "hi": HARD_MAX_NIGHTS_PER_MONTH}},
     {"id": "disable_2n2off", "family": "night_recovery", "label_ko": "2N→2OFF 회복 규칙 해제",
      "apply": lambda c: {"two_offs_after_two_nig": False}},
     {"id": "disable_3n2off", "family": "night_recovery", "label_ko": "3N→2OFF 회복 규칙 해제",
@@ -153,8 +168,16 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
     opts: list[dict[str, Any]] = []
     for b in (treatment_recommendations or []):
         treatments = b.get("treatments") or []
-        auto = [t for t in treatments if t.get("action_type") != "data_correction_required"]
-        manual = [t for t in treatments if t.get("action_type") == "data_correction_required"]
+
+        def _manual_only(t: dict[str, Any]) -> bool:
+            # ★ 월 야간 상한 처방이 '15(하드락)로도 부족' 판정이면 자동 적용할 게 없다 — 눌러도
+            #   같은 실패이거나(값 없음) 하드락을 넘는다. 수동(증원 필요)으로 내린다(OMC 재리뷰 2026-10-02).
+            return t.get("action_type") == "data_correction_required" or (
+                bool(t.get("sizing_insufficient"))
+                and t.get("config_key") in ("max_nig_per_month", "max_night_shifts_per_month"))
+
+        auto = [t for t in treatments if not _manual_only(t)]
+        manual = [t for t in treatments if _manual_only(t)]
         if not auto:
             continue  # 전부 수동(data_correction_required)이면 자동 적용 불가 → 옵션 제외
         _bid = str(b.get("bundle_id") or "?")
@@ -280,6 +303,12 @@ def _config_ceiling(r: dict[str, Any]) -> int | None:
     return None
 
 
+def _room(r: dict[str, Any]) -> int:
+    """개인 한도를 올릴 수 있는 최대치 = min(못 넘는 천장, 하드락 #6 월 15회)."""
+    hc = _hard_ceiling(r)
+    return min(hc, HARD_MAX_NIGHTS_PER_MONTH) if hc is not None else HARD_MAX_NIGHTS_PER_MONTH
+
+
 def _allocate_night_caps(
     blocked: list[dict[str, Any]], gap: int,
 ) -> list[tuple[dict[str, Any], int]]:
@@ -292,12 +321,12 @@ def _allocate_night_caps(
     ★★ room 은 근무가능일이 아니라 `_hard_ceiling` 이다 — 회복 제약(2N→2OFF)이 더 낮으면
       근무가능일까지 올려봐야 거기서 멈춘다.
     """
-    ordered = sorted(blocked, key=lambda r: _hard_ceiling(r) or 0)
+    ordered = sorted(blocked, key=_room)
     remain, left = gap, len(ordered)
     out: list[tuple[dict[str, Any], int]] = []
     for r in ordered:
         per = -(-remain // left) if left > 0 else 0            # ceil
-        room = _hard_ceiling(r)
+        room = _room(r)
         val = max(1, min(per, room) if room is not None else per)
         cur = r.get("personal_night_cap")
         # 실제 공급량은 **올린 값과 현재 한도 중 큰 쪽** — 상향이 아닌 사람의 기존 공급을
@@ -347,9 +376,12 @@ def personal_night_cap_options_from_issues(
         # ★ 개인 한도가 병목이어도 **못 올리는 축과 동률**이면 대상이 아니다. personal==working
         #   이거나 personal==recovery 면 개인 한도만 올려도 min 이 그대로라 카드를 눌러
         #   재생성해도 같은 INFEASIBLE 이 난다(재생성 몇 분이 헛클릭이 된다).
+        # ★ **N전담은 대상이 아니다**(2026-10-02 사용자 지적). N전담 횟수는 계약·운영으로 정한 값이라
+        #   일괄 상향에 끼면 안 된다. 그들의 현재 공급은 아래 `others` 에 그대로 들어가 부족분에서 빠진다.
         blocked = [r for r in rows
                    if "personal" in _binds(r)
                    and not any(k in _binds(r) for k in _IMMUTABLE_BINDS)
+                   and not r.get("is_night_dedicated")
                    and str(r.get("nurse_id") or "")]
         if not blocked:
             continue
@@ -730,6 +762,13 @@ def probe_relaxations(
                     logger("[UndiagProbe] 압박군(단일+콤보) 미해결 "
                            "→ 나머지 완화 전수 폴백(hard-filter)")
             spec = item.get("search")
+            # 완화할 여지가 없는 항목(apply 가 빈 delta — 예: 월 야간 상한이 이미 하드락 15)은
+            #   탐색 없이 건너뛴다(재계산 낭비 방지).
+            try:
+                if item["apply"](base_config) == {}:
+                    continue
+            except Exception:
+                pass
             # ── 단조 노브: 고정 델타 대신 최소침습 feasible 값 이분탐색 ──
             if spec and _remaining > 0:
                 val, used = _search_boundary(

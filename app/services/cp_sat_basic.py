@@ -1558,6 +1558,12 @@ class CPSATBasicEngine:
                     grouped=grouped,
                     shift_type_map=shift_id_to_type,
                 )
+                # ★ 1단계 해 없음 표시(`_fallback_stage1_no_solution`)는 **폴백이 유일한 생산자일 때만**
+                #   쓴다. primary 를 돌린 경우(SKIP_PRIMARY=0)엔 primary 가 남긴 실배정(best_roster)이
+                #   있을 수 있어, 폴백 실패만으로 그 결과를 거부하면 예전 성공이 실패로 바뀐다
+                #   (Codex 9회차) — 그 경로는 예전 동작 그대로 둔다. 운영·dev Lambda 는 primary 스킵(기본).
+                if os.getenv("SKIP_PRIMARY", "1") == "0":
+                    setattr(roster_system, "_fallback_stage1_no_solution", None)
                 # 폴백 결과 진단(log-only, 솔버 무영향) — [HardViolations] 요약 노출.
                 # N균등([N균등-결과])은 fallback_lex.py stage3에서 이미 출력하므로 여기선 제외.
                 _log_post_solve_result_diagnostics(roster_system, self.logger_prefix)

@@ -138,6 +138,15 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
         ).all()
         if r[0] not in _source_ids
     ]
+    # ★ 그 달과 겹치는 **끝난 파견**으로 온 사람도 — 엔진 명단(아래 `get_active_assignments_for_month`:
+    #   active·completed)엔 들어가는데 원티드 수집에서만 빠져, 받는 병동 생성에 그 사람 원티드가
+    #   없었다(2026-10-06). 같은 조회로 맞춘다.
+    for _a in get_active_assignments_for_month(db, current_user.group_id, req.year, req.month):
+        _aid = str(_a.nurse_id)
+        if (_a.reason in _INBOUND_REASONS and _a.target_group_id == current_user.group_id
+                and _a.source_group_id != current_user.group_id
+                and _aid not in _source_ids and _aid not in _inbound_ids):
+            _inbound_ids.append(_aid)
     nurse_ids = _source_ids + _inbound_ids
     if _inbound_ids:
         print(f"[RosterCreate] fixed_wanted 조회 대상 inbound nurse 추가: {_inbound_ids}")
@@ -780,6 +789,9 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
             "allow_soft_fallback": True,
             "constraints_json": _ensure_grade1_default({}),
             "constraints_max_json": {},
+            # 병원이 직접 넣은 등급 최소(기본 floor 적용 전). 엔진은 쓰지 않고, 생성 결과의
+            #   등급 최소 미달 보고(constraint_impact `_evaluate_grade`)가 이것만 센다.
+            "configured_constraints_json": {},
         }
 
     def _safe_json_obj(raw, field_name: str) -> dict:
@@ -828,14 +840,16 @@ def _fetch_grade_config_dict(db: Session, office_id: str, group_id: str) -> dict
     if not row:
         return _default()
 
+    configured_min = _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json")
     return {
         "use_dynamic_scaling": bool(getattr(row, "use_dynamic_scaling", True)),
         "allow_soft_fallback": bool(getattr(row, "allow_soft_fallback", False)),
         # [GRADE_DEFAULT_111] 등록 config 에도 grade-1 D/E/N 각 1 floor 를 보장.
-        "constraints_json": _ensure_grade1_default(
-            _safe_json_obj(getattr(row, "constraints_json_text", None), "constraints_json")
-        ),
+        "constraints_json": _ensure_grade1_default(configured_min),
         "constraints_max_json": _safe_json_obj(getattr(row, "constraints_max_json_text", None), "constraints_max_json"),
+        # floor 적용 전 원본 — 미달 보고용(_default 주석 참고). 병원이 1등급을 0으로 둔
+        #   병동에서 floor 미달까지 '하드 위반' 으로 알리던 것을 막는다.
+        "configured_constraints_json": configured_min,
     }
 
 
@@ -3288,6 +3302,71 @@ _CHANGE_LABEL_KO = {
 }
 
 
+def assert_night_caps_within_hard_lock(config_delta: dict | None, monthly_limit_release: list | None) -> None:
+    """해결 카드가 되돌려 보낸 월 야간 값이 하드락 #6(1인 월 15회)을 넘으면 400.
+
+    ★ 카드는 서버가 만들지만 적용 요청은 클라이언트가 그 값을 **그대로 echo** 한다 — 배포 전에 만든
+      카드·조작된 요청이 15 를 넘는 값을 넣을 수 있다(OMC 리뷰 2026-10-02). 큐에 넣기 전(라우터)에
+      막는다 — 워커에서 거부하면 SQS 재시도·DLQ 로 번진다. 설정 화면 저장값은 대상이 아니다.
+    """
+    from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _hard
+
+    def _num(v) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError) as exc:   # 숫자가 아니면 500 이 아니라 400
+            raise HTTPException(status_code=400, detail=f"월 나이트 값이 숫자가 아닙니다: {v!r}") from exc
+
+    over: list[str] = []
+    for key in ("max_nig_per_month", "max_night_shifts_per_month"):
+        val = (config_delta or {}).get(key)
+        if val is not None and _num(val) > _hard:
+            over.append(f"{key}={val}")
+    for rel in monthly_limit_release or []:
+        if not isinstance(rel, dict):
+            continue
+        if rel.get("field") in ("n_exact", "n_max", "n_min") and rel.get("value") is not None and _num(rel["value"]) > _hard:
+            over.append(f"{rel.get('nurse_id')}:{rel.get('field')}={rel.get('value')}")
+    if over:
+        raise HTTPException(status_code=400, detail=f"월 나이트는 1인 최대 {_hard}회(하드락)입니다: {', '.join(over)}")
+
+
+def n_only_release_targets(db, group_id: str, year: int, month: int, monthly_limit_release: list | None) -> set[str]:
+    """해결 카드의 월 야간 한도 변경(`monthly_limit_release`) 대상 중 **그 달 N전담**인 간호사.
+
+    ★ 카드 생성은 N전담을 뺀다(96e4f86) — 하지만 적용 요청은 클라이언트가 카드 값을 echo 하므로,
+      일반 근무자일 때 받은 카드를 그 사람이 N전담이 된 뒤 다시 보내면 N전담 고정 횟수(n_exact)가
+      지워지고 즉시 커밋됐다(Codex 커밋 큐 3회차 HIGH). 판정은 카드 생성과 같은 `is_n_only_profile` 이되
+      **그 달 기준** 근무형태(`group_members_in_month` 의 as_of — 파견 온 사람은 파견지 근무형태)로 본다.
+    """
+    from services.assignment_service import group_members_in_month
+    from services.cp_sat.allowed_shift_types import is_n_only_profile
+
+    want = {str(r.get("nurse_id")) for r in (monthly_limit_release or [])
+            if isinstance(r, dict) and r.get("nurse_id") and r.get("field") in ("n_exact", "n_max", "n_min")}
+    if not want or not group_id:
+        return set()
+    # ★ use_mid 는 **설정과 무관하게 False 로** 본다 — MID 를 빼고 N 만 남으면 N전담. 생성이 쓰는 설정
+    #   (요청 config_id·모달 config·config_override)과 최신 설정이 달라 [N,M] 같은 프로필을 서로 다르게
+    #   판정하면 보호를 비켜 갔다(Codex 커밋 큐 4회차 HIGH). use_mid=True 에서 N전담이면 False 에서도
+    #   N전담이라 이쪽이 항상 넓다. 대가: MID 쓰는 병동의 N+M 근무자 카드도 막힌다(드물고 하드락 쪽이 안전).
+    use_mid = False
+    profile = {str(m["nurse_id"]): m.get("as_of_allowed_shifts")
+               for m in group_members_in_month(db, group_id, int(year), int(month))["members"]
+               if str(m["nurse_id"]) in want}
+    for nid, raw in db.query(Nurse.nurse_id, Nurse.allowed_shifts).filter(
+            Nurse.nurse_id.in_(list(want - set(profile)))).all():
+        profile[str(nid)] = raw   # 그 달 명단에 없으면 지금 프로필로
+    return {nid for nid, raw in profile.items() if is_n_only_profile(raw, use_mid=use_mid)}
+
+
+def assert_release_not_n_only(db, group_id: str, year: int, month: int, monthly_limit_release: list | None) -> None:
+    """N전담의 월 야간 한도를 바꾸려는 해결 카드 적용은 큐에 넣기 전에 400(N전담 횟수는 하드락·계약 값)."""
+    bad = n_only_release_targets(db, group_id, year, month, monthly_limit_release)
+    if bad:
+        raise HTTPException(status_code=400, detail=f"N전담 간호사의 월 나이트 횟수는 해결 카드로 바꿀 수 없습니다: {sorted(bad)}")
+
+
 def _mk_change(nurse_id, attr, frm, to):
     """resolution_options.changes[*] 항목. 프론트가 label_ko/config_key 로 라벨을 렌더하므로
     (attr 만 주면 'undefined 표시') 둘을 함께 채운다.
@@ -3745,6 +3824,46 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         )
     # 구형 반환 형식 호환
     return cp_sat_result, {}, None
+
+
+def _enqueue_assignment_created_push(db: Session, req, current_user, assignments, nurses_in_group) -> None:
+    """파견·병동이동 대상자에게 '근무표 생성' 알림(S09)을 발송 대기열에 넣는다. **커밋은 호출부**.
+
+    알림 준비가 실패해도 근무표 저장은 막지 않는다.
+    ★ 준비용 조회(병동 이름·간호사 이름)는 **별도 읽기 세션**에서 한다. 업무 세션에서 조회하다
+      DB 오류(시간 초과·교착)가 나면 세션이 실패 상태가 되어, 예외를 삼켜도 뒤이은 근무표 저장
+      commit 이 함께 실패한다(Codex 2026-10-02). 업무 세션에는 대기열 행 추가(`db.add`)만 한다.
+    ★ 저장 **전**에 부르므로 `nurses_in_group` 에 파견 들어온 간호사가 아직 없다(저장 뒤에 붙인다).
+      거기서 못 찾은 이름은 간호사 테이블에서 직접 읽는다 — 안 그러면 알림에 사번이 찍힌다.
+    """
+    try:
+        from db.client2 import SessionLocal
+        from services.assignment_service import _get_group_name
+        from utils.utils import send_assignment_roster_created_push
+        nurse_ids = {
+            str(a.nurse_id) for a in assignments
+            if a.reason in ("파견", "병동이동") and a.status != "cancelled"
+        }
+        if not nurse_ids:
+            return
+        names_by_id = {str(n.nurse_id): n.name for n in nurses_in_group}
+        ordered = [str(n.nurse_id) for n in nurses_in_group if str(n.nurse_id) in nurse_ids]
+        rest = sorted(nurse_ids - set(ordered))
+        with SessionLocal() as read_db:
+            group_name = _get_group_name(read_db, current_user.group_id) or str(current_user.group_id)
+            if rest:
+                names_by_id.update({
+                    str(nid): name
+                    for nid, name in read_db.query(Nurse.nurse_id, Nurse.name).filter(Nurse.nurse_id.in_(rest))
+                })
+        names = [names_by_id.get(nid) or nid for nid in ordered + rest]
+        send_assignment_roster_created_push(
+            nurse_name=", ".join(names), group_name=group_name, year=req.year, month=req.month,
+            recipients=list(nurse_ids), office_code=current_user.office_id,
+            sender_emp_seq_no=current_user.nurse_id, sender_member_id=current_user.account_id, db=db,
+        )
+    except Exception as e:
+        print(f"[RosterCreate] assignment 생성 알림 준비 실패: {e}")
 
 
 def _persist_entries(db: Session, schedule, generated, req):
@@ -4296,7 +4415,72 @@ def _carried_hardlock_relaxations(final_cfg, ss_orig_on: bool, iw_orig_on: bool)
     return out
 
 
+# 엔진 1단계 시간 초과(해 없음 미증명) — 첫 생성이면 일시 실패(TimeoutError)로 올린다.
+_STAGE1_UNKNOWN_CODE = "STAGE1_UNKNOWN"
+
+
 def _validate_generated_roster(
+    generated: dict[str, list[str]] | None,
+    roster_system,
+    nurses_context: list | None = None,
+    config_context: dict | None = None,
+    grade_config_context: dict | None = None,
+) -> str | None:
+    """엔진 결과 검증 — 기존 검증(`_validate_generated_roster_core`)을 **먼저** 돌리고, 그게 놓친
+    '엔진 1단계 해 없음'만 더 잡는다(순수 추가 · 기존 검증이 잡은 경우의 문구·원인 탐색은 그대로).
+
+    ★ 놓치는 경우: 확정 원티드 등 고정 칸이 남아 '실근무 0건'·'하루 0명' 증상에 안 걸린다
+      (성남 61-AN 2026-11 지정 1N + 1N 금지 → 빈 근무 116칸이 '성공' 저장 · 운영 2026-07~10
+      61-RN 25건). 엔진 표시(`fallback_lex` `_fallback_stage1_no_solution`)를 직접 본다.
+    """
+    msg = _validate_generated_roster_core(
+        generated, roster_system, nurses_context=nurses_context,
+        config_context=config_context, grade_config_context=grade_config_context,
+    )
+    if msg:
+        return msg
+
+    def _with_ontology(m: str) -> str:
+        if roster_system is not None:
+            try:
+                setattr(roster_system, "_ontology_last_reason",
+                        attach_reason_code_ontology(message=m, severity="hard"))
+            except Exception:
+                pass
+        return m
+
+    _s1_none = getattr(roster_system, "_fallback_stage1_no_solution", None)
+    if _s1_none == "unknown":
+        # 엔진 1단계가 시간 안에 해를 못 찾았다(해 없음은 증명 안 됨). 빈 배정은 실패로 돌리되
+        # 완화 사다리 신호(`_infeasible_empty`)는 세우지 않는다 — 다시 돌리면 풀릴 수 있다.
+        # 첫 생성이면 호출부가 TimeoutError 로 올려 워커가 재시도하고(`_STAGE1_UNKNOWN_CODE`),
+        # 완화 재시도·진단 중이면 '그 시도 실패' 로만 쓰인다.
+        return _with_ontology(
+            f"[reason_code={_STAGE1_UNKNOWN_CODE}] 엔진 1단계가 제한 시간 안에 해를 찾지 못했습니다"
+            "(해 없음 미증명)."
+        )
+    if _s1_none == "infeasible":
+        # 엔진 1단계가 해 없음을 증명했다(하드 제약끼리 충돌). 확정 원티드 등 고정 칸이 남아
+        # 기존 검증의 '실근무 0건'·'하루 0명' 증상에 안 걸리는 경우라 엔진 표시를 직접 본다.
+        # 신호·문구는 실근무 0건과 같게 둔다 — 완화 사다리·구조진단·해결 카드가 그대로 이어받는다.
+        try:
+            setattr(roster_system, "_infeasible_empty", True)
+        except Exception:
+            pass
+        ev = getattr(roster_system, "_validator_evidence", None) or {}
+        ev_brief = {
+            "total_failed_cells": ev.get("total_failed_cells"),
+            "required_minus_assigned_total": ev.get("required_minus_assigned_total"),
+            "fixed_forbidden_count": ev.get("fixed_forbidden_count"),
+        }
+        return _with_ontology(
+            "[reason_code=NO_ASSIGNMENT] 엔진 배정 0건(1단계 해 없음 — 고정 칸만 남음 · 증상). "
+            f"원인은 구조진단에서 결정. evidence={ev_brief}"
+        )
+    return None
+
+
+def _validate_generated_roster_core(
     generated: dict[str, list[str]] | None,
     roster_system,
     nurses_context: list | None = None,
@@ -4570,6 +4754,17 @@ def _compute_coverage_gaps(roster_system) -> list[dict]:
         return []
 
 
+def _violation_counts_by_family(violations) -> dict[str, int]:
+    """위반 목록 → {family prefix: 건수}. family 구분은 품질 알림과 같은 함수로 한다."""
+    from utils.roster_quality import _family_label
+
+    counts: dict[str, int] = {}
+    for v in violations or []:
+        fam, _ = _family_label(getattr(v, "node_id", None))
+        counts[fam] = counts.get(fam, 0) + 1
+    return counts
+
+
 def _build_constraint_impact_payload(roster_system, req) -> dict:
     """생성 완료된 roster_system 기준 constraint-impact 요약을 생성한다."""
     started = time.perf_counter()
@@ -4670,6 +4865,9 @@ def _build_constraint_impact_payload(roster_system, req) -> dict:
             "preceptee_atom_count": analysis.preceptee_atom_count,
             "coverage_excluded_atom_count": analysis.coverage_excluded_atom_count,
             "hard_violation_count": analysis.hard_violation_count,
+            # violated_constraints 는 50건에서 자른다 → 종류별 건수는 자르기 전 전체로 따로 싣는다
+            #   (품질 알림 `roster_quality._ontology_violations` 가 이걸로 센다).
+            "violated_counts_by_family": _violation_counts_by_family(analysis.violated_constraints),
             "risky_constraint_count": analysis.risky_constraint_count,
             "constraint_mode_summary": analysis.constraint_mode_summary,
             "preflight_alerts": analysis.preflight_alerts,
@@ -5183,11 +5381,17 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         from db.models import NurseMonthlyLimit as _NML
         _gid = str(current_user.group_id)
         _applied = []
+        # ★ 쓰기 직전에 다시 본다 — 큐 대기 중 N전담으로 바뀐 사람의 고정 횟수를 지우지 않게. 워커에서 예외를
+        #   내면 SQS 재시도로 번지므로 거부는 라우터(`assert_release_not_n_only`)가 하고 여기선 건너뛴다.
+        _n_only = n_only_release_targets(db, _gid, int(req.year), int(req.month), _mlr)
         for _rel in _mlr:
             _rnid = str(_rel.get("nurse_id") or "")
             _rfld = _rel.get("field")
             _rval = _rel.get("value")
             if not _rnid or _rfld not in ("n_exact", "n_max") or _rval is None:
+                continue
+            if _rnid in _n_only:
+                print(f"[RosterGenerate] N전담 월 야간 한도는 해결 카드로 바꾸지 않음 — 건너뜀: {_rnid}:{_rfld}={_rval}")
                 continue
             _row = (
                 db.query(_NML)
@@ -6712,6 +6916,101 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             # 차감 실패는 생성을 막지 않는다(기존 동작으로 진행). 다만 초과가 남을 수 있다.
             print(f"[FixedShiftCoverage] 차감 실패(무시): {type(_fx_exc).__name__}: {_fx_exc}")
 
+    # ── 솔버 전 산술 차단: 간호사별 나이트 하한 합 > 그 달 나이트 칸 ─────────────────
+    # ★ 엔진과 같은 입력(고정근무자 차감 뒤 config_dict · 엔진 간호사 · 고정 칸)으로 판정한다.
+    #   개인 n_exact/n_min 합이 날짜별 N 상한의 합을 넘으면 다른 규칙과 무관하게 배정이 없다.
+    #   솔버를 돌리지 않고 사전검사처럼 바로 막고, 근무자 관리 그 달로 보내는 카드 하나만 낸다.
+    #   실사례(2026-10-08 운영 102598edcd0e 11월): 11월 한도 행이 없어 10월 값(합 31)이 이월,
+    #   30일 × 하루 N 1명 = 30칸 → 솔버 INFEASIBLE 뒤 진단이 원인을 못 찾아 카드 0장이었다.
+    # ★ 판정 실패는 생성을 막지 않는다(기존 흐름대로 솔버 진행). 판정 규칙은 오판이 없도록
+    #   모르는 것을 크게 잡는다(`lagrangian.detect_night_forced_oversupply`).
+    if nurses_for_engine:
+        _nfo = None
+        try:
+            from calendar import monthrange as _mr_nfo
+
+            from services.cp_sat_basic import _build_shift_normalizer
+            from services.ontology_graph.lagrangian import detect_night_forced_oversupply
+
+            # 고정 칸 코드 정규화는 엔진과 **같은 두 매핑**으로 한다(`_fixed_n_by_day` 참조).
+            #   · 근무코드 목록 → `_build_code_to_main_map`(엔진 `code2main` 과 같은 함수)
+            #   · 근무코드 정의 → `_run_cp_sat_basic` 이 `shift_definitions` 를 만드는 방식 그대로
+            _c2m_nfo = _build_code_to_main_map(shift_manage_data)
+            _defs_nfo = [
+                {
+                    "shift_id": getattr(_s, "shift_id", None),
+                    "default_shift": getattr(_s, "default_shift", None) or getattr(_s, "shift_id", None),
+                    "shift_gb": getattr(_s, "shift_gb", None),
+                    "type": getattr(_s, "type", None),
+                    "show_in_preference": getattr(_s, "show_in_preference", None),
+                }
+                for _s in _load_shift_lookup(db, current_user.office_id, current_user.group_id).values()
+            ]
+            _i2m_nfo, _ = _build_shift_normalizer(_defs_nfo)
+            # 엔진 고정 칸은 엔진 인덱스(nurse_index) 형식이다 — 엔진과 같은 정렬로 nurse_id 로 바꾼다.
+            #   못 바꾸는 칸은 nurse_id=None 으로 남겨 판정 쪽이 '모름'으로 건너뛰게 한다.
+            _idx2nid_nfo = {
+                _i: _nid for _nid, _i in _build_engine_nurse_index_map(nurses_for_engine).items()
+            }
+            _fixed_nfo = [
+                {"nurse_id": _idx2nid_nfo.get(_c.get("nurse_index")),
+                 "day_index": _c.get("day_index"), "shift": _c.get("shift")}
+                for _c in (combined_fixed_cells or [])
+            ]
+            _nfo = detect_night_forced_oversupply(
+                nurses_for_engine, config_dict, _mr_nfo(req.year, req.month)[1],
+                fixed_cells=_fixed_nfo, code2main=_c2m_nfo, id_to_main=_i2m_nfo,
+            )
+        except Exception as _nfo_exc:
+            print(f"[NightOversupply] 판정 실패(무시하고 진행): {type(_nfo_exc).__name__}: {_nfo_exc}")
+            _nfo = None
+        if _nfo:
+            from services.ontology_graph.mcs_trace import (
+                night_forced_oversupply_card,
+                night_forced_oversupply_message,
+            )
+            from services.precheck import build_blocking_payload as _bbp_nfo
+            _arith_nfo = {
+                "forced_n_sum": _nfo["forced_n_sum"], "n_slots": _nfo["n_slots"],
+                "excess": _nfo["excess"], "year": req.year, "month": req.month,
+            }
+            _msg_nfo = night_forced_oversupply_message(_nfo["targets"], _arith_nfo)
+            payload = _bbp_nfo({"status": "blocked", "issues": [{
+                "reason_code": "MONTHLY_NIGHT_FORCED_OVERSUPPLY",
+                "severity": "error",
+                "evidence": {**_arith_nfo,
+                             "nurses": [{"nurse_id": t["nurse_id"], "name": t["name"],
+                                         "current": t["current"], "field": t["field"]}
+                                        for t in _nfo["targets"]]},
+            }]})
+            _inf_nfo = payload.setdefault("infeasibility", {})
+            # 이 원인은 산술로 확정이라 이 카드 하나만 낸다(다른 일반 카드와 섞이면 안내가 갈린다).
+            _inf_nfo["resolution_options"] = [
+                night_forced_oversupply_card(_nfo["targets"], _arith_nfo)]
+            _inf_nfo["summary_message_ko"] = _msg_nfo
+            _inf_nfo["fix_suggestions_ko"] = [_msg_nfo]
+            print(f"[NightOversupply][BLOCKING] 나이트 하한 합 {_nfo['forced_n_sum']} > "
+                  f"칸 {_nfo['n_slots']} — 솔버 호출 생략. HTTP 500 응답.")
+            # 사전검사 차단과 같은 기록을 남긴다(프리셋 목록 제외·사후 분석용). 기록 실패는 무시.
+            try:
+                _mark_config_generate_status(
+                    db, latest_config, "blocked",
+                    _build_generate_snapshot(db, latest_config, "blocked",
+                                             req.year, req.month,
+                                             _nurses_dict_for_precheck, precheck_config,
+                                             job_id, _persistent_fix),
+                    req.year, req.month, job_id, _base_intervened)
+                if _ctx is not None:
+                    _ctx["recorded"] = True
+            except Exception as _nfo_rec_exc:
+                print(f"[NightOversupply] 차단 기록 실패(무시): {_nfo_rec_exc}")
+            try:
+                db.delete(schedule)
+                db.commit()
+            except Exception:
+                db.rollback()
+            raise HTTPException(status_code=500, detail=payload)
+
     # UNDIAGNOSED 탐색 기준의 대체값(첫 시도 스냅샷이 없을 때). 아래 완화 사다리가 config_dict 의
     # 최상위 키를 누적 갱신(same_shift·isolated_work·n2n_min_gap)하므로 첫 시도 직전 값을 떠 둔다.
     _first_attempt_cfg: dict | None = None
@@ -6827,6 +7126,14 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         config_context=config_dict,
         grade_config_context=_fetch_grade_config_dict(db, current_user.office_id, current_user.group_id),
     )
+    if validation_error and f"reason_code={_STAGE1_UNKNOWN_CODE}" in validation_error:
+        # 1단계가 시간 안에 해를 못 찾았는데(해 없음 미증명) 기존 검증은 아무것도 못 잡았다 —
+        # 예전엔 빈 배정이 '성공' 저장되던 경우다. 저장하지도, 확정 실패(완화 사다리·해결 카드·
+        # 워커 ack)로 보내지도 않는다. TimeoutError 는 워커가 일시 장애로 보고 재시도하고
+        # (`worker._is_transient`), draft 는 바깥 래퍼가 지운다(`_record_unclassified_failure`).
+        # ★ 기존 검증이 '실근무 0건'·'하루 0명' 을 잡은 경우는 여기 안 온다 — 예전처럼 완화
+        #   사다리로 간다(그 경로로 성공하던 작업을 막지 않는다 · Codex 8회차).
+        raise TimeoutError(f"{validation_error} 일시 실패로 다시 시도합니다.")
     applied_relaxations: list[str] = []
     # 사다리가 config_dict 에 누적하는 하드락 해제를 최종 결과 기준으로 알리려고 원래 값을 잡아 둔다
     #   (`_carried_hardlock_relaxations`).
@@ -7633,7 +7940,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                                 #   · fix_all_personal(월한도/주말) = 단일 통합 카드
                                 #   · banned/allowed(금지근무 모순) = 대안 2카드(HN 선택)
                                 _oid0 = _cards[0].get("option_id") or ""
-                                if _oid0 == "cause:fix_all_personal":
+                                if _oid0 in ("cause:fix_all_personal", "cause:night_only_over_hard_cap"):
+                                    # night_only_over_hard_cap(야간전담 >15 정정 안내)도 단독 — 안 그러면
+                                    # 그 위에 '상한을 올리라' 는 일반 설명카드가 함께 떠 서로 모순된다.
                                     unrecoverable["infeasibility"]["_sole_option"] = _cards[0]
                                 elif _oid0 in ("cause:banned_release", "cause:allowed_add"):
                                     unrecoverable["infeasibility"]["_sole_option"] = list(_cards)
@@ -7806,12 +8115,22 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                                     _cflags = (presolve_diag or {}).get("constraint_flags") or []
                                 except NameError:
                                     _cflags = []
+                                # ★ N전담이면 야간 쪽은 **아무것도 바꾸지 않는다** — N전담 15회 고정은 하드락이다
+                                #   (2026-10-02 사용자 지적). 개인 고정을 낮추지도, 병동 상한을 올리지도 않는다. 주말
+                                #   해제만 내되, 이 probe 검증은 월 한도를 안 봐서 야간 충돌이 남을 수 있으므로
+                                #   verified=False 로 낸다(아래 else 분기).
+                                from services.cp_sat.allowed_shift_types import is_n_only_profile as _is_n_only
+                                _culprit_nu = next((n for n in (nurses_for_engine or [])
+                                                    if str(getattr(n, "nurse_id", "")) == _culprit), None)
+                                _culprit_n_only = _is_n_only(getattr(_culprit_nu, "allowed_shifts", None),
+                                                             use_mid=bool((_probe_base or {}).get("use_mid")))
                                 _nflag = next(
                                     (f for f in _cflags
                                      if str(f.get("nurse_id")) == _culprit
                                      and f.get("type") == "night_floor_over_cap"), None)
-                                if _nflag:
-                                    _mn = int(_nflag.get("max_nig") or 0)
+                                if _nflag and not _culprit_n_only:
+                                    from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _HARD_N
+                                    _mn = min(int(_nflag.get("max_nig") or 0), _HARD_N)   # 하드락 #6 안으로
                                     _nf = int(_nflag.get("n_floor") or 0)
                                     _wk_opt = {
                                         "option_id": f"release_weekend_off+lower_night:{_culprit}",
@@ -7853,6 +8172,23 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                                             "config_key": None, "target": {"nurse_id": _culprit},
                                         },
                                     }
+                                    if _nflag:   # N전담 + 야간 고정이 병동 상한을 넘는 충돌 — 야간은 하드락이라 그대로
+                                        # ★ presolve 의 n_floor > max_nig 는 **산술로 확정된 모순**이라 주말만 풀면
+                                        #   반드시 다시 실패한다. 자동 적용하면 주말휴무만 영구로 사라지므로 수동
+                                        #   안내로 내리고 자동 적용 필드를 뺀다(OMC 리뷰 2026-10-02).
+                                        _wk_opt["verified"] = False
+                                        _wk_opt.pop("weekend_off_release", None)
+                                        _wk_opt["changes"] = []          # 자동으로 바꾸는 게 없다
+                                        _wk_opt["fix"]["mode"] = "manual"
+                                        _wk_opt["fix"]["how_ko"] = (
+                                            f"근무 설정의 '한 달 밤 근무 최대 횟수'와 {_nm} 간호사의 나이트 개수를 "
+                                            f"맞춘 뒤 다시 만드세요.")
+                                        _wk_opt["title_ko"] = f"{_nm} 간호사(야간전담) 나이트 설정 확인 필요"
+                                        _wk_opt["trade_off_ko"] = (
+                                            f"{_nm} 간호사(야간전담)의 나이트 개수가 병동 월 야간 상한보다 커서 그대로는 "
+                                            f"다시 만들어도 실패합니다. 근무 설정의 '한 달 밤 근무 최대 횟수'와 근무자의 "
+                                            f"나이트 개수(야간전담 15회 고정 — 하드락)가 맞는지 먼저 확인하세요. 주말 휴무 "
+                                            f"해제는 그다음에 필요하면 하세요.")
                                 # 그룹 전체 끄는 coarse '단독' 옵션(apply 가 weekend_off_only_enable 하나뿐)만
                                 # 개인 지목으로 대체. 콤보(예: weekend_off_only_enable + max_nig 상향)는 유효한
                                 # 대안이므로 남긴다 — 그래야 "개인 낮추기 / config 상한 올리기" 두 갈래가 모두 노출.
@@ -7883,8 +8219,14 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                             _cfg_mn = int(_probe_base.get("max_nig_per_month") or 0)
                             # 후보: n_exact 또는 n_max 가 config 야간 상한보다 큰 간호사(그 값을 상한
                             # 이하로 낮추면 충돌 해소). 야간이 상한을 초과할 수 없으니 이들이 병목 후보.
+                            # ★ N전담은 후보에서 뺀다 — N전담 15회 고정은 하드락이라 해결카드가 바꾸는 대상이
+                            #   아니다(2026-10-02 사용자 지적). 낮추면 나머지가 강제 OFF 가 되어 야간 공급도 준다.
+                            from services.cp_sat.allowed_shift_types import is_n_only_profile as _is_n_only
                             _nc_cands = []
                             for _n in (nurses_for_engine or []):
+                                if _is_n_only(getattr(_n, "allowed_shifts", None),
+                                              use_mid=bool(_probe_base.get("use_mid"))):
+                                    continue
                                 for _fld in ("n_exact", "n_max"):
                                     _val = getattr(_n, _fld, None)
                                     if _val is not None and _cfg_mn and int(_val) > _cfg_mn:
@@ -8128,6 +8470,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         )
     except Exception as _oncall_exc:
         print(f"[Oncall] 후처리 실패 — 콜 미부여 진행: {_oncall_exc}")
+    # ★ S09 알림은 근무표 저장과 **같은 커밋**에 남긴다(`_persist_entries` 끝의 commit).
+    #   저장 뒤 따로 넣으면 그 사이 죽었을 때 근무표는 있는데 알림 근거가 없다(Codex 2026-10-02).
+    _enqueue_assignment_created_push(db, req, current_user, _assignments, nurses_in_group)
     _persist_entries(db, schedule, generated, req)
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──
@@ -8240,32 +8585,6 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     except Exception as _a1_exc:
         print(f"[A1Probe] failed (ignore): {_a1_exc}")
 
-    # ── assignment 대상자 근무표 생성 알림 (S09) ──
-    try:
-        from utils.utils import send_assignment_roster_created_push
-        from services.assignment_service import _get_group_name
-        _assign_nurse_ids = set()
-        for _a in _assignments:
-            if _a.reason in ("파견", "병동이동") and _a.status != "cancelled":
-                _assign_nurse_ids.add(str(_a.nurse_id))
-        if _assign_nurse_ids:
-            _gname = _get_group_name(db, current_user.group_id) or str(current_user.group_id)
-            _nurse_names = [
-                n.name for n in nurses_in_group if str(n.nurse_id) in _assign_nurse_ids
-            ] or list(_assign_nurse_ids)
-            send_assignment_roster_created_push(
-                nurse_name=", ".join(_nurse_names),
-                group_name=_gname,
-                year=req.year,
-                month=req.month,
-                recipients=list(_assign_nurse_ids),
-                office_code=current_user.office_id,
-                sender_emp_seq_no=current_user.nurse_id,
-                sender_member_id=current_user.account_id,
-            )
-    except Exception as e:
-        print(f"[RosterCreate] assignment 생성 알림 실패: {e}")
-
     # 휴가 자동 부여 요약 — 화면이 생성 결과를 검토할 수 있게 싣는다.
     #   ★ 기능이 꺼져 있거나 대상 코드가 없으면 후처리가 stats 를 안 채우므로 키 자체가
     #     없다. 프론트는 키 유무로 "이번 생성에 적용됐는가" 를 판단하면 된다.
@@ -8335,6 +8654,10 @@ def request_schedule_service(req: RosterRequest, current_user, db: Session):
         # raise Exception("설정값을 입력해주세요")
     if not latest_config or latest_config == None:
         return "noConfigId"
+    # ★ 번호를 읽기 전에 그룹·달 잠금 — 새 버전 저장·복사와 동시에 같은 VER 를 만들지 않게.
+    #   생성 작업은 30초까지 기다린다(409 면 워커가 실패 알림·재시도로 번진다).
+    from services.schedule_versioning import lock_version_numbering
+    lock_version_numbering(db, current_user.group_id, req.year, req.month, timeout_ms=30000)
     latest_version = db.query(func.max(Schedule.version)).filter(
         Schedule.group_id == current_user.group_id,
         Schedule.year == req.year,

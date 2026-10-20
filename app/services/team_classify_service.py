@@ -386,6 +386,10 @@ def apply_team_classification(
     # 현재 팀 = 시점(period) 기준 — raw nurse.team_id 는 period 기록 후 갱신 안 돼 재실행 시
     #   skip 실패(non-idempotent). period 로 정확·멱등 비교(NULL 이행 후에도 동작).
     _team_now = resolve_teams_for_month(db, group_id, effective)
+    # ★ 여기서는 간호사들을 미리 잠그지 않는다 — 아래 `create_permanent_change` 가 간호사마다 커밋해
+    #   트랜잭션 소유 앱 잠금이 첫 간호사에서 풀린다(Codex 3회차). 같은 간호사의 구간 중복은
+    #   `set_team_period` 안의 간호사 단위 잠금이 막고, 한 번에 한 명만 쥐므로 교착도 없다.
+    #   (일괄 분류가 간호사별 커밋이라 중간 실패 시 일부만 적용되는 것은 기존 구조 — 별건.)
     for a in assignments:
         nid = a["nurse_id"]
         new_team = a["team_id"]

@@ -4052,6 +4052,13 @@ def optimize_fallback_lex_hard_first(
         if _cap_retry_on:
             _attempt_plan.append((_bs, _lb + "+capslack", True))
     _hard_unknown: dict = {}
+    # 계열(hard·broad_soft)별 **마지막** 판정 'infeasible'(해 없음 증명) | 'unknown'(시간 초과·
+    #   미증명) — 아래 '폴백 중단' 표시가 둘을 가른다. 증명된 해 없음만 확정 실패로 보낸다.
+    #   ★ 시도 이력이 아니라 계열별 덮어쓰기다 — capslack 은 같은 계열이 UNKNOWN 일 때만 돌고,
+    #     그 모델은 월 상한을 초과칸으로 푼 **더 느슨한** 모델이라 거기서 해 없음(INFEASIBLE·
+    #     초과 최적 증명)이 나오면 원래 모델도 해가 없다. 앞의 UNKNOWN 을 남기면 증명된 입력이
+    #     재시도만 반복한다(Codex 4회차).
+    _s1_outcomes: dict = {}
     for broad_soft, attempt_label, _use_cap in _attempt_plan:
         if _use_cap and not _hard_unknown.get(broad_soft):
             continue
@@ -4131,6 +4138,7 @@ def optimize_fallback_lex_hard_first(
             #     기준을 0 으로 둔다 — 0.15 면 LP 하한이 초과 1칸 근처에 붙어 거기서 '최적' 으로
             #     멈출 수 있다.
             _cap_sl1 = list(getattr(m1, "_monthly_cap_slacks", []) or [])
+            _cap_proven = False   # 월 상한 초과가 '최적 증명'으로 남았는가(= 못 없앤다)
             if st in (cp_model.OPTIMAL, cp_model.FEASIBLE) and _cap_sl1:
                 _cap_over = int(sum(s1.Value(v) for v in _cap_sl1))
                 _s1_cap_tight = _s1_cap_tight or _cap_over > 0
@@ -4159,6 +4167,7 @@ def optimize_fallback_lex_hard_first(
                           f"{_cp_sat_status_to_text(_st_ext)})")
                     _cap_over = _cap_new
                     if _st_ext == cp_model.OPTIMAL:
+                        _cap_proven = True
                         break  # 간격 0 으로 증명까지 끝났다 — 남은 초과는 실제로 못 없앤다
                 if st == cp_model.FEASIBLE and _cap_over == 0 and _cap_ext_left >= 5:
                     # ★ 초과 0 이어도 최적 증명 없이(FEASIBLE) 끝났으면 커버리지가 덜 다듬어진 채
@@ -4188,6 +4197,9 @@ def optimize_fallback_lex_hard_first(
                     print(f"{logger_prefix} [MonthlyLimit][CapSlack] attempt={attempt_label} "
                           f"월 상한 초과 {_cap_over}칸 남음 → 하드 위반이라 이 시도는 실패로 처리")
                     st = cp_model.UNKNOWN
+            if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                _s1_outcomes[broad_soft] = (
+                    "infeasible" if (st == cp_model.INFEASIBLE or _cap_proven) else "unknown")
             if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 _log_off_slack_used(f"stage1:{attempt_label}", s1, m1)
                 best_short = int(s1.Value(sum(short1)))
@@ -4230,6 +4242,18 @@ def optimize_fallback_lex_hard_first(
     _mark("stage1_all")
     if best_short is None or best_over is None:
         print(f"{logger_prefix} 폴백 중단: 1단계 해를 찾지 못함")
+        # ★ 해가 없다는 표시를 따로 세운다 — 이 함수의 반환값은 해가 있어도 부족·안전 위반이
+        #   남으면 False 라 '해 없음' 판정에 못 쓴다. 표시 없이 돌아가면 빈 배정이 결과로
+        #   변환돼 고정 칸(확정 원티드)만 남은 판이 '성공' 저장된다(성남 61-AN 2026-11:
+        #   지정 1N + 1N 금지 → 빈 근무 116칸). 생성 검증(`_validate_generated_roster`)이 읽는다.
+        #   ★ 값이 둘이다 — 'infeasible'(모든 계열이 해 없음을 증명) 만 확정 실패(완화 사다리·
+        #     해결 카드)로 가고, 시간 초과로 끝난 계열이 하나라도 있으면 'unknown' 으로 일시
+        #     실패(재시도)다. 시간 초과를 해 없음으로 보내면 풀리는 입력이 설정 완화를 거쳐
+        #     재시도 없이 끝난다.
+        _s1_reason = ("infeasible" if _s1_outcomes
+                      and all(o == "infeasible" for o in _s1_outcomes.values()) else "unknown")
+        print(f"{logger_prefix} [Stage1] 해 없음 판정={_s1_reason} 계열별={_s1_outcomes}")
+        setattr(roster_system, "_fallback_stage1_no_solution", _s1_reason)
         return False
 
     # ── 전날 N 금지 최소화(최소화 모드일 때만 · build_model 의 `_ban_min` 주석) ──

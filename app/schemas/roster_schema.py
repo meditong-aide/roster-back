@@ -245,6 +245,19 @@ class PublishRequest(BaseModel):
     issue_comment: str = None
 
 
+class SaveAsRequest(BaseModel):
+    """[새 버전으로 저장] — 편집한 근무표를 원본은 그대로 두고 새 버전으로 저장한다."""
+
+    source_schedule_id: str = Field(description="편집을 시작한 원본 버전. 원본은 바뀌지 않는다.")
+    year: int
+    month: int
+    roster: List[Dict[str, Any]] = Field(
+        description="`/roster/save` 와 같은 모양 — 간호사별 {nurse_id, schedule:[날짜순 코드], schedule_ids}",
+    )
+    name: Optional[str] = Field(None, description="새 버전 이름. 비우면 '원본이름 수정본'(50자에서 자름).")
+    memo: Optional[str] = Field(None, description="새 버전 메모. null 이면 원본 메모를 이어받는다.")
+
+
 class CaseItem(BaseModel):
     """Wanted case 항목 스키마입니다.
 

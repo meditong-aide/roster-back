@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from db.client2 import get_db
 from db.models import Shift, Nurse, ScheduleEntry, ShiftManage, RosterConfig, Group
 from schemas.auth_schema import User as UserSchema
-from routers.auth import get_current_user_from_cookie
+from routers.auth import get_current_user_from_cookie, require_current_user
 from services.group_access import resolve_effective_group, caller_is_head_nurse
 from services.shift_manage_defaults import ensure_default_shift_manage
 from schemas.roster_schema import ShiftAddRequest, RemoveShiftRequest, MoveShiftRequest, ShiftManageSaveRequest, ShiftUpdateRequest, ShiftUploadConfirmRequest, ShiftImportRequest
@@ -164,7 +164,7 @@ VALID_NURSE_CLASSES = {"RN", "AN", "보조"}
 def add_shift(
     req: ShiftAddRequest,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -187,7 +187,7 @@ def add_shift(
 def update_shift(
     req: ShiftUpdateRequest,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -210,7 +210,7 @@ def update_shift(
 def remove_shift(
     req: RemoveShiftRequest,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -224,7 +224,7 @@ def remove_shift(
 def move_shift(
     req: MoveShiftRequest,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -239,7 +239,7 @@ def move_shift(
 # [Shifts] - 엑셀 일괄 업로드
 @router.get("/shifts/template-download")
 def download_shift_template(
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
 ):
     """근무코드 엑셀 업로드 템플릿 다운로드"""
     try:

@@ -4,7 +4,7 @@ from typing import List
 from datalayer.common import Common
 from datalayer.message import Message
 from db.client2 import msdb_manager
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
 
 router = APIRouter()
@@ -12,7 +12,7 @@ templates = Jinja2Templates(directory="templates")
 
 # 메세지 화면 출력
 @router.get("/reply", summary="메세지등록 화면처리")
-def message_write_form(idx:int, request: Request,current_user: UserSchema = Depends(get_current_user_from_cookie)):
+def message_write_form(idx:int, request: Request,current_user: UserSchema = Depends(require_current_user)):
     if not idx:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="잘못된 접근 입니다.")
 
@@ -30,7 +30,7 @@ def message_write_form(idx:int, request: Request,current_user: UserSchema = Depe
     return templates.TemplateResponse("message_reply.html", {"request": request, "sendername": sendername, "sendempseqno": sendempseqno})
 
 @router.post("/reply", summary="메세지등록")
-def set_message(current_user: UserSchema = Depends(get_current_user_from_cookie),
+def set_message(current_user: UserSchema = Depends(require_current_user),
         # 기본 정보 (읽기 전용 포함)
         receptionid: str = Form(...),
         message: str = Form(...),

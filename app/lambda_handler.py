@@ -60,6 +60,10 @@ def handler(event: dict, context) -> dict:
         - **JSONDecodeError, 그 외 Exception**: 그대로 raise → SQS visibility timeout 후 재시도.
           DB 일시 단절·네트워크 오류 등 transient 실패가 영구 손실되지 않도록 보장한다.
           반복 실패 보호는 SQS RedrivePolicy(maxReceiveCount + DLQ)로 인프라 측에서 담당.
+        - ★``process_job`` 은 **입력·설정 오류·infeasibility** 로 난 생성 실패를 FAILED 로
+          기록한 뒤 정상 반환한다(``worker._is_input_failure``). 그래서 여기까지 올라오는 예외는
+          일시 장애(``worker._is_transient``), 코드 버그(Lambda 오류 알람이 세도록), 또는 FAILED
+          기록 자체에 실패한 것이다(기록 없이 ack 하면 작업이 RUNNING 으로 남으므로 재시도에 맡긴다).
     """
     global _IS_COLD_START
     is_cold_start = _IS_COLD_START

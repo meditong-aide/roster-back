@@ -948,38 +948,10 @@ def _merge_team_cell(ws, col, first_row, last_row, label, center, border_all, gr
 
 
 def _sort_team_ids_by_name(team_name_map: dict) -> list:
-    """팀 id 들을 근무표 만들기 화면(team-sort-util.sortTeamGroupsByTeamName)과 동일
-    순서로 정렬한다. 1순위 그룹: 한글(0) < 영문(1) < 숫자(2) < 기타(3). 2순위: 자연
-    정렬(숫자 런은 int 로 비교)+소문자. 3순위: team_id.
-    (export 엔 활성 실팀만 오므로 미배정/임시팀 분기는 불필요.)
-    """
-    import re as _re
+    """팀명순 정렬 — 정본은 `team_period.sort_team_ids_by_name`(마감본 팀 목록과 공용)."""
+    from services.team_period import sort_team_ids_by_name
 
-    def _group_rank(name: str) -> int:
-        first = (name or "").strip()[:1]
-        if not first:
-            return 3
-        if "가" <= first <= "힣":
-            return 0
-        if first.isascii() and first.isalpha():
-            return 1
-        if first.isdigit():
-            return 2
-        return 3
-
-    def _natural_key(name: str) -> list:
-        # Intl.Collator({numeric:true}) 근사: 숫자 런은 (0,int), 그 외는 (1,소문자).
-        # 토큰 타입을 앞에 둬 int/str 직접 비교(TypeError)를 원천 차단.
-        out = []
-        for tok in _re.findall(r"\d+|\D+", name or ""):
-            out.append((0, int(tok)) if tok.isdigit() else (1, tok.casefold()))
-        return out
-
-    def _key(tid):
-        name = team_name_map.get(tid) or ""
-        return (_group_rank(name), _natural_key(name), tid)
-
-    return sorted(team_name_map.keys(), key=_key)
+    return sort_team_ids_by_name(team_name_map)
 
 
 #: 요일 라벨. `calendar.weekday()` 가 월=0 이므로 그 순서다.

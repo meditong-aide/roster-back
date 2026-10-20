@@ -1,6 +1,6 @@
 from schemas.roster_schema import PreferenceData, PreferenceSubmit, WantedEntryItem
 from services.wanted_service import WantedAnalysisError, analyze_wanted_text
-from routers.auth import get_current_user_from_cookie
+from routers.auth import require_current_user
 from services.group_access import (
     resolve_home_group_id,
     caller_is_head_nurse,
@@ -87,7 +87,14 @@ async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Opti
     text = (getattr(req, "request", None) or "").strip()
     if not text:
         return
-    group_id = req.group_id or getattr(current_user, "group_id", None)
+    # ★★분석 대상 그룹은 **본인 소속(home) 그룹**만. 분석은 그 그룹 간호사 이름 전체를 외부 LLM
+    #   으로 보내므로, 클라이언트가 준 group_id 를 그대로 쓰면 다른 병동·병원 간호사 실명이
+    #   새어 나간다(저장 단계의 403 은 분석이 끝난 **뒤**라 막지 못한다). 원티드는 본인 것이라
+    #   저장도 언제나 home 그룹에 된다(``_resolve_write_group_id`` · 기존 data 경로의 ``home_gid``).
+    #   그래서 req.group_id 는 분석에 쓰지 않는다 — 근무코드·기본 근무형도 저장과 같은 소속 병동
+    #   기준으로 해석된다. (req.group_id 가 home 과 다르면 분석 결과가 붙는 순간 신규 저장 경로가
+    #   403 을 낸다 — 이번 변경 전부터 있던 동작으로 별건.)
+    group_id = resolve_home_group_id(db, current_user)
     if not group_id:
         return
     try:
@@ -132,7 +139,7 @@ async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Opti
 @router.post("")
 async def save_preference_draft(
     req: PreferenceData,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -158,7 +165,7 @@ async def save_preference_draft(
 @router.post("/submit")
 async def submit_preferences(
     req: PreferenceData,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -206,7 +213,7 @@ async def submit_preferences(
 @router.post("/submit/empty")
 def submit_empty_preferences(
     req: PreferenceSubmit,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -220,13 +227,15 @@ def submit_empty_preferences(
 @router.post("/retract")
 def retract_submission(
     req: PreferenceSubmit,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
         return retract_submission_service(req, current_user, db)
     except HTTPException:
         raise
+    except PreferenceConflictError as e:
+        _raise_domain_error(e)
     except Exception as e:
         print('[preferences.py] error', e)
         raise HTTPException(status_code=500, detail=f"제출 철회 실패: {str(e)}")
@@ -237,7 +246,7 @@ def get_latest_preference(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -264,7 +273,7 @@ def get_all_preferences(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db)
 ):
     try:
@@ -299,7 +308,7 @@ def get_monthly_memo(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """본인의 그 달 원티드 메모. 저장된 적 없으면 monthly_memo=null."""
@@ -319,7 +328,7 @@ def get_monthly_memo(
 @router.patch("/monthly-memo")
 def patch_monthly_memo(
     req: MonthlyMemoUpdate,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """월별 메모 저장. wanted_monthly_memo 외의 어떤 테이블도 건드리지 않는다."""
@@ -352,7 +361,7 @@ def list_group_monthly_memos(
     year: int,
     month: int,
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """관리보드용 — 그룹에서 메모를 쓴 사람만 모아 돌려준다.

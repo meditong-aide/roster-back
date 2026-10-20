@@ -217,6 +217,63 @@ FAMILY_PRESENTATION: dict[str, dict[str, Any]] = {
 _FAMILY_KO["night_coverage"] = "야간 커버리지"
 
 
+def night_forced_oversupply_message(targets: list[dict], arithmetic: dict) -> str:
+    """나이트 고정 합 > 그 달 나이트 칸 — 화면 요약 문장(원인 + 어디서 무엇을)."""
+    _m = arithmetic.get("month")
+    _mo = f"{int(_m)}월 " if _m else ""
+    _where = f"근무자 관리 {int(_m)}월" if _m else "근무자 관리"
+    _top = ", ".join(f"{t.get('name') or t.get('nurse_id')} {int(t.get('current') or 0)}개"
+                     for t in targets[:4])
+    _more = f" 외 {len(targets) - 4}명" if len(targets) > 4 else ""
+    return (f"간호사별 {_mo}나이트 고정 개수 합({arithmetic.get('forced_n_sum')}개)이 {_mo}나이트 칸 수"
+            f"({arithmetic.get('n_slots')}칸)보다 {arithmetic.get('excess')}개 많아 근무표를 만들 수 없어요 — "
+            f"{_where}에서 나이트 개수를 합계 {arithmetic.get('n_slots')}개 이하로 줄여 주세요. "
+            f"[{_top}{_more}]")
+
+
+def night_forced_oversupply_card(targets: list[dict], arithmetic: dict) -> dict[str, Any]:
+    """나이트 고정 합 > 그 달 나이트 칸 → **근무자 관리 그 달로 보내는** 안내 카드.
+
+    솔버 전 산술 차단(`roster_create_service` 의 나이트 합계 검사)이 이 카드 하나만 낸다.
+    누구를 몇 개 줄일지는 병동이 정할 일이라 자동 적용하지 않는다(어느 간호사를 줄여도 합만
+    맞으면 된다). 카드를 누르면 화면이 `fix.target` 의 연·월로 근무자 관리를 연다.
+    ★ 하드락을 풀지 않는다 — 개인 나이트 개수(데이터)를 고치는 안내다.
+
+    Args:
+        targets: `detect_night_forced_oversupply` 의 targets(나이트 하한이 있는 간호사, 큰 순).
+        arithmetic: `{forced_n_sum, n_slots, excess, year, month}`.
+    """
+    _y, _m = arithmetic.get("year"), arithmetic.get("month")
+    _forced, _slots = arithmetic.get("forced_n_sum"), arithmetic.get("n_slots")
+    _excess = arithmetic.get("excess")
+    _mo = f"{int(_m)}월 " if _m else ""
+    _ym = f"{int(_y)}년 {int(_m)}월" if (_y and _m) else "해당 월"
+    _names = ", ".join(f"{t.get('name') or t.get('nurse_id')} {int(t.get('current') or 0)}개"
+                       for t in targets[:5])
+    _more = f" 외 {len(targets) - 5}명" if len(targets) > 5 else ""
+    return {
+        "option_id": "cause:night_forced_oversupply",
+        "kind": "manual_fix", "source": "cause", "verified": False,
+        "title_ko": f"{_mo}나이트 고정 개수 합계가 나이트 칸보다 {_excess}개 많습니다 — 근무자 관리에서 조정",
+        "trade_off_ko": (f"간호사별 나이트 고정 개수 합 {_forced}개 > {_mo}나이트 칸 {_slots}칸. "
+                         f"근무자 관리 {_ym}에서 나이트 개수를 합계 {_slots}개 이하로 줄인 뒤 다시 만드세요. "
+                         f"지난달 값이 이어서 적용 중일 수 있어요(그 달 값을 저장하면 이월이 끊깁니다). "
+                         f"[{_names}{_more}]"),
+        "changes": [],
+        "fix": {
+            "mode": "manual_navigate", "where": "nurse.monthly_limit",
+            "where_label_ko": f"근무자 관리 > {_ym} > 나이트 개수",
+            "how_ko": f"나이트 개수 합계를 {_slots}개 이하로 줄여 저장한 뒤 다시 생성하세요.",
+            "config_key": None,
+            "target": {
+                "year": _y, "month": _m,
+                "nurse_ids": [t.get("nurse_id") for t in targets if t.get("nurse_id")],
+                "forced_n_sum": _forced, "n_slots": _slots, "excess": _excess,
+            },
+        },
+    }
+
+
 def cause_to_resolution_options(
     classification: str, top_family: str | None, targets: list[dict] | None,
 ) -> list[dict[str, Any]]:
@@ -277,18 +334,39 @@ def cause_to_resolution_options(
         #   올려** 정당한 고-야간을 수용한다(night-short 병동의 올바른 레버). 일반(비야간전담)만 내린다.
         ml_no = [t for t in ml if t.get("is_night_only")]
         ml_reg = [t for t in ml if not t.get("is_night_only")]
+        # ★ 야간전담의 나이트 개수가 하드락 #6(월 15회)을 넘으면 **데이터 오류**다 — 상한을 올려서
+        #   수용할 수 없으므로(15 가 끝) 자동 적용 카드를 내지 않고 정정 안내만 낸다. 예전엔 상한을
+        #   15 로 잘라 바뀌는 게 없는 카드가 '유일 해결책'으로 나가 눌러도 같은 실패를 반복했다
+        #   (OMC 리뷰 2026-10-02).
+        from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH as _HARD_N
+        _over = [t for t in ml_no if int(t.get("current") or 0) > _HARD_N]
+        if _over:
+            _names_over = ", ".join(f"{t.get('name') or t['nurse_id']}({int(t.get('current') or 0)}회)"
+                                    for t in _over)
+            return [{
+                "option_id": "cause:night_only_over_hard_cap",
+                "kind": "manual_fix", "source": "cause", "verified": False,
+                "title_ko": f"야간전담 나이트 개수가 월 {_HARD_N}회를 넘습니다 — 정정 필요",
+                "trade_off_ko": (f"{_names_over} — 월 나이트는 1인 최대 {_HARD_N}회(하드락)입니다. "
+                                 f"근무자 관리에서 나이트 개수를 {_HARD_N}회 이하로 고친 뒤 다시 만드세요."),
+                "changes": [],
+                "fix": {"mode": "manual", "where": "nurse.monthly_limit",
+                        "where_label_ko": "근무자 관리 > 해당 근무자 > 나이트 개수"},
+            }]
         for t in ml_reg:
             nm = t.get("name") or t["nurse_id"]
             # n_max(상한)로 완화: 야간을 '정확히 N'이 아니라 '최대 N 까지'로 묶는다.
             # 솔버가 그 아래로 자유롭게 배정 → 근무표 품질 유리. 적용 경로가 하한(n_min)이
             # 새 상한보다 크면 함께 해제하므로 하한충돌(예: min13 > max7)도 풀린다.
-            monthly_limit_release.append({"nurse_id": t["nurse_id"], "field": "n_max",
-                                          "value": int(t["cap"])})
+            # 상한값이 저장 데이터상 15 를 넘어도 하드락 #6 안으로 자른다(적용 시 400 방지).
+            _to = min(int(t["cap"]), _HARD_N)
+            monthly_limit_release.append({"nurse_id": t["nurse_id"], "field": "n_max", "value": _to})
             changes.append({"nurse_id": t["nurse_id"], "config_key": "n_max",
                             "label_ko": f"{nm} 월 야간 최대",
-                            "from": t.get("current"), "to": int(t["cap"])})
+                            "from": t.get("current"), "to": _to})
         if ml_no:
             # 야간전담들이 요구하는 야간수의 최댓값까지 상한을 올려 전원 수용.
+            # ★ 하드락 #6(월 15) 을 넘는 사람은 위에서 이미 걸렀다 — 여기 값은 항상 15 이하다.
             _needed = max(int(t.get("current") or 0) for t in ml_no)
             _cur_cap = min((int(t["cap"]) for t in ml_no if t.get("cap") is not None), default=0)
             if _needed > _cur_cap:
@@ -308,12 +386,17 @@ def cause_to_resolution_options(
                             "label_ko": f"{nm} 주말 휴무", "from": None, "to": "해제"})
         n_nurses = len({t["nurse_id"] for t in ml + wk})
         _trade = "해당 간호사들의 야간/주말 설정이 아래대로 바뀝니다."
-        if ml_no:
+        if ml_no and apply_cfg:
             _nm0 = ml_no[0].get("name") or ml_no[0]["nurse_id"]
-            _trade = (f"{_nm0} 등 야간전담이 필요한 야간을 서려면 '월 야간 상한'을 올려야 합니다. "
-                      f"이 값은 병동 전체 공통이라 전 간호사의 상한이 함께 오릅니다 — 다만 '최대'라 "
-                      f"다른 간호사를 더 세우진 않고(솔버가 필요할 때만 사용), 이 병동은 야간이 "
-                      f"부족한 상태라 여력 확보에 도움이 됩니다. 야간 피로 누적에 유의하세요.")
+            # ★ 야간전담은 상한까지 **고정으로** 선다(OFF ≤ 근무가능일−상한) — 개인 한도가 없는
+            #   야간전담은 상한을 올리면 나이트도 그만큼 는다. 일반 간호사는 '최대'라 필요할 때만 쓴다.
+            _trade = (f"{_nm0} 등 야간전담이 필요한 야간을 서려면 '월 야간 상한'을 올려야 합니다"
+                      f"(최대 {_HARD_N}회 — 하드락). 이 값은 병동 전체 공통이라 전 간호사의 상한이 함께 "
+                      f"오릅니다. 일반 간호사는 '최대'라 필요할 때만 더 서지만, 개인 나이트 개수가 없는 "
+                      f"야간전담은 상한만큼 서게 됩니다. 야간 피로 누적에 유의하세요.")
+        if not changes:
+            # 바뀌는 게 없으면 자동 적용 카드를 내지 않는다(눌러도 같은 실패 — '유일 해결책' 오인 방지).
+            return []
         card: dict[str, Any] = {
             "option_id": "cause:fix_all_personal",
             "kind": "relax_constraint", "source": "cause", "verified": False,

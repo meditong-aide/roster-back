@@ -33,6 +33,9 @@ def seeded(db):
     db.add(Group(group_id="A", group_name="A병동", office_id="o1"))
     db.add(Nurse(nurse_id="n1", account_id="acc_n1", group_id="A", office_id="o1", name="n1",
                  active=1, allowed_shifts=[], grade=1))
+    # 일괄 저장은 관리자·수간호사·그룹관리자만(2026-10-02) — 수간호사 판정은 DB 간호사 행 기준
+    db.add(Nurse(nurse_id="HN", account_id="acc_HN", group_id="A", office_id="o1", name="수간",
+                 active=1, allowed_shifts=[], grade=1, is_head_nurse=1, hn_auth="HN"))
     db.flush()
     return db
 

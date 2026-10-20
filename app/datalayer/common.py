@@ -37,16 +37,17 @@ class Common:
 
     @staticmethod
     def set_push_master():
-        _queryString = """
-        Insert into eun_gw.bizwiz20db.TB_Mobile_Push_History_Master(Message, OfficeCode, EmpSeqNo, SendID, SendUserType, PushCode, PushSubCode, SendType, LinkUrl, RegDate, LinkCode)
-        Values(%s, %s, %s, %s, 'U', %s, %s, 'F', %s, GetDate(), %s)
-        """
-        return _queryString
+        """알림 원본 1건을 넣고 그 Idx 를 같은 배치에서 돌려준다(`utils.gw_write_push` 용).
 
-    @staticmethod
-    def get_push_max_id():
+        ★ 예전엔 넣은 뒤 `Select Top 1 Idx ... Order By Idx Desc` 로 **다시** 읽었다 — 동시에 두 알림이
+          나가면 남의 번호를 집어 수신자가 다른 알림에 붙는다. Idx 는 IDENTITY(2026-10 확인)라
+          SCOPE_IDENTITY 가 이 INSERT 의 값만 준다.
+        """
         _queryString = """
-        Select Top 1 Idx From eun_gw.bizwiz20db.TB_Mobile_Push_History_Master Order By Idx Desc
+        SET NOCOUNT ON;
+        Insert into eun_gw.bizwiz20db.TB_Mobile_Push_History_Master(Message, OfficeCode, EmpSeqNo, SendID, SendUserType, PushCode, PushSubCode, SendType, LinkUrl, RegDate, LinkCode)
+        Values(%s, %s, %s, %s, 'U', %s, %s, 'F', %s, GetDate(), %s);
+        SELECT CAST(SCOPE_IDENTITY() AS bigint) AS Idx;
         """
         return _queryString
 
@@ -59,27 +60,37 @@ class Common:
         return _queryString
 
     @staticmethod
-    def get_user_device_key(receiveEmpSeqNo: str):
+    def get_user_device_key(recipient_count: int):
+        """푸시를 받을 기기 키. 사번은 `%s` 자리표시자로 넘긴다(개수 = recipient_count).
+
+        제외: 앱에서 푸시를 끈 사람(PushYN='N') · 알림 허용 시간대 밖인 사람 · 기기 키가 없는 사람.
+        ★ 예전 조회와 달라진 점(2026-10)
+          - 푸시 설정 행이 **없으면 켜짐**으로 본다. 예전엔 `b.PushYN = 'Y'` 가 LEFT JOIN 을
+            사실상 INNER 로 만들어, 설정 화면엔 '켜짐'으로 보이는데 실제로는 한 건도 못 받았다.
+          - 시간대 사용을 끈 사람(PushTimeYN<>'Y')은 저장된 시간대를 무시한다. 예전엔 두 분기
+            어디에도 안 걸려 영구 제외였다.
+          - 자정을 넘기는 시간대(예: 20:00~02:00)도 맞게 판정한다. 예전엔 영영 안 맞았다.
+          - 사번을 문자열로 이어 붙이지 않는다(f-string IN 은 varchar 암묵 변환·주입 위험).
+        """
+        placeholders = ", ".join(["%s"] * max(recipient_count, 1))
         _queryString = f"""
-        select distinct z.DeviceKey
-          from (
-                select a.MemberID, b.PushYN, b.pushTimeYn, c.DeviceKey
-                  from bizwiz20db.Member_Login a left join eun_gw.bizwiz20db.TB_Mobile_User_Setting_List b on a.MemberID = b.MemberID
-                       left join eun_gw.bizwiz20db.TB_Mobile_User_Device_List c on a.MemberID = c.MemberID
-                where a.EmpSeqNo in ({receiveEmpSeqNo})
-                  and b.PushYN = 'Y' and ((b.stime is null or b.stime = '') and (b.etime is null or b.etime = ''))
-        
-                Union all
-        
-                select a.MemberID, b.PushYN, b.pushTimeYn, c.DeviceKey
-                  from bizwiz20db.Member_Login a left join eun_gw.bizwiz20db.TB_Mobile_User_Setting_List b on a.MemberID = b.MemberID
-                       left join eun_gw.bizwiz20db.TB_Mobile_User_Device_List c on a.MemberID = c.MemberID
-                where a.EmpSeqNo in ({receiveEmpSeqNo})
-                  and b.PushYN = 'Y' and b.PushTimeYN = 'Y' and (b.stime is not null and b.stime <> '') and (b.etime is not null and b.etime <> '')
-                  and CONVERT(time, b.stime + ':00') <= CONVERT(time, GETDATE()) 
-                  and CONVERT(time, b.etime + ':00') >= CONVERT(time, GETDATE())
-               ) z
-        where z.DeviceKey is not null and z.DeviceKey <> ''
+        select distinct c.DeviceKey
+          from bizwiz20db.Member_Login a
+               left join eun_gw.bizwiz20db.TB_Mobile_User_Setting_List b on a.MemberID = b.MemberID
+               join eun_gw.bizwiz20db.TB_Mobile_User_Device_List c on a.MemberID = c.MemberID
+         where a.EmpSeqNo in ({placeholders})
+           and isnull(b.PushYN, 'Y') = 'Y'
+           and c.DeviceKey is not null and c.DeviceKey <> ''
+           and (
+                 isnull(b.PushTimeYN, 'N') <> 'Y'
+              or isnull(b.stime, '') = '' or isnull(b.etime, '') = ''
+              or (b.stime <= b.etime
+                  and CONVERT(time, b.stime + ':00') <= CONVERT(time, GETDATE())
+                  and CONVERT(time, b.etime + ':00') >= CONVERT(time, GETDATE()))
+              or (b.stime > b.etime
+                  and (CONVERT(time, b.stime + ':00') <= CONVERT(time, GETDATE())
+                       or CONVERT(time, b.etime + ':00') >= CONVERT(time, GETDATE())))
+           )
         """
         return _queryString
 

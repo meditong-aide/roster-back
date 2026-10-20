@@ -32,7 +32,7 @@ def _resolve_group_and_office(
 @router.get("/config", response_model=GradeConfigResponse)
 def get_grade_config(
     group_id: Optional[str] = None,
-    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
     """그룹의 Grade 설정을 조회합니다."""

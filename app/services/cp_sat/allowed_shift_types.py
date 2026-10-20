@@ -45,6 +45,12 @@ def is_code_blocked_by_profile(raw, code: str, use_mid: bool = False) -> bool:
     return str(code).strip().upper() not in allowed
 
 
+#: 월 나이트 횟수 상한 — **하드락 #6**(CLAUDE.md · 간호사 1인당 월 최대 15회). 해결 카드가 병동 공통
+#: 상한(`max_nig_per_month`)이나 개인 한도(n_max)를 이보다 높게 **제안하면 안 된다**(하드락 완화 금지 —
+#: 못 풀면 infeasible 보고). N전담은 엔진에서 이 값으로 **고정**된다(OFF ≤ 근무가능일−상한 · N ≤ 상한).
+HARD_MAX_NIGHTS_PER_MONTH = 15
+
+
 def effective_night_cap(nu, global_max_night: int) -> int:
     """야간 전담(N-only) 간호사의 '실효 N 상한'.
 
