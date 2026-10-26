@@ -682,7 +682,7 @@ def _rule_safety_score(
 
     max_conseq = _hl_int(config, "max_conseq_work")
     monthly_night_limit = _hl_int(config, "max_nig_per_month")
-    banned_day_after_eve = _hl_bool(config, "banned_day_after_eve")
+    ban_shift_transitions = _hl_bool(config, "ban_shift_transitions")
 
     prev_work, next_work = _compute_streak(
         schedule_ctx,
@@ -701,11 +701,11 @@ def _rule_safety_score(
         risk += 60.0
         tags.append("night_to_day_evening_risk")
 
-    if banned_day_after_eve and prev_main == "E" and target_main == "D":
+    if ban_shift_transitions and prev_main == "E" and target_main == "D":
         risk += 55.0
         tags.append("eve_to_day_risk")
 
-    if banned_day_after_eve and target_main == "E" and next_main == "D":
+    if ban_shift_transitions and target_main == "E" and next_main == "D":
         risk += 55.0
         tags.append("lookahead_eve_to_day_risk")
 
@@ -2268,8 +2268,8 @@ def _count_path_violations(
     monthly_night_limit = (
         _hl_int(config, "max_nig_per_month")
     )
-    banned_day_after_eve = (
-        _hl_bool(config, "banned_day_after_eve")
+    ban_shift_transitions = (
+        _hl_bool(config, "ban_shift_transitions")
     )
     two_off_after_two = (
         _hl_bool(config, "two_offs_after_two_nig")
@@ -2356,7 +2356,7 @@ def _count_path_violations(
                     _add("night_nd", nid, d, f"{name}: N→D 위반")
                 if prev_code == "N" and code == "E":
                     _add("night_ne", nid, d, f"{name}: N→E 위반")
-                if banned_day_after_eve and prev_code == "E" and code == "D":
+                if ban_shift_transitions and prev_code == "E" and code == "D":
                     _add("eve_ed", nid, d, f"{name}: E→D 위반")
 
         night_count = sum(

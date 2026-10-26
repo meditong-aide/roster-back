@@ -85,10 +85,10 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         strength='HARD',
         module='common',
         governing_keys=(
-            'banned_day_after_eve',
+            'ban_shift_transitions',
             'max_conseq_work',
-            'not_one_night',
-            'three_seq_nig',
+            'ban_single_night',
+            'allow_three_consecutive_nights',
             'use_mid',
             'banned_wanted_entries.banned_shift_ids',
             'banned_wanted_entries.is_applied',
@@ -118,7 +118,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         strength='HARD',
         module='common',
         governing_keys=(
-            'preceptee_on',
+            'preceptee_follows_preceptor',
             'nurse_preceptee_period.preceptor_id',
             'nurses.preceptor_id',
         ),
@@ -160,7 +160,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
             'day_req',
             'eve_req',
             'nig_req',
-            'preceptee_shift_count',
+            'count_preceptee_in_staffing',
             'use_mid',
             'daily_shift.d_count',
             'daily_shift.e_count',
@@ -195,7 +195,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         strength='HARD',
         module='common',
         governing_keys=(
-            'preceptee_shift_count',
+            'count_preceptee_in_staffing',
             'use_mid',
             'daily_shift.d_count_max',
             'daily_shift.e_count_max',
@@ -237,45 +237,45 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
             'day_req',
             'eve_req',
             'nig_req',
-            'off_first',
+            'staffing_first',
             'daily_shift.d_count',
             'daily_shift.e_count',
             'daily_shift.m_count',
             'daily_shift.n_count',
             'shift_manage.manpower',
         ),
-        desc_ko='off_first 이고 max 미설정이면 배정 ≤ 요구(남는 칸은 OFF 로 회수)',
+        desc_ko='staffing_first 이고 max 미설정이면 배정 ≤ 요구(남는 칸은 OFF 로 회수)',
     ),
     RuleSpec(
         id='max_cov_off_equalize',
         strength='AUX',
         module='common',
         governing_keys=(
-            'off_first',
+            'staffing_first',
             'daily_shift.d_count_max',
             'daily_shift.e_count_max',
             'daily_shift.max_enabled',
             'daily_shift.n_count_max',
         ),
-        desc_ko='max 커버리지·off_first 병동의 간호사 간 OFF 균등화 보조 변수(AddMax/MinEquality 포함)',
+        desc_ko='max 커버리지·staffing_first 병동의 간호사 간 OFF 균등화 보조 변수(AddMax/MinEquality 포함)',
     ),
     RuleSpec(
         id='isolated_off_slack',
         strength='AUX',
         module='common',
         governing_keys=(
-            'sequential_offs',
+            'avoid_isolated_off_and_work',
             'runtime.enforce_clustered_offs',
             'runtime.isolated_off_slack_penalty',
         ),
-        desc_ko='고립 OFF 슬랙 정의(lex 는 sequential_offs, primary 는 enforce_clustered_offs 로 켬)',
+        desc_ko='고립 OFF 슬랙 정의(lex 는 avoid_isolated_off_and_work, primary 는 enforce_clustered_offs 로 켬)',
     ),
     RuleSpec(
         id='transition_ban',
         strength='HARD',
         module='common',
         governing_keys=(
-            'banned_day_after_eve',
+            'ban_shift_transitions',
             'runtime.ban_e_to_d',
             'runtime.ban_n_to_d',
             'runtime.ban_n_to_e',
@@ -307,11 +307,11 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         desc_ko='역방향 M→D 금지(2026-09-16 추가). 고정 셀로 M→D 가 명시된 자리는 면제',
     ),
     RuleSpec(
-        id='not_one_night',
+        id='not_one_night',  # nm:external
         strength='HARD',
         module='common',
         governing_keys=(
-            'not_one_night',
+            'ban_single_night',
             'nurse_monthly_limits.n_exact',
             'nurse_monthly_limits.n_max',
             'runtime.prev_month_n_offs_after_by_idx',
@@ -445,19 +445,19 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         strength='HARD',
         module='common',
         governing_keys=(
-            'three_seq_nig',
+            'allow_three_consecutive_nights',
             'runtime.prev_month_n_offs_after_by_idx',
             'runtime.prev_month_n_tail_by_idx',
         ),
         hard_lock_rule_nos=(3,),
-        desc_ko='연속 N 상한(three_seq_nig 면 3, 아니면 2)과 월경계 보정',
+        desc_ko='연속 N 상한(allow_three_consecutive_nights 면 3, 아니면 2)과 월경계 보정',
     ),
     RuleSpec(
         id='cnight_excess',
         strength='AUX',
         module='lex',
         governing_keys=(
-            'three_seq_nig',
+            'allow_three_consecutive_nights',
         ),
         desc_ko='연속 N 초과 슬랙',
     ),
@@ -487,7 +487,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         strength='AUX',
         module='lex',
         governing_keys=(
-            'two_offs_per_week',
+            'prefer_two_offs_per_7days',
         ),
         desc_ko='주 2OFF 부족 슬랙',
     ),
@@ -629,27 +629,27 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         strength='AUX',
         module='lex',
         governing_keys=(
-            'nod_noe',
+            'avoid_nod_noe_eod',
         ),
-        desc_ko='N-O-D 패턴 표지(nod_noe)',
+        desc_ko='N-O-D 패턴 표지(avoid_nod_noe_eod)',
     ),
     RuleSpec(
         id='pattern_noe',
         strength='AUX',
         module='lex',
         governing_keys=(
-            'nod_noe',
+            'avoid_nod_noe_eod',
         ),
-        desc_ko='N-O-E 패턴 표지(nod_noe)',
+        desc_ko='N-O-E 패턴 표지(avoid_nod_noe_eod)',
     ),
     RuleSpec(
         id='pattern_eod',
         strength='AUX',
         module='lex',
         governing_keys=(
-            'nod_noe',
+            'avoid_nod_noe_eod',
         ),
-        desc_ko='E-O-D 패턴 표지(nod_noe)',
+        desc_ko='E-O-D 패턴 표지(avoid_nod_noe_eod)',
     ),
     RuleSpec(
         id='off_quota',
@@ -657,7 +657,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         module='lex',
         governing_keys=(
             'off_days',
-            'off_first',
+            'staffing_first',
             'nurse_allowed_shift_period.allowed_shifts',
             'nurse_weekendoff_period.weekend_off',
             'nurses.allowed_shifts',
@@ -674,7 +674,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         governing_keys=(
             'health_leave_enabled',
             'off_days',
-            'off_first',
+            'staffing_first',
             'nurse_allowed_shift_period.allowed_shifts',
             'nurse_leave_period.health_leave_eligible',
             'nurse_weekendoff_period.weekend_off',
@@ -690,7 +690,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         governing_keys=(
             'health_leave_enabled',
             'off_days',
-            'off_first',
+            'staffing_first',
             'nurse_allowed_shift_period.allowed_shifts',
             'nurse_leave_period.health_leave_eligible',
             'nurse_weekendoff_period.weekend_off',
@@ -705,7 +705,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         governing_keys=(
             'health_leave_enabled',
             'off_days',
-            'off_first',
+            'staffing_first',
             'nurse_allowed_shift_period.allowed_shifts',
             'nurse_leave_period.health_leave_eligible',
             'nurse_weekendoff_period.weekend_off',
@@ -731,7 +731,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         governing_keys=(
             'max_nig_per_month',
             'off_days',
-            'off_first',
+            'staffing_first',
             'two_offs_after_three_nig',
             'two_offs_after_two_nig',
             'daily_shift.max_enabled',
@@ -784,12 +784,12 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         module='lex',
         governing_keys=(
             'health_leave_enabled',
-            'nod_noe',
+            'avoid_nod_noe_eod',
             'off_days',
-            'off_first',
-            'sequential_offs',
-            'three_seq_nig',
-            'two_offs_per_week',
+            'staffing_first',
+            'avoid_isolated_off_and_work',
+            'allow_three_consecutive_nights',
+            'prefer_two_offs_per_7days',
             'nurse_allowed_shift_period.allowed_shifts',
             'nurse_leave_period.health_leave_eligible',
             'nurse_weekendoff_period.weekend_off',
@@ -838,8 +838,8 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
         module='lex',
         governing_keys=(
             'off_days',
-            'off_first',
-            'sequential_offs',
+            'staffing_first',
+            'avoid_isolated_off_and_work',
             'use_mid',
             'daily_shift.d_count',
             'daily_shift.e_count',
@@ -1244,14 +1244,14 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
             'nurse_monthly_limits.n_exact',
             'nurse_monthly_limits.o_exact',
             'env.AIDE_S1_CAP_SLACK',
-            'off_first',
+            'staffing_first',
         ),
         desc_ko=(
             '간호사별 월 D/E/N/O 상한(정확치 아님)의 초과칸 슬랙 정의(monthly_limit_constraints.py:173 '
             '— upper_slack=True 일 때만). 하드 의미는 그대로다(docstring) — 상한을 `합 <= 상한 + 초과칸`'
             '으로 걸고 fallback_lex stage1 이 초과칸을 최우선으로 최소화하며, 0 이 아닌 해는 버린다. '
             'stage1 서브솔브 안에서는 lex_freeze_monthly_cap 이 0 으로 동결한다. 호출은 fallback_lex '
-            '전용(cp_sat_basic 은 upper_slack 인자를 안 넘겨 기본 False). ★O 축은 `off_first=True` 면 '
+            '전용(cp_sat_basic 은 upper_slack 인자를 안 넘겨 기본 False). ★O 축은 `staffing_first=True` 면 '
             '개인 OFF 한도(o_min/o_max/o_exact) 자체를 호출 전에 비워(roster_create_service.py — '
             '"근무 우선 모드는 OFF 한도를 안 읽는다") 이 슬랙 대상에서 빠진다. ★id 가 '
             '`monthly_limit_` 로 시작하지 않게 지었다 — RULE_PREFIXES 의 동적 접두(간호사별 '
@@ -1273,7 +1273,7 @@ _RULE_SPECS: tuple[RuleSpec, ...] = (
             'nurse_monthly_limits.n_exact',
             'nurse_monthly_limits.o_exact',
             'env.AIDE_S1_CAP_SLACK',
-            'off_first',
+            'staffing_first',
             'runtime.ban_night_minimize',
         ),
         freezes=('monthly_cap_slack',),
@@ -1301,11 +1301,11 @@ RULE_PREFIXES: dict[str, RuleSpec] = {
             strength='HARD',
             module='common',
             governing_keys=(
-                'fixed_wanted_use_yn',
+                'apply_confirmed_wanted',
                 'max_conseq_work',
-                'not_one_night',
-                'preceptee_on',
-                'three_seq_nig',
+                'ban_single_night',
+                'preceptee_follows_preceptor',
+                'allow_three_consecutive_nights',
                 'two_offs_after_three_nig',
                 'two_offs_after_two_nig',
                 'fixed_wanted_entries.shift_id',
@@ -1338,11 +1338,11 @@ RULE_PREFIXES: dict[str, RuleSpec] = {
                 'nurse_monthly_limits.o_exact',
                 'nurse_monthly_limits.o_max',
                 'nurse_monthly_limits.o_min',
-                'off_first',
+                'staffing_first',
             ),
             desc_ko=(
                 '간호사별 월 D/E/N/O 하한·상한·정확치. 이름은 동적 monthly_limit_{d|e|n|o}. '
-                '★O 축은 `off_first=True` 면 호출 전에 o_min/o_max/o_exact 가 전부 None 으로 '
+                '★O 축은 `staffing_first=True` 면 호출 전에 o_min/o_max/o_exact 가 전부 None 으로 '
                 '비워져(roster_create_service.py `_run_cp_sat_basic` — "근무 우선 모드는 OFF '
                 '한도를 안 읽는다") 이 제약 자체가 안 걸린다(2026-10-12 dev c1fd5d5)'
             ),

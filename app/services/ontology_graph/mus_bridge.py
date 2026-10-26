@@ -32,7 +32,7 @@ _PATTERN_TO_FAMILY = {
     "transition_ban": "BoundaryTransitionBan",
     "carryover_boundary": "CarryoverBoundary",
     "night_recovery": "NightRecovery",
-    "not_one_night": "NotOneNight",
+    "not_one_night": "NotOneNight",  # nm:external
     "consecutive_work": "ConsecutiveWorkLimit",
 }
 

@@ -72,7 +72,7 @@ ENGINE_RULE_FAMILY: dict[str, str] = {
     'transition_ban': 'BoundaryTransitionBan',  # app/services/semantics/ontology_audit.py:176 · app/services/ontology_graph/mus_bridge.py:23 외
     'mid_transition': '없음: 미구현',  # app/services/semantics/ontology_audit.py:162-184 · app/services/ontology_graph/mus_bridge.py:22-45 외
     'mid_to_day_ban': '없음: 미구현',  # app/services/semantics/ontology_audit.py:162-184 · app/services/ontology_graph/mus_bridge.py:22-45 외
-    'not_one_night': 'NotOneNight',  # app/services/semantics/ontology_audit.py:178 · app/services/ontology_graph/mus_bridge.py:26 외
+    'not_one_night': 'NotOneNight',  # app/services/semantics/ontology_audit.py:178 · app/services/ontology_graph/mus_bridge.py:26 외 · nm:external
     'ban_night_before_fixed_off': 'BanNightBeforeFixedOff',  # app/services/semantics/ontology_audit.py:171 · app/services/semantics/ontology.yaml:172 외
     'ban_night_before_fixed_off_slack': '없음: 보조식',  # app/services/cp_sat/fallback_lex.py:2222
     'lex_freeze_ban_night': '없음: 단계 동결',  # app/services/cp_sat/fallback_lex.py:2245 · app/services/cp_sat/fallback_lex.py:2247

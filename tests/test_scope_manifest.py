@@ -17,7 +17,7 @@ from services.ontology_graph.scope_manifest import exact_or_unknown, unmodeled_a
 
 
 def _cfg(extra=None):
-    c = {"not_one_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
+    c = {"ban_single_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
          "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     if extra:
         c.update(extra)
@@ -79,14 +79,14 @@ def test_health_leave_flags_unmodeled():
     assert solve_hybrid(nu, _cfg({"health_leave_enabled": True}), 6).status == "UNKNOWN"
 
 
-def test_preceptee_shift_count_false_flags_unmodeled():
+def test_count_preceptee_in_staffing_false_flags_unmodeled():
     """프리셉티 커버리지 제외(shift_count=False)만 미지원. 기본 True(일치)면 지원."""
     from services.ontology_graph.scope_manifest import unmodeled_active
     nu = [{"nurse_id": f"n{i}"} for i in range(5)]
     # 기본(둘 다 카운트) = 그래프와 일치 → 지원
-    assert unmodeled_active(nu, _cfg({"preceptee_on": True})) == []
+    assert unmodeled_active(nu, _cfg({"preceptee_follows_preceptor": True})) == []
     # 제외(그래프 과다=낙관) → FEASIBLE 불확실 → 미지원 표시
-    assert "config.preceptee_shift_count=False" in unmodeled_active(
-        nu, _cfg({"preceptee_on": True, "preceptee_shift_count": False}))
+    assert "config.count_preceptee_in_staffing=False" in unmodeled_active(
+        nu, _cfg({"preceptee_follows_preceptor": True, "count_preceptee_in_staffing": False}))
     # preceptee 기능 자체 off → 무관
-    assert unmodeled_active(nu, _cfg({"preceptee_on": False, "preceptee_shift_count": False})) == []
+    assert unmodeled_active(nu, _cfg({"preceptee_follows_preceptor": False, "count_preceptee_in_staffing": False})) == []

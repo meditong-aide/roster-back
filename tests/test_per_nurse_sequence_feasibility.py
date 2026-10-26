@@ -98,7 +98,7 @@ def test_dp_matches_bruteforce():
                 ban_n_to_d=c["ban_nd"], ban_e_to_d=c["ban_ed"], ban_n_to_e=c["ban_ne"],
                 two_offs_after_two_nig=(c["rec_block"] == 2),
                 two_offs_after_three_nig=(c["rec_block"] == 3),
-                not_one_night=c["not_one"], n_min=c["n_min"], n_max=c["n_cap"],
+                ban_single_night=c["not_one"], n_min=c["n_min"], n_max=c["n_cap"],
             )
             bf = not _bf_exists(num_days, set(), {}, c["K"], c["L"], c["ban_nd"], c["ban_ed"],
                                 c["ban_ne"], c["rec_block"], c["not_one"], c["n_min"], c["n_cap"])
@@ -115,7 +115,7 @@ def test_dp_matches_bruteforce_with_fixed():
                 max_consecutive_work=None, max_consecutive_nights=None,
                 ban_n_to_d=ban, ban_e_to_d=False, ban_n_to_e=False,
                 two_offs_after_two_nig=False, two_offs_after_three_nig=False,
-                not_one_night=False, n_min=0, n_max=99,
+                ban_single_night=False, n_min=0, n_max=99,
             )
             bf = not _bf_exists(num_days, set(), fixed, None, None, ban, False, False, 0, False, 0, 99)
             assert dp == bf, (num_days, ban, fixed)

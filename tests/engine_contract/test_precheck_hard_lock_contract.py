@@ -10,7 +10,7 @@
 
 비교에서 의도적으로 빠지는 것(레지스트리 하드락·인접·영향 키 중 precheck 가 값으로 쓰지 않는 13키)은
 `hard_lock_view.NOT_CONSUMED` 에 이유와 함께 적혀 있고, 이 파일이 '전부 분류됐는가'를 지킨다.
-특히 `off_days` 는 엔진이 off_first=False 인 병동의 N 전담·주말휴무가 아닌 간호사에게만 OFF 하드 하한(min_off — 휴가 제외·구조
+특히 `off_days` 는 엔진이 staffing_first=False 인 병동의 N 전담·주말휴무가 아닌 간호사에게만 OFF 하드 하한(min_off — 휴가 제외·구조
 OFF 계산)을 거는데 precheck 는 그 계산을 재현하지 않아 하드 용량에서 일부러 뺀다(느슨한 쪽, 놓칠 수는 있어도 오차단은 없다).
 같은 값을 요구하면 오히려 오차단이다.
 
@@ -49,13 +49,13 @@ class _Absent:
 _ABSENT = _Absent()
 BASE = {
     "daily_shift_requirements": {"D": 1, "E": 1, "N": 1}, "max_conseq_work": 5,
-    "max_nig_per_month": 15, "banned_day_after_eve": True, "three_seq_nig": True,
-    "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "not_one_night": False,
+    "max_nig_per_month": 15, "ban_shift_transitions": True, "allow_three_consecutive_nights": True,
+    "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "ban_single_night": False,
     "use_mid": False, "off_days": 8, "shift_priority": 0.7,
 }
 VALUES = (_ABSENT, None, 0, -1, True, False, "false", 2, 3, 4, 6, 16)
 BOOL_KEYS = frozenset({
-    "banned_day_after_eve", "two_offs_after_three_nig", "two_offs_after_two_nig", "not_one_night",
+    "ban_shift_transitions", "two_offs_after_three_nig", "two_offs_after_two_nig", "ban_single_night",
     "use_mid", "ban_e_to_d", "ban_n_to_d", "ban_n_to_e",
 })
 #: 이 단계 전에는 precheck 가 받지 못하던 키 — 엔진이 못 읽는 설정이면 하나도 실리면 안 된다.
@@ -85,12 +85,12 @@ def _precheck_view(roster_config) -> dict:
     seq = precheck_sequence_params(roster_config)
     return {
         "max_conseq_work": roster_config.get("max_conseq_work"),
-        "banned_day_after_eve": roster_config.get("banned_day_after_eve"),
-        "three_seq_nig": seq["max_consecutive_nights"],
+        "ban_shift_transitions": roster_config.get("ban_shift_transitions"),
+        "allow_three_consecutive_nights": seq["max_consecutive_nights"],
         "two_offs_after_three_nig": seq["two_offs_after_three_nig"],
         "two_offs_after_two_nig": seq["two_offs_after_two_nig"],
         "max_nig_per_month": roster_config.get("max_nig_per_month"),
-        "not_one_night": seq["not_one_night"],
+        "ban_single_night": seq["ban_single_night"],
         "use_mid": roster_config.get("use_mid"),
         "ban_e_to_d": seq["ban_e_to_d"],
         "ban_n_to_d": seq["ban_n_to_d"],
@@ -102,12 +102,12 @@ def _precheck_view(roster_config) -> dict:
 #: 키 대응이 뒤바뀌거나 별칭 정규화가 잘못 들어가면 이 표와 어긋나 빨개진다.
 ENGINE_ATTR = {
     "max_conseq_work": "max_consecutive_work_days",
-    "banned_day_after_eve": "banned_day_after_eve",
-    "three_seq_nig": "max_consecutive_nights",
+    "ban_shift_transitions": "ban_shift_transitions",
+    "allow_three_consecutive_nights": "max_consecutive_nights",
     "two_offs_after_three_nig": "two_offs_after_three_nig",
     "two_offs_after_two_nig": "two_offs_after_two_nig",
     "max_nig_per_month": "max_night_shifts_per_month",
-    "not_one_night": "not_one_night",
+    "ban_single_night": "ban_single_night",
     "use_mid": "use_mid",
     "ban_e_to_d": "ban_e_to_d",
     "ban_n_to_d": "ban_n_to_d",
@@ -201,38 +201,38 @@ def test_c8_build_precheck_input_alone_carries_no_new_keys():
     assert not (NEWLY_CARRIED & set(inp.roster_config))
 
 
-def test_c8_attach_maps_three_seq_nig_to_integer_cap():
-    """(가드) 엔진의 `three_seq_nig` 는 bool 이 아니라 연속 N 상한 정수(3/2) — 이름을 바꿔 정수로 싣는다.
+def test_c8_attach_maps_allow_three_consecutive_nights_to_integer_cap():
+    """(가드) 엔진의 `allow_three_consecutive_nights` 는 bool 이 아니라 연속 N 상한 정수(3/2) — 이름을 바꿔 정수로 싣는다.
 
     bool 로 접어 싣으면 `2`(참)가 L=3 으로 읽혀 연속 N 상한이 틀어진다.
     """
     for raw, cap in ((True, 3), (False, 2), (None, 2), (0, 2)):
-        roster_config = _roster_config(_with("three_seq_nig", raw))
+        roster_config = _roster_config(_with("allow_three_consecutive_nights", raw))
         assert roster_config["max_consecutive_nights"] == cap
-        assert "three_seq_nig" not in roster_config
+        assert "allow_three_consecutive_nights" not in roster_config
 
 
 def test_c8_sequence_params_keep_legacy_defaults_for_direct_callers():
     """(가드) bridge 를 거치지 않는 직접 호출부(라우터 `POST /groups/{id}/roster/precheck`·테스트)는 10c 전과 같은 값을 본다.
 
-    키가 없으면 전이 금지 3종 켬 · 연속 N 상한 2(`three_seq_nig` 참이면 3) · 회복·1N 끔 · 연속근무 상한 없음.
-    bridge 가 실은 엔진 값(`ban_e_to_d`·`max_consecutive_nights`)은 옛 키(`banned_day_after_eve`·`three_seq_nig`)보다 이긴다.
+    키가 없으면 전이 금지 3종 켬 · 연속 N 상한 2(`allow_three_consecutive_nights` 참이면 3) · 회복·1N 끔 · 연속근무 상한 없음.
+    bridge 가 실은 엔진 값(`ban_e_to_d`·`max_consecutive_nights`)은 옛 키(`ban_shift_transitions`·`allow_three_consecutive_nights`)보다 이긴다.
     """
     legacy = precheck_sequence_params({})
     assert legacy == {
         "max_consecutive_work": None, "max_consecutive_nights": 2, "ban_n_to_d": True, "ban_e_to_d": True,
         "ban_n_to_e": True, "two_offs_after_two_nig": False, "two_offs_after_three_nig": False,
-        "not_one_night": False,
+        "ban_single_night": False,
     }
-    assert precheck_sequence_params({"three_seq_nig": True})["max_consecutive_nights"] == 3
-    assert precheck_sequence_params({"banned_day_after_eve": False})["ban_e_to_d"] is False
-    carried = {"three_seq_nig": True, "max_consecutive_nights": 2, "banned_day_after_eve": True, "ban_e_to_d": False}
+    assert precheck_sequence_params({"allow_three_consecutive_nights": True})["max_consecutive_nights"] == 3
+    assert precheck_sequence_params({"ban_shift_transitions": False})["ban_e_to_d"] is False
+    carried = {"allow_three_consecutive_nights": True, "max_consecutive_nights": 2, "ban_shift_transitions": True, "ban_e_to_d": False}
     params = precheck_sequence_params(carried)
     assert params["max_consecutive_nights"] == 2 and params["ban_e_to_d"] is False
     assert precheck_sequence_params({"max_consecutive_nights": "abc"})["max_consecutive_nights"] == 2
-    # 엔진은 `banned_day_after_eve` 가 거짓이면 개별 스위치와 무관하게 전이 금지를 모두 끈다(마스킹이 이긴다) —
+    # 엔진은 `ban_shift_transitions` 가 거짓이면 개별 스위치와 무관하게 전이 금지를 모두 끈다(마스킹이 이긴다) —
     # 옛 단언(개별 `ban_e_to_d=True` 가 마스킹을 이김)은 엔진과 다른 값을 정답으로 고정하고 있었다.
-    masked = precheck_sequence_params({"banned_day_after_eve": False, "ban_e_to_d": True, "ban_n_to_d": True, "ban_n_to_e": True})
+    masked = precheck_sequence_params({"ban_shift_transitions": False, "ban_e_to_d": True, "ban_n_to_d": True, "ban_n_to_e": True})
     assert (masked["ban_e_to_d"], masked["ban_n_to_d"], masked["ban_n_to_e"]) == (False, False, False)
 
 
@@ -240,21 +240,21 @@ def test_c8_sequence_params_keep_legacy_defaults_for_direct_callers():
 TRANSITION_COMBOS = list(itertools.product((True, False), repeat=3))
 
 
-@pytest.mark.parametrize("banned_day_after_eve", (True, False))
+@pytest.mark.parametrize("ban_shift_transitions", (True, False))
 @pytest.mark.parametrize(("ban_e_to_d", "ban_n_to_d", "ban_n_to_e"), TRANSITION_COMBOS)
-def test_c8_transition_ban_combinations_match_the_engine_model(ban_e_to_d, ban_n_to_d, ban_n_to_e, banned_day_after_eve):
+def test_c8_transition_ban_combinations_match_the_engine_model(ban_e_to_d, ban_n_to_d, ban_n_to_e, ban_shift_transitions):
     """전이 금지 3종 8조합 × 마스킹 2 — 엔진이 모델에 거는 값(마스킹 포함)과 precheck 가 읽는 값이 조합마다 같다.
 
     단일 키 행렬(위)은 한 키만 바꾸므로 두 키를 뒤바꾼 변이(예: effective 가 `ban_e_to_d` 와 `ban_n_to_e` 를 바꿔 돌려줌)를
     못 잡는다. 서로 다른 값을 동시에 두면 뒤바뀜이 드러난다.
     """
     cfg = {**BASE, "ban_e_to_d": ban_e_to_d, "ban_n_to_d": ban_n_to_d, "ban_n_to_e": ban_n_to_e,
-           "banned_day_after_eve": banned_day_after_eve}
+           "ban_shift_transitions": ban_shift_transitions}
     engine = _engine_value(cfg)
     view = _precheck_view(_roster_config(cfg))
     for name in ("ban_e_to_d", "ban_n_to_d", "ban_n_to_e"):
         assert view[name] == engine[name], (name, view[name], engine[name])
-    expected = (ban_e_to_d, ban_n_to_d, ban_n_to_e) if banned_day_after_eve else (False, False, False)
+    expected = (ban_e_to_d, ban_n_to_d, ban_n_to_e) if ban_shift_transitions else (False, False, False)
     assert tuple(engine[name] for name in ("ban_e_to_d", "ban_n_to_d", "ban_n_to_e")) == expected
 
 
@@ -269,16 +269,16 @@ def test_c8_direct_call_sequence_params_equal_the_engine_when_keys_are_explicit(
     """bridge 를 거치지 않는 직접 호출부도 키를 명시하면 엔진 모델과 같은 규칙 값을 본다(마스킹·연속 N 상한 포함).
 
     키가 없을 때의 옛 기본값은 따로 고정돼 있다(`..._keep_legacy_defaults_for_direct_callers`). 여기서는 명시한 키만 비교한다 —
-    16조합(three_seq_nig × banned_day_after_eve × ban_e_to_d × ban_n_to_e, ban_n_to_d 는 ban_e_to_d 의 반대, 회복·1N 은 조합으로 순환).
+    16조합(allow_three_consecutive_nights × ban_shift_transitions × ban_e_to_d × ban_n_to_e, ban_n_to_d 는 ban_e_to_d 의 반대, 회복·1N 은 조합으로 순환).
     """
     three_seq, banned, ban_e, ban_n_e = flags
-    raw = {"three_seq_nig": three_seq, "banned_day_after_eve": banned, "ban_e_to_d": ban_e, "ban_n_to_d": not ban_e,
+    raw = {"allow_three_consecutive_nights": three_seq, "ban_shift_transitions": banned, "ban_e_to_d": ban_e, "ban_n_to_d": not ban_e,
            "ban_n_to_e": ban_n_e, "two_offs_after_two_nig": ban_e, "two_offs_after_three_nig": ban_n_e,
-           "not_one_night": three_seq}
+           "ban_single_night": three_seq}
     engine = _engine_value({**BASE, **raw})
     params = precheck_sequence_params(raw)
-    assert params["max_consecutive_nights"] == engine["three_seq_nig"]
-    for name in ("ban_e_to_d", "ban_n_to_d", "ban_n_to_e", "two_offs_after_two_nig", "two_offs_after_three_nig", "not_one_night"):
+    assert params["max_consecutive_nights"] == engine["allow_three_consecutive_nights"]
+    for name in ("ban_e_to_d", "ban_n_to_d", "ban_n_to_e", "two_offs_after_two_nig", "two_offs_after_three_nig", "ban_single_night"):
         assert params[name] == bool(engine[name]), (name, params[name], engine[name])
 
 

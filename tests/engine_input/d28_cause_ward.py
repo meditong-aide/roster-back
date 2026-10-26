@@ -60,9 +60,9 @@ def ward():
     ]
     w.shift_manage = [shift_manage_row(1, "D", ["D"], 1), shift_manage_row(2, "E", ["E"], 1),
                       shift_manage_row(3, "N", ["N"], 1), shift_manage_row(5, "M", ["D2"], 1)]
-    w.config = config_row(day_req=1, eve_req=1, nig_req=1, use_mid=True, fixed_wanted_use_yn=True,
+    w.config = config_row(day_req=1, eve_req=1, nig_req=1, use_mid=True, apply_confirmed_wanted=True,
                           two_offs_after_two_nig=True, two_offs_after_three_nig=True,
-                          not_one_night=True)
+                          ban_single_night=True)
     w.raw = {"n2n_min_gap": 0, "fixed_holiday_off_yn": 0}
     w.extras.append(_rows("FixedWantedEntry", _fixed_rows()))
     return w

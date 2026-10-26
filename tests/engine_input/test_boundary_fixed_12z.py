@@ -1,6 +1,6 @@
 """Codex 5차 [P2](12z) — 확정 N 블록은 연속 나이트 상한(L)까지 이어 갈 수 있다(NNN OO 허용).
 
-전월이 D 로 끝나고 1~2일이 확정 N 이며 three_seq_nig·two_offs_after_two_nig 가 켜진 병동: 3일(엔진 칸)에 N 을 막고 OFF 를
+전월이 D 로 끝나고 1~2일이 확정 N 이며 allow_three_consecutive_nights·two_offs_after_two_nig 가 켜진 병동: 3일(엔진 칸)에 N 을 막고 OFF 를
 강제하면 엔진이 허용하는 NNN OO 를 잘라 해를 줄이고, 그날 그 간호사가 필요한 precheck 에 거짓 부족을 만든다.
 회복 의무는 블록이 실제로 끝나는 길이에 맞게(NN → #5 · NNN → #4) 엔진이 건다. 블록이 이미 L 이면 다음 날 OFF 강제 그대로.
 """
@@ -34,7 +34,7 @@ def _rf(fixed, rules):
     ({0: "N", 1: "N"}, R3_X, set(), {2: {"D", "E"}}),
     # 블록이 이미 L(3) — 4일(색인 3) N 금지 · 3·4일 아니라 4·5일(색인 3·4) 강제 OFF 그대로
     ({0: "N", 1: "N", 2: "N"}, R3, {3, 4}, {3: {"N", "D", "E"}}),
-    # L=2(three_seq_nig 꺼짐): 블록이 이미 L — 3일 N 금지 · 3·4일 강제 OFF 그대로
+    # L=2(allow_three_consecutive_nights 꺼짐): 블록이 이미 L — 3일 N 금지 · 3·4일 강제 OFF 그대로
     ({0: "N", 1: "N"}, R2, {2, 3}, {2: {"N", "D", "E"}}),
     # 회복이 닿는 칸(3·4·5일)에 확정 근무가 끼면 엔진 회복이 확정 칸과 부딪힌다 — 예전 방식(N 금지 · OFF 옮김) 그대로
     ({0: "N", 1: "N", 3: "D"}, R3, {2, 4}, {2: {"N", "D", "E"}}),
@@ -96,7 +96,7 @@ def test_engine_block_at_limit_keeps_forced_off(engine, engine_input_tables, mon
 
 
 def test_cfg_has_expected_flags():
-    assert CFG["Y"]["two_offs_after_two_nig"] and CFG["Z"]["three_seq_nig"] is False
+    assert CFG["Y"]["two_offs_after_two_nig"] and CFG["Z"]["allow_three_consecutive_nights"] is False
 
 
 # ── 사전 주입(2N→2OFF recovery) — 이어 갈 수 있는 확정 N 블록에는 박지 않는다 ───────────────────────────
@@ -105,7 +105,7 @@ def test_cfg_has_expected_flags():
 @pytest.mark.parametrize("start,end,days,work,limit,expected", [
     (0, 1, 30, set(), 3, True),          # Codex 사례 — NN · L=3
     (0, 2, 30, set(), 3, False),         # 블록이 이미 L
-    (0, 1, 30, set(), 2, False),         # L=2(three_seq_nig 꺼짐)
+    (0, 1, 30, set(), 2, False),         # L=2(allow_three_consecutive_nights 꺼짐)
     (0, 1, 30, {2}, 3, False),   # 다음 날이 확정 근무 칸
     (0, 1, 30, {3}, 3, False),   # 회복이 닿는 둘째 칸이 확정 근무 — 엔진 회복과 부딪힌다
     (0, 1, 30, {4}, 3, False),   # N 으로 이으면 회복이 닿는 칸이 확정 근무

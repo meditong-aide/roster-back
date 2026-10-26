@@ -283,7 +283,7 @@ def _probe_samples() -> tuple[dict, ...]:
         return (spec.key, *spec.aliases)
 
     below = {**strict_base(), **dict.fromkeys(_keys("max_conseq_work"), 4),
-             **dict.fromkeys(_keys("max_nig_per_month"), 10), "three_seq_nig": False}
+             **dict.fromkeys(_keys("max_nig_per_month"), 10), "allow_three_consecutive_nights": False}
     defaults = {s.key: (s.current_default == "True" if s.current_default in ("True", "False") else int(s.current_default))
                 for s in SETTINGS if s.hard_lock is not None}
     return strict_base(), below, defaults, {}, {**strict_base(), "max_conseq_work": 0}

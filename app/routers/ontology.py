@@ -23,6 +23,8 @@ from typing import Any, Iterable
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from services.engine_contract.names import to_external_deep
+
 
 router = APIRouter(prefix="/ontology", tags=["ontology"])
 
@@ -941,7 +943,7 @@ CONFLICT_CATALOG: dict[str, dict[str, Any]] = {
         "action_target": "fixed_assignment",
         "adjustable": True,
     },
-    "cpsat_mus:not_one_night": {
+    "cpsat_mus:not_one_night": {  # nm:external
         "title": "야간 배정 규칙 과부하",
         "what_ko": "야간 단독 금지·월간 N상한·OFF상한·회복 규칙이 동시에 너무 좁습니다.",
         "action_ko": "월간 야간 상한을 1~2 늘리거나, 야간 단독 금지 규칙을 완화하세요.",
@@ -1098,7 +1100,7 @@ def _guidance_category_for_core(core: dict[str, Any]) -> str | None:
         "max_consecutive_work",
         "transition_ban",
         "monthly_limit_n",
-        "not_one_night",
+        "not_one_night",  # nm:external
         "recovery_2n2off",
         "recovery_3n2off",
         "recovery_off",
@@ -2089,7 +2091,8 @@ def ontology_audit_endpoint() -> JSONResponse:
     """
     from services.semantics.ontology_audit import audit_all, audit_summary
     findings = audit_all()
-    return JSONResponse(audit_summary(findings))
+    # findings 의 I5 config_key 는 파이썬 이름이다 — 응답은 바깥 이름으로(NM)
+    return JSONResponse(to_external_deep(audit_summary(findings)))
 
 
 @router.get("/matrix/case/{case_id}/payload")
@@ -2111,7 +2114,8 @@ def matrix_case_payload(case_id: str) -> JSONResponse:
                 "category": case["category"],
                 "expected_cats": sorted(case["expected_cats"]),
             },
-            "payload": payload,
+            # resolution_options 의 apply·config_key 는 파이썬 이름이다 — 응답은 바깥 이름으로(NM)
+            "payload": to_external_deep(payload),
             "verdict": result,
         })
     except Exception as exc:

@@ -731,7 +731,7 @@ NURSE_ATTRS: tuple[NurseAttrSpec, ...] = (
         hidden_no=None,
         rule_key_forms=('nurse_monthly_limits.n_max',),
         divergences=[],
-        rule_refs=[{'id': 'not_one_night', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [7], 'hard_lock_indirect': []}, {'id': 'off_cap', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_cap_slack', 'module': 'lex', 'strength': 'AUX', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'lex_freeze_monthly_cap', 'module': 'lex', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_limit_*', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}],
+        rule_refs=[{'id': 'not_one_night', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [7], 'hard_lock_indirect': []}, {'id': 'off_cap', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_cap_slack', 'module': 'lex', 'strength': 'AUX', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'lex_freeze_monthly_cap', 'module': 'lex', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_limit_*', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}],  # nm:external
     ),
     NurseAttrSpec(
         key='n_exact',
@@ -754,7 +754,7 @@ NURSE_ATTRS: tuple[NurseAttrSpec, ...] = (
         hidden_no=None,
         rule_key_forms=('nurse_monthly_limits.n_exact',),
         divergences=[],
-        rule_refs=[{'id': 'not_one_night', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [7], 'hard_lock_indirect': []}, {'id': 'off_cap', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_cap_slack', 'module': 'lex', 'strength': 'AUX', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'lex_freeze_monthly_cap', 'module': 'lex', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_limit_*', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}],
+        rule_refs=[{'id': 'not_one_night', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [7], 'hard_lock_indirect': []}, {'id': 'off_cap', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_cap_slack', 'module': 'lex', 'strength': 'AUX', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'lex_freeze_monthly_cap', 'module': 'lex', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_limit_*', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}],  # nm:external
     ),
     NurseAttrSpec(
         key='o_min',
@@ -772,11 +772,11 @@ NURSE_ATTRS: tuple[NurseAttrSpec, ...] = (
         lanes={'engine': True, 'precheck': False, 'ontology': False},
         hard_lock_rule_nos=(),
         hard_lock_kind=None,
-        hard_lock_detail='off_first=True 면 엔진 호출 직전에 o_min/o_max/o_exact 를 None 으로 비운다(사본 — 간호사 객체는 그대로) [코드] app/services/roster_create_service.py:3451-3454',
+        hard_lock_detail='staffing_first=True 면 엔진 호출 직전에 o_min/o_max/o_exact 를 None 으로 비운다(사본 — 간호사 객체는 그대로) [코드] app/services/roster_create_service.py:3451-3454',
         editor='USER_SCREEN',
         hidden_no=None,
         rule_key_forms=('nurse_monthly_limits.o_min',),
-        divergences=[{'id': 'ML-O-OFFFIRST', 'desc': 'off_first=True 면 엔진만 o_* 를 비우고 precheck·온톨로지 dict(_ONTOLOGY_NURSE_FIELDS)는 원값을 싣는다. 지금 3벌 중 o_* 를 읽는 곳은 엔진뿐이라 판정 차이는 0이지만, 온톨로지가 o_* 를 읽기 시작하면 갈린다', 'evidence': ['app/services/roster_create_service.py:3451-3454', 'app/services/roster_create_service.py:6462-6470'], 'tag': '[코드]'}, {'id': 'ML-PRECHECK-BLIND', 'desc': 'runtime precheck 는 n_exact·n_max 만 본다(night_cap). d/e/o 한도·n_min 은 생성 precheck 에 없음', 'evidence': ['app/services/precheck/runtime_bridge.py:286-295'], 'tag': '[코드]'}],
+        divergences=[{'id': 'ML-O-OFFFIRST', 'desc': 'staffing_first=True 면 엔진만 o_* 를 비우고 precheck·온톨로지 dict(_ONTOLOGY_NURSE_FIELDS)는 원값을 싣는다. 지금 3벌 중 o_* 를 읽는 곳은 엔진뿐이라 판정 차이는 0이지만, 온톨로지가 o_* 를 읽기 시작하면 갈린다', 'evidence': ['app/services/roster_create_service.py:3451-3454', 'app/services/roster_create_service.py:6462-6470'], 'tag': '[코드]'}, {'id': 'ML-PRECHECK-BLIND', 'desc': 'runtime precheck 는 n_exact·n_max 만 본다(night_cap). d/e/o 한도·n_min 은 생성 precheck 에 없음', 'evidence': ['app/services/precheck/runtime_bridge.py:286-295'], 'tag': '[코드]'}],
         rule_refs=[{'id': 'monthly_limit_*', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}],
     ),
     NurseAttrSpec(
@@ -795,11 +795,11 @@ NURSE_ATTRS: tuple[NurseAttrSpec, ...] = (
         lanes={'engine': True, 'precheck': False, 'ontology': False},
         hard_lock_rule_nos=(),
         hard_lock_kind=None,
-        hard_lock_detail='off_first=True 면 엔진 호출 직전에 o_min/o_max/o_exact 를 None 으로 비운다(사본 — 간호사 객체는 그대로) [코드] app/services/roster_create_service.py:3451-3454',
+        hard_lock_detail='staffing_first=True 면 엔진 호출 직전에 o_min/o_max/o_exact 를 None 으로 비운다(사본 — 간호사 객체는 그대로) [코드] app/services/roster_create_service.py:3451-3454',
         editor='USER_SCREEN',
         hidden_no=None,
         rule_key_forms=('nurse_monthly_limits.o_max',),
-        divergences=[{'id': 'ML-O-OFFFIRST', 'desc': 'off_first=True 면 엔진만 o_* 를 비우고 precheck·온톨로지 dict(_ONTOLOGY_NURSE_FIELDS)는 원값을 싣는다. 지금 3벌 중 o_* 를 읽는 곳은 엔진뿐이라 판정 차이는 0이지만, 온톨로지가 o_* 를 읽기 시작하면 갈린다', 'evidence': ['app/services/roster_create_service.py:3451-3454', 'app/services/roster_create_service.py:6462-6470'], 'tag': '[코드]'}, {'id': 'ML-PRECHECK-BLIND', 'desc': 'runtime precheck 는 n_exact·n_max 만 본다(night_cap). d/e/o 한도·n_min 은 생성 precheck 에 없음', 'evidence': ['app/services/precheck/runtime_bridge.py:286-295'], 'tag': '[코드]'}],
+        divergences=[{'id': 'ML-O-OFFFIRST', 'desc': 'staffing_first=True 면 엔진만 o_* 를 비우고 precheck·온톨로지 dict(_ONTOLOGY_NURSE_FIELDS)는 원값을 싣는다. 지금 3벌 중 o_* 를 읽는 곳은 엔진뿐이라 판정 차이는 0이지만, 온톨로지가 o_* 를 읽기 시작하면 갈린다', 'evidence': ['app/services/roster_create_service.py:3451-3454', 'app/services/roster_create_service.py:6462-6470'], 'tag': '[코드]'}, {'id': 'ML-PRECHECK-BLIND', 'desc': 'runtime precheck 는 n_exact·n_max 만 본다(night_cap). d/e/o 한도·n_min 은 생성 precheck 에 없음', 'evidence': ['app/services/precheck/runtime_bridge.py:286-295'], 'tag': '[코드]'}],
         rule_refs=[{'id': 'monthly_cap_slack', 'module': 'lex', 'strength': 'AUX', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'lex_freeze_monthly_cap', 'module': 'lex', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_limit_*', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}],
     ),
     NurseAttrSpec(
@@ -818,11 +818,11 @@ NURSE_ATTRS: tuple[NurseAttrSpec, ...] = (
         lanes={'engine': True, 'precheck': False, 'ontology': False},
         hard_lock_rule_nos=(),
         hard_lock_kind=None,
-        hard_lock_detail='off_first=True 면 엔진 호출 직전에 o_min/o_max/o_exact 를 None 으로 비운다(사본 — 간호사 객체는 그대로) [코드] app/services/roster_create_service.py:3451-3454',
+        hard_lock_detail='staffing_first=True 면 엔진 호출 직전에 o_min/o_max/o_exact 를 None 으로 비운다(사본 — 간호사 객체는 그대로) [코드] app/services/roster_create_service.py:3451-3454',
         editor='USER_SCREEN',
         hidden_no=None,
         rule_key_forms=('nurse_monthly_limits.o_exact',),
-        divergences=[{'id': 'ML-O-OFFFIRST', 'desc': 'off_first=True 면 엔진만 o_* 를 비우고 precheck·온톨로지 dict(_ONTOLOGY_NURSE_FIELDS)는 원값을 싣는다. 지금 3벌 중 o_* 를 읽는 곳은 엔진뿐이라 판정 차이는 0이지만, 온톨로지가 o_* 를 읽기 시작하면 갈린다', 'evidence': ['app/services/roster_create_service.py:3451-3454', 'app/services/roster_create_service.py:6462-6470'], 'tag': '[코드]'}, {'id': 'ML-PRECHECK-BLIND', 'desc': 'runtime precheck 는 n_exact·n_max 만 본다(night_cap). d/e/o 한도·n_min 은 생성 precheck 에 없음', 'evidence': ['app/services/precheck/runtime_bridge.py:286-295'], 'tag': '[코드]'}],
+        divergences=[{'id': 'ML-O-OFFFIRST', 'desc': 'staffing_first=True 면 엔진만 o_* 를 비우고 precheck·온톨로지 dict(_ONTOLOGY_NURSE_FIELDS)는 원값을 싣는다. 지금 3벌 중 o_* 를 읽는 곳은 엔진뿐이라 판정 차이는 0이지만, 온톨로지가 o_* 를 읽기 시작하면 갈린다', 'evidence': ['app/services/roster_create_service.py:3451-3454', 'app/services/roster_create_service.py:6462-6470'], 'tag': '[코드]'}, {'id': 'ML-PRECHECK-BLIND', 'desc': 'runtime precheck 는 n_exact·n_max 만 본다(night_cap). d/e/o 한도·n_min 은 생성 precheck 에 없음', 'evidence': ['app/services/precheck/runtime_bridge.py:286-295'], 'tag': '[코드]'}],
         rule_refs=[{'id': 'monthly_cap_slack', 'module': 'lex', 'strength': 'AUX', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'lex_freeze_monthly_cap', 'module': 'lex', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}, {'id': 'monthly_limit_*', 'module': 'common', 'strength': 'HARD', 'hard_lock_rule_nos': [], 'hard_lock_indirect': []}],
     ),
     NurseAttrSpec(

@@ -133,7 +133,7 @@ def test_no_naive_pattern_in_narrative_text_through_payload():
             {"reason_code": "CAPACITY_TOTAL_SHORTAGE",
              "details": {"required": 100, "capacity": 50, "shortage": 50,
                          "nurse_count": 5, "days": 30, "off_days": 8,
-                         "off_first": False, "source": "test"}},
+                         "staffing_first": False, "source": "test"}},
         ],
     )
     narr = payload["infeasibility"]["resolution_narrative"]

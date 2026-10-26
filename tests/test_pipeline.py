@@ -53,7 +53,7 @@ def test_only_infeasible_certificate_skips_solver():
 
 def test_graph_infeasible_short_circuits():
     nu = [{"nurse_id": f"n{i}"} for i in range(5)]
-    cfg = {"two_offs_after_two_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_two_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 2},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     r = diagnose_pipeline(nu, cfg, 6)
@@ -64,7 +64,7 @@ def test_graph_infeasible_short_circuits():
 def test_feasible_invokes_solver():
     """지원범위 FEASIBLE 이라도 solver 를 실행한다(생성·최적화)."""
     nu = [{"nurse_id": f"n{i}"} for i in range(6)]
-    cfg = {"not_one_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
+    cfg = {"ban_single_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     r = diagnose_pipeline(nu, cfg, 6)
     assert r.solver_invoked is True

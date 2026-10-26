@@ -29,6 +29,7 @@ from services.engine_contract.effective import (
     effective,
     effective_hard_lock,
 )
+from services.engine_contract.names import to_internal
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APP_ROOT = REPO_ROOT / "app"
@@ -68,7 +69,8 @@ def _build(engine, config_data: dict) -> tuple[object, type[BaseException] | Non
 def _load_golden_config_data(name: str) -> dict:
     require_golden(GOLDEN)  # D29 — 골든이 없는 체크아웃에서는 건너뜀(REQUIRE_GOLDEN=1 이면 실패) · 일부만 있으면 실패
     data = json.loads((GOLDEN_DIR / f"{name}.json").read_text(encoding="utf-8"))
-    return data["layers"]["L1"][0]["config_data"]
+    # 골든 기록은 바깥(옛) 이름 키일 수 있다 — 엔진 입구(`create_config_from_db`)는 파이썬 이름만 받으므로 얕게 옮긴다(NM).
+    return to_internal(data["layers"]["L1"][0]["config_data"])
 
 
 # ── `effective()` 계약 (§4.8) ────────────────────────────────────────────
@@ -88,7 +90,7 @@ def test_unknown_setting_key_rejects_non_registry_spellings(base_cfg, bad_key):
 
 @pytest.mark.parametrize(
     "key",
-    ["cross_month_hard_rules_enable", "version", "off_swap_enabled", "day_req"],
+    ["cross_month_hard_rules_enable", "version", "convert_excess_off_to_leave", "day_req"],
 )
 def test_not_in_config_for_out_of_scope_keys(base_cfg, key):
     with pytest.raises(NotInConfig) as exc_info:
@@ -121,12 +123,22 @@ def test_alias_resolves_to_canonical_key_for_every_registry_alias():
             assert canonical_key(alias) == spec.key
 
 
+def test_canonical_key_resolves_outer_column_names(base_cfg):
+    """바깥(옛) 이름 14칸(`SettingSpec.column`)도 정본 키로 풀린다(NM D58) — 옛 이름 요청·저장 JSON 이 UnknownSettingKey 를 내지 않게."""
+    columns = {s.column: s.key for s in S.SETTINGS if s.column}
+    assert len(columns) == 14
+    for column, key in columns.items():
+        assert canonical_key(column) == key
+        assert canonical_key(key) == key
+    assert effective(base_cfg, "not_one_night") is effective(base_cfg, "ban_single_night")
+
+
 #: 레지스트리를 레지스트리로 검증하는 순환을 피한다 — 실제 소비자 철자를 리터럴로 고정한다
 #: (리뷰 반영, review_m/probe_misuse_env.py (3)·roster_ir.py:135·constraint_impact/control.py:348,408-409).
 _EXTERNAL_ALIAS_SPELLINGS: tuple[tuple[str, str], ...] = (
     ("max_night_shifts_per_month", "max_nig_per_month"),  # constraint_impact/control.py:348
     ("max_consecutive_work_days", "max_conseq_work"),  # constraint_impact/control.py:408
-    ("max_consecutive_nights", "three_seq_nig"),  # constraint_impact/control.py:409 · roster_ir.py:133
+    ("max_consecutive_nights", "allow_three_consecutive_nights"),  # constraint_impact/control.py:409 · roster_ir.py:133
     ("max_consecutive_work", "max_conseq_work"),  # ontology_graph/roster_ir.py:135
 )
 
@@ -143,7 +155,7 @@ def test_effective_rejects_non_nurse_roster_config_objects():
     from db.models import RosterConfig
     from schemas.roster_schema import RosterConfigCreate
 
-    row = {"max_conseq_work": 7, "three_seq_nig": True}
+    row = {"max_conseq_work": 7, "allow_three_consecutive_nights": True}
     orm = RosterConfig(**row)
     ns = types.SimpleNamespace(**row)
     pyd = RosterConfigCreate(
@@ -189,12 +201,12 @@ def test_direct_nurse_roster_config_lacks_setattr_only_fields():
 def test_hard_lock_key_shape():
     assert HARD_LOCK_CFG_KEYS == (
         "max_conseq_work",
-        "banned_day_after_eve",
-        "three_seq_nig",
+        "ban_shift_transitions",
+        "allow_three_consecutive_nights",
         "two_offs_after_three_nig",
         "two_offs_after_two_nig",
         "max_nig_per_month",
-        "not_one_night",
+        "ban_single_night",
         "use_mid",
         "ban_e_to_d",
         "ban_n_to_d",
@@ -209,12 +221,12 @@ def test_hard_lock_key_shape():
 
 _EMPTY_CONFIG_EXPECTED = {
     "max_conseq_work": 5,
-    "banned_day_after_eve": True,
-    "three_seq_nig": 3,
+    "ban_shift_transitions": True,
+    "allow_three_consecutive_nights": 3,
     "two_offs_after_three_nig": True,
     "two_offs_after_two_nig": False,
     "max_nig_per_month": 15,
-    "not_one_night": False,
+    "ban_single_night": False,
     "use_mid": False,
     "ban_e_to_d": True,
     "ban_n_to_d": True,
@@ -269,19 +281,19 @@ def test_null_preserved_not_coerced_to_false():
     """Q16 'NULL→꺼짐 현행 유지' — bool() 로 접지 않고 None 을 그대로 낸다."""
     with contextlib.redirect_stdout(io.StringIO()):
         r1 = effective_hard_lock({"two_offs_after_three_nig": None})
-        r2 = effective_hard_lock({"banned_day_after_eve": None})
+        r2 = effective_hard_lock({"ban_shift_transitions": None})
     assert r1["two_offs_after_three_nig"] is None
-    assert r2["banned_day_after_eve"] is None
+    assert r2["ban_shift_transitions"] is None
     assert r2["ban_e_to_d"] is False and r2["ban_n_to_d"] is False and r2["ban_n_to_e"] is False
 
 
 def test_input_alias_not_normalized():
     """별칭 정규화는 생성 진입(`engine_contract.aliases`)이 하고 `create_config_from_db` 는 정본만 읽는다 — 이 거울은 정규화하지 않는다."""
     with contextlib.redirect_stdout(io.StringIO()):
-        r1 = effective_hard_lock({"max_consecutive_nights": 7})  # three_seq_nig 의 별칭
+        r1 = effective_hard_lock({"max_consecutive_nights": 7})  # allow_three_consecutive_nights 의 별칭
         r2 = effective_hard_lock({"max_consecutive_work_days": 7})  # max_conseq_work 의 별칭
         r3 = effective_hard_lock({"max_night_shifts_per_month": 20})  # max_nig_per_month 의 별칭
-    assert r1["three_seq_nig"] == 3  # 별칭을 무시하고 정본 키 부재 기본값(3)
+    assert r1["allow_three_consecutive_nights"] == 3  # 별칭을 무시하고 정본 키 부재 기본값(3)
     assert r2["max_conseq_work"] == 5
     assert r3["max_nig_per_month"] == 15
 
@@ -335,7 +347,7 @@ def _boundary_hard_lock_snippet() -> str:
     start = next(i for i in range(fn.lineno - 1, fn.end_lineno) if lines[i].strip().startswith("def _safe_int"))
     end = next(
         i for i in range(start, fn.end_lineno)
-        if lines[i].strip().startswith("L = 3 if bool(config_dict.get('three_seq_nig', False)) else 2")
+        if lines[i].strip().startswith("L = 3 if bool(config_dict.get('allow_three_consecutive_nights', False)) else 2")
     )
     return textwrap.dedent("\n".join(lines[start : end + 1]))
 
@@ -343,7 +355,7 @@ def _boundary_hard_lock_snippet() -> str:
 def _boundary_hard_lock(config_dict: dict) -> dict:
     ns: dict = {"config_dict": config_dict}
     exec(_boundary_hard_lock_snippet(), ns)  # noqa: S102 — 설계 §4.9 보강, 빌더 원문 그대로 비교
-    return {"max_conseq_work": ns["K"], "three_seq_nig": ns["L"]}
+    return {"max_conseq_work": ns["K"], "allow_three_consecutive_nights": ns["L"]}
 
 
 def test_boundary_builder_ignores_alias_and_diverges_from_effective_only_on_default():
@@ -353,14 +365,14 @@ def test_boundary_builder_ignores_alias_and_diverges_from_effective_only_on_defa
     with contextlib.redirect_stdout(io.StringIO()):
         empty = effective_hard_lock({})
         aliased = effective_hard_lock({"max_consecutive_nights": 7})
-        canon_on = effective_hard_lock({"three_seq_nig": True, "max_consecutive_nights": 7})
-        canon_off = effective_hard_lock({"three_seq_nig": False, "max_consecutive_nights": 7})
+        canon_on = effective_hard_lock({"allow_three_consecutive_nights": True, "max_consecutive_nights": 7})
+        canon_off = effective_hard_lock({"allow_three_consecutive_nights": False, "max_consecutive_nights": 7})
     boundary_empty = _boundary_hard_lock({})
     boundary_aliased = _boundary_hard_lock({"max_consecutive_nights": 7})
-    assert (empty["three_seq_nig"], boundary_empty["three_seq_nig"]) == (3, 2)
-    assert (aliased["three_seq_nig"], boundary_aliased["three_seq_nig"]) == (3, 2)
-    assert (canon_on["three_seq_nig"], _boundary_hard_lock({"three_seq_nig": True, "max_consecutive_nights": 7})["three_seq_nig"]) == (3, 3)
-    assert (canon_off["three_seq_nig"], _boundary_hard_lock({"three_seq_nig": False, "max_consecutive_nights": 7})["three_seq_nig"]) == (2, 2)
+    assert (empty["allow_three_consecutive_nights"], boundary_empty["allow_three_consecutive_nights"]) == (3, 2)
+    assert (aliased["allow_three_consecutive_nights"], boundary_aliased["allow_three_consecutive_nights"]) == (3, 2)
+    assert (canon_on["allow_three_consecutive_nights"], _boundary_hard_lock({"allow_three_consecutive_nights": True, "max_consecutive_nights": 7})["allow_three_consecutive_nights"]) == (3, 3)
+    assert (canon_off["allow_three_consecutive_nights"], _boundary_hard_lock({"allow_three_consecutive_nights": False, "max_consecutive_nights": 7})["allow_three_consecutive_nights"]) == (2, 2)
 
 
 def test_print_not_suppressed(capsys):
@@ -472,13 +484,13 @@ _GOLDEN_L1_NAMES = (
 _GOLDEN_FIXED_EXPECTED = {
     "S1": _EMPTY_CONFIG_EXPECTED,
     "S2": {
-        "max_conseq_work": 5, "banned_day_after_eve": None, "three_seq_nig": 2,
+        "max_conseq_work": 5, "ban_shift_transitions": None, "allow_three_consecutive_nights": 2,
         "two_offs_after_three_nig": None, "two_offs_after_two_nig": None,
-        "max_nig_per_month": 15, "not_one_night": False, "use_mid": False,
+        "max_nig_per_month": 15, "ban_single_night": False, "use_mid": False,
         "ban_e_to_d": False, "ban_n_to_d": False, "ban_n_to_e": False,
     },
     "S4": {**_EMPTY_CONFIG_EXPECTED, "use_mid": True},
-    "S7": {**_EMPTY_CONFIG_EXPECTED, "two_offs_after_two_nig": True, "not_one_night": True},
+    "S7": {**_EMPTY_CONFIG_EXPECTED, "two_offs_after_two_nig": True, "ban_single_night": True},
 }
 
 

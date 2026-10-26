@@ -23,7 +23,7 @@ def _cfg(**over):
     base = {
         "daily_shift_requirements": {"D": 1, "E": 1, "N": 1}, "off_days": 8, "max_nig_per_month": 15,
         "two_offs_after_three_nig": True, "initial_constraints": {"forbidden": {}, "forced_off": {}},
-        "max_conseq_work": 2, "three_seq_nig": True, "ban_n_to_d": True, "banned_day_after_eve": True,
+        "max_conseq_work": 2, "allow_three_consecutive_nights": True, "ban_n_to_d": True, "ban_shift_transitions": True,
     }
     base.update(over)
     return base
@@ -55,7 +55,7 @@ def test_k1_db_keys_are_translated_to_graph_names():
 
 
 def test_k2_masking_and_two_night_limit():
-    ir = _ir(_pin(_cfg(banned_day_after_eve=False, three_seq_nig=False)))
+    ir = _ir(_pin(_cfg(ban_shift_transitions=False, allow_three_consecutive_nights=False)))
     assert ir.config["forbid_night_to_day"] is False
     assert ir.config["max_consecutive_nights"] == 2
 
@@ -106,16 +106,16 @@ def test_k7_env_cap_is_reflected(monkeypatch):
     assert ir.config["max_consecutive_work"] == 6
 
 
-@pytest.mark.parametrize("over", [{}, {"three_seq_nig": None}])
+@pytest.mark.parametrize("over", [{}, {"allow_three_consecutive_nights": None}])
 def test_k8_view_does_not_reinterpret_defaults(over):
     from services.precheck.hard_lock_view import engine_hard_lock
 
     cfg = _cfg(**over)
-    if "three_seq_nig" in over:
-        cfg.pop("three_seq_nig")
+    if "allow_three_consecutive_nights" in over:
+        cfg.pop("allow_three_consecutive_nights")
     eff = engine_hard_lock(copy.deepcopy(cfg))
     ir = _ir(_pin(cfg))
-    assert ir.config["max_consecutive_nights"] == eff["three_seq_nig"]
+    assert ir.config["max_consecutive_nights"] == eff["allow_three_consecutive_nights"]
     assert ir.config["max_consecutive_work"] == eff["max_conseq_work"]
     assert calendar.monthrange(2026, 11)[1] == ir.num_days
 
@@ -159,7 +159,7 @@ def test_c4_original_initial_constraints_untouched():
 @pytest.mark.parametrize("cells,extra", [
     ([_cell("n0", 4, "N"), _cell("n0", 5, "D")], {}),
     ([_cell("n0", 4, "N"), _cell("n0", 5, "E")], {}),
-    ([_cell("n0", 0, "N")], {"not_one_night": True}),
+    ([_cell("n0", 0, "N")], {"ban_single_night": True}),
 ])
 def test_c5_exempt_adjacent_nurse_loses_all_cells_but_others_keep(cells, extra):
     cells = cells + [_cell("n0", 9, "O"), _cell("n1", 3, "D")]

@@ -20,19 +20,20 @@ sys.path.insert(0, os.path.join(_HERE, "..", "..", "app"))
 sys.path.insert(0, _HERE)
 
 from exact_oracle import is_feasible  # noqa: E402
+from services.engine_contract.names import to_external  # noqa: E402
 from services.ontology_graph.axis_diagnose import multi_axis_diagnose  # noqa: E402
 
 # (name, k, num_days, dsr, rules, why)
 _SPECS = [
     ("hard_residual_recovery_off_starvation", 5, 6, {"D": 1, "E": 1, "N": 2},
-     {"two_offs_after_two_nig": True, "not_one_night": True},
+     {"two_offs_after_two_nig": True, "ban_single_night": True},
      "N2/일 + run후 2 OFF 회복이 하루 1 OFF 자리와 충돌(회복=실제 OFF). N/notN 모델은 "
      "D/E 를 회복으로 관대 인정해 못 봄."),
     ("hard_residual_three_night_recovery", 5, 6, {"D": 1, "E": 1, "N": 2},
-     {"two_offs_after_three_nig": True, "not_one_night": True},
+     {"two_offs_after_three_nig": True, "ban_single_night": True},
      "3연속 야간 후 2 OFF 회복 규칙 하에서 동일 결합 충돌(다른 회복 규칙 변주)."),
     ("hard_residual_night_to_day_ban", 5, 6, {"D": 1, "E": 1, "N": 2},
-     {"two_offs_after_two_nig": True, "not_one_night": True, "forbid_night_to_day": True},
+     {"two_offs_after_two_nig": True, "ban_single_night": True, "forbid_night_to_day": True},
      "야간 다음날 주간 금지 전이가 D/E/N 배정을 결합으로 막음(N/notN 모델은 전이 못 봄)."),
 ]
 
@@ -64,7 +65,8 @@ def main():
         ours = multi_axis_diagnose(nu, cfg, dd, c["year"], c["month"]).status
         if oracle is False and ours != "INFEASIBLE_CERTIFIED":
             with open(os.path.join(out_dir, f"synth-{name}.json"), "w") as f:
-                json.dump(c, f, ensure_ascii=False, indent=2)
+                # 사례 파일은 바깥(옛) 설정 이름으로 저장한다(NM X4) — replay 가 읽을 때 `to_internal` 로 푼다.
+                json.dump({**c, "config": to_external(c["config"])}, f, ensure_ascii=False, indent=2)
             print(f"  ✓ 저장 synth-{name}.json  (oracle=INFEAS, 우리={ours})")
             made += 1
         else:

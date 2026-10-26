@@ -175,7 +175,7 @@ _FAMILY_TO_MUS_TOKENS: dict[str, list[str]] = {
     "OffWindow":               ["OffWindowRequirement", "off_window_requirement"],
     "BoundaryTransitionBan":   ["TransitionBanN2D", "TransitionBanE2D", "TransitionBanN2E", "transition_ban"],
     "AllowedShiftMask":        ["AllowedShiftMaskBan", "SpecialShiftBanW", "allowed_shift_mask"],
-    "NotOneNight":             ["NotOneNight", "not_one_night"],
+    "NotOneNight":             ["NotOneNight", "not_one_night"],  # nm:external
     "PrecepteeSync":           [],  # 산술 detector (team_grade_precheck) 만, MUS 변수 없음
     "AssignmentWindow":        [],  # 데이터 영역 (active days) — MUS 미발생
     "CarryoverBoundary":       ["CarryoverRecovery", "carryover_boundary"],

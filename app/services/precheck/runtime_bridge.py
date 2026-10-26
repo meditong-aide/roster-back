@@ -131,16 +131,16 @@ def _engine_min_off_required(
     nd: dict, config_dict: dict, join_day: int, leave_day: int, days_in_month: int, *,
     preceptor_id: str | None, is_weekend_off: bool, use_mid: bool, n_blocked: int = 0,
 ) -> int:
-    """엔진 OFF 하드 하한(min_off)의 **하한값**(EI-14r3) — `off_first=False` 이고 N 전담·주말휴무·프리셉티가 아닌 간호사에게만.
+    """엔진 OFF 하드 하한(min_off)의 **하한값**(EI-14r3) — `staffing_first=False` 이고 N 전담·주말휴무·프리셉티가 아닌 간호사에게만.
 
     엔진(fallback_lex.py:3253-3345)은 `compute_off_bounds` 의 `min_off_required`(휴가 제외·부분월 비례)를 slack 0 하드로 건다.
     여기서는 같은 순수 함수를 휴가 0·근무 구간 일수로 부른다 — 휴가가 있으면 엔진 값보다 크지 않게 `max(global + p, min_off)` 로만
     쓰므로(`_hard_off_floor`) 오차단이 없다. 보건휴가 가산(`extra_min_off`)은 넣지 않는다(느슨한 쪽).
     배정 차단일 수 `n_blocked` 는 엔진처럼 구간 일수에서 뺀다(`avail_days = T1 - T0 + 1 - len(차단일)` — fallback_lex.py:3263 · EI-10g1).
-    제외(0): `off_first` 참 · 주말휴무자 · N 전담 · 프리셉티(`preceptor_id`) · 구간 일수 ≤ 0.
+    제외(0): `staffing_first` 참 · 주말휴무자 · N 전담 · 프리셉티(`preceptor_id`) · 구간 일수 ≤ 0.
     """
     span = leave_day - join_day + 1 - max(0, int(n_blocked))
-    if span <= 0 or bool(config_dict.get("off_first", False)) or is_weekend_off or preceptor_id:
+    if span <= 0 or bool(config_dict.get("staffing_first", False)) or is_weekend_off or preceptor_id:
         return 0
     if is_n_only_profile(nd.get("allowed_shifts"), use_mid=use_mid):
         return 0

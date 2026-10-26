@@ -1,7 +1,7 @@
 """EI-15 15a — 대체근무 추천의 하드락 키 기본값 통일(D24) expected-diff 시험.
 
 바뀐 것: 설정(config)이 비었을 때(config 없음 · 속성 없음 · 0/None)의 하드락 키 기본값.
-  연속근무 6→5 · 월 나이트 8→15 · banned_day_after_eve False→True · two_offs_after_three_nig False→True.
+  연속근무 6→5 · 월 나이트 8→15 · ban_shift_transitions False→True · two_offs_after_three_nig False→True.
 안 바뀐 것: 근무표가 쓴 config 행에 값이 있으면 그 값을 그대로 읽는다([RVERIFY-08]).
 """
 
@@ -15,7 +15,7 @@ import pytest
 from services import replacement_recommend_service as rrs
 from services.engine_contract.defaults import registry_default
 
-_HARD_KEYS = ("max_conseq_work", "max_nig_per_month", "banned_day_after_eve",
+_HARD_KEYS = ("max_conseq_work", "max_nig_per_month", "ban_shift_transitions",
               "two_offs_after_two_nig", "two_offs_after_three_nig")
 
 
@@ -23,7 +23,7 @@ def test_registry_default_matches_engine_defaults():
     assert registry_default("max_conseq_work") == 5
     assert registry_default("max_nig_per_month") == 15
     assert registry_default("two_offs_after_three_nig") is True
-    assert registry_default("banned_day_after_eve") is True
+    assert registry_default("ban_shift_transitions") is True
     assert registry_default("two_offs_after_two_nig") is False
     # 별칭으로 물어도 정본과 같다
     assert registry_default("max_consecutive_work_days") == 5
@@ -39,17 +39,17 @@ def test_empty_config_uses_engine_defaults(cfg):
 def test_empty_config_bool_defaults_flip_on():
     # 옛 기본 False → 새 True (config 없음 · 속성 없음)
     for cfg in (None, SimpleNamespace()):
-        assert rrs._hl_bool(cfg, "banned_day_after_eve") is True
+        assert rrs._hl_bool(cfg, "ban_shift_transitions") is True
         assert rrs._hl_bool(cfg, "two_offs_after_three_nig") is True
         assert rrs._hl_bool(cfg, "two_offs_after_two_nig") is False
 
 
 def test_config_row_values_win():
-    cfg = SimpleNamespace(max_conseq_work=4, max_nig_per_month=9, banned_day_after_eve=False,
+    cfg = SimpleNamespace(max_conseq_work=4, max_nig_per_month=9, ban_shift_transitions=False,
                           two_offs_after_three_nig=None, two_offs_after_two_nig=True)
     assert rrs._hl_int(cfg, "max_conseq_work") == 4
     assert rrs._hl_int(cfg, "max_nig_per_month") == 9
-    assert rrs._hl_bool(cfg, "banned_day_after_eve") is False
+    assert rrs._hl_bool(cfg, "ban_shift_transitions") is False
     assert rrs._hl_bool(cfg, "two_offs_after_three_nig") is False  # NULL 은 엔진처럼 꺼짐
     assert rrs._hl_bool(cfg, "two_offs_after_two_nig") is True
 

@@ -8,7 +8,7 @@ from services.ontology_graph.joint_coverage import (
 )
 from services.ontology_graph.lagrangian import explain_infeasibility_from_config
 
-_RULES = {"two_offs_after_three_nig": True, "not_one_night": True}
+_RULES = {"two_offs_after_three_nig": True, "ban_single_night": True}
 
 
 def _cfg(demand_n):

@@ -119,6 +119,8 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from services.engine_contract.names import EXTERNAL_TO_INTERNAL
+
 from .golden import diff_paths
 
 #: 16개 골든 전부(test_scenarios 의 12 + test_ladder 의 4) — must_vanish 를 "전 시나리오"로
@@ -229,6 +231,10 @@ class StageDiff:
     query_reorder: (EI-10g) 시나리오 이름 목록 — 그 시나리오는 쿼리 **수는 같고 순서열만** 바뀌어도 된다(앞당겨 읽기).
                  (c) 의 부분열 검사를 정렬한 순서열로 본다(= `query_added` 를 뺀 쿼리 다중집합이 이전과 같다). 새 순서열 자체는 재생성
                  골든의 정확 비교가 고정한다.
+    key_renames: (NM) 옛 키 → 새 키. 비교 전에 골든 기록의 dict 키만 이 표로 바꾼다 — 값·쿼리는 그대로 정확 비교라
+                 '이름만 바뀌고 값은 같다'를 단언한다.
+    key_renames_skip: (NM) `key_renames` 를 걸지 않을 dict 경로 정규식(그 dict 아래 전부) — 바깥 이름이 맞는 자리
+                 (요청 모델 원문 `L3.calls[].args.req` · 저장 JSON `snapshot.config`).
     """
 
     vanish_patterns: tuple[str, ...] = ()
@@ -238,6 +244,8 @@ class StageDiff:
     must_change: dict[str, tuple[str, ...]] = field(default_factory=dict)
     query_added: dict[str, tuple[str, ...]] = field(default_factory=dict)
     query_reorder: tuple[str, ...] = ()
+    key_renames: dict[str, str] = field(default_factory=dict)
+    key_renames_skip: tuple[str, ...] = ()
 
 
 EI2_STAGES: dict[str, StageDiff] = {
@@ -412,7 +420,7 @@ EI10_DONE: tuple[str, ...] = ("10c", "10d", "10e", "10f")
 #:   번들이 coverage_min 단독이 되어(`treatment_recommendations[2]`·`resolution_options[3]`) graph 노드 11→10·간선 24→21 이고
 #:   `policy_forbidden` [] · `blocked_by_hard_lock` 0 이다(싱크가 거를 카드가 생산되지 않는다). 서술·hard_case 는 그대로다.
 #: 11b 는 요청 가드가 하드락 BLOCK 을 모두 400 으로 막고(D13 ③ `max_consecutive_nights` 는 값과 무관하게 400) 경계 L 이 정본
-#:   `three_seq_nig` 만 읽는다(D13 ①). 골든은 0 이다 — 하니스는 서비스를 직접 부르고 별칭을 싣지 않으며(S8 override 는 인접 키),
+#:   `allow_three_consecutive_nights` 만 읽는다(D13 ①). 골든은 0 이다 — 하니스는 서비스를 직접 부르고 별칭을 싣지 않으며(S8 override 는 인접 키),
 #:   경계 L 값은 같다. 허용 0(빈 `StageDiff`) 그 자체가 단언이다.
 #: 11c 는 카드가 아닌 출구 칸에 '정책상 금지' 표지를 단다(H1 — §2.5). presolve EI5 는 problem_list 의 night_recovery 처방
 #:   (`problem_list[2].mapped_treatments[0]`)에 `policy_forbidden`·`rule_nos` 가 붙고, 월 나이트 상한 처방 rationale 에 '(최대 15 —
@@ -571,7 +579,7 @@ EI14C1_STAGES: dict[str, StageDiff] = {
     "14d": StageDiff(),
     #: 14r1 — 경고 2종의 온톨로지 심각도 표기(precheck_warning/soft). EXPECTED_ISSUES 16개 전부 이슈 없음이라 골든 0.
     "14r1": StageDiff(),
-    #: 14b2a1 — 정본 키 번역(max_conseq_work·three_seq_nig·ban_n_to_d → 그래프 이름) 겹침. 소비자 출력이 골든에 없어 0.
+    #: 14b2a1 — 정본 키 번역(max_conseq_work·allow_three_consecutive_nights·ban_n_to_d → 그래프 이름) 겹침. 소비자 출력이 골든에 없어 0.
     "14b2a1": StageDiff(),
     #: 14b2a2 — 고정 셀 → initial_constraints 겹침(면제 인접 간호사 제외). 소비자 출력이 골든에 없어 0.
     "14b2a2": StageDiff(),
@@ -580,7 +588,7 @@ EI14C1_STAGES: dict[str, StageDiff] = {
     #: 14r2 — 개인 DP 에 MID 규칙(mid_transition·mid_to_day_ban). 골든 병동 MID 고정 쌍 없음(EXPECTED_ISSUES 16개 전부 빈 집합)이라 0.
     "14r2": StageDiff(),
     #: 14r3 — OFF 하드 하한(min_off)을 용량 바닥에 반영. EXPECTED_ISSUES 16개 전부 빈 집합 유지라 골든 0.
-    #:   ★ 골든 병동은 용량이 넉넉해 `golden/` 16개는 0 이지만, golden_presolve 의 `EI5-precheck-block`(RN 2명 · off_days 8 · off_first
+    #:   ★ 골든 병동은 용량이 넉넉해 `golden/` 16개는 0 이지만, golden_presolve 의 `EI5-precheck-block`(RN 2명 · off_days 8 · staffing_first
     #:   기본 False)은 근무 용량 증거가 바뀐다: 간호사 한 명의 근무가능일 25(연속근무 닫힌형) → 22(= 30 − min_off 8) —
     #:   용량 합 50 → 44 · 부족 130 → 136 · 용량 숫자가 든 문구(`rendered_ko`). 차단 여부·이슈 코드·카드 id 는 그대로다.
     #:   동결본(FROZEN_SHA256)은 다시 쓰지 않고 허용 차이 패턴으로 받는다.
@@ -682,9 +690,21 @@ EID_STAGES: dict[str, StageDiff] = {
     ),
 }
 EID_DONE: tuple[str, ...] = ("10g2", "10g3", "10g4")   # 단계 커밋마다 하나씩 더한다
+#: NM — roster_config 14칸의 파이썬 이름 정리(`services.engine_contract.names`). 엔진 입력 dict 키만 새 이름이 되고 값·쿼리는 같다.
+#:   골든에서 옛 이름 키가 있는 dict 는 7종이다(실측) — L0 config_dict · L0p config(ORM __dict__) · L1 config_data · L2 settings_eff ·
+#:   L3 objects(후처리 latest_config) · attempts[].delta.config_data.changed 는 파이썬 이름이 되고, L3 calls[].args.req(RosterRequest
+#:   요청 모델 원문)와 golden_presolve snapshot.config(시도 스냅숏 = 저장 JSON)는 바깥 이름 그대로다.
+NM_STAGES: dict[str, StageDiff] = {
+    "nm": StageDiff(
+        key_renames=dict(EXTERNAL_TO_INTERNAL),
+        key_renames_skip=(r"^\$\.layers\.L3\.calls\[\d+\]\.args\.req$", r"^\$\.snapshot\.config$"),
+    ),
+}
+NM_DONE: tuple[str, ...] = ("nm",)
 ALL_STAGES: dict[str, StageDiff] = {**EI2_STAGES, **EI10_STAGES, **EI11_STAGES, **EI13_STAGES, **EI14C1_STAGES, **EI12_STAGES, **EI13C_STAGES,
-                                     **EID_STAGES}
-ALL_DONE: tuple[str, ...] = EI2_DONE + EI10_DONE + EI11_DONE + EI13_DONE + EI14C1_DONE + EI12_DONE + EI13C_DONE + EID_DONE
+                                     **EID_STAGES, **NM_STAGES}
+ALL_DONE: tuple[str, ...] = (EI2_DONE + EI10_DONE + EI11_DONE + EI13_DONE + EI14C1_DONE + EI12_DONE + EI13C_DONE + EID_DONE
+                             + NM_DONE)
 
 
 def _active_stages(done: tuple[str, ...], stages: Mapping[str, StageDiff]) -> tuple[StageDiff, ...]:
@@ -739,6 +759,17 @@ def _classify_line(name: str, line: str, vanish_pats: list, change_pats: list) -
     return "vanished", path
 
 
+def _rename_dict_keys(obj, renames: Mapping[str, str], skip: tuple = (), path: str = "$"):
+    """(NM `key_renames`) dict 키만 바꾼 깊은 사본 — 값(문자열 포함)은 그대로 둔다. `skip` 정규식에 맞는 경로 아래는 그대로."""
+    if any(pattern.match(path) for pattern in skip):
+        return obj
+    if isinstance(obj, dict):
+        return {renames.get(k, k): _rename_dict_keys(v, renames, skip, f"{path}.{k}") for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_rename_dict_keys(v, renames, skip, f"{path}[{i}]") for i, v in enumerate(obj)]
+    return obj
+
+
 def _missing_musts(name: str, musts: list[str], seen: set[str], label: str) -> list[str]:
     """`musts` 경로(접두 일치) 중 실제로 `seen` 에 없는 것의 위반 문구."""
     return [f"{name}: {label} — {must}" for must in musts
@@ -759,10 +790,15 @@ def check_record(name: str, golden: dict, actual: dict, *, done: tuple[str, ...]
     query_delta = sum(stage.query_delta.get(name, 0) for stage in active)
     query_added = tuple(query for stage in active for query in stage.query_added.get(name, ()))
     query_reorder = any(name in stage.query_reorder for stage in active)
+    key_renames = {old: new for stage in active for old, new in stage.key_renames.items()}
+    key_renames_skip = tuple(re.compile(p) for stage in active for p in stage.key_renames_skip)
 
     violations: list[str] = []
     seen: dict[str, set[str]] = {"vanished": set(), "changed": set()}
-    for line in diff_paths(_inline_l3_objects(golden), _inline_l3_objects(actual)):
+    golden_cmp = _inline_l3_objects(golden)
+    if key_renames:
+        golden_cmp = _rename_dict_keys(golden_cmp, key_renames, key_renames_skip)
+    for line in diff_paths(golden_cmp, _inline_l3_objects(actual)):
         kind, value = _classify_line(name, line, vanish_pats, change_pats)
         if kind == "violation":
             violations.append(value)

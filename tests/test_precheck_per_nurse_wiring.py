@@ -41,13 +41,13 @@ def test_fixed_n_then_fixed_d_is_exempt_like_engine():
 
 def test_forced_night_then_fixed_day_blocks():
     # 1N 금지 + 3일 고정 O·4일 고정 N → 5일 N 강제(자유칸) → 6일 고정 D 와 N→D 금지 충돌 → 개인 단독 불가능
-    res = run_precheck(_inp({3: "O", 4: "N", 6: "D"}, {"ban_n_to_d": True, "not_one_night": True}))
+    res = run_precheck(_inp({3: "O", 4: "N", 6: "D"}, {"ban_n_to_d": True, "ban_single_night": True}))
     assert CODE in _codes(res)
     assert has_blocking_issues(res)  # blocking 확정
 
 
 def test_conflict_gone_when_ban_off():
-    res = run_precheck(_inp({3: "O", 4: "N", 6: "D"}, {"ban_n_to_d": False, "not_one_night": True}))
+    res = run_precheck(_inp({3: "O", 4: "N", 6: "D"}, {"ban_n_to_d": False, "ban_single_night": True}))
     assert CODE not in _codes(res)
 
 
@@ -58,6 +58,6 @@ def test_no_fixed_no_issue():
 
 
 def test_fixed_e_then_fixed_d_is_exempt_like_engine():
-    # 고정 E→고정 D — 엔진은 두 칸 다 고정이면 E→D 금지(banned_day_after_eve 기본 True)를 면제한다(EI-10c)
+    # 고정 E→고정 D — 엔진은 두 칸 다 고정이면 E→D 금지(ban_shift_transitions 기본 True)를 면제한다(EI-10c)
     res = run_precheck(_inp({2: "E", 3: "D"}))
     assert CODE not in _codes(res)

@@ -32,7 +32,7 @@ def _cfg(dsr, rules, fb=None, fo=None):
     return c
 
 
-_R = {"two_offs_after_two_nig": True, "not_one_night": True, "forbid_night_to_day": True}
+_R = {"two_offs_after_two_nig": True, "ban_single_night": True, "forbid_night_to_day": True}
 
 
 def test_audit_structural_and_rules_complete():
@@ -42,7 +42,7 @@ def test_audit_structural_and_rules_complete():
     assert rep["rule_probes"]["all_ok"]
     # 각 활성 규칙이 실제로 위반을 거부했는가(거짓 통과 없음)
     kinds = {p["rule"].split("(")[0] for p in rep["rule_probes"]["probes"]}
-    assert "not_one_night" in kinds and "max_run" in kinds
+    assert "ban_single_night" in kinds and "max_run" in kinds
 
 
 def test_semantic_reconstruction_matches_oracle():
@@ -57,7 +57,7 @@ def test_conditioning_splits_into_components():
     nu = _pool(6)
     fo = {f"n{i}": [3, 4, 5] for i in range(3)}
     fo.update({f"n{i}": [0, 1, 2] for i in range(3, 6)})
-    r = diagnose_conditioning(nu, _cfg({"D": 1, "E": 0, "N": 1}, {"not_one_night": True}, fo=fo), 6)
+    r = diagnose_conditioning(nu, _cfg({"D": 1, "E": 0, "N": 1}, {"ban_single_night": True}, fo=fo), 6)
     assert r.components_seen == 2
     assert r.status in ("FEASIBLE_WITNESS", "INFEASIBLE_CERTIFIED")
 
@@ -68,7 +68,7 @@ def test_conditioning_sound_on_dense_case():
     frontier DP 의 temporal sweep 이 적합(상보적)."""
     r = diagnose_conditioning(_pool(5),
                               _cfg({"D": 1, "E": 1, "N": 2},
-                                   {"two_offs_after_two_nig": True, "not_one_night": True}), 6,
+                                   {"two_offs_after_two_nig": True, "ban_single_night": True}), 6,
                               budget=80_000)
     assert r.status in ("INFEASIBLE_CERTIFIED", "UNKNOWN")   # feasible 오판만 없으면 sound
 
@@ -79,7 +79,7 @@ def test_context_cache_preserves_correctness_and_helps_components():
     nu = _pool(6)
     fo = {f"n{i}": [3, 4, 5] for i in range(3)}
     fo.update({f"n{i}": [0, 1, 2] for i in range(3, 6)})
-    r = diagnose_conditioning(nu, _cfg({"D": 1, "E": 0, "N": 1}, {"not_one_night": True}, fo=fo), 6)
+    r = diagnose_conditioning(nu, _cfg({"D": 1, "E": 0, "N": 1}, {"ban_single_night": True}, fo=fo), 6)
     assert r.components_seen == 2 and r.status in ("FEASIBLE_WITNESS", "INFEASIBLE_CERTIFIED")
 
 
@@ -88,6 +88,6 @@ def test_empty_domain_forced_conflict():
     fb = {"n0": {2: ["O"]}}
     fo = {"n0": [2]}
     r = diagnose_conditioning(_pool(4), _cfg({"D": 1, "E": 1, "N": 1},
-                                             {"not_one_night": True}, fb=fb, fo=fo), 5)
+                                             {"ban_single_night": True}, fb=fb, fo=fo), 5)
     assert r.status == "INFEASIBLE_CERTIFIED"
     assert r.certificate.kind == "empty_domain"

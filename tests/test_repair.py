@@ -24,7 +24,7 @@ def _pool(k):
 
 def test_domain_verified_only_true_on_feasible():
     """UNKNOWN 을 domain_verified 로 처리하지 않는다(과거 재발 버그)."""
-    cfg = {"two_offs_after_two_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_two_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 2},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     reps = verify_repairs(_pool(5), cfg, 6)
@@ -38,7 +38,7 @@ def test_domain_verified_only_true_on_feasible():
 
 def test_shadow_not_called_solver_verified():
     """근사 shadow CP-SAT 결과는 shadow_cpsat 에만, solver_verified 는 None(운영 verifier 없음)."""
-    cfg = {"two_offs_after_two_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_two_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 2},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     reps = verify_repairs(_pool(5), cfg, 6)   # 기본 ShadowIRVerifier
@@ -48,7 +48,7 @@ def test_shadow_not_called_solver_verified():
 
 def test_production_verifier_sets_solver_verified():
     """운영 exact verifier(exact=True) 주입 시에만 solver_verified 채워짐."""
-    cfg = {"two_offs_after_two_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_two_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 2},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
 
@@ -63,6 +63,6 @@ def test_production_verifier_sets_solver_verified():
 
 
 def test_no_repairs_when_feasible():
-    cfg = {"not_one_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
+    cfg = {"ban_single_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     assert verify_repairs(_pool(6), cfg, 6) == []

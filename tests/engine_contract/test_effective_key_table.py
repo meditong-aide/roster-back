@@ -54,25 +54,25 @@ class Row:
 # ── 부록 A. 키 표(63행, 현행 실측) ────────────────────────────────────────
 KEY_TABLE: tuple[Row, ...] = (
     Row('max_conseq_work', 'max_consecutive_work_days', 5, Raises(TypeError), 0, -1, 4, 4, _NA, extra=((7, 7), ('6', '6'))),
-    Row('banned_day_after_eve', 'banned_day_after_eve', True, None, 0, -1, False, False, False, extra=(('false', 'false'),)),
-    Row('three_seq_nig', 'max_consecutive_nights', 3, 2, 2, 3, False, 2, 2, extra=((2, 3), (7, 3))),
+    Row('ban_shift_transitions', 'ban_shift_transitions', True, None, 0, -1, False, False, False, extra=(('false', 'false'),)),
+    Row('allow_three_consecutive_nights', 'max_consecutive_nights', 3, 2, 2, 3, False, 2, 2, extra=((2, 3), (7, 3))),
     Row('two_offs_after_three_nig', 'two_offs_after_three_nig', True, None, 0, -1, False, False, False),
     Row('two_offs_after_two_nig', 'two_offs_after_two_nig', False, None, 0, -1, True, True, False),
     Row('max_nig_per_month', 'max_night_shifts_per_month', 15, 15, 15, 15, 4, 4, _NA, extra=((20, 20), (True, True), ('20', Raises(TypeError)))),
-    Row('not_one_night', 'not_one_night', False, None, 0, -1, True, True, False),
+    Row('ban_single_night', 'ban_single_night', False, None, 0, -1, True, True, False),
     Row('use_mid', 'use_mid', False, False, False, True, True, True, False),
     Row('off_days', 'standard_personal_off_days', 8, None, 0, -1, 4, 4, _NA),
-    Row('nod_noe', 'nod_noe', True, None, 0, -1, False, False, False),
-    Row('preceptee_on', 'preceptee_on', True, False, False, True, False, False, False),
+    Row('avoid_nod_noe_eod', 'avoid_nod_noe_eod', True, None, 0, -1, False, False, False),
+    Row('preceptee_follows_preceptor', 'preceptee_follows_preceptor', True, False, False, True, False, False, False),
     Row('ban_night_before_fixed_wanted_off', 'ban_night_before_fixed_wanted_off', False, False, False, True, True, True, False),
-    Row('min_exp_per_shift', 'min_experience_per_shift', 3, None, 0, -1, 4, 4, _NA),
-    Row('req_exp_nurses', 'required_experienced_nurses', 1, None, 0, -1, 4, 4, _NA),
-    Row('two_offs_per_week', 'enforce_two_offs_per_week', True, None, 0, -1, False, False, False),
-    Row('max_conseq_off', 'max_conseq_off', 3, 3, 3, -1, 4, 4, _NA),
+    Row('senior_min_years', 'min_experience_per_shift', 3, None, 0, -1, 4, 4, _NA),
+    Row('senior_nurses_per_shift', 'required_experienced_nurses', 1, None, 0, -1, 4, 4, _NA),
+    Row('prefer_two_offs_per_7days', 'enforce_two_offs_per_week', True, None, 0, -1, False, False, False),
+    Row('soft_max_conseq_off', 'soft_max_conseq_off', 3, 3, 3, -1, 4, 4, _NA),
     Row('shift_priority', 'shift_requirement_priority', 0.7, Raises(TypeError), 0.05, 0.05, 0.5, 0.5, _NA),
-    Row('sequential_offs', 'sequential_offs', True, None, 0, -1, False, False, False),
-    Row('preceptee_shift_count', 'preceptee_shift_count', True, False, False, True, False, False, False),
-    Row('off_first', 'off_first', False, False, False, True, True, True, False),
+    Row('avoid_isolated_off_and_work', 'avoid_isolated_off_and_work', True, None, 0, -1, False, False, False),
+    Row('count_preceptee_in_staffing', 'count_preceptee_in_staffing', True, False, False, True, False, False, False),
+    Row('staffing_first', 'staffing_first', False, False, False, True, True, True, False),
     Row('n2n_min_gap', 'n2n_min_gap', 0, 0, 0, -1, 4, 4, _NA),
     Row('ban_e_to_d', 'ban_e_to_d', True, False, False, True, False, False, False),
     Row('ban_n_to_d', 'ban_n_to_d', True, False, False, True, False, False, False),
@@ -245,9 +245,9 @@ def test_key_table_extra_rows(row: Row, _engine):
         _assert_matches(extra_expected, cfg, err, row.field, f"{row.key}-extra-{extra_input!r}")
 
 
-def test_banned_day_after_eve_extra_leaves_ban_e_to_d_true(_engine):
+def test_ban_shift_transitions_extra_leaves_ban_e_to_d_true(_engine):
     """'false' 는 Python 에서 truthy 라 `if not x` 해제 판정을 통과하지 못한다(실효 완화 아님)."""
-    cfg, err = _run_variant(_engine, "banned_day_after_eve", "false", present=True)
+    cfg, err = _run_variant(_engine, "ban_shift_transitions", "false", present=True)
     assert err is None
     assert cfg.ban_e_to_d is True and cfg.ban_n_to_d is True and cfg.ban_n_to_e is True
 
@@ -277,16 +277,16 @@ def test_section73_max_conseq_work(_engine):
         assert err is None and cfg.max_consecutive_work_days == expected
 
 
-def test_section73_banned_day_after_eve_and_ban_star(_engine):
+def test_section73_ban_shift_transitions_and_ban_star(_engine):
     for value, present, expect_banned, expect_ban_star in (
         (None, False, True, True),  # 부재
         (None, True, None, False),
         (0, True, 0, False),
         (-1, True, -1, True),
     ):
-        cfg, err = _run_variant(_engine, "banned_day_after_eve", value, present=present)
+        cfg, err = _run_variant(_engine, "ban_shift_transitions", value, present=present)
         assert err is None
-        assert cfg.banned_day_after_eve == expect_banned
+        assert cfg.ban_shift_transitions == expect_banned
         for ban_field in ("ban_e_to_d", "ban_n_to_d", "ban_n_to_e", "ban_d_to_n"):
             assert getattr(cfg, ban_field) is expect_ban_star
 
@@ -325,12 +325,12 @@ def test_section73_off_days_three_columns(_engine):
 #: W3_clamp_int_caps 둘 다 기존 545 건을 통과했다). 상한 초과·0·−1·False·문자열을 추가한다.
 _HARDLOCK_EXTREME_VALUES: dict[str, tuple[object, ...]] = {
     "max_conseq_work": (None, 0, -1, 7, "6"),
-    "banned_day_after_eve": (None, 0, -1, False, "false"),
-    "three_seq_nig": (None, 2, 7, False),
+    "ban_shift_transitions": (None, 0, -1, False, "false"),
+    "allow_three_consecutive_nights": (None, 2, 7, False),
     "two_offs_after_three_nig": (None, 0, -1, False),
     "two_offs_after_two_nig": (None, 0, -1, True),
     "max_nig_per_month": (None, 0, -1, 20, True, "20"),
-    "not_one_night": (None, 0, -1, True),
+    "ban_single_night": (None, 0, -1, True),
     "use_mid": (None, 0, -1, True),
 }
 
@@ -367,8 +367,8 @@ def test_effective_hard_lock_extreme_values_locked_literal():
     with contextlib.redirect_stdout(io.StringIO()):
         assert effective_hard_lock({**BASE, "max_conseq_work": 7})["max_conseq_work"] == 7
         assert effective_hard_lock({**BASE, "max_nig_per_month": 20})["max_nig_per_month"] == 20
-        r = effective_hard_lock({**BASE, "banned_day_after_eve": "false"})
-    assert r["banned_day_after_eve"] == "false" and r["ban_e_to_d"] is True
+        r = effective_hard_lock({**BASE, "ban_shift_transitions": "false"})
+    assert r["ban_shift_transitions"] == "false" and r["ban_e_to_d"] is True
 
 
 # ── 부록 B. 요구인원 파생 표(REQ_TABLE) ───────────────────────────────────
@@ -563,7 +563,9 @@ def test_create_config_from_db_reads_only_known_keys():
 
 
 #: `config_data` 를 인자로 받아도 되는 헬퍼 — 이 밖으로 위임하면 AST 가드가 못 본다.
-_ALLOWED_CONFIG_DATA_HELPERS: frozenset[str] = frozenset({"resolve_effective_off_days"})
+#: `check_engine_config_keys`(NM S2 엔진 입구 검사)는 키 이름만 보고 값은 읽지 않으며 키만 바꾼 얕은 사본을 돌려준다 —
+#: 위임된 쪽에 숨은 설정 읽기가 없다.
+_ALLOWED_CONFIG_DATA_HELPERS: frozenset[str] = frozenset({"resolve_effective_off_days", "check_engine_config_keys"})
 
 
 def _variable_key_get_lines(target: ast.AST) -> list[int]:
@@ -639,12 +641,12 @@ def test_alias_index_has_no_duplicate_owners():
 # ── §4.5 레지스트리 교차 단언 ──────────────────────────────────────────────
 
 #: `current_default` 와 '부재' 결과가 실제로 어긋나는 키(값 영역 차이·기호 기본값).
-_DEFAULT_CROSS_SKIP = frozenset({"three_seq_nig", "soft_max_consecutive_work_days"})
+_DEFAULT_CROSS_SKIP = frozenset({"allow_three_consecutive_nights", "soft_max_consecutive_work_days"})
 
 #: None 결과의 자동 토큰(`f"None→{v!r}"`/`"TypeError"`)이 `null_behavior` 서술과 다른 4키 —
 #: 서술 형식이 다를 뿐, 전부 레지스트리 원문의 부분 문자열이다(§4.5).
 _NULL_TOKEN_OVERRIDE: dict[str, str] = {
-    "banned_day_after_eve": "None→cfg.banned_day_after_eve=None",
+    "ban_shift_transitions": "None→cfg.ban_shift_transitions=None",
     "off_days": "cfg.standard_personal_off_days=None",
     "shift_preference_weights": "None 이면 None",
     "soft_max_consecutive_work_days": "None·0→max_conseq_work",

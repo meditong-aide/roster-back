@@ -32,8 +32,8 @@ def _cfg(**extra):
     """엔진 기본에 가까운 설정(3연속 N 허용 · 3N→2OFF 켬 · 2N→2OFF 끔 · 1N 허용)."""
     base = {
         "daily_shift_requirements": {"D": 1, "E": 1, "N": 1}, "max_conseq_work": 5,
-        "max_nig_per_month": 15, "banned_day_after_eve": True, "three_seq_nig": True,
-        "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "not_one_night": False,
+        "max_nig_per_month": 15, "ban_shift_transitions": True, "allow_three_consecutive_nights": True,
+        "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "ban_single_night": False,
         "use_mid": False, "off_days": 8, "shift_priority": 0.7,
     }
     base.update(extra)
@@ -228,7 +228,7 @@ def test_r10d3b_fixed_night_and_fixed_off_for_night_only_nurse_pass():
 
 
 def test_r10d4_four_fixed_nights_blocks():
-    """✗ 고정 NNNN — 연속 N 상한 3(three_seq_nig)을 넘는다: 엔진 불가능(전에는 칸을 못 봐 통과했다)."""
+    """✗ 고정 NNNN — 연속 N 상한 3(allow_three_consecutive_nights)을 넘는다: 엔진 불가능(전에는 칸을 못 봐 통과했다)."""
     result, codes = _run(_nurses(), _cfg(), _cells("n0", {4: "N", 5: "N", 6: "N", 7: "N"}))
     assert SEQ in codes and has_blocking_issues(result)
 
@@ -394,9 +394,9 @@ def test_r10d10b_control_without_blocked_days_still_blocks_night_only_nurse():
 def test_r10d10c_single_night_on_blocked_days_is_not_a_sequence_conflict():
     """✗ E1b — 1N 금지, 차단일 {9,10,11} 위 O·N·O 고정: 엔진은 그 칸들을 건너뛴다. 남기면 단독 N 이라 PER_NURSE 로 막는다."""
     engine_cells = [_engine_cell(0, 9, "OFF"), _engine_cell(0, 10, "N"), _engine_cell(0, 11, "OFF")]
-    ((result, codes), cells) = _blocked_run(_nurses(10), _cfg(not_one_night=True), engine_cells, {"n0": {9, 10, 11}})
+    ((result, codes), cells) = _blocked_run(_nurses(10), _cfg(ban_single_night=True), engine_cells, {"n0": {9, 10, 11}})
     assert cells == [] and SEQ not in codes and not has_blocking_issues(result)
-    ((_r, control), _c) = _blocked_run(_nurses(10), _cfg(not_one_night=True), engine_cells, None)
+    ((_r, control), _c) = _blocked_run(_nurses(10), _cfg(ban_single_night=True), engine_cells, None)
     assert SEQ in control  # 대조군: 차단일이 없으면 엔진도 불가능
 
 

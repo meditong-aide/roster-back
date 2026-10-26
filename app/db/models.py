@@ -17,8 +17,9 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.mysql import TINYINT
-from sqlalchemy.orm import relationship, deferred
+from sqlalchemy.orm import relationship, deferred, synonym
 from db.client2 import Base
+from services.engine_contract.names import EXTERNAL_TO_INTERNAL, OldNameDescriptor
 from sqlalchemy import DATE, DECIMAL, TEXT, Time, text
 from datetime import datetime
 
@@ -837,28 +838,28 @@ class RosterConfig(Base):
     day_req = Column(INTEGER)
     eve_req = Column(INTEGER)
     nig_req = Column(INTEGER)
-    min_exp_per_shift = Column(INTEGER)
-    req_exp_nurses = Column(INTEGER)
-    two_offs_per_week = Column(BOOLEAN)
+    senior_min_years = Column(INTEGER, name="min_exp_per_shift", key="senior_min_years")  # 책임 간호사로 칠 경력 연차(년)
+    senior_nurses_per_shift = Column(INTEGER, name="req_exp_nurses", key="senior_nurses_per_shift")  # 근무마다 둘 책임 간호사 수(명)
+    prefer_two_offs_per_7days = Column(BOOLEAN, name="two_offs_per_week", key="prefer_two_offs_per_7days")  # 1일부터 7일 블록마다 OFF 2개 미만 벌점(soft)
     max_nig_per_month = Column(INTEGER)
-    three_seq_nig = Column(BOOLEAN)
+    allow_three_consecutive_nights = Column(BOOLEAN, name="three_seq_nig", key="allow_three_consecutive_nights")  # True=나이트 최대 3연속 · False=2연속(하드락 #3)
     two_offs_after_three_nig = Column(BOOLEAN)
     two_offs_after_two_nig = Column(BOOLEAN)
-    banned_day_after_eve = Column(BOOLEAN)
+    ban_shift_transitions = Column(BOOLEAN, name="banned_day_after_eve", key="ban_shift_transitions")  # E→D·N→D·N→E 전이 금지 스위치(하드락 #2 · D→N 은 사후 검사만)
     max_conseq_work = Column(INTEGER)
     off_days = Column(INTEGER)
     # 연속 OFF 최대 개수(soft 상한). NULL=앱 기본 3 적용. (k+1)연속 OFF 고weight 벌점, 불가피 시 양보.
-    max_conseq_off = Column(INTEGER, nullable=True)
+    soft_max_conseq_off = Column(INTEGER, name="max_conseq_off", key="soft_max_conseq_off", nullable=True)  # 연속 OFF 상한(벌점 — 넘을 수 있음)
     shift_priority = Column(FLOAT)
-    sequential_offs = Column(BOOLEAN)
-    nod_noe = Column(BOOLEAN)
-    not_one_night = Column(BOOLEAN, nullable=False, default=False)
+    avoid_isolated_off_and_work = Column(BOOLEAN, name="sequential_offs", key="avoid_isolated_off_and_work")  # 고립 OFF·고립 근무 벌점
+    avoid_nod_noe_eod = Column(BOOLEAN, name="nod_noe", key="avoid_nod_noe_eod")  # N-O-D·N-O-E·E-O-D 패턴 벌점
+    ban_single_night = Column(BOOLEAN, name="not_one_night", key="ban_single_night", nullable=False, default=False)  # 1N 금지(하드락 #7)
     use_mid = Column(BOOLEAN, nullable=False, default=False)
     created_at = Column(DATETIME, default=func.now())
-    preceptee_on = Column(BOOLEAN, nullable=False, default=False)
-    preceptee_shift_count = Column(BOOLEAN, nullable=False, default=True)
+    preceptee_follows_preceptor = Column(BOOLEAN, name="preceptee_on", key="preceptee_follows_preceptor", nullable=False, default=False)  # 프리셉티가 프리셉터 근무를 따라감(하드)
+    count_preceptee_in_staffing = Column(BOOLEAN, name="preceptee_shift_count", key="count_preceptee_in_staffing", nullable=False, default=True)  # 프리셉티를 근무 인원에 셈
     weekly_off_group = Column(BOOLEAN)
-    fixed_wanted_use_yn = Column(BOOLEAN, nullable=False, default=False)
+    apply_confirmed_wanted = Column(BOOLEAN, name="fixed_wanted_use_yn", key="apply_confirmed_wanted", nullable=False, default=False)  # 확정 원티드를 고정 칸으로 반영
     # ban_night_before_fixed_off: ORM 매핑 제거(DDL DROP 대상). 컬럼이 아니라 solver 기본값으로 존속 —
     #   roster_config.py 의 dataclass 기본값(True) + cp_sat_basic create_config_from_db 의
     #   config_data.get('ban_night_before_fixed_off', True) 가 컬럼 부재 시 동일 동작 보장(prod 전량 True).
@@ -872,8 +873,8 @@ class RosterConfig(Base):
     ban_night_before_fixed_wanted_off = Column(BOOLEAN, nullable=True, default=None)
     show_level = Column(BOOLEAN, nullable=False, default=True)
     show_preceptor = Column(BOOLEAN, nullable=False, default=True)
-    off_first = Column(BOOLEAN, nullable=False, default=False)
-    off_swap_enabled = Column(BOOLEAN, nullable=False, default=False)
+    staffing_first = Column(BOOLEAN, name="off_first", key="staffing_first", nullable=False, default=False)  # True=근무 인원 우선(남는 칸 OFF · 월 OFF 수 무시)
+    convert_excess_off_to_leave = Column(BOOLEAN, name="off_swap_enabled", key="convert_excess_off_to_leave", nullable=False, default=False)  # OFF 기준 초과분 연차 전환 후처리
     # ── 보건휴가 자동 부여 ──
     #   NULL = 미설정(= 꺼짐). 기존 row 를 건드리지 않으려 nullable 로 둔다.
     #   판정은 항상 bool(getattr(cfg, ..., False)) — None 이 False 로 떨어져야 한다.
@@ -921,6 +922,14 @@ class RosterConfig(Base):
     # NOTE: 그룹별 version 유일성 인덱스(ux_roster_config_group_version,
     #   WHERE version IS NOT NULL 필터드 유니크)는 개발 마무리 후 추가 예정.
     #   현재는 version 할당이 MAX+1(앱) 단독 — 동시 저장 충돌은 실무상 희박해 보류.
+
+
+# ── NM — roster_config 14칸의 옛(바깥) 이름 호환 심 ──
+#   물리 컬럼·API·저장 JSON 은 옛 이름 그대로고, 파이썬 속성만 새 이름이다(services/engine_contract/names.py).
+#   옛 이름으로 읽고 쓰면 새 속성으로 잇는다(클래스 수준 질의 `RosterConfig.<옛> == …` 도 새 컬럼으로) —
+#   운영은 동작 유지 + 경고 1회, 시험(ROSTER_NM_STRICT=1)은 OldConfigNameError 로 남은 자리를 드러낸다.
+for _old_name, _new_name in EXTERNAL_TO_INTERNAL.items():
+    setattr(RosterConfig, _old_name, synonym(_new_name, descriptor=OldNameDescriptor(_old_name)))
 
 
 class RosterConfigAttempt(Base):

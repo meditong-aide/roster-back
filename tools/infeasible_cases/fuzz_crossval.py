@@ -47,7 +47,7 @@ def _rand_case(rng: random.Random) -> tuple:
             break
     rules = {}
     if rng.random() < 0.7:
-        rules["not_one_night"] = True
+        rules["ban_single_night"] = True
     r = rng.random()
     if r < 0.4:
         rules["two_offs_after_two_nig"] = True
@@ -114,7 +114,7 @@ def cpsat_feasible(nurses, cfg, days):
     rD, rE, rN = dsr.get("D", 0), dsr.get("E", 0), dsr.get("N", 0)
     S = ["D", "E", "N", "O"]
     max_run = int(cfg.get("max_consecutive_nights", 3) or 3)
-    min_run = 2 if cfg.get("not_one_night") else 1
+    min_run = 2 if cfg.get("ban_single_night") else 1
     maxw = cfg.get("max_consecutive_work")
     x = {}
     for i, nu in enumerate(nurses):
@@ -148,7 +148,7 @@ def cpsat_feasible(nurses, cfg, days):
         # max_run: 연속 N ≤ max_run
         for d in range(days - max_run):
             m.Add(sum(N[d:d + max_run + 1]) <= max_run)
-        # not_one_night: 고립 N 금지 (경계 lenient — 내부만). N[d] → N[d-1] ∨ N[d+1]
+        # ban_single_night: 고립 N 금지 (경계 lenient — 내부만). N[d] → N[d-1] ∨ N[d+1]
         if min_run >= 2:
             for d in range(1, days - 1):
                 m.AddBoolOr([N[d].Not(), N[d - 1], N[d + 1]])

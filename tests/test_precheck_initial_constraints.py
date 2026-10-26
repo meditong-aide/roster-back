@@ -97,7 +97,7 @@ def test_precheck_nurse_gets_constraints_except_fixed_days_and_preceptees_get_no
 
 
 def test_dp_choices_forbidden_removes_forced_off_wins_fixed_wins():
-    base = {"num_days": 4, "allowed": {"N"}, "not_one_night": True}
+    base = {"num_days": 4, "allowed": {"N"}, "ban_single_night": True}
     # 고정 N(1일) 양옆 N 금지 → 단독 N → 불가능 / 한쪽만 금지면 가능
     assert nurse_sequence_infeasible(**base, fixed={1: "N"}, forbidden={0: {"N"}, 2: {"N"}}) is True
     assert nurse_sequence_infeasible(**base, fixed={1: "N"}, forbidden={0: {"N"}}) is False

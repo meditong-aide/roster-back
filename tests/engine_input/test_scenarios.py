@@ -245,7 +245,7 @@ PATH_CHECKS = {
         ("첫 시도까지", _first_attempt),
         ("카드 delta 가 raw n2n 을 덮음", lambda r, o: _cfg(r)["n2n_min_gap"] == 0 and _cfg(r)["same_shift_hard_k"] == 0),
         ("처방 → 등급 상한 soft", lambda r, o: _l1(r)["grade_config"]["allow_soft_fallback"] is True),
-        ("req 1N 금지", lambda r, o: _cfg(r)["not_one_night"] is True),
+        ("req 1N 금지", lambda r, o: _cfg(r)["ban_single_night"] is True),
         ("분배 게이지", lambda r, o: (_cfg(r)["distribution_mode"], _cfg(r)["oversupply_balance_gauge"]) == ("balanced", 8)),
         ("확정 원티드 T 만 하드 고정", lambda r, o: sorted(_fixed(r, "fixed_wanted")) == [(0, 2, "D"), (0, 9, "O"), (1, 4, "N")]),
         ("특수코드 연차", lambda r, o: _fixed(r, "special_fixed") == [(3, 11, "연")]),

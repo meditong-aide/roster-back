@@ -19,8 +19,8 @@ class _Nu:
         self.allowed_shifts = allowed
 
 
-# 3N2OFF(3연속 후 2OFF) + not_one_night(고립1N 금지) 활성 = 실병동 설정.
-_RULES = {"two_offs_after_three_nig": True, "not_one_night": True}
+# 3N2OFF(3연속 후 2OFF) + ban_single_night(고립1N 금지) 활성 = 실병동 설정.
+_RULES = {"two_offs_after_three_nig": True, "ban_single_night": True}
 
 
 def _cfg(forbidden, forced_off, **rules):
@@ -45,7 +45,7 @@ def test_dp_case2_recovery_blocked_infeasible():
 
 
 def test_dp_case3_isolated_single_night_infeasible():
-    """③ 고립 1N: 11일 O금지(강제N)인데 10·12 강제OFF → 1N 고립 → not_one_night 위반."""
+    """③ 고립 1N: 11일 O금지(강제N)인데 10·12 강제OFF → 1N 고립 → ban_single_night 위반."""
     assert per_nurse_night_feasible({11}, {10, 12}, 31, _RULES) is False
 
 

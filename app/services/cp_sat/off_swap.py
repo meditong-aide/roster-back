@@ -3,7 +3,7 @@
 `roster_config.off_swap_enabled=True` 일 때 동작.
 월 OFF 수 baseline(`off_days`) 초과분을 `shifts.off_swap_target=True` 로 등록된
 코드로 변환한다. 보호 4종(회복 OFF / fixed_wanted / '주' / N전담)은 후보에서 제외.
-주2OFF(`two_offs_per_week`)를 켠 병동은 주별 휴일 하한을 깨야 하는 몫은 바꾸지 않고
+주2OFF(`prefer_two_offs_per_7days`)를 켠 병동은 주별 휴일 하한을 깨야 하는 몫은 바꾸지 않고
 O 로 남긴다(`_pick_keeping_week_off`) — 그 병동은 초과분이 전부 바뀌지 않을 수 있다.
 
 호출 위치: `roster_create_service._persist_entries` 직전.
@@ -38,7 +38,7 @@ def postprocess_off_swap(
         db: SQLAlchemy 세션
         schedule: 저장 대상 Schedule (group_id/year/month/office_id 사용)
         generated: {nurse_id: [shift_code_per_day, ...]} — 1일=index 0
-        latest_config: RosterConfig 인스턴스 (off_swap_enabled / off_days / use_mid)
+        latest_config: RosterConfig 인스턴스 (convert_excess_off_to_leave / off_days / use_mid)
         req: RosterRequest (year, month)
 
     Returns:
@@ -46,10 +46,10 @@ def postprocess_off_swap(
     """
     print(
         f"[OffSwap][ENTER] schedule={schedule.schedule_id} "
-        f"off_swap_enabled={getattr(latest_config, 'off_swap_enabled', None)!r}"
+        f"convert_excess_off_to_leave={getattr(latest_config, 'convert_excess_off_to_leave', None)!r}"
     )
-    if not bool(getattr(latest_config, "off_swap_enabled", False)):
-        print("[OffSwap][SKIP] off_swap_enabled=False — early return")
+    if not bool(getattr(latest_config, "convert_excess_off_to_leave", False)):
+        print("[OffSwap][SKIP] convert_excess_off_to_leave=False — early return")
         return generated
 
     target = _resolve_target_shift(db, schedule.group_id)
@@ -108,8 +108,8 @@ def postprocess_off_swap(
     #   지킬 하한이 없으므로 기존 순서(월말부터) 초과분을 전부 바꾼다. 켠 병동은 하한을
     #   깨야 하는 몫을 바꾸지 않고 O 로 남긴다(`_pick_keeping_week_off`).
     #   DB 컬럼명은 `two_offs_per_week` 다(엔진 dataclass 의 `enforce_two_offs_per_week`
-    #   와 이름이 다르다). NULL(미설정)은 False 로 떨어진다.
-    two_offs_on = bool(getattr(latest_config, "two_offs_per_week", False))
+    #   와 이름이 다르다). ORM 속성은 `prefer_two_offs_per_7days`. NULL(미설정)은 False 로 떨어진다.
+    two_offs_on = bool(getattr(latest_config, "prefer_two_offs_per_7days", False))
 
     converted_total = 0
     skipped_n_only = 0
@@ -180,7 +180,7 @@ def postprocess_off_swap(
         f"[OffSwap][DONE] schedule={schedule.schedule_id} converted={converted_total} "
         f"baseline={baseline} target_shift={target.shift_id} "
         f"skipped_n_only={skipped_n_only} "
-        f"kept_off_for_week_floor={kept_for_floor} (two_offs_per_week={two_offs_on})"
+        f"kept_off_for_week_floor={kept_for_floor} (prefer_two_offs_per_7days={two_offs_on})"
     )
     return generated
 

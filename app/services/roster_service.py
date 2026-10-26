@@ -37,6 +37,7 @@ from db.models import (
 from db.roster_config import NurseRosterConfig
 from db.nurse_config import Nurse as NurseEngine
 from routers.utils import get_days_in_month
+from services.engine_contract.names import to_internal
 
 logger = logging.getLogger(__name__)
 from schemas.roster_schema import RosterConfigCreate, PublishRequest, RosterRequest
@@ -233,8 +234,9 @@ def materialize_generation_config(
             RosterConfigModel.group_id == group_id,
         ).first()
 
+    # payload(요청 모델)는 바깥(옛) 이름 필드다 — baseline(ORM) 속성과 견주려고 파이썬 이름으로 바꾼다(NM).
     pdict = {
-        k: v for k, v in payload.model_dump().items() if k not in _COMPARE_EXCLUDE
+        k: v for k, v in to_internal(payload.model_dump()).items() if k not in _COMPARE_EXCLUDE
     }
     # 미전송(None) 보존 필드는 **baseline 값으로 정규화한 뒤** 비교한다.
     #   이 필드를 모르는 화면은 None 을 보내는데, 그걸 baseline 의 True/False 와 그대로
@@ -412,7 +414,8 @@ def save_roster_config_service(
             day_req = eve_req = nig_req = 3
 
         # 3) 설정 저장 (프리셋 upsert)
-        config_dict = config_data.model_dump()
+        # 요청 모델은 바깥(옛) 이름 필드 — ORM 속성(setattr·RosterConfigModel(**…))은 파이썬 이름이다(NM).
+        config_dict = to_internal(config_data.model_dump())
         # 메타 필드는 컬럼 직접매핑에서 분리 — version 은 서버가 할당
         req_config_id = config_dict.pop('config_id', None)
         config_name = config_dict.pop('config_name', None)
@@ -3137,6 +3140,8 @@ def create_issued_roster_snapshot(
             .first()
         )
         if cfg:
+            # 저장 JSON(마감 사본 config_json) — 프론트 snapshot-type.ts 가 바깥(옛) 이름 키로 읽는다.
+            #   키는 옛 이름 그대로, 값만 ORM 의 새 속성에서 읽는다(NM · `# nm:external` 줄).
             config_json = {
                 "config_id": cfg.config_id,
                 "office_id": cfg.office_id,
@@ -3144,21 +3149,21 @@ def create_issued_roster_snapshot(
                 "day_req": cfg.day_req,
                 "eve_req": cfg.eve_req,
                 "nig_req": cfg.nig_req,
-                "min_exp_per_shift": cfg.min_exp_per_shift,
-                "req_exp_nurses": cfg.req_exp_nurses,
-                "two_offs_per_week": cfg.two_offs_per_week,
+                "min_exp_per_shift": cfg.senior_min_years,  # nm:external
+                "req_exp_nurses": cfg.senior_nurses_per_shift,  # nm:external
+                "two_offs_per_week": cfg.prefer_two_offs_per_7days,  # nm:external
                 "max_nig_per_month": cfg.max_nig_per_month,
-                "three_seq_nig": cfg.three_seq_nig,
+                "three_seq_nig": cfg.allow_three_consecutive_nights,  # nm:external
                 "two_offs_after_three_nig": cfg.two_offs_after_three_nig,
                 "two_offs_after_two_nig": cfg.two_offs_after_two_nig,
-                "banned_day_after_eve": cfg.banned_day_after_eve,
+                "banned_day_after_eve": cfg.ban_shift_transitions,  # nm:external
                 "max_conseq_work": cfg.max_conseq_work,
                 "off_days": cfg.off_days,
                 "shift_priority": cfg.shift_priority,
-                "sequential_offs": cfg.sequential_offs,
-                "nod_noe": cfg.nod_noe,
-                "preceptee_on": cfg.preceptee_on,
-                "preceptee_shift_count": cfg.preceptee_shift_count,
+                "sequential_offs": cfg.avoid_isolated_off_and_work,  # nm:external
+                "nod_noe": cfg.avoid_nod_noe_eod,  # nm:external
+                "preceptee_on": cfg.preceptee_follows_preceptor,  # nm:external
+                "preceptee_shift_count": cfg.count_preceptee_in_staffing,  # nm:external
                 "created_at": cfg.created_at.isoformat()
                 if getattr(cfg, "created_at", None)
                 else None,

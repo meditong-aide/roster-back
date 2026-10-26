@@ -207,7 +207,8 @@ def test_first_line_judgement_defect_propagates_unchanged(seeded, spies, monkeyp
 
 def test_gate_sits_right_after_group_resolution_and_before_any_write():
     """관문 두 줄은 그룹 해석 바로 뒤, 개인 속성 쓰기(`_wor =`)·materialize·`_ctx["config"]` 보다 앞이다(순서 고정).
-    두 줄 모두 호출 자리에서 try 로 감싸지 않는다."""
+    두 줄 모두 호출 자리에서 try 로 감싸지 않는다.
+    NM — 관문 뒤에서 바깥 이름을 파이썬 이름으로 바꾼다(`to_internal` — 별칭 정규화와 같은 줄)."""
     tree = ast.parse((APP / "services/roster_create_service.py").read_text(encoding="utf-8"))
     (func,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_generate_roster_service_impl"]
     body = [ast.unparse(n) for n in func.body]
@@ -218,7 +219,7 @@ def test_gate_sits_right_after_group_resolution_and_before_any_write():
     # 11r — 관문 바로 뒤에서 정수 상한 키 값을 판정이 본 정수로 맞춘다(쓰기 0 · 그 뒤가 개인 속성 쓰기).
     assert body[resolve + 4] == "config_override = _normalize_int_cap_override(config_override)"
     assert body[resolve + 5] == "_override_given = bool(config_override)"  # EI-12 12r — 정규화 전 '개입 여부'(값 없는 별칭도 개입)
-    assert body[resolve + 6] == "config_override = normalize_aliases(config_override)"  # EI-12 12a — 판정 뒤 별칭 → 정본
+    assert body[resolve + 6] == "config_override = normalize_aliases(to_internal(config_override))"  # EI-12 12a — 판정 뒤 별칭 → 정본 · NM — 그 앞에서 바깥 이름 → 파이썬 이름
     assert body[resolve + 7].startswith("_wor = weekend_off_release or ")
     config_line = next(n.lineno for n in ast.walk(func) if isinstance(n, ast.Assign)
                        and ast.unparse(n) == "_ctx['config'] = latest_config")

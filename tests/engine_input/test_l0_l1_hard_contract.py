@@ -28,6 +28,7 @@ import json
 
 import pytest
 from fastapi import HTTPException
+from services.engine_contract.names import to_internal
 
 from .boundary_cases import (
     CFG,
@@ -86,7 +87,7 @@ EXCLUSIONS: dict[str, Exclusion] = {
                      "team_handoff_policy_by_team", "fixed_cells")),
     "E3": Exclusion("수요 — 고정근무 차감이 precheck 뒤라 L1 ≤ L0(precheck 가 더 엄격). L1 은 차감 뒤 수요(나이트 사전 검사 L0p 가 "
                     "받은 값)와 같아야 한다 — 차감 밖으로 수요가 줄면 위반", DEMAND),
-    "E4": Exclusion("근무 우선(off_first)의 개인 OFF 한도 — 엔진 입력에서 None(2026-10-12 사용자 결정)", OFF_LIMITS),
+    "E4": Exclusion("근무 우선(staffing_first)의 개인 OFF 한도 — 엔진 입력에서 None(2026-10-12 사용자 결정)", OFF_LIMITS),
     "E5": Exclusion("등급 설정의 allow_soft_fallback 한 칸 — 처방 soft:grade_max 가 엔진 쪽만 켠다(L0 False → L1 True 만). "
                     "등급 설정의 다른 칸과 간호사 등급은 R7·R8 로 같아야 한다", ("allow_soft_fallback",)),
 }
@@ -170,11 +171,11 @@ def _nurse_violations(l0: dict, l1: dict) -> list[str]:
     n1 = {str(n["nurse_id"]): n for n in l1["nurses_data"]}
     if set(n0) != set(n1):
         return [f"R7 명단 {sorted(set(n0) ^ set(n1))}"]
-    off_first = bool(l1["config_data"].get("off_first"))
+    staffing_first = bool(l1["config_data"].get("staffing_first"))
     bad = [f"R7 {nid}.{f}: {n0[nid].get(f)!r} → {n1[nid].get(f)!r}" for nid in sorted(n0) for f in NURSE_HARD
            if n0[nid].get(f) != n1[nid].get(f)]
     bad += [f"R7/E4 {nid}.{f}: {n0[nid].get(f)!r} → {n1[nid].get(f)!r}" for nid in sorted(n0)
-            for f in EXCLUSIONS["E4"].fields if n1[nid].get(f) != (None if off_first else n0[nid].get(f))]
+            for f in EXCLUSIONS["E4"].fields if n1[nid].get(f) != (None if staffing_first else n0[nid].get(f))]
     return bad
 
 
@@ -226,10 +227,17 @@ def test_golden_l0_hard_elements_reach_l1(name):
         assert not layers.get("L1") and rec["path"] == PRE_ENGINE_BLOCK[name], (rec["path"], len(layers.get("L1") or []))
         return
     assert layers.get("L0") and layers.get("L1"), name
-    assert contract_violations(layers["L0"][0], layers["L1"][0], (layers.get("L0p") or [None])[0]) == []
+    # 골든의 설정 dict 는 옛(바깥) 이름이거나(재생성 전) 새 이름이다 — 층별 설정 dict 자리만 파이썬 이름으로 맞춘다(간호사 dict 등은 그대로).
+    l0 = {**layers["L0"][0], "config_dict": to_internal(layers["L0"][0]["config_dict"])}
+    l1 = {**layers["L1"][0], "config_data": to_internal(layers["L1"][0]["config_data"])}
+    l0p = (layers.get("L0p") or [None])[0]
+    if l0p:
+        l0p = {**l0p, "config": to_internal(l0p.get("config"))}  # config 없는 L0p 도 받는다(없으면 None → 뒤에서 c0)
+    assert contract_violations(l0, l1, l0p) == []
     # 사다리 골든 — 재시도·탐색 시도마다 L0 경계 칸이 그 시도의 엔진 입력에 있다(리뷰 HIGH).
-    c0 = layers["L0"][0]["config_dict"]
-    assert [f"{site}: {v}" for site, cfg in attempt_configs(layers) for v in _cell_violations(c0, cfg)] == []
+    # 시도 config 는 골든 원본(첫 시도 + 차이가 같은 이름 체계)으로 되살린 다음에 바꾼다 — 먼저 바꾸면 옛 이름 차이와 섞인다.
+    c0 = l0["config_dict"]
+    assert [f"{site}: {v}" for site, cfg in attempt_configs(layers) for v in _cell_violations(c0, to_internal(cfg))] == []
 
 
 # ── ② 경계 변형(프로덕션 경로를 L2 직전까지 실제로 돈다 · solve 0) ─────────────────
@@ -433,9 +441,9 @@ def _pair(**over) -> tuple[dict, dict, dict]:
     """최소 L0 · L1 · L0p(같은 값) — 제외 단위 시험용."""
     nurse = {"nurse_id": "N01", "grade": 1, "preceptor_id": None, "o_min": 8, "o_max": None, "o_exact": None}
     demand = [{"D": 2, "E": 2, "N": 2}]
-    l0 = {"config_dict": {"daily_shift_requirements_by_day": demand, "off_first": False}, "nurses_dict": [dict(nurse)],
+    l0 = {"config_dict": {"daily_shift_requirements_by_day": demand, "staffing_first": False}, "nurses_dict": [dict(nurse)],
           "fixed_cells": [], "grade_config": {"allow_soft_fallback": False, "constraints": {"1": 1}}}
-    l1 = {"config_data": {"daily_shift_requirements_by_day": [dict(demand[0])], "off_first": False},
+    l1 = {"config_data": {"daily_shift_requirements_by_day": [dict(demand[0])], "staffing_first": False},
           "nurses_data": [dict(nurse)], "shift_manage_data": [], "grade_config": {"allow_soft_fallback": False,
                                                                                   "constraints": {"1": 1}}}
     l0p = {"config": {"daily_shift_requirements_by_day": [dict(demand[0])]}}
@@ -482,8 +490,8 @@ def test_exclusion_e3_demand_may_drop_only_by_the_fixed_cut():
                                  l0p__config__daily_shift_requirements_by_day=up))   # L1 > L0
 
 
-def test_exclusion_e4_off_limits_none_only_when_off_first():
-    assert _codes(*_pair(l1__config_data__off_first=True, l0__config_dict__off_first=True,
+def test_exclusion_e4_off_limits_none_only_when_staffing_first():
+    assert _codes(*_pair(l1__config_data__staffing_first=True, l0__config_dict__staffing_first=True,
                          l1__nurses_data__0__o_min=None)) == set()
     assert "R7/E4" in _codes(*_pair(l1__nurses_data__0__o_min=None))
 
@@ -499,7 +507,7 @@ def test_exclusion_e5_only_allow_soft_fallback_may_turn_on():
 # ── ⑨ 독립 판정기 자체 점검(손으로 적은 기대값) ────────────────────────────────
 
 
-_BASE = {"banned_day_after_eve": True, "three_seq_nig": True, "max_conseq_work": 5}
+_BASE = {"ban_shift_transitions": True, "allow_three_consecutive_nights": True, "max_conseq_work": 5}
 _G2_N12 = {i: "N" for i in range(19) if NIGHT_CAP_G2[i] == "N"}
 JUDGE = [
     ({17: "N", 18: "N"}, {19: "N", 20: "N"}, {**_BASE, **CFG["X"]}, {"#3"}),
@@ -509,8 +517,8 @@ JUDGE = [
     ({17: "N", 18: "N"}, {19: "O", 20: "D"}, {**_BASE, **CFG["Y"]}, {"#5"}),
     ({17: "N", 18: "N"}, {19: "O", 20: "D"}, {**_BASE, **CFG["X"]}, set()),
     ({16: "N", 17: "N", 18: "N"}, {19: "O", 20: "D"}, {**_BASE, **CFG["X"]}, {"#4"}),
-    ({18: "O"}, {19: "N", 20: "O"}, {**_BASE, "not_one_night": True}, {"#7"}),
-    ({18: "N"}, {19: "O", 20: "O"}, {**_BASE, "not_one_night": True}, set()),
+    ({18: "O"}, {19: "N", 20: "O"}, {**_BASE, "ban_single_night": True}, {"#7"}),
+    ({18: "N"}, {19: "O", 20: "O"}, {**_BASE, "ban_single_night": True}, set()),
     ({0: "N", 1: "N", 2: "N", 3: "N"}, {10: "D"}, {**_BASE, **CFG["X"]}, set()),
     ({17: "N"}, {19: "N", 20: "N"}, {**_BASE, **CFG["Z"]}, set()),
     ({17: "N", 18: "N"}, {19: "N"}, {**_BASE, **CFG["Z"]}, {"#3"}),

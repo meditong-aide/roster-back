@@ -18,9 +18,9 @@ _EXPECTED_SIMPLE = {
     "max_consecutive_work": "max_conseq_work",
     "max_night_shifts_per_month": "max_nig_per_month",
     "standard_personal_off_days": "off_days",
-    "min_experience_per_shift": "min_exp_per_shift",
-    "required_experienced_nurses": "req_exp_nurses",
-    "enforce_two_offs_per_week": "two_offs_per_week",
+    "min_experience_per_shift": "senior_min_years",
+    "required_experienced_nurses": "senior_nurses_per_shift",
+    "enforce_two_offs_per_week": "prefer_two_offs_per_7days",
     "shift_requirement_priority": "shift_priority",
 }
 
@@ -75,4 +75,4 @@ def test_non_numeric_alias_values_are_dropped_not_renamed():
     for bad in ("5.9", [1], {"a": 1}):
         assert normalize_aliases({"shift_requirement_priority": bad, "x": 1}) == {"x": 1}
     assert normalize_aliases({"shift_requirement_priority": 0.5}) == {"shift_priority": 0.5}
-    assert normalize_aliases({"enforce_two_offs_per_week": False}) == {"two_offs_per_week": False}
+    assert normalize_aliases({"enforce_two_offs_per_week": False}) == {"prefer_two_offs_per_7days": False}

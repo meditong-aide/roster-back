@@ -173,16 +173,16 @@ def main() -> int:
 
         # ----------- C: req_exp_nurses raise (Grade min stress) -----------
         def c(cfg):
-            old = cfg.get("req_exp_nurses")
-            cfg["req_exp_nurses"] = 10
-            return {"req_exp_nurses": {"old": old, "new": 10}}
+            old = cfg.get("req_exp_nurses")  # nm:external
+            cfg["req_exp_nurses"] = 10  # nm:external
+            return {"req_exp_nurses": {"old": old, "new": 10}}  # nm:external
         results.append(run_scenario(s, baseline, "C_req_exp_nurses_10", c))
 
         # ----------- D: min_exp_per_shift raise -----------
         def d(cfg):
-            old = cfg.get("min_exp_per_shift")
-            cfg["min_exp_per_shift"] = 10
-            return {"min_exp_per_shift": {"old": old, "new": 10}}
+            old = cfg.get("min_exp_per_shift")  # nm:external
+            cfg["min_exp_per_shift"] = 10  # nm:external
+            return {"min_exp_per_shift": {"old": old, "new": 10}}  # nm:external
         results.append(run_scenario(s, baseline, "D_min_exp_per_shift_10", d))
 
         # ----------- E: use_mid=true (likely triggers ConfigIntegrity T0 if MID not configured) -----------
@@ -198,9 +198,9 @@ def main() -> int:
             old1 = cfg.get("max_nig_per_month")
             cfg["max_nig_per_month"] = 2
             diff["max_nig_per_month"] = {"old": old1, "new": 2}
-            old2 = cfg.get("req_exp_nurses")
-            cfg["req_exp_nurses"] = 8
-            diff["req_exp_nurses"] = {"old": old2, "new": 8}
+            old2 = cfg.get("req_exp_nurses")  # nm:external
+            cfg["req_exp_nurses"] = 8  # nm:external
+            diff["req_exp_nurses"] = {"old": old2, "new": 8}  # nm:external
             return diff
         results.append(run_scenario(s, baseline, "F_combo_nig_grade", f))
 
@@ -211,8 +211,8 @@ def main() -> int:
             diff["max_nig_per_month"] = 1
             cfg["off_days"] = 22.0
             diff["off_days"] = 22.0
-            cfg["req_exp_nurses"] = 10
-            diff["req_exp_nurses"] = 10
+            cfg["req_exp_nurses"] = 10  # nm:external
+            diff["req_exp_nurses"] = 10  # nm:external
             return diff
         results.append(run_scenario(s, baseline, "G_severe_triple", g))
 

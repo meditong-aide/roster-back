@@ -33,12 +33,12 @@ def _cfg(**extra):
     """엔진 기본에 가까운 설정 — 연속근무 상한은 운영에 많은 6."""
     base = {
         "daily_shift_requirements": {"D": 1, "E": 1, "N": 1}, "max_conseq_work": 6,
-        "max_nig_per_month": 15, "banned_day_after_eve": True, "three_seq_nig": True,
-        "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "not_one_night": False,
+        "max_nig_per_month": 15, "ban_shift_transitions": True, "allow_three_consecutive_nights": True,
+        "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "ban_single_night": False,
         "use_mid": False, "off_days": 8, "shift_priority": 0.7,
-        # EI-14r3 — 이 파일은 연속근무·주휴·퇴사 용량을 따로 잰다. OFF 하드 하한(min_off — off_first=False 병동)은 별개 제약이라 끈다
+        # EI-14r3 — 이 파일은 연속근무·주휴·퇴사 용량을 따로 잰다. OFF 하드 하한(min_off — staffing_first=False 병동)은 별개 제약이라 끈다
         # (그 하한은 test_precheck_min_off_floor.py · test_precheck_vs_engine_stage1.py::test_s7e* 가 본다).
-        "off_first": True,
+        "staffing_first": True,
     }
     base.update(extra)
     return base
@@ -278,11 +278,11 @@ def test_r10f7_empty_span_nurses_add_nothing_and_break_nothing():
     base = _ward_with_n0()
     cells = [{"nurse_id": "x1", "day_index": 0, "shift": "N"}]  # 구간 밖 고정 칸 — 판정에 쓰이지 않는다
     with_empty = base + _empty_span_nurses()
-    inp = _build(with_empty, _cfg(not_one_night=True), cells)
+    inp = _build(with_empty, _cfg(ban_single_night=True), cells)
     empty = [nurse for nurse in inp.nurses if nurse.nurse_id.startswith("x")]
     assert [(nurse.join_day, nurse.leave_day) for nurse in empty] == [EMPTY] * 3
     assert [_working_capacity(nurse, inp.roster_config) for nurse in empty] == [0, 0, 0]
-    reference = run_precheck(_build(base, _cfg(not_one_night=True)))  # 예외 없이 끝까지 돈다(run_runtime_precheck 는 삼킨다)
+    reference = run_precheck(_build(base, _cfg(ban_single_night=True)))  # 예외 없이 끝까지 돈다(run_runtime_precheck 는 삼킨다)
     assert {i["reason_code"] for i in run_precheck(inp)["issues"]} == {i["reason_code"] for i in reference["issues"]}
 
 
@@ -315,7 +315,7 @@ def test_r10f5_fixed_night_on_the_resignation_day_is_outside_the_engine_range():
     전에는 퇴사일을 구간에 넣어 그 고정 N 이 구간 끝의 단독 N(1N)으로 보여 PER_NURSE_SEQUENCE_INFEASIBLE 로 막았다(오차단).
     """
     nurses = _ward_with_n0(resignation_date=datetime(2026, 11, 10))
-    result, codes = _run(nurses, _cfg(not_one_night=True), _single_night_cells(9))
+    result, codes = _run(nurses, _cfg(ban_single_night=True), _single_night_cells(9))
     assert SEQ not in codes and not has_blocking_issues(result)
 
 
@@ -325,13 +325,13 @@ def test_r10f5b_fixed_night_on_the_new_last_work_day_blocks_like_engine():
     전에는 퇴사일(11/11, 인덱스 10)이 구간에 있어 N 을 하루 더 이을 수 있다고 보고 통과시켰다(놓침).
     """
     nurses = _ward_with_n0(resignation_date=datetime(2026, 11, 11))
-    result, codes = _run(nurses, _cfg(not_one_night=True), _single_night_cells(9))
+    result, codes = _run(nurses, _cfg(ban_single_night=True), _single_night_cells(9))
     assert SEQ in codes and has_blocking_issues(result)
 
 
 def test_r10f5c_same_cells_without_resignation_pass():
     """(가드) 퇴사자가 없으면 11/10 고정 N 뒤에 11/11 N 을 이을 수 있어 가능하다 — 전/후 통과."""
-    result, codes = _run(_ward_with_n0(), _cfg(not_one_night=True), _single_night_cells(9))
+    result, codes = _run(_ward_with_n0(), _cfg(ban_single_night=True), _single_night_cells(9))
     assert SEQ not in codes and not has_blocking_issues(result)
 
 

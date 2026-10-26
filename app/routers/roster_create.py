@@ -26,12 +26,37 @@ from services.roster_create_service import (
     # generate_roster_service_with_fixed_cells,
     request_schedule_service,
 )
+from services.engine_contract.names import to_external, to_external_deep, to_internal
 from services.job_status_service import create_job_record
 from services.group_access import resolve_effective_group
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["roster_create"])
+
+
+def _request_config_to_internal(config: dict[str, Any] | None, field: str) -> dict[str, Any] | None:
+    """요청 본문의 설정 dict(`config_override`·`apply`, 바깥 이름)를 파이썬 이름으로 바꾼다.
+
+    같은 칸을 두 이름·다른 값으로 함께 보내면 `to_internal` 이 ValueError 를 던진다 — 서버 오류(500)가 아니라
+    잘못된 요청(400)이다. 문구에는 키를 적지 않는다(ValueError 문구는 파이썬 이름을 담는다 — 화면 문구는 바깥 이름만).
+    """
+    try:
+        return to_internal(config)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"{field} 에 같은 설정이 서로 다른 이름·값으로 중복되어 있습니다."
+        ) from exc
+
+
+def _external_http_error(exc: HTTPException) -> HTTPException:
+    """구조화 detail(infeasibility 해결 카드 등)의 설정 키를 바깥 이름으로 바꾼 예외 — 문자열 detail 은 그대로 돌려준다.
+
+    프론트가 해결 카드의 `apply` 를 모달 설정에 병합해 다시 보내므로, 새 이름이 나가면 요청 모델이 그 키를 버려
+    해결책이 조용히 무효가 된다."""
+    if not isinstance(exc.detail, (dict, list)):
+        return exc
+    return HTTPException(status_code=exc.status_code, detail=to_external_deep(exc.detail), headers=exc.headers)
 
 
 def _fallback_unrecoverable_from_exception(error_message: str) -> dict:
@@ -65,14 +90,14 @@ def _fallback_unrecoverable_from_exception(error_message: str) -> dict:
     if not reasons:
         _add("INTERNAL_GENERATION_ERROR")
 
-    return build_unrecoverable_payload(
+    return to_external_deep(build_unrecoverable_payload(
         precheck_result={"issues": []},
         applied_relaxations=[],
         last_error_reason=msg,
         violated_constraints=reasons,
         conflict_cores=[],
         pool_snapshot={},
-    )
+    ))
 
 
 class HoldGenerateRequest(BaseModel):
@@ -187,9 +212,11 @@ async def roster_create_async(
         _db, current_user, getattr(req, "group_id", None)
     )
     req.group_id = target_group_id
+    # config_override 는 요청 본문(바깥 이름) — 하드락 판정·생성 서비스에는 파이썬 이름(co)으로 넘긴다.
+    # req 는 바꾸지 않는다: 아래 req.dict() 가 SQS params·응답 job 으로 바깥 이름 그대로 나가야 한다.
+    co = _request_config_to_internal(getattr(req, "config_override", None), "config_override")
     # 해결 카드 재생성 값이 하드락 #6(월 나이트 15)을 넘거나 N전담 횟수를 바꾸면 큐에 넣기 전에 400.
-    assert_night_caps_within_hard_lock(
-        getattr(req, "config_override", None), getattr(req, "monthly_limit_release", None))
+    assert_night_caps_within_hard_lock(co, getattr(req, "monthly_limit_release", None))
     assert_release_not_n_only(_db, target_group_id, req.year, req.month, getattr(req, "monthly_limit_release", None))
 
     # 모달 payload 제공 시: config 굳히기(materialize) + 라이브 동기화(apply).
@@ -225,19 +252,19 @@ async def roster_create_async(
         try:
             return {
                 "mode": "sync",
-                "result": generate_roster_service(
+                "result": to_external_deep(generate_roster_service(
                     req, current_user, _db,
-                    config_override=(getattr(req, "config_override", None) or None),
+                    config_override=(co or None),
                     treatment_ids=(getattr(req, "treatment_ids", None) or None),
                     weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
                     monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
                     banned_wanted_release=(getattr(req, "banned_wanted_release", None) or None),
                     allowed_shift_add=(getattr(req, "allowed_shift_add", None) or None),
-                ),
+                )),
                 "materialized_config": materialized,
             }
-        except HTTPException:
-            raise
+        except HTTPException as exc:
+            raise _external_http_error(exc)
         except Exception as exc:
             raise HTTPException(
                 status_code=500, detail=f"근무표 생성 실패: {exc}"
@@ -315,26 +342,27 @@ def generate_roster_endpoint(
     예시:
         year=2025, month=3 요청 시 동기 생성 결과 반환.
     """
-    assert_night_caps_within_hard_lock(
-        getattr(req, "config_override", None), getattr(req, "monthly_limit_release", None))
+    # config_override 는 요청 본문(바깥 이름) — 하드락 판정·생성 서비스에는 파이썬 이름(co)으로 넘긴다.
+    co = _request_config_to_internal(getattr(req, "config_override", None), "config_override")
+    assert_night_caps_within_hard_lock(co, getattr(req, "monthly_limit_release", None))
     if getattr(req, "monthly_limit_release", None):
         assert_release_not_n_only(db, resolve_effective_group(db, current_user, getattr(req, "group_id", None)),
                                   req.year, req.month, req.monthly_limit_release)
     try:
         # 해결책 재생성 파라미터를 서비스로 전달(누락 시 config_override 의 비-DB 솔버키
         # (예: weekend_off_only_enable)와 weekend_off_release/monthly_limit_release 가 반영 안 됨).
-        return generate_roster_service(
+        return to_external_deep(generate_roster_service(
             req, current_user, db,
             treatment_ids=(getattr(req, "treatment_ids", None) or None),
-            config_override=(getattr(req, "config_override", None) or None),
+            config_override=(co or None),
             weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
             monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
             banned_wanted_release=(getattr(req, "banned_wanted_release", None) or None),
             allowed_shift_add=(getattr(req, "allowed_shift_add", None) or None),
-        )
-    except HTTPException:
-        # 구조화된 infeasibility 페이로드 등 의도된 HTTPException은 그대로 전파
-        raise
+        ))
+    except HTTPException as e:
+        # 구조화된 infeasibility 페이로드 등 의도된 HTTPException은 그대로 전파(설정 키만 바깥 이름으로)
+        raise _external_http_error(e)
     except Exception as e:
         # ★ 메시지만 찍으면 원인을 못 찾는다 — 실제로 'Permission denied' 한 줄만 남아
         #   어디서 난 것인지 추적이 불가능했다(2026-08-04). 규칙대로 스택을 남긴다
@@ -379,7 +407,8 @@ def apply_resolution_endpoint(
     주의: 적용~원복 사이 동안 해당 group 의 config 가 일시 변경되므로, 동일 group 의 동시
     생성과는 경합 가능(수간호사 월간 생성 빈도상 위험 낮음). 영구 반영은 별도 설정 저장 단계.
     """
-    delta = {k: v for k, v in (req.apply or {}).items()}
+    # apply 는 해결 카드가 내보낸 바깥 이름 그대로 echo 된다 — 이후 하드락 판정·컬럼 스냅숏·setattr·원복은 파이썬 이름(delta)으로 돈다.
+    delta = dict(_request_config_to_internal(req.apply, "apply") or {})
     treatment_ids = list(req.treatment_ids or [])
     if not delta and not treatment_ids:
         raise HTTPException(status_code=400, detail="apply(컬럼 delta) 또는 treatment_ids 가 필요합니다.")
@@ -389,14 +418,14 @@ def apply_resolution_endpoint(
     # ── ontology treatment 경로: 런타임 적용(DB 미변경, 이번 생성만, persist N/A) ──
     if treatment_ids:
         try:
-            result = generate_roster_service(gen_req, current_user, db, treatment_ids=treatment_ids)
+            result = to_external_deep(generate_roster_service(gen_req, current_user, db, treatment_ids=treatment_ids))
             if isinstance(result, dict):
                 result["applied_resolution"] = {
                     "option_id": req.option_id, "treatment_ids": treatment_ids, "persisted": False,
                 }
             return result
-        except HTTPException:
-            raise  # 여전히 infeasible → 새 옵션 payload 전파
+        except HTTPException as e:
+            raise _external_http_error(e)  # 여전히 infeasible → 새 옵션 payload 전파(설정 키만 바깥 이름으로)
         except Exception as e:
             print("apply-resolution(treatment) error", e)
             payload = _fallback_unrecoverable_from_exception(f"treatment 적용 재생성 실패: {str(e)}")
@@ -408,7 +437,8 @@ def apply_resolution_endpoint(
     # RosterConfig(dataclass) 필드면 허용하고 config_override 로 라우팅해 적용한다.
     import dataclasses as _dc
     from db.roster_config import NurseRosterConfig as _NRC
-    allowed_cols = {c.name for c in RosterConfig.__table__.columns}
+    # c.key = ORM 속성 이름(파이썬 이름). c.name 은 물리 컬럼 이름(옛 이름)이라 delta 키(파이썬 이름)와 맞지 않는다.
+    allowed_cols = {c.key for c in RosterConfig.__table__.columns}
     _valid_override = {f.name for f in _dc.fields(_NRC)}
     bad = [k for k in delta if k not in allowed_cols and k not in _valid_override]
     if bad:
@@ -443,21 +473,22 @@ def apply_resolution_endpoint(
         _cd_mode = None
         if col_delta:
             _cd_mode = "persist" if bool(getattr(req, "persist", False)) else "temporary"
-        result = generate_roster_service(
+        result = to_external_deep(generate_roster_service(
             gen_req, current_user, db, config_override=(override_delta or None),
             column_delta_mode=_cd_mode
-        )
+        ))
         if bool(getattr(req, "persist", False)):
             _keep = True  # 성공 후에만 도달 → 컬럼 변경 영구 유지
         if isinstance(result, dict):
             result["applied_resolution"] = {
-                "option_id": req.option_id, "changes": delta, "persisted": _keep,
+                "option_id": req.option_id, "changes": to_external(delta), "persisted": _keep,
                 # 비-컬럼 키는 DB 컬럼이 없어 영구저장 불가 → persist 여부와 무관하게 이번 생성만 적용
-                "transient_keys": (list(override_delta.keys()) or None),
+                "transient_keys": (list(to_external(override_delta)) or None),
             }
         return result
-    except HTTPException:
-        raise  # 여전히 infeasible → _keep=False → finally 컬럼 원복, 새 옵션 payload 전파
+    except HTTPException as e:
+        # 여전히 infeasible → _keep=False → finally 컬럼 원복, 새 옵션 payload 전파(설정 키만 바깥 이름으로)
+        raise _external_http_error(e)
     except Exception as e:
         print("apply-resolution error", e)
         payload = _fallback_unrecoverable_from_exception(f"해결책 적용 재생성 실패: {str(e)}")

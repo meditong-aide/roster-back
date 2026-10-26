@@ -60,6 +60,7 @@ from services.cp_sat.allowed_shift_types import (
     effective_night_cap,
     normalize_allowed_shift_codes,
 )
+from services.engine_contract.names import check_engine_config_keys
 
 logger = logging.getLogger(__name__)
 
@@ -451,6 +452,9 @@ class CPSATBasicEngine:
             - 엔진의 커버리지 제약은 `daily_shift_requirements`(및 by_day)를 기반으로 동작한다.
               이 값이 비어있거나 키가 D/E/N으로 정규화되지 않으면 OFF로 쏠릴 수 있다.
         """
+        # 엔진 입구 검사(NM S2) — 설정 키는 파이썬 이름(새 이름)이어야 한다. 바깥(옛) 이름이 남아 있으면 시험(strict)은 오류,
+        # 운영은 새 이름으로 옮기고 이름별로 한 번 경고한다. dict 가 아니면 그대로 통과한다.
+        config_data = check_engine_config_keys(config_data, where="create_config_from_db")
         print('config_data', config_data.get('shift_priority'))
         # 법규 제약사항 (Hard Constraints)
         max_conseq_work = config_data.get('max_conseq_work', 5)
@@ -461,18 +465,18 @@ class CPSATBasicEngine:
         if _mcw_env:
             max_conseq_work = min(int(max_conseq_work or 5), int(_mcw_env))
             print(f"[MaxConsecWork] hard={max_conseq_work} (env={_mcw_env})")
-        banned_day_after_eve = config_data.get('banned_day_after_eve', True)
-        three_seq_nig = config_data.get('three_seq_nig', True)
+        ban_shift_transitions = config_data.get('ban_shift_transitions', True)
+        allow_three_consecutive_nights = config_data.get('allow_three_consecutive_nights', True)
         two_offs_after_three_nig = config_data.get('two_offs_after_three_nig', True)
         two_offs_after_two_nig = config_data.get('two_offs_after_two_nig', False)
-        not_one_night = config_data.get('not_one_night', False)
+        ban_single_night = config_data.get('ban_single_night', False)
         ban_night_before_fixed_off = bool(config_data.get('ban_night_before_fixed_off', True))
         # ★ 기본값이 위와 **반대(False)** 다 — 컬럼이 없거나 NULL 인 병동은 꺼진 채로 둔다.
         #   dev 는 이 컬럼이 뒤늦게 추가돼(prod→dev 마이그가 DDL 을 안 옮긴다) 없을 수 있다.
         ban_night_before_fixed_wanted_off = bool(
             config_data.get('ban_night_before_fixed_wanted_off', False)
         )
-        off_first = bool(config_data.get('off_first', False))
+        staffing_first = bool(config_data.get('staffing_first', False))
         # config.max_nig_per_month 를 그대로 사용. 2026-01-15 hotfix (d095cc6d)
         # `if != 15: = 17` override 는 제거 — DB/payload 값을 신뢰.
         # 단, 0/None/음수 garbage 값은 INFEASIBLE 유발하므로 15 로 floor (config 정정 권장).
@@ -485,15 +489,15 @@ class CPSATBasicEngine:
             )
             max_nig_per_month = 15
         print(f"{self.logger_prefix} max_nig_per_month(raw)={max_nig_per_month}")
-        # off_first=False(default): 근무 shift oversupply (OFF cap을 min_off_required + HARD recovery buffer로 tight clamp)
-        # off_first=True: OFF oversupply (dev HEAD 기존 동작: max_off_allowed = _base_max + _extra_off + auto_max scaling)
-        print(f"{self.logger_prefix} [OffPriorityMode] off_first={off_first} (False=Work oversupply/OFF tight, True=OFF oversupply/loose)")
+        # staffing_first=False(default): 근무 shift oversupply (OFF cap을 min_off_required + HARD recovery buffer로 tight clamp)
+        # staffing_first=True: OFF oversupply (dev HEAD 기존 동작: max_off_allowed = _base_max + _extra_off + auto_max scaling)
+        print(f"{self.logger_prefix} [OffPriorityMode] staffing_first={staffing_first} (False=Work oversupply/OFF tight, True=OFF oversupply/loose)")
         
         # 병원 내규 (Soft Constraints)
-        min_exp_per_shift = config_data.get('min_exp_per_shift', 3)
-        req_exp_nurses = config_data.get('req_exp_nurses', 1)
-        two_offs_per_week = config_data.get('two_offs_per_week', True)
-        sequential_offs = config_data.get('sequential_offs', True)
+        senior_min_years = config_data.get('senior_min_years', 3)
+        senior_nurses_per_shift = config_data.get('senior_nurses_per_shift', 1)
+        prefer_two_offs_per_7days = config_data.get('prefer_two_offs_per_7days', True)
+        avoid_isolated_off_and_work = config_data.get('avoid_isolated_off_and_work', True)
         enforce_clustered_offs = bool(config_data.get("enforce_clustered_offs", False))
         isolated_off_slack_penalty = int(config_data.get("isolated_off_slack_penalty", 300000) or 0)
 
@@ -550,23 +554,23 @@ class CPSATBasicEngine:
             #     'N': config_data.get('nig_req', 2)
             # },
             # 병원 내규 (Soft Constraints)
-            min_experience_per_shift=min_exp_per_shift,
-            required_experienced_nurses=req_exp_nurses,
-            enforce_two_offs_per_week=two_offs_per_week,
+            min_experience_per_shift=senior_min_years,
+            required_experienced_nurses=senior_nurses_per_shift,
+            enforce_two_offs_per_week=prefer_two_offs_per_7days,
             # 법규 제약사항 (Hard Constraints)
             max_night_shifts_per_month=max_nig_per_month,
-            max_consecutive_nights=3 if three_seq_nig else 2,
-            not_one_night=not_one_night,
+            max_consecutive_nights=3 if allow_three_consecutive_nights else 2,
+            ban_single_night=ban_single_night,
             ban_night_before_fixed_off=ban_night_before_fixed_off,
             ban_night_before_fixed_wanted_off=ban_night_before_fixed_wanted_off,
-            off_first=off_first,
+            staffing_first=staffing_first,
             max_consecutive_work_days=max_conseq_work,
             # 추가된 새로운 제약사항들
-            banned_day_after_eve=banned_day_after_eve,
+            ban_shift_transitions=ban_shift_transitions,
             two_offs_after_three_nig=two_offs_after_three_nig,
             two_offs_after_two_nig=two_offs_after_two_nig,
-            sequential_offs=sequential_offs,
-            nod_noe=config_data.get('nod_noe', True),
+            avoid_isolated_off_and_work=avoid_isolated_off_and_work,
+            avoid_nod_noe_eod=config_data.get('avoid_nod_noe_eod', True),
             enforce_clustered_offs=enforce_clustered_offs,
             isolated_off_slack_penalty=isolated_off_slack_penalty,
             global_monthly_off_days=0,
@@ -584,8 +588,8 @@ class CPSATBasicEngine:
             preceptor_focus_shifts=config_data.get('preceptor_focus_shifts', None),
             # 정책(사용자 지시): preceptee 팔로우는 기본 활성. config에 값이 없으면 True로 처리
             # (미설정/만료로 인한 우발적 False 방지). 명시적 False는 그대로 유지됨.
-            preceptee_on=bool(config_data.get('preceptee_on', True)),
-            preceptee_shift_count=bool(config_data.get('preceptee_shift_count', True)),
+            preceptee_follows_preceptor=bool(config_data.get('preceptee_follows_preceptor', True)),
+            count_preceptee_in_staffing=bool(config_data.get('count_preceptee_in_staffing', True)),
             use_mid=bool(config_data.get('use_mid', False)),
             # 휴무 상한 제어: 최소 필요 OFF 대비 허용 초과 일수
             # - 빡빡하게 off_days에 맞추다 보면 연속근무가 길어지는 현상이 생길 수 있어,
@@ -599,7 +603,7 @@ class CPSATBasicEngine:
             soft_consecutive_work_penalty_weight=int(config_data.get("soft_consecutive_work_penalty_weight", 180) or 0),
             # 연속 OFF 최대 개수(roster_config.max_conseq_off, 기본 3) — 4연속+ 고weight soft 벌점, 불가피 시 양보
             # (NULL/0/미설정은 기본 3 적용)
-            max_conseq_off=int(config_data.get("max_conseq_off") or 3),
+            soft_max_conseq_off=int(config_data.get("soft_max_conseq_off") or 3),
             max_conseq_off_penalty_weight=int(config_data.get("max_conseq_off_penalty_weight", 5000) or 0),
             # 같은 시프트(D/E/N) 연속 ≤3 soft
             max_same_shift=bool(config_data.get("max_same_shift", True)),
@@ -664,7 +668,7 @@ class CPSATBasicEngine:
         ban_n_to_e = bool(config_data.get("ban_n_to_e", True))
         ban_d_to_n = bool(config_data.get("ban_d_to_n", True))
         ban_n_to_d = bool(config_data.get("ban_n_to_d", True))
-        if not banned_day_after_eve:
+        if not ban_shift_transitions:
             ban_e_to_d = False
             ban_n_to_e = False
             ban_d_to_n = False
@@ -1558,7 +1562,7 @@ class CPSATBasicEngine:
         # ── 후처리 완료 후 프리셉티 roster를 프리셉터와 동기화 ──
         # 규칙: 프리셉터의 DEN/O → 프리셉티 동일 복사
         #       프리셉터의 특수코드(법,생,휴 등 원티드) → 프리셉티는 OFF
-        preceptee_follow = bool(getattr(roster_system.config, 'preceptee_on', True))
+        preceptee_follow = bool(getattr(roster_system.config, 'preceptee_follows_preceptor', True))
         if preceptee_follow and hasattr(roster_system, 'nurses'):
             _shift_types = roster_system.config.shift_types
             _off_s_idx = _shift_types.index('O') if 'O' in _shift_types else None
@@ -1814,7 +1818,7 @@ class CPSATBasicEngine:
         #         # )
         #         # roster_system.roster = updated_roster
         #         # Grade Repair 이후 프리셉티 재동기화
-        #         _pf = bool(getattr(roster_system.config, 'preceptee_on', False))
+        #         _pf = bool(getattr(roster_system.config, 'preceptee_follows_preceptor', False))
         #         if _pf and hasattr(roster_system, 'nurses'):
         #             _st = roster_system.config.shift_types
         #             _oi = _st.index('O') if 'O' in _st else None
@@ -1895,7 +1899,7 @@ class CPSATBasicEngine:
         )
         # 프리셉티 최종 결과를 프리셉터 결과로 직접 동기화
         # (roster 레벨은 엔진 정규화 코드(W 등)를 사용하므로, 최종 result 문자열 기준으로 덮어쓴다)
-        if bool(getattr(roster_system.config, 'preceptee_on', False)):
+        if bool(getattr(roster_system.config, 'preceptee_follows_preceptor', False)):
             _off_code = canonical_to_shift_id.get('O', 'O')
             _id2i_final = {nu.db_id: n for n, nu in enumerate(nurses)}
             _synced_final = 0
@@ -2054,7 +2058,7 @@ class CPSATBasicEngine:
             'shift_requirement', 'night_consecutive',
             'consecutive_work', 'night_nd', 'night_ne',
             'eve_ed', 'night_month_limit',
-            'not_one_night', 'rec_2n2o', 'rec_3n2o',
+            'not_one_night', 'rec_2n2o', 'rec_3n2o',  # nm:external — RosterSystem 위반 type 문자열
             'initial_forbidden', 'weekend_off_only',
             'consecutive_4off', 'cross_month_4off',
         }
@@ -2814,7 +2818,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
     #   - 맵 있음(권위 모드): 맵의 day 집합만 신뢰. 종료자는 맵에 부재 → 미follow. default=follow 없음.
     #   - 맵 없음(전환 폴백, 백필 전): 기존 캐시 기반(preceptor_id) + 전체월 follow 로 무회귀.
     # 설계: docs/NURSE_PRECEPTEE_PERIOD_DESIGN.md §6.
-    preceptee_follow = bool(getattr(rs.config, 'preceptee_on', False))
+    preceptee_follow = bool(getattr(rs.config, 'preceptee_follows_preceptor', False))
     _id_to_idx_pre = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
     preceptee_follow_days: dict[int, set[int]] = getattr(rs, "preceptee_follow_days", {}) or {}
     # 권위 플래그(builder 가 그룹의 period row 존재로 판정). bool(맵) 아님 — 활성자 0이어도 권위 유지.
@@ -3188,10 +3192,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 continue
             hard_call(m, "exactly_one_shift", "AddExactlyOne", (X(n,d,s) for s in range(S)))
 
-    # ───────────── 2-B-2. 프리셉티 팔로우 제약 추가 (preceptee_on=True 일 때) ──────────
+    # ───────────── 2-B-2. 프리셉티 팔로우 제약 추가 (preceptee_follows_preceptor=True 일 때) ──────────
     # preceptee_follow, preceptee_indices 는 위(2-A1 직전)에서 이미 계산됨
-    print(f"[CP-SAT-Basic] preceptee_on={getattr(rs.config, 'preceptee_on', 'MISSING')}, "
-          f"preceptee_shift_count={getattr(rs.config, 'preceptee_shift_count', 'MISSING')}, "
+    print(f"[CP-SAT-Basic] preceptee_follows_preceptor={getattr(rs.config, 'preceptee_follows_preceptor', 'MISSING')}, "
+          f"count_preceptee_in_staffing={getattr(rs.config, 'count_preceptee_in_staffing', 'MISSING')}, "
           f"preceptee_follow={preceptee_follow}, preceptee_indices={len(preceptee_indices)}명")
     if preceptee_follow and preceptee_indices:
         id_to_idx = {nu.db_id: n for n, nu in enumerate(rs.nurses)}
@@ -3229,14 +3233,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         print(f"[CP-SAT-Basic] 프리셉티 팔로우 모드: {len(preceptee_indices)}명, "
               f"제약 {constraint_count}개 추가, 개별 하드제약 면제 적용")
 
-    # preceptee_shift_count=False 이면 DEN 하드제약에서 프리셉티 제외 (preceptee_on 무관)
-    _pte_shift_count = getattr(rs.config, 'preceptee_shift_count', True)
+    # count_preceptee_in_staffing=False 이면 DEN 하드제약에서 프리셉티 제외 (preceptee_follows_preceptor 무관)
+    _pte_shift_count = getattr(rs.config, 'count_preceptee_in_staffing', True)
     exclude_preceptee_from_den = (not _pte_shift_count) and bool(preceptee_indices)
     _pte_cnt = len(preceptee_indices)
     if exclude_preceptee_from_den:
-        print(f"[CP-SAT-Basic] [DEN커버리지] preceptee_shift_count=False → 프리셉티 {_pte_cnt}명 제외, DEN 대상: {N - _pte_cnt}명/{N}명")
+        print(f"[CP-SAT-Basic] [DEN커버리지] count_preceptee_in_staffing=False → 프리셉티 {_pte_cnt}명 제외, DEN 대상: {N - _pte_cnt}명/{N}명")
     elif preceptee_indices:
-        print(f"[CP-SAT-Basic] [DEN커버리지] preceptee_shift_count=True → 프리셉티 {_pte_cnt}명 포함, DEN 대상: {N}명/{N}명")
+        print(f"[CP-SAT-Basic] [DEN커버리지] count_preceptee_in_staffing=True → 프리셉티 {_pte_cnt}명 포함, DEN 대상: {N}명/{N}명")
     # 프리셉티 제외 시 fixed_cnt도 재계산
     if exclude_preceptee_from_den:
         fixed_cnt_adj = [[0] * S for _ in range(D)]
@@ -3265,9 +3269,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         for day_map in max_by_day if isinstance(day_map, dict)
     )
     print(f"[MinMaxCoverage] max_by_day type={type(max_by_day).__name__}, len={len(max_by_day) if isinstance(max_by_day, list) else 'N/A'}, sample={max_by_day[0] if isinstance(max_by_day, list) and max_by_day else 'None'}, has_any_max={_has_any_max}")
-    # off_first=True: 사용자가 max coverage를 명시 안 한 코드/일에 대해 min을 max로 강제(=잔여 셀을 OFF로 회수).
-    _off_first_cfg = bool(getattr(cfg, "off_first", False))
-    print(f"[CP-SAT-Basic] [OffFirstCoverage] off_first={_off_first_cfg}, _has_any_max={_has_any_max} → force_min_as_max={_off_first_cfg and not _has_any_max}")
+    # staffing_first=True: 사용자가 max coverage를 명시 안 한 코드/일에 대해 min을 max로 강제(=잔여 셀을 OFF로 회수).
+    _staffing_first_cfg = bool(getattr(cfg, "staffing_first", False))
+    print(f"[CP-SAT-Basic] [OffFirstCoverage] staffing_first={_staffing_first_cfg}, _has_any_max={_has_any_max} → force_min_as_max={_staffing_first_cfg and not _has_any_max}")
     m_coverage_shortage_vars = []  # M soft min shortage (max coverage 없을 때)
     max_coverage_excess_vars = []  # max coverage 초과 soft 패널티
     daily_assigned_by_code: dict[str, list] = {}  # 일자별 커버리지 균등화용 {code: [(day, assigned_var, need, need_max)]}
@@ -3377,8 +3381,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 # 일자별 커버리지 균등화용 수집 (물리일만)
                 if d < D_phys and need_max > 0:
                     daily_assigned_by_code.setdefault(code, []).append((d, assigned, need, need_max))
-            elif _off_first_cfg:
-                # off_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
+            elif _staffing_first_cfg:
+                # staffing_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
                 # need=0 (fixed_wanted 가 min 다 채움) 케이스에도 assigned <= 0 강제 → 추가 근무 차단.
                 hard_add(m, "off_first_coverage_cap", assigned <= max(0, need))
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
@@ -3389,28 +3393,28 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 over_vars_by_day.setdefault(d, {})[code] = ov
 
     # ───────────── 2-D. Max coverage Off 균등 분배 ───
-    # off_first=True: max coverage 미설정이라도 OFF가 잔여 셀로 회수되므로
+    # staffing_first=True: max coverage 미설정이라도 OFF가 잔여 셀로 회수되므로
     # 일반 간호사 사이에 균등 분배 유도가 핵심 요구사항.
     max_cov_off_equalize_terms = []
-    if _has_any_max or _off_first_cfg:
+    if _has_any_max or _staffing_first_cfg:
         off_idx = rs.config.shift_types.index('O')
         nurse_off_vars = []
         for n in range(N):
             # 프리셉티는 프리셉터 스케줄을 따라가므로 균등화 대상에서 제외
             if n in preceptee_indices:
                 continue
-            # off_first=True: 주말휴무자·N 전담은 OFF cap이 일반 풀과 상이 → 풀에서 제외
+            # staffing_first=True: 주말휴무자·N 전담은 OFF cap이 일반 풀과 상이 → 풀에서 제외
             #   - 주말휴무자: weekend OFF 고정 슬롯
             #   - N 전담: 월 N 15회 후 잔여 셀 일괄 OFF (cap 관리 대상 아님)
             # 나머지 일반 근무자에 대해서만 동일 OFF 수렴 유도
-            if _off_first_cfg:
+            if _staffing_first_cfg:
                 _nu = rs.nurses[n] if n < len(rs.nurses) else None
                 if _nu is not None and bool(getattr(_nu, "is_weekend_off", False)):
                     continue
                 _raw_nn = getattr(_nu, "allowed_shifts", None) if _nu is not None else None
                 if isinstance(_raw_nn, (set, list, tuple)) and set(_raw_nn) == {"N"}:
                     continue
-            # off_first=False 경로의 OFF cap 식과 동일한 도메인:
+            # staffing_first=False 경로의 OFF cap 식과 동일한 도메인:
             #   phys_range_off = month_total_day_range(T0,T1,D_phys) ∖ blocked_by_nurse[n]
             #   휴가/공가(vacation_off_cells) 제외, 고정 OFF는 X(n,d,off)=1로 자동 카운트
             T0, T1 = join[n], leave[n]
@@ -3421,11 +3425,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             _phys_range_off_eq = [d for d in _phys_range_off_eq if (n, d) not in vacation_off_cells]
             if not _phys_range_off_eq:
                 continue
-            # off_first=True HARD 풀 가드: 풀먼스 active window 아닌 간호사는 제외
+            # staffing_first=True HARD 풀 가드: 풀먼스 active window 아닌 간호사는 제외
             #   - 중도 가입자(T0>0) / 중도 퇴사자(T1<D_phys-1) → 최대 OFF 용량 상이
             #   - blocked_by_nurse 보유자 → 출장/연수 등으로 OFF 가용량 비대칭
             #   동일 OFF 강제 시 INFEASIBLE 또는 풀 전체 OFF가 그들에 끌려 내려감
-            if _off_first_cfg:
+            if _staffing_first_cfg:
                 if T0 > 0 or T1 < D_phys - 1 or _blk_set_n:
                     continue
             total_off_n = m.NewIntVar(0, len(_phys_range_off_eq), f"mc_off_{n}")
@@ -3438,14 +3442,14 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             aux_call(m, "max_cov_off_equalize", "AddMinEquality", off_global_min, nurse_off_vars)
             off_range = m.NewIntVar(0, D_phys, "mc_off_range")
             aux_add(m, "max_cov_off_equalize", off_range == off_global_max - off_global_min)
-            # off_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
+            # staffing_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
             # (사용자 명세: off_days 무시 + daily 커버리지 우선 → OFF 균등은 차순위)
-            if _off_first_cfg:
-                print(f"[MaxCoverage] OFF range는 SOFT (off_first=True, daily 커버리지 우선)")
-            _off_eq_weight = -100000 if _off_first_cfg else -200
+            if _staffing_first_cfg:
+                print(f"[MaxCoverage] OFF range는 SOFT (staffing_first=True, daily 커버리지 우선)")
+            _off_eq_weight = -100000 if _staffing_first_cfg else -200
             max_cov_off_equalize_terms.append(_off_eq_weight * off_range)
             # L1 deviation: 양 끝점뿐 아니라 중간 분산도 평탄화
-            if _off_first_cfg and len(nurse_off_vars) >= 3:
+            if _staffing_first_cfg and len(nurse_off_vars) >= 3:
                 _N_eq = len(nurse_off_vars)
                 _off_sum = m.NewIntVar(0, D_phys * _N_eq, "mc_off_sum")
                 aux_add(m, "max_cov_off_equalize", _off_sum == sum(nurse_off_vars))
@@ -3998,19 +4002,19 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
         if n not in n_forbid_n:
             # 1N 금지: N 배정 시 인접일 중 최소 1일은 N 이어야 한다.
             # 단 nurse_monthly_limit.n_max==1 nurse 는 면제 (사용자 명시 의도 우선).
-            if bool(getattr(cfg, "not_one_night", False)) and n not in _single_n_allowed:
+            if bool(getattr(cfg, "ban_single_night", False)) and n not in _single_n_allowed:
                 # MUS용 assumption literal — 이 nurse의 1N 금지 정책 binding 여부 식별
                 _assume_no1n = None
                 if _assume_registry is not None:
                     _assume_no1n = _assume_registry.create_literal(
                         f"NotOneNight:nurse_{n}",
                         meta={
-                            "node_id": f"not_one_night:nurse_{n}",
+                            "node_id": f"not_one_night:nurse_{n}",  # nm:external — MUS 규칙 id
                             "type": "NotOneNightNode",
                             "label": "1N 단독 금지",
                             "value": True,
                             "scope": "nurse", "scope_key": f"nurse_{n}",
-                            "pattern": "not_one_night",
+                            "pattern": "not_one_night",  # nm:external — MUS 규칙 id
                             "nurse_id": str(getattr(nu, "nurse_id", n)),
                             "human_message_ko": "야간(N) 단독 박힘 금지 (인접일 중 ≥1일 N 필요)",
                             "resolution_hint": "이 간호사의 n_max 한도를 1로 설정하면 1N 금지에서 면제됩니다.",
@@ -4039,9 +4043,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if not neighbors:
                         continue
                     if _assume_no1n is not None:
-                        hard_add(m, "not_one_night", X(n, d, night) <= sum(neighbors)).OnlyEnforceIf(_assume_no1n)
+                        hard_add(m, "not_one_night", X(n, d, night) <= sum(neighbors)).OnlyEnforceIf(_assume_no1n)  # nm:external — 규칙 id
                     else:
-                        hard_add(m, "not_one_night", X(n, d, night) <= sum(neighbors))
+                        hard_add(m, "not_one_night", X(n, d, night) <= sum(neighbors))  # nm:external — 규칙 id
                     _emit_rec.emit(
                         family="NotOneNight",
                         scope={"nurse_index": n, "day": d + 1},
@@ -4251,8 +4255,8 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             _off_cap_skip = False
             _auto_min_off = None  # max coverage 기반 자동 최소 OFF
             _auto_max_off = None  # min coverage 기반 자동 최대 OFF
-            # off_first=True 시: max coverage 미설정이라도 _auto_max_off가 OFF cap의 단일 소스
-            if _has_any_max or _off_first_cfg:
+            # staffing_first=True 시: max coverage 미설정이라도 _auto_max_off가 OFF cap의 단일 소스
+            if _has_any_max or _staffing_first_cfg:
                 _blocked_set = set(blocked_by_nurse.keys()) if blocked_by_nurse else set()
                 _total_off_capacity = 0  # min coverage 기준 최대 OFF 가용량
                 _total_off_required = 0  # max coverage 기준 최소 OFF 필요량
@@ -4349,9 +4353,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 # N전담 예외: offcap 고정값 적용 제외 (max는 별도 공식 avail_days-15)
                 if is_n_only:
                     min_off_required = 0
-                # off_first=True: 사용자 명세상 월 OFF 수(off_days) 무시 → min_off HARD 해제.
+                # staffing_first=True: 사용자 명세상 월 OFF 수(off_days) 무시 → min_off HARD 해제.
                 # (실제 OFF는 daily 커버리지 + 6연근/N패턴 hard에 의해 자연 결정)
-                if bool(getattr(cfg, "off_first", False)):
+                if bool(getattr(cfg, "staffing_first", False)):
                     min_off_required = 0
                 if min_off_required > 0 and phys_range_off:
                     hard_add(m, "min_off",
@@ -4437,10 +4441,10 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
                         if n in _4o_cross_affected:
                             _extra_off += 1
-                        # off_first 분기: False=근무 oversupply(OFF tight) / True=min coverage 잔여 OFF 회수
-                        _off_first = bool(getattr(cfg, "off_first", False))
-                        if _off_first:
-                            # off_first=True: daily_shift min coverage 기반 capacity가 단일 cap 소스
+                        # staffing_first 분기: False=근무 oversupply(OFF tight) / True=min coverage 잔여 OFF 회수
+                        _staffing_first = bool(getattr(cfg, "staffing_first", False))
+                        if _staffing_first:
+                            # staffing_first=True: daily_shift min coverage 기반 capacity가 단일 cap 소스
                             # off_days config은 무시 (실제 OFF는 잔여 셀로 자연 결정).
                             if _auto_max_off is not None:
                                 _ratio = nonvac_active_days / max(1, D_phys)
@@ -4454,7 +4458,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 # 안전 폴백: _auto_max_off 계산 실패 시 nonvac_active_days로 cap
                                 max_off_allowed = max(min_off_required, nonvac_active_days)
                         else:
-                            # off_first=False: OFF tight clamp (min_off_required + HARD recovery buffer only)
+                            # staffing_first=False: OFF tight clamp (min_off_required + HARD recovery buffer only)
                             max_off_allowed = min(
                                 min_off_required + _extra_off,
                                 nonvac_active_days,
@@ -4489,11 +4493,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             hard_add(m, "off_cap", _off_cap_expr_reg)
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
-                            f"cap_semantics={off_cap_semantics}, off_first={_off_first}, vac_cnt={vacation_cnt}, "
+                            f"cap_semantics={off_cap_semantics}, staffing_first={_staffing_first}, vac_cnt={vacation_cnt}, "
                             f"structural_nonvac={structural_cnt}, nonvac_active_days={nonvac_active_days}, "
                             f"min_off={min_off_required}, max_off={max_off_allowed}"
                             + (f", extra_off={_extra_off}" if _extra_off > 0 else "")
-                            + (f", auto_max={_auto_max_off}" if (_off_first and _auto_max_off is not None) else "")
+                            + (f", auto_max={_auto_max_off}" if (_staffing_first and _auto_max_off is not None) else "")
                         )
         except Exception as exc:
             print(
@@ -5079,7 +5083,7 @@ _FALLBACK_DIAG_HARD_TYPES = {
     'shift_requirement', 'night_consecutive',
     'consecutive_work', 'night_nd', 'night_ne',
     'eve_ed', 'night_month_limit',
-    'not_one_night', 'rec_2n2o', 'rec_3n2o',
+    'not_one_night', 'rec_2n2o', 'rec_3n2o',  # nm:external — RosterSystem 위반 type 문자열
     'initial_forbidden', 'weekend_off_only',
     'consecutive_4off', 'cross_month_4off',
 }

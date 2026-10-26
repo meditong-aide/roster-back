@@ -91,7 +91,7 @@ RELAX_CATALOG: list[dict[str, Any]] = [
      "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)},
      "search": {"key": "off_days", "dir": "down", "lo": 0}},
     {"id": "disable_preceptee_sync", "family": "coupling", "label_ko": "프리셉티 동반(팔로우) 해제",
-     "apply": lambda c: {"preceptee_on": False}},
+     "apply": lambda c: {"preceptee_follows_preceptor": False}},
     # ── verified 승격(2026-07-20): 기존엔 온톨로지 treatment(verified:false)만 있던 완화들.
     # probe로 추가해 "재solve로 feasible 확인됨"(verified:true) 승격. apply 키는 비-DB-컬럼
     # (솔버 config)이라 apply-resolution이 config_override 경로로 라우팅해야 클릭 적용됨.
@@ -122,10 +122,10 @@ TRADEOFF_KO: dict[str, str] = {
 COL_LABEL_KO: dict[str, str] = {
     "max_nig_per_month": "월 야간 상한", "two_offs_after_two_nig": "2N→2OFF 회복",
     "two_offs_after_three_nig": "3N→2OFF 회복", "max_conseq_work": "연속근무 상한",
-    "not_one_night": "단일 야간 금지", "ban_night_before_fixed_off": "고정OFF 전 야간 금지",
+    "ban_single_night": "단일 야간 금지", "ban_night_before_fixed_off": "고정OFF 전 야간 금지",
     "ban_night_before_fixed_wanted_off": "신청 휴무 전 야간 금지",
-    "banned_day_after_eve": "E→D 전이 금지", "off_days": "월 OFF 요구일수",
-    "preceptee_on": "프리셉티 동반(팔로우)",
+    "ban_shift_transitions": "E→D 전이 금지", "off_days": "월 OFF 요구일수",
+    "preceptee_follows_preceptor": "프리셉티 동반(팔로우)",
     "weekend_off_only_enable": "주말휴무 전용", "ban_n_to_d": "N→D 전이 금지",
     "ban_n_to_e": "N→E 전이 금지", "team_min_soft_fallback": "팀 최소 soft 완화",
     "enforce_4o_hard": "OFF 4연속 금지",

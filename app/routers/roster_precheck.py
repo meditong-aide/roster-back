@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from db.client2 import get_db
 from routers.auth import require_current_user
 from schemas.auth_schema import User as UserSchema
+from services.engine_contract.names import to_external_deep, to_internal
 from services.precheck.team_grade_precheck import (
     PrecheckInput,
     PrecheckNurse,
@@ -81,7 +82,8 @@ def _to_input(req: PrecheckRequest) -> PrecheckInput:
         num_days=int(req.num_days),
         nurses=nurses,
         teams=list(req.teams or []),
-        roster_config=dict(req.roster_config or {}),
+        # 요청 설정은 바깥 이름 — precheck 는 파이썬 이름으로 읽는다(NM)
+        roster_config=to_internal(dict(req.roster_config or {})),
         team_coverage=dict(req.team_coverage or {}),
         grade_constraints=dict(req.grade_constraints or {}),
     )
@@ -98,7 +100,8 @@ def precheck_roster(
     try:
         inp = _to_input(req)
         result = run_precheck(inp, stop_on_config_error=bool(req.stop_on_config_error))
-        return result
+        # issues[].evidence 에 파이썬 이름의 설정 키가 실린다 — 응답은 바깥 이름으로(NM)
+        return to_external_deep(result)
     except HTTPException:
         raise
     except Exception as e:

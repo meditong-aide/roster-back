@@ -6,6 +6,7 @@ models use the test engine instead of production MSSQL.
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from datetime import datetime, date, time
@@ -21,6 +22,11 @@ from sqlalchemy.pool import StaticPool
 # ── Add app/ to path FIRST so 'db' package is findable ──────────
 APP_DIR = Path(__file__).resolve().parent.parent / "app"
 sys.path.insert(0, str(APP_DIR))
+
+# ── NM — 옛 설정 이름(바깥 이름)이 파이썬 안쪽에 남으면 예외로 드러낸다(services/engine_contract/names.py) ──
+#   운영은 새 이름으로 이어 동작을 유지하지만, 시험은 남은 자리를 찾아야 하므로 strict 다.
+#   이미 값이 있으면(예: 묶음 작업 중 ROSTER_NM_STRICT=0) 그대로 둔다.
+os.environ.setdefault("ROSTER_NM_STRICT", "1")
 
 # ── Patch db.client2 before anything imports models ──────────────
 # We need to pre-create a fake db.client2 module with a SQLite Base
@@ -241,25 +247,25 @@ def seed_data(db: Session) -> dict:
         day_req=2,
         eve_req=2,
         nig_req=2,
-        min_exp_per_shift=2,
-        req_exp_nurses=1,
-        two_offs_per_week=True,
+        senior_min_years=2,
+        senior_nurses_per_shift=1,
+        prefer_two_offs_per_7days=True,
         max_nig_per_month=7,
-        three_seq_nig=False,
+        allow_three_consecutive_nights=False,
         two_offs_after_three_nig=True,
         two_offs_after_two_nig=False,
-        banned_day_after_eve=True,
+        ban_shift_transitions=True,
         max_conseq_work=5,
         off_days=8,
         shift_priority=0.5,
-        sequential_offs=True,
-        nod_noe=True,
-        not_one_night=False,
+        avoid_isolated_off_and_work=True,
+        avoid_nod_noe_eod=True,
+        ban_single_night=False,
         use_mid=False,
-        preceptee_on=True,
-        preceptee_shift_count=True,
+        preceptee_follows_preceptor=True,
+        count_preceptee_in_staffing=True,
         weekly_off_group=False,
-        fixed_wanted_use_yn=True,
+        apply_confirmed_wanted=True,
         show_level=True,
         show_preceptor=True,
     )

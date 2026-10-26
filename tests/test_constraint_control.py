@@ -38,7 +38,7 @@ def _baseline_config() -> dict:
         "ban_e_to_d": True,
         "ban_n_to_e": True,
         "max_conseq_work": 5,
-        "three_seq_nig": True,
+        "allow_three_consecutive_nights": True,
         "two_offs_after_two_nig": True,
         "two_offs_after_three_nig": True,
         "daily_shift_requirements": {"D": 5, "E": 3, "N": 2},
@@ -403,7 +403,7 @@ def _preview_diff(monkeypatch, adjustments: list[dict], payload: dict) -> dict:
     return router.preview_adjustments(body, current_user=SimpleNamespace(office_id=1), db=None)
 
 
-_PREVIEW_PAYLOAD = {"max_conseq_work": 4, "max_nig_per_month": 8, "three_seq_nig": True}
+_PREVIEW_PAYLOAD = {"max_conseq_work": 4, "max_nig_per_month": 8, "allow_three_consecutive_nights": True}
 
 
 def test_preview_diff_catches_canonical_consecutive_work_key(monkeypatch):
@@ -424,8 +424,8 @@ def test_preview_diff_is_empty_for_consecutive_night_adjustment(monkeypatch):
 
 
 def test_preview_diff_catches_three_seq_nig_when_the_forbidden_mark_is_absent(monkeypatch):
-    """12t — 레지스트리의 런타임 금지 표지(D13)가 없으면 연속 나이트 조정이 정본 bool `three_seq_nig` 로 접혀 쓰인다(2 → False).
-    그때 미리보기 diff 가 그 키를 잡아야 한다 — `watched` 의 `three_seq_nig` 를 고정한다(지금은 표지가 있어 늘 '적용 불가'라 닿지 않는 칸)."""
+    """12t — 레지스트리의 런타임 금지 표지(D13)가 없으면 연속 나이트 조정이 정본 bool `allow_three_consecutive_nights` 로 접혀 쓰인다(2 → False).
+    그때 미리보기 diff 가 그 키를 잡아야 한다 — `watched` 의 `allow_three_consecutive_nights` 를 고정한다(지금은 표지가 있어 늘 '적용 불가'라 닿지 않는 칸)."""
     from services.policy import hard_lock
 
     monkeypatch.setattr(hard_lock, "runtime_forbidden_violation", lambda key: None)

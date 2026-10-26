@@ -81,7 +81,7 @@ def _seq_cert(m: dict, num_days: int, config: dict) -> Certificate | None:
     rules = []
     if config.get("two_offs_after_three_nig"):
         rules.append("3연속 야간 후 2일 휴식")
-    if config.get("not_one_night"):
+    if config.get("ban_single_night"):
         rules.append("고립 1야간 금지")
     if rules:
         ante.append("규칙: " + " · ".join(rules))

@@ -96,11 +96,11 @@ def _rule_probes(nurses, config, num_days) -> dict:
         probes.append({"rule": name, "reject": got_reject, "expected": expect_reject, "ok": ok})
 
     O = "O"
-    # not_one_night: 고립 1야간
-    if config.get("not_one_night"):
+    # ban_single_night: 고립 1야간
+    if config.get("ban_single_night"):
         s = [O] * num_days
         s[1] = "N"                                    # 고립 N (양옆 O)
-        probe("not_one_night(고립1N)", s, True)
+        probe("ban_single_night(고립1N)", s, True)
     # max run: max_run+1 연속 N (N 가능 가정)
     if num_days >= max_run + 1:
         s = [O] * num_days

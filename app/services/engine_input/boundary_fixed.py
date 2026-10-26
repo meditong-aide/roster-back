@@ -50,11 +50,11 @@ def _int_or_none(value) -> int | None:
 
 
 def rules_from_config(cfg: Mapping) -> BoundaryRules:
-    """월중 경계 빌더(`build_mid_month_boundary_constraints`)와 같은 해석 — K = `max_conseq_work` → 5 · L = 정본 `three_seq_nig` 만(D13 ①) · 전이 금지는 `banned_day_after_eve` 가 켜졌을 때만."""
+    """월중 경계 빌더(`build_mid_month_boundary_constraints`)와 같은 해석 — K = `max_conseq_work` → 5 · L = 정본 `allow_three_consecutive_nights` 만(D13 ①) · 전이 금지는 `ban_shift_transitions` 가 켜졌을 때만."""
     k = _int_or_none(cfg.get("max_conseq_work"))
-    ban = bool(cfg.get("banned_day_after_eve"))
+    ban = bool(cfg.get("ban_shift_transitions"))
     return BoundaryRules(
-        K=5 if k is None else k, L=3 if bool(cfg.get("three_seq_nig", False)) else 2,
+        K=5 if k is None else k, L=3 if bool(cfg.get("allow_three_consecutive_nights", False)) else 2,
         two2=bool(cfg.get("two_offs_after_two_nig")), two3=bool(cfg.get("two_offs_after_three_nig")),
         ban_nd=ban and bool(cfg.get("ban_n_to_d", True)), ban_ed=ban and bool(cfg.get("ban_e_to_d", True)),
         ban_ne=ban and bool(cfg.get("ban_n_to_e", True)))

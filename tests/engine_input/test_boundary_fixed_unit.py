@@ -187,8 +187,8 @@ def _builder_rules(config_dict: dict) -> dict:
 
 RULE_CONFIGS = [
     {}, {"max_conseq_work": "6"}, {"max_conseq_work": None, "max_consecutive_work_days": 4}, {"max_conseq_work": " "},
-    {"max_conseq_work": "x"}, {"three_seq_nig": True}, {"banned_day_after_eve": True},
-    {"banned_day_after_eve": True, "ban_n_to_e": False, "ban_e_to_d": 0}, {"banned_day_after_eve": False, "ban_e_to_d": True},
+    {"max_conseq_work": "x"}, {"allow_three_consecutive_nights": True}, {"ban_shift_transitions": True},
+    {"ban_shift_transitions": True, "ban_n_to_e": False, "ban_e_to_d": 0}, {"ban_shift_transitions": False, "ban_e_to_d": True},
     {"two_offs_after_two_nig": 1, "two_offs_after_three_nig": True},
 ]
 

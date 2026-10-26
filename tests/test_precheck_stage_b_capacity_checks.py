@@ -106,7 +106,7 @@ def test_per_nurse_dp_runs_when_only_off_is_banned_without_any_fixed_cell():
 def test_off_floor_is_max_of_floor_and_forced_off_not_their_sum():
     """바닥(min_off)과 강제 OFF 는 겹칠 수 있다 — 합치면 엔진보다 엄해져 오차단이다(max)."""
     nd = {"nurse_id": "N01", "name": "N01", "allowed_shifts": ["D"], "is_weekend_off": False, "joining_date": "2024-03-01T00:00:00"}
-    cfg = {"off_first": False, "off_days": 8, "daily_shift_requirements": {"D": 1, "E": 0, "N": 0},
+    cfg = {"staffing_first": False, "off_days": 8, "daily_shift_requirements": {"D": 1, "E": 0, "N": 0},
            "initial_constraints": {"forced_off": {"N01": [2, 3, 4, 5, 6, 7]}, "forbidden": {}}}
     inp = build_precheck_input(nurses_dict=[nd], config_dict=cfg, grade_config=None, fixed_cells=None, year=2026, month=11)
     n, rc = inp.nurses[0], inp.roster_config

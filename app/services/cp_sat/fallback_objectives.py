@@ -317,7 +317,7 @@ def build_fallback_stage3_objective_terms(
     # 연속 OFF 소프트 상한 (max_consecutive_off_days) — 연속근무 soft의 미러.
     # (k+1)연속 OFF 창마다 고weight 벌점 → hard처럼 억제하되 불가피 시 양보(infeasible 방지).
     try:
-        soft_off_k = int(getattr(cfg, "max_conseq_off", 0) or 0)
+        soft_off_k = int(getattr(cfg, "soft_max_conseq_off", 0) or 0)
         w_soft_off = int(getattr(cfg, "max_conseq_off_penalty_weight", 0) or 0)
         if soft_off_k > 0 and w_soft_off > 0:
             off_idx = cfg.shift_types.index("O")
@@ -456,10 +456,10 @@ def build_fallback_stage3_objective_terms(
     except Exception:
         pass
 
-    # 고립 근무 (O W O: OFF 사이 단일 근무 "퐁당퐁당") soft — N 제외(not_one_night 별도 관리).
+    # 고립 근무 (O W O: OFF 사이 단일 근무 "퐁당퐁당") soft — N 제외(ban_single_night 별도 관리).
     # 경계일(d=T0/T1)은 양옆 OFF 확인 불가라 자연히 제외(range(T0+1, T1)).
     try:
-        if bool(getattr(cfg, "sequential_offs", True)) and "O" in cfg.shift_types:
+        if bool(getattr(cfg, "avoid_isolated_off_and_work", True)) and "O" in cfg.shift_types:
             # 고립근무 벌점 — A/B 주입구(`AIDE_ISO_WORK_W`) → 설정 → 상수(1500) 순.
             import os as _os_iw
             _iw_w = int(_os_iw.environ.get("AIDE_ISO_WORK_W", "") or 0) \

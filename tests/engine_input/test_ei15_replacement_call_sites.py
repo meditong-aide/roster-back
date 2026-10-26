@@ -52,7 +52,7 @@ def test_path_violations_consecutive_boundary_is_five():
 def test_path_violations_eve_to_day_and_3n2o_default_on():
     ed = _month(d1="E", d2="D")
     assert "eve_ed" in _violations(ed)
-    assert "eve_ed" not in _violations(ed, SimpleNamespace(banned_day_after_eve=False))
+    assert "eve_ed" not in _violations(ed, SimpleNamespace(ban_shift_transitions=False))
     nnn_o = _month(d1="N", d2="N", d3="N", d4="O", d5="D")
     assert "rec_3n2o" in _violations(nnn_o)
     assert "rec_3n2o" not in _violations(nnn_o, SimpleNamespace(two_offs_after_three_nig=False))
@@ -92,7 +92,7 @@ def _tags(config, schedule, day_idx, code):
 def test_rule_safety_eve_to_day_and_night_limit_defaults():
     assert "eve_to_day_risk" in _tags(None, ["E", "D"], 1, "D")
     assert "lookahead_eve_to_day_risk" in _tags(None, ["E", "D"], 0, "E")
-    assert "eve_to_day_risk" not in _tags(SimpleNamespace(banned_day_after_eve=False), ["E", "D"], 1, "D")
+    assert "eve_to_day_risk" not in _tags(SimpleNamespace(ban_shift_transitions=False), ["E", "D"], 1, "D")
 
     def row(k):
         r = ["O"] * 30
@@ -146,5 +146,5 @@ def test_feasibility_alert_reads_preceptee_default_from_registry(monkeypatch):
     feasibility_alerts.run_preflight_feasibility_alerts(
         nurses_in_group=nurses, config_dict={"use_mid": True}, year=2026, month=11,
     )
-    assert "preceptee_on" in seen
+    assert "preceptee_follows_preceptor" in seen
     assert "max_conseq_work" not in seen and "use_mid" not in seen

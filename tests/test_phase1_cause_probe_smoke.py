@@ -42,7 +42,7 @@ class _MockConfig:
     daily_shift_requirements_by_day: Any = None
     daily_shift_requirements_max_by_day: Any = None
     max_night_shifts_per_month: int = 0
-    off_first: bool = False
+    staffing_first: bool = False
     global_monthly_off_days: int = 8
     standard_personal_off_days: int = 0
     shift_definitions: Any = None

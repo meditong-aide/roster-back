@@ -101,7 +101,7 @@ def model_signature(nurses: list, config: dict, num_days: int) -> str:
     import hashlib
     ir = parse_to_ir(nurses, config, num_days)
     parts = [f"days={num_days}"]
-    # ① 비셀 규칙(회복·not_one_night·max_run·전이·커버리지) — 파라미터 포함
+    # ① 비셀 규칙(회복·ban_single_night·max_run·전이·커버리지) — 파라미터 포함
     for r in sorted((r for r in ir.rules if not isinstance(r, CellDomainRule)),
                     key=lambda x: type(x).__name__):
         parts.append(type(r).__name__ + ":" + repr(sorted(
@@ -130,7 +130,7 @@ def parse_to_ir(nurses: list, config: dict, num_days: int) -> RosterConstraintIR
         rules.append(NightRecoveryRule(3, 2))
     if config.get("two_offs_after_two_nig"):
         rules.append(NightRecoveryRule(2, 2))
-    if config.get("not_one_night"):
+    if config.get("ban_single_night"):
         rules.append(NotOneNightRule())
     mcn = config.get("max_consecutive_nights") or config.get("max_consec_nights")
     if mcn:                                          # 명시된 경우만(미설정=엔진 기본 6, 주입 금지)
@@ -173,7 +173,7 @@ def compile_graph(ir: RosterConstraintIR):
             config["two_offs_after_three_nig" if r.trigger_run >= 3
                    else "two_offs_after_two_nig"] = True
         elif isinstance(r, NotOneNightRule):
-            config["not_one_night"] = True
+            config["ban_single_night"] = True
         elif isinstance(r, MaxConsecutiveNightsRule):
             config["max_consecutive_nights"] = r.limit
         elif isinstance(r, MaxConsecutiveWorkRule):

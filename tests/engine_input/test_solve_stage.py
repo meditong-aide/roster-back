@@ -669,8 +669,8 @@ def test_build_roster_index_map_matches_production_sort_key_on_non_degenerate_or
     assert roster["nurse_id_to_engine_index"] == {"N03": 0, "N02": 1, "N01": 2}
 
 
-def test_build_roster_off_first_zeroes_personal_limits_without_mutating_prelude(shim_db):  # noqa: F811
-    """`off_first=True` 면 `o_min`/`o_max`/`o_exact` 를 지운다(:3491-3492) — 원본은 그대로.
+def test_build_roster_staffing_first_zeroes_personal_limits_without_mutating_prelude(shim_db):  # noqa: F811
+    """`staffing_first=True` 면 `o_min`/`o_max`/`o_exact` 를 지운다(:3491-3492) — 원본은 그대로.
 
     `o_min`/`o_max` 는 월 한도 오버레이가 `__dict__` 로 직접 얹는 칸이라(:5666-5702) ORM
     컬럼이 아니다 — `nurses_for_engine` 에만 넣고(DB 시드 대상은 그대로 둔다, ORM 생성자가
@@ -682,7 +682,7 @@ def test_build_roster_off_first_zeroes_personal_limits_without_mutating_prelude(
     engine_nurses = [{**ward.nurses[0], "o_min": 2, "o_max": 10, "o_exact": None}]
     prelude = _make_prelude(ward, nurses_for_engine=engine_nurses)
     stage_a = builder.build_precheck_stage(shim_db, prelude)
-    roster = builder._build_roster(prelude, stage_a, {**prelude.config_dict, "off_first": True})
+    roster = builder._build_roster(prelude, stage_a, {**prelude.config_dict, "staffing_first": True})
     assert roster["nurses"][0]["o_min"] is None and roster["nurses"][0]["o_max"] is None
     assert prelude.nurses_for_engine[0]["o_min"] == 2  # 원본 prelude 는 불변
 
@@ -696,7 +696,7 @@ def test_build_settings_eff_input_merges_demand_post_team_and_shift_definitions(
                         post=DemandSnapshot(base={"D": 2}, by_day=[{"D": 1}], max_by_day=[{"D": 3}]))
     team = {"team_min_by_team": {"1": {"D": 1}}}
     codebook = {"shift_definitions": [{"shift_id": "D"}]}
-    out = builder._build_settings_eff_input({"day_req": 2, "off_first": False}, demand, team, codebook)
+    out = builder._build_settings_eff_input({"day_req": 2, "staffing_first": False}, demand, team, codebook)
     assert out["daily_shift_requirements_by_day"] == [{"D": 1}]
     assert out["daily_shift_requirements_max_by_day"] == [{"D": 3}]
     assert out["team_min_by_team"] == {"1": {"D": 1}}

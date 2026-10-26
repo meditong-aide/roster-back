@@ -188,16 +188,16 @@ def _seed_test_db(db: Session):
     # Roster Config
     db.add(RosterConfig(
         config_id=1, office_id="OFF001", group_id="GRP001",
-        day_req=2, eve_req=2, nig_req=2, min_exp_per_shift=2,
-        req_exp_nurses=1, two_offs_per_week=True, max_nig_per_month=7,
-        three_seq_nig=False, two_offs_after_three_nig=True,
-        two_offs_after_two_nig=False, banned_day_after_eve=True,
+        day_req=2, eve_req=2, nig_req=2, senior_min_years=2,
+        senior_nurses_per_shift=1, prefer_two_offs_per_7days=True, max_nig_per_month=7,
+        allow_three_consecutive_nights=False, two_offs_after_three_nig=True,
+        two_offs_after_two_nig=False, ban_shift_transitions=True,
         max_conseq_work=5, off_days=8, shift_priority=0.5,
-        sequential_offs=True, nod_noe=True,
-        not_one_night=False, use_mid=False,
-        preceptee_on=True, preceptee_shift_count=True,
+        avoid_isolated_off_and_work=True, avoid_nod_noe_eod=True,
+        ban_single_night=False, use_mid=False,
+        preceptee_follows_preceptor=True, count_preceptee_in_staffing=True,
         weekly_off_group=False,
-        fixed_wanted_use_yn=True,
+        apply_confirmed_wanted=True,
         show_level=True, show_preceptor=True,
     ))
     db.flush()

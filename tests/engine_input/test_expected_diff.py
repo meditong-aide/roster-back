@@ -375,13 +375,17 @@ def test_ei10_stages_registered_and_active_by_default():
         EI14C1_STAGES,
         EID_DONE,
         EID_STAGES,
+        NM_DONE,
+        NM_STAGES,
     )
 
     assert set(EI10_STAGES) == set(EI10_DONE) == {"10c", "10d", "10e", "10f"}
     # EI-11 단계는 그 단계 프로덕션 커밋마다 EI11_* 에 더해진다(ei11/EI11_SPEC_v2.md §4.3) — 11a0 은 허용 0 이다.
     # EI-13 갈래 A — 13a 는 쿼리 감소(재조회 제거)만 허용한다(13a-1·13b 는 골든 변화 0 이라 등록하지 않는다).
-    assert ALL_DONE == EI2_DONE + EI10_DONE + EI11_DONE + EI13_DONE + EI14C1_DONE + EI12_DONE + EI13C_DONE + EID_DONE
-    assert set(ALL_STAGES) == {"2a", "2b", "2c", "2d", "10c", "10d", "10e", "10f"} | set(EI11_STAGES) | set(EI13_STAGES) | set(EI14C1_STAGES) | set(EI12_STAGES) | set(EI13C_STAGES) | set(EID_STAGES)
+    assert ALL_DONE == (EI2_DONE + EI10_DONE + EI11_DONE + EI13_DONE + EI14C1_DONE + EI12_DONE + EI13C_DONE + EID_DONE
+                        + NM_DONE)
+    assert set(ALL_STAGES) == ({"2a", "2b", "2c", "2d", "10c", "10d", "10e", "10f"} | set(EI11_STAGES) | set(EI13_STAGES)
+                               | set(EI14C1_STAGES) | set(EI12_STAGES) | set(EI13C_STAGES) | set(EID_STAGES) | set(NM_STAGES))
     assert EI11_STAGES["11a0"] == StageDiff()
     for name in EI10_DONE:
         stage = EI10_STAGES[name]
@@ -486,3 +490,26 @@ def test_ei10_10f_allows_no_golden_change():
                            done=done, stages=stages)
     vanished = check_record("S5", golden, _record({"other_key": 1}), done=done, stages=stages)
     assert changed and created and vanished, "10f 는 어떤 변화도 허용하지 않는다"
+
+
+def test_nm_stage_renames_only_config_dicts():
+    """NM 단계는 이름표 그대로의 키 바꾸기만 허용하고, 바깥 이름이 맞는 자리(요청 원문·저장 JSON)는 바꾸지 않는다."""
+    import re
+
+    from services.engine_contract.names import EXTERNAL_TO_INTERNAL
+
+    from .expected_diff import NM_DONE, NM_STAGES, StageDiff, _rename_dict_keys
+
+    assert NM_DONE == ("nm",)
+    stage = NM_STAGES["nm"]
+    assert stage.key_renames == dict(EXTERNAL_TO_INTERNAL)
+    assert stage == StageDiff(key_renames=stage.key_renames, key_renames_skip=stage.key_renames_skip), "이름 바꾸기 말고는 허용 0"
+    skip = tuple(re.compile(p) for p in stage.key_renames_skip)
+    record = {"layers": {"L0": [{"config_dict": {"off_first": True}}],
+                         "L3": {"calls": [{"args": {"req": {"not_one_night": None}, "latest_config": {"nod_noe": True}}}]}},
+              "snapshot": {"config": {"three_seq_nig": True}}}
+    out = _rename_dict_keys(record, stage.key_renames, skip)
+    assert out["layers"]["L0"][0]["config_dict"] == {"staffing_first": True}
+    assert out["layers"]["L3"]["calls"][0]["args"]["req"] == {"not_one_night": None}, "요청 모델 원문은 바깥 이름"
+    assert out["layers"]["L3"]["calls"][0]["args"]["latest_config"] == {"avoid_nod_noe_eod": True}
+    assert out["snapshot"]["config"] == {"three_seq_nig": True}, "저장 JSON 은 바깥 이름"

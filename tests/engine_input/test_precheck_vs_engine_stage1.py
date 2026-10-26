@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 from services.cp_sat import fallback_lex as fallback_lex_module
 from services.cp_sat_basic import CPSATBasicEngine
+from services.engine_contract.names import to_internal
 from services.engine_input.views import _attach_stage_b, _precheck_cells_or_empty
 from services.precheck import has_blocking_issues, run_runtime_precheck
 from services.precheck.runtime_bridge import prepare_precheck_input
@@ -73,17 +74,18 @@ def _shift_manage() -> list[dict]:
 #: 자동 완화 사다리 하드·월경계·OFF 상한은 끈다 — 비교 대상은 하드락·고정 칸·근무 구간·주휴·주말휴무뿐이다.
 NEUTRAL = {
     "daily_shift_requirements_by_day": [], "daily_shift_requirements_max_by_day": [],
-    "isolated_work_hard": False, "same_shift_hard_k": 0, "n2n_min_gap": 0, "off_first": False,
+    "isolated_work_hard": False, "same_shift_hard_k": 0, "n2n_min_gap": 0, "staffing_first": False,
     "max_extra_off_days": 30, "weekly_off_map": {}, "initial_constraints": {}, "off_window_constraints": {},
     "prev_month_n_tail": {}, "prev_month_n_offs_after": {}, "prev_month_last_main": {}, "prev_month_last_n_k": {},
     "prev_month_off_tail": {}, "cross_month_hard_rules_enable": False, "ban_night_before_fixed_wanted_off": False,
-    "ban_night_before_fixed_off": False, "fixed_wanted_use_yn": True, "two_offs_per_week": False,
-    "not_one_night": False, "two_offs_after_two_nig": False, "two_offs_after_three_nig": False,
+    "ban_night_before_fixed_off": False, "apply_confirmed_wanted": True, "prefer_two_offs_per_7days": False,
+    "ban_single_night": False, "two_offs_after_two_nig": False, "two_offs_after_three_nig": False,
 }
 
 
 def config(**over) -> dict:
-    cfg = copy.deepcopy(_template()["config_data"])
+    # 골든 S7 의 설정 dict 는 옛(바깥) 이름일 수 있다(재생성 전) — 파이썬 이름으로 맞춘 위에 NEUTRAL·덮기(새 이름)를 얹는다.
+    cfg = to_internal(copy.deepcopy(_template()["config_data"]))
     cfg.update(copy.deepcopy(NEUTRAL))
     cfg["daily_shift_requirements"] = {"D": 1, "E": 1, "N": 1}
     cfg.update(over)
@@ -189,14 +191,14 @@ def test_s1_ban_n_to_e_off_only_allows_forced_night_then_evening(monkeypatch):
 
     (독립 리뷰 변이: effective.py 반환값의 `ban_e_to_d` 와 `ban_n_to_e` 를 뒤바꾸면 기존 테스트 1488건은 모두 초록이었다.)
     """
-    cfg = config(not_one_night=True, ban_n_to_e=False, ban_e_to_d=True, ban_n_to_d=True)
+    cfg = config(ban_single_night=True, ban_n_to_e=False, ban_e_to_d=True, ban_n_to_d=True)
     cells = [engine_cell(3, "OFF"), engine_cell(4, "N"), engine_cell(6, "E")]
     assert_agree(monkeypatch, [nurse()], cfg, cells, engine_ok=True)
 
 
 def test_s1b_control_all_transition_bans_on_blocks_the_same_cells(monkeypatch):
     """(가드) 대조군 — 전이 금지 3종이 모두 켜져 있으면 같은 칸은 엔진도 불가능(N→E)이고 precheck 도 막는다."""
-    cfg = config(not_one_night=True)
+    cfg = config(ban_single_night=True)
     cells = [engine_cell(3, "OFF"), engine_cell(4, "N"), engine_cell(6, "E")]
     assert_agree(monkeypatch, [nurse()], cfg, cells, engine_ok=False)
 
@@ -210,51 +212,51 @@ def test_s1c_each_transition_ban_switch_is_independent(monkeypatch, off_key, nex
     """
     cells = [engine_cell(3, "OFF"), engine_cell(4, "N"), engine_cell(6, next_shift)]
     switches = {key: key != off_key for key in ("ban_e_to_d", "ban_n_to_d", "ban_n_to_e")}
-    assert_agree(monkeypatch, [nurse()], config(not_one_night=True, **switches), cells, engine_ok=True)
-    assert_agree(monkeypatch, [nurse()], config(not_one_night=True), cells, engine_ok=False)
+    assert_agree(monkeypatch, [nurse()], config(ban_single_night=True, **switches), cells, engine_ok=True)
+    assert_agree(monkeypatch, [nurse()], config(ban_single_night=True), cells, engine_ok=False)
 
 
-# ── 연속 N 상한(`three_seq_nig`) · 회복(2N→2OFF·3N→2OFF) ─────────────────────────────────────────────────
+# ── 연속 N 상한(`allow_three_consecutive_nights`) · 회복(2N→2OFF·3N→2OFF) ─────────────────────────────────────────────────
 
 
 def _nights(*days: int) -> list[dict]:
     return [engine_cell(day, "N") for day in days]
 
 
-def test_s2_three_seq_nig_allows_fixed_nnn(monkeypatch):
-    """3연속 N 허용(`three_seq_nig`)이면 고정 NNN 은 엔진 가능 — precheck 가 연속 N 상한을 3 으로 읽어야 한다."""
-    cfg = config(three_seq_nig=True, two_offs_after_three_nig=False)
+def test_s2_allow_three_consecutive_nights_allows_fixed_nnn(monkeypatch):
+    """3연속 N 허용(`allow_three_consecutive_nights`)이면 고정 NNN 은 엔진 가능 — precheck 가 연속 N 상한을 3 으로 읽어야 한다."""
+    cfg = config(allow_three_consecutive_nights=True, two_offs_after_three_nig=False)
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10, 11, 12), engine_ok=True)
 
 
 def test_s2b_two_night_cap_blocks_fixed_nnn(monkeypatch):
-    """(가드) `three_seq_nig` 가 꺼져 있으면 연속 N 상한 2 라 같은 NNN 은 엔진 불가능 — precheck 도 막는다."""
-    cfg = config(three_seq_nig=False, two_offs_after_three_nig=False)
+    """(가드) `allow_three_consecutive_nights` 가 꺼져 있으면 연속 N 상한 2 라 같은 NNN 은 엔진 불가능 — precheck 도 막는다."""
+    cfg = config(allow_three_consecutive_nights=False, two_offs_after_three_nig=False)
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10, 11, 12), engine_ok=False)
 
 
-def test_s2c_four_nights_block_even_with_three_seq_nig(monkeypatch):
+def test_s2c_four_nights_block_even_with_allow_three_consecutive_nights(monkeypatch):
     """(가드) 4연속 N 은 어느 설정에서도 엔진 불가능 — 상한을 늘려 읽으면 놓친다."""
-    cfg = config(three_seq_nig=True, two_offs_after_three_nig=False)
+    cfg = config(allow_three_consecutive_nights=True, two_offs_after_three_nig=False)
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10, 11, 12, 13), engine_ok=False)
 
 
 def test_s3_two_offs_after_two_with_three_night_run_allows_nnn_then_oo(monkeypatch):
     """2N→2OFF + 3연속 N 허용 — NNN 뒤 OO 는 엔진 가능(회복은 블록이 끝날 때 걸린다). 옛 DP 는 2개에서 끊어 막았다."""
-    cfg = config(three_seq_nig=True, two_offs_after_two_nig=True)
+    cfg = config(allow_three_consecutive_nights=True, two_offs_after_two_nig=True)
     cells = _nights(10, 11, 12) + [engine_cell(13, "OFF"), engine_cell(14, "OFF")]
     assert_agree(monkeypatch, [nurse()], cfg, cells, engine_ok=True)
 
 
 def test_s3b_recovery_blocks_a_work_day_right_after_the_night_block(monkeypatch):
     """(가드) 같은 설정에서 NNN 바로 다음 날 고정 D 는 엔진 불가능(OO 가 필요) — precheck 도 막는다."""
-    cfg = config(three_seq_nig=True, two_offs_after_two_nig=True)
+    cfg = config(allow_three_consecutive_nights=True, two_offs_after_two_nig=True)
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10, 11, 12) + [engine_cell(13, "D")], engine_ok=False)
 
 
 def test_s3c_three_offs_after_three_only_binds_blocks_of_three(monkeypatch):
     """3N→2OFF — 2연속 N 뒤 고정 D 는 엔진 가능(블록 길이 2 < 3), 3연속 N 뒤 고정 D 는 불가능."""
-    cfg = config(three_seq_nig=True, two_offs_after_three_nig=True, two_offs_after_two_nig=False)
+    cfg = config(allow_three_consecutive_nights=True, two_offs_after_three_nig=True, two_offs_after_two_nig=False)
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10, 11) + [engine_cell(12, "D")], engine_ok=True)
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10, 11, 12) + [engine_cell(13, "D")], engine_ok=False)
 
@@ -262,22 +264,22 @@ def test_s3c_three_offs_after_three_only_binds_blocks_of_three(monkeypatch):
 # ── 1N 금지와 면제 ───────────────────────────────────────────────────────────────────────────────────
 
 
-def test_s4_not_one_night_blocks_an_isolated_fixed_night(monkeypatch):
+def test_s4_ban_single_night_blocks_an_isolated_fixed_night(monkeypatch):
     """1N 금지 — 앞뒤가 고정 O 인 단독 N 은 엔진 불가능, precheck 도 막는다."""
     cells = [engine_cell(9, "OFF"), engine_cell(10, "N"), engine_cell(11, "OFF")]
-    assert_agree(monkeypatch, [nurse()], config(not_one_night=True), cells, engine_ok=False)
+    assert_agree(monkeypatch, [nurse()], config(ban_single_night=True), cells, engine_ok=False)
 
 
 def test_s4b_monthly_night_cap_one_exempts_the_single_night(monkeypatch):
     """월 N 상한 1(`n_exact=1`) 간호사는 1N 금지를 엔진이 면제한다 — 같은 칸이 가능, precheck 도 막지 않는다."""
     cells = [engine_cell(9, "OFF"), engine_cell(10, "N"), engine_cell(11, "OFF")]
-    assert_agree(monkeypatch, [nurse(n_exact=1)], config(not_one_night=True), cells, engine_ok=True)
+    assert_agree(monkeypatch, [nurse(n_exact=1)], config(ban_single_night=True), cells, engine_ok=True)
 
 
 def test_s4c_day_one_fixed_night_is_exempt(monkeypatch):
     """그 달 1일 고정 N 은 1N 금지를 엔진이 면제한다(fallback_lex.py:2136) — 2일이 고정 O 여도 가능."""
     cells = [engine_cell(0, "N"), engine_cell(1, "OFF")]
-    assert_agree(monkeypatch, [nurse()], config(not_one_night=True), cells, engine_ok=True)
+    assert_agree(monkeypatch, [nurse()], config(ban_single_night=True), cells, engine_ok=True)
 
 
 def test_s4d_a_joiners_first_day_is_not_exempt(monkeypatch):
@@ -287,7 +289,7 @@ def test_s4d_a_joiners_first_day_is_not_exempt(monkeypatch):
     """
     cells = [engine_cell(9, "N"), engine_cell(10, "OFF")]
     joiner = nurse(joining_date="2026-11-10T00:00:00")
-    assert_agree(monkeypatch, [joiner], config(not_one_night=True), cells, engine_ok=False)
+    assert_agree(monkeypatch, [joiner], config(ban_single_night=True), cells, engine_ok=False)
 
 
 # ── 배정 차단일 위 고정 칸 · 근무 구간 밖 고정 칸 — 엔진은 활동일 밖 칸을 건너뛴다 ───────────────────────────
@@ -305,14 +307,14 @@ def test_s5_fixed_day_on_a_blocked_day_is_skipped_by_engine_and_precheck(monkeyp
 def test_s5b_isolated_night_on_blocked_days_is_skipped(monkeypatch):
     """E1b — 1N 금지, 차단일 {9,10,11} 위 O·N·O 고정: 엔진 가능. 차단일이 없으면 단독 N 이라 불가능이다."""
     cells = [engine_cell(9, "OFF"), engine_cell(10, "N"), engine_cell(11, "OFF")]
-    blocked = config(not_one_night=True, blocked_by_nurse_id={"N01": {9, 10, 11}})
+    blocked = config(ban_single_night=True, blocked_by_nurse_id={"N01": {9, 10, 11}})
     assert_agree(monkeypatch, [nurse()], blocked, cells, engine_ok=True)
-    assert_agree(monkeypatch, [nurse()], config(not_one_night=True), cells, engine_ok=False)
+    assert_agree(monkeypatch, [nurse()], config(ban_single_night=True), cells, engine_ok=False)
 
 
 def test_s5c_one_blocked_day_inside_a_night_run_breaks_it(monkeypatch):
     """E1c — 연속 N 상한 3 에서 NNNN(10~13일) 중 12일이 차단일이면 엔진은 그 칸을 건너뛰어 가능하다(대조군은 불가능)."""
-    cfg = config(three_seq_nig=True, two_offs_after_three_nig=False)
+    cfg = config(allow_three_consecutive_nights=True, two_offs_after_three_nig=False)
     cells = _nights(10, 11, 12, 13)
     assert_agree(monkeypatch, [nurse()], {**cfg, "blocked_by_nurse_id": {"N01": {12}}}, cells, engine_ok=True)
     assert_agree(monkeypatch, [nurse()], cfg, cells, engine_ok=False)
@@ -335,11 +337,11 @@ WEEKEND = {0, 6, 7, 13, 14, 20, 21, 27, 28}  # 2026-11 토·일(1일이 일요�
 def _capacity_config(work_days, **over) -> dict:
     """D 전담 한 명의 용량 시나리오 설정 — D 요구를 `work_days` 에만 둔다(엔진이 그 날들에 근무하도록 모양을 고정한다).
 
-    OFF 하한(min_off)은 off_first=False 병동에서만 엔진이 하드로 거는 별개 제약이라(precheck 는 일부러 뺀다) 여기서는 끈다.
+    OFF 하한(min_off)은 staffing_first=False 병동에서만 엔진이 하드로 거는 별개 제약이라(precheck 는 일부러 뺀다) 여기서는 끈다.
     """
     days = set(work_days)
     need = [{"D": 1 if day in days else 0, "E": 0, "N": 0} for day in range(30)]
-    return {"off_first": True, "max_conseq_work": 6, "daily_shift_requirements": {"D": 1, "E": 0, "N": 0},
+    return {"staffing_first": True, "max_conseq_work": 6, "daily_shift_requirements": {"D": 1, "E": 0, "N": 0},
             "daily_shift_requirements_by_day": need, **over}
 
 
@@ -375,8 +377,8 @@ def test_s7b_weekend_off_resigner_capacity_is_the_weekdays_inside_the_span(monke
     weekdays = [day for day in range(19) if day not in WEEKEND]
     assert len(weekdays) == 14
     nurse_kwargs = {"is_weekend_off": True, "resignation_date": "2026-11-20T00:00:00"}
-    # 주말휴무자는 엔진 OFF 하한(min_off)에서 빠지므로 off_first=False(엔진 기본)로 돌린다 — 독립 리뷰가 잰 설정과 같다.
-    _assert_capacity_matches_engine(monkeypatch, _capacity_config(weekdays, off_first=False), nurse_kwargs, [], 14)
+    # 주말휴무자는 엔진 OFF 하한(min_off)에서 빠지므로 staffing_first=False(엔진 기본)로 돌린다 — 독립 리뷰가 잰 설정과 같다.
+    _assert_capacity_matches_engine(monkeypatch, _capacity_config(weekdays, staffing_first=False), nurse_kwargs, [], 14)
 
 
 def test_s7c_weekend_off_flag_decides_whether_weekends_are_forced_off(monkeypatch):
@@ -401,18 +403,18 @@ def test_s7d_consecutive_work_cap_reaches_precheck_capacity(monkeypatch):
 
 
 def test_s7e_off_hard_floor_min_off_reaches_precheck_capacity(monkeypatch):
-    """off_first=False · off_days=8 — 엔진은 OFF 하드 하한(min_off 8)을 걸어 최대 근무일이 22 이고(23 불가능) precheck 용량도 22 다.
+    """staffing_first=False · off_days=8 — 엔진은 OFF 하드 하한(min_off 8)을 걸어 최대 근무일이 22 이고(23 불가능) precheck 용량도 22 다.
 
     (EI-14r3 — 전에는 precheck 가 이 하한을 빼 연속근무 닫힌형 26 이었다. 엔진 22 ≤ precheck 26 은 오차단은 아니나 놓침이었다.)
     """
-    cfg = _capacity_config(range(30), off_first=False, off_days=8)
+    cfg = _capacity_config(range(30), staffing_first=False, off_days=8)
     _assert_capacity_matches_engine(monkeypatch, cfg, {}, [], 22)
 
 
 def test_s7e2_weekly_off_days_are_inside_the_min_off_not_added_on_top(monkeypatch):
     """월요일 주휴 5일 + off_days=8 — 엔진 하드 O 5일은 OFF 8 안에 들어가므로 최대 근무일은 22(= 30−8)이고 precheck 도 22 다
     (바닥 `max(5, 8)` — 5+8=13 으로 이중 감산하면 17 로 엔진이 푸는 달을 막는다)."""
-    cfg = _capacity_config((day for day in range(30) if day not in MONDAYS), off_first=False, off_days=8)
+    cfg = _capacity_config((day for day in range(30) if day not in MONDAYS), staffing_first=False, off_days=8)
     cfg["weekly_off_map"] = {"N01": MONDAYS}
     _assert_capacity_matches_engine(monkeypatch, cfg, {}, weekly_off_cells(MONDAYS), 22)
 
@@ -479,10 +481,10 @@ def test_s10_blocked_days_reduce_capacity_exactly_like_the_engine(monkeypatch):
 
 
 def test_s10b_blocked_days_with_min_off_floor_use_the_engine_avail_days(monkeypatch):
-    """off_first=False · off_days=8 · 12일 차단 — 엔진 OFF 하한은 `avail_days = 30 − 12` 기준이다. precheck 용량이 엔진 최대 근무일과 같다
+    """staffing_first=False · off_days=8 · 12일 차단 — 엔진 OFF 하한은 `avail_days = 30 − 12` 기준이다. precheck 용량이 엔진 최대 근무일과 같다
     (차단일을 안 빼고 min_off 를 구하면 엔진보다 커져 오차단이다)."""
     blocked = _blocked(range(5, 17))
-    cfg = _capacity_config((day for day in range(30) if day not in blocked), off_first=False, off_days=8,
+    cfg = _capacity_config((day for day in range(30) if day not in blocked), staffing_first=False, off_days=8,
                            max_conseq_work=30, blocked_by_nurse_id={"N01": blocked})
     inp = precheck_input([nurse(allowed_shifts=["D"])], config(**cfg), [])
     expected = _working_capacity(inp.nurses[0], inp.roster_config)
@@ -494,7 +496,7 @@ def test_s10c_blocked_day_that_is_also_a_weekend_is_counted_once(monkeypatch):
     """주말휴무자 + 차단일이 주말과 겹침 — 주말 OFF 와 차단일을 두 번 빼면 오차단이다. 엔진 최대 근무일과 precheck 용량이 같다."""
     blocked = {6, 7, 13, 14}  # 2026-11 의 주말 일부
     weekdays = [day for day in range(30) if day not in WEEKEND and day not in blocked]
-    cfg = _capacity_config(weekdays, off_first=False, blocked_by_nurse_id={"N01": blocked})
+    cfg = _capacity_config(weekdays, staffing_first=False, blocked_by_nurse_id={"N01": blocked})
     inp = precheck_input([nurse(allowed_shifts=["D"], is_weekend_off=True)], config(**cfg), [])
     expected = _working_capacity(inp.nurses[0], inp.roster_config)
     _assert_capacity_matches_engine(monkeypatch, cfg, {"is_weekend_off": True}, [], expected)
@@ -507,13 +509,13 @@ def test_s10d_blocked_day_inside_a_recovery_run_is_not_blocked_by_precheck(monke
     (측정: 차단일이 N 블록 **바로 뒤**(12일)면 엔진이 오히려 불가능이다 — 회복 OFF 칸 변수가 없어서다. precheck 는 그 경우를 못 막는다 = 느슨한
     쪽이라 오차단이 아니다.)
     """
-    cfg = config(two_offs_after_two_nig=True, three_seq_nig=False, blocked_by_nurse_id={"N01": {11}})
+    cfg = config(two_offs_after_two_nig=True, allow_three_consecutive_nights=False, blocked_by_nurse_id={"N01": {11}})
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10, 11), engine_ok=True)
 
 
 def test_s10e_blocked_days_next_to_an_isolated_night_do_not_make_precheck_stricter(monkeypatch):
     """1N 금지 · 차단일 {11} 옆 고정 N(10일) — 엔진 가능 여부와 상관없이 precheck 는 엔진이 가능한 모든 모양을 통과시킨다(오차단 0)."""
-    cfg = config(not_one_night=True, blocked_by_nurse_id={"N01": {11}})
+    cfg = config(ban_single_night=True, blocked_by_nurse_id={"N01": {11}})
     for cells in (_nights(10), _nights(10, 12), _nights(9, 10)):
         status = engine_status(monkeypatch, [nurse()], cfg, cells)
         _result, codes = precheck([nurse()], cfg, cells)
@@ -528,7 +530,7 @@ def test_s10f_blocked_days_make_a_daily_shortage_precheck_now_reports(monkeypatc
     (오차단이 아니라 '차단일만큼 인원이 적다'는 사실을 반영). 차단일이 없으면(X-BLK-2) 막지 않는다.
     """
     nurses = [nurse(nid, allowed_shifts=["D"]) for nid in ("N01", "N02", "N03")]
-    cfg = config(off_first=True, max_conseq_work=30, daily_shift_requirements={"D": 3, "E": 0, "N": 0})
+    cfg = config(staffing_first=True, max_conseq_work=30, daily_shift_requirements={"D": 3, "E": 0, "N": 0})
     blocked_cfg = {**cfg, "blocked_by_nurse_id": {"N01": _blocked(range(5, 17))}}
     result, codes = precheck(nurses, blocked_cfg, [])
     day_issues = [i for i in result["issues"] if i["reason_code"] == "GLOBAL_DAY_CAPACITY_SHORTAGE"]
@@ -547,7 +549,7 @@ def test_s10g_cut_demand_is_what_the_engine_nurses_must_fill(monkeypatch):
     차감 전 수요(4)를 precheck 에 주면 '인원 부족'으로 막는다(전 차단) — 차감 뒤 수요(3)를 주면 통과하고 엔진은 가능이다(후 통과).
     """
     nurses = [nurse(nid, allowed_shifts=["D"]) for nid in ("N01", "N02", "N03")]
-    base = dict(off_first=True, max_conseq_work=30)
+    base = dict(staffing_first=True, max_conseq_work=30)
     pre_cut = config(**base, daily_shift_requirements={"D": 4, "E": 0, "N": 0})
     post_cut = config(**base, daily_shift_requirements={"D": 3, "E": 0, "N": 0})
     _result, before = precheck(nurses, pre_cut, [])
@@ -567,22 +569,22 @@ def _ic(forced_off=None, forbidden=None) -> dict:
 
 def test_s11_banned_neighbours_make_a_forced_single_night_impossible(monkeypatch):
     """1N 금지 · 고정 N(10일) · 양옆(9·11일) N 금지(금지 원티드) — 단독 N 이라 엔진 불가능이고 개인 DP 도 막는다."""
-    cfg = config(not_one_night=True, **_ic(forbidden={"N01": {9: ["N"], 11: ["N"]}}))
+    cfg = config(ban_single_night=True, **_ic(forbidden={"N01": {9: ["N"], 11: ["N"]}}))
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10), engine_ok=False)
     # 대조군 — 금지가 한쪽뿐이면 반대편 N 으로 이어 갈 수 있다(엔진 가능 · precheck 도 통과)
-    cfg1 = config(not_one_night=True, **_ic(forbidden={"N01": {9: ["N"]}}))
+    cfg1 = config(ban_single_night=True, **_ic(forbidden={"N01": {9: ["N"]}}))
     assert_agree(monkeypatch, [nurse()], cfg1, _nights(10), engine_ok=True)
 
 
 def test_s11b_forced_off_neighbours_make_a_forced_single_night_impossible(monkeypatch):
     """1N 금지 · 고정 N(10일) · 양옆(9·11일) 강제 OFF(전월 경계·허용근무 쉬는 날) — 엔진 불가능, 개인 DP 도 막는다."""
-    cfg = config(not_one_night=True, **_ic(forced_off={"N01": [9, 11]}))
+    cfg = config(ban_single_night=True, **_ic(forced_off={"N01": [9, 11]}))
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10), engine_ok=False)
 
 
 def test_s11c_fixed_cell_beats_forbidden_on_the_same_day(monkeypatch):
     """고정 N(10일)이 같은 날 N 금지와 겹침 — 고정이 이겨 엔진 가능(오차단 금지). 1N 금지라 11일이 N 으로 이어진다."""
-    cfg = config(not_one_night=True, **_ic(forbidden={"N01": {10: ["N"]}}))
+    cfg = config(ban_single_night=True, **_ic(forbidden={"N01": {10: ["N"]}}))
     assert_agree(monkeypatch, [nurse()], cfg, _nights(10), engine_ok=True)
 
 
@@ -594,7 +596,7 @@ def test_s11d_fixed_work_beats_forced_off_on_the_same_day(monkeypatch):
 
 def test_s11e_forbidden_off_inside_a_recovery_window(monkeypatch):
     """2N→2OFF · 고정 NN(10·11일) 뒤 12일에 OFF 금지(O 가 금지 코드) — 엔진 불가능 여부를 그대로 따라간다(오차단 금지)."""
-    cfg = config(two_offs_after_two_nig=True, three_seq_nig=False, **_ic(forbidden={"N01": {12: ["O"]}}))
+    cfg = config(two_offs_after_two_nig=True, allow_three_consecutive_nights=False, **_ic(forbidden={"N01": {12: ["O"]}}))
     cells = _nights(10, 11)
     status = engine_status(monkeypatch, [nurse()], cfg, cells)
     _result, codes = precheck([nurse()], cfg, cells)
@@ -608,7 +610,7 @@ def test_s11e_forbidden_off_inside_a_recovery_window(monkeypatch):
 def test_s11f_empty_or_malformed_constraints_leave_the_verdict_alone(monkeypatch):
     """빈 initial_constraints · 모양이 틀린 값 — 판정이 그대로다(키 없음과 같다)."""
     cells = [engine_cell(3, "OFF"), engine_cell(4, "N"), engine_cell(6, "E")]
-    base = config(not_one_night=True, ban_n_to_e=False, ban_e_to_d=True, ban_n_to_d=True)
+    base = config(ban_single_night=True, ban_n_to_e=False, ban_e_to_d=True, ban_n_to_d=True)
     for extra in ({}, _ic(), {"initial_constraints": "garbage"}, {"initial_constraints": {"forbidden": {"N01": {"x": ["N"]}}}}):
         _result, codes = precheck([nurse()], {**base, **extra}, cells)
         assert SEQ not in codes, extra
@@ -617,7 +619,7 @@ def test_s11f_empty_or_malformed_constraints_leave_the_verdict_alone(monkeypatch
 def test_s11g_constraints_outside_the_active_span_or_on_preceptees_are_ignored(monkeypatch):
     """퇴사로 구간이 0~18 인 간호사 — 구간 밖(25일) 강제 OFF·금지는 무시한다(엔진은 활동일 밖 칸을 건너뛴다)."""
     resigner = nurse(resignation_date="2026-11-20T00:00:00")
-    cfg = config(not_one_night=True, **_ic(forced_off={"N01": [24, 26]}, forbidden={"N01": {24: ["N"], 26: ["N"]}}))
+    cfg = config(ban_single_night=True, **_ic(forced_off={"N01": [24, 26]}, forbidden={"N01": {24: ["N"], 26: ["N"]}}))
     assert_agree(monkeypatch, [resigner], cfg, _nights(25), engine_ok=True)
 
 
@@ -655,7 +657,7 @@ def test_s12c_forbidden_shift_on_a_day_is_a_day_shortage_but_a_fixed_cell_wins(m
     """D 전담 3명 · D 수요 3 · 한 명이 7일에 D 금지 — 그날 D 가용 2 < 3 이라 일자 부족을 낸다(D28 새로 막히는 조건). 같은 날 그 간호사에게
     고정 D 칸이 있으면 금지는 무시된다(고정이 이긴다) — 부족이 없다."""
     nurses = [nurse(nid, allowed_shifts=["D"]) for nid in ("N01", "N02", "N03")]
-    base = dict(off_first=True, max_conseq_work=30, daily_shift_requirements={"D": 3, "E": 0, "N": 0})
+    base = dict(staffing_first=True, max_conseq_work=30, daily_shift_requirements={"D": 3, "E": 0, "N": 0})
     cfg = config(**base, **_ic(forbidden={"N01": {7: ["D"]}}))
     result, codes = precheck(nurses, cfg, [])
     shortage_days = {i["evidence"]["day"] for i in result["issues"] if i["reason_code"] == "GLOBAL_SHIFT_ALLOWED_SHORTAGE"}
@@ -669,7 +671,7 @@ def test_s12c_forbidden_shift_on_a_day_is_a_day_shortage_but_a_fixed_cell_wins(m
 def test_s12d_forced_off_day_is_a_day_capacity_shortage(monkeypatch):
     """D 전담 3명 · D 수요 3 · 한 명이 9일 강제 OFF(전월 경계·허용근무 쉬는 날) — 그날 가용 2 < 3 → 일자 용량 부족."""
     nurses = [nurse(nid, allowed_shifts=["D"]) for nid in ("N01", "N02", "N03")]
-    base = dict(off_first=True, max_conseq_work=30, daily_shift_requirements={"D": 3, "E": 0, "N": 0})
+    base = dict(staffing_first=True, max_conseq_work=30, daily_shift_requirements={"D": 3, "E": 0, "N": 0})
     result, codes = precheck(nurses, config(**base, **_ic(forced_off={"N01": [9]})), [])
     days = {i["evidence"]["day"] for i in result["issues"] if i["reason_code"] == "GLOBAL_DAY_CAPACITY_SHORTAGE"}
     assert days == {9}, days

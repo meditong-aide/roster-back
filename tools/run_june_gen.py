@@ -95,7 +95,7 @@ def main() -> int:
     _tmp_cfg = _rc.NurseRosterConfig()
     print(f"[run_june_gen] off_cap_relax_extra (cfg default)={_tmp_cfg.off_cap_relax_extra}")
 
-    # 시화병원 RosterConfig.off_swap_enabled 사전 조회
+    # 시화병원 RosterConfig.convert_excess_off_to_leave 사전 조회
     try:
         from db.client2 import SessionLocal as _SL  # type: ignore
         from db.models import RosterConfig as _RC  # type: ignore
@@ -103,13 +103,13 @@ def main() -> int:
         try:
             _rc_row = _db.query(_RC).filter(_RC.group_id == user.group_id).first()
             print(
-                f"[run_june_gen] DB RosterConfig.off_swap_enabled="
-                f"{getattr(_rc_row, 'off_swap_enabled', None) if _rc_row else 'NO_ROW'}"
+                f"[run_june_gen] DB RosterConfig.convert_excess_off_to_leave="
+                f"{getattr(_rc_row, 'convert_excess_off_to_leave', None) if _rc_row else 'NO_ROW'}"
             )
         finally:
             _db.close()
     except Exception as exc:
-        print(f"[run_june_gen] off_swap_enabled probe failed: {exc}")
+        print(f"[run_june_gen] convert_excess_off_to_leave probe failed: {exc}")
 
     req = RosterRequest(year=2026, month=6, grade_strategy="COMBINED")
 

@@ -122,7 +122,7 @@ def test_build_narrative_raises_on_injected_naive_text():
         # 임의 사용자 데이터에 naive 문구 포함 — narrative builder 가 검출해야
         "details": {"required": "간호사를 줄이세요", "capacity": 0, "shortage": 0,
                     "nurse_count": 0, "days": 0, "off_days": 0,
-                    "off_first": False, "source": "test"},
+                    "staffing_first": False, "source": "test"},
     }]
     with pytest.raises(ValueError, match="naive"):
         build_narrative(cause_payloads=cps)

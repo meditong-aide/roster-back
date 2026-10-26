@@ -57,7 +57,7 @@ def test_roundtrip_and_graph_matches_oracle():
 def test_ir_extracts_rules_and_unsupported():
     nu = [{"nurse_id": "n0", "allowed_shifts": ["N"], "n_exact": 13},
           {"nurse_id": "n1"}]
-    cfg = {"two_offs_after_three_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_three_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 2},
            "initial_constraints": {"forbidden": {"n0": {2: ["O"]}}, "forced_off": {"n1": [3]}}}
     ir = parse_to_ir(nu, cfg, 6)
@@ -72,7 +72,7 @@ def test_ir_extracts_rules_and_unsupported():
 def test_cpsat_backend_compiles_and_agrees_on_two_rule():
     """IR→CP-SAT: 2N2OFF(정확 인코딩) 케이스에서 oracle 과 일치."""
     nu = [{"nurse_id": f"n{i}"} for i in range(5)]
-    cfg = {"two_offs_after_two_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_two_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 2},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     ir = parse_to_ir(nu, cfg, 6)

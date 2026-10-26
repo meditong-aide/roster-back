@@ -712,7 +712,7 @@ def build_main_objective_terms(
     # (k+1)연속 OFF 창마다 고weight 벌점 → hard처럼 억제하되, soft라 불가피 시 양보
     # (OFF 과잉/하드 제약 충돌 시에도 절대 infeasible 유발 안 함). 연속근무 soft의 미러.
     try:
-        soft_off_k = int(getattr(cfg, "max_conseq_off", 0) or 0)
+        soft_off_k = int(getattr(cfg, "soft_max_conseq_off", 0) or 0)
         w_soft_off = int(getattr(cfg, "max_conseq_off_penalty_weight", 0) or 0)
         if soft_off_k > 0 and w_soft_off > 0:
             for n in range(N):
@@ -901,7 +901,7 @@ def build_main_objective_terms(
     )
 
     # (4-4) N-O-D/E 패턴
-    if getattr(cfg, "nod_noe", True):
+    if getattr(cfg, "avoid_nod_noe_eod", True):
         for n in range(N):
             for d in range(join[n], leave[n] - 2):
                 if any((n, d + k) not in active_days for k in range(4)):
@@ -923,14 +923,14 @@ def build_main_objective_terms(
         ):
             obj.append(-NOD_NOE_PENALTY * _var)
 
-    # (4-5) 고립 OFF (sequential_offs ON일 때만, fallback과 동일)
+    # (4-5) 고립 OFF (avoid_isolated_off_and_work ON일 때만, fallback과 동일)
     # ★★ 여기에는 **휴가·공가 제외가 없다.** 연차·반차·공가는 솔버에서 전부 `off` 로 접히므로
     #   이 식은 본인이 신청한 휴가를 "근무 사이에 낀 고립 OFF" 로 읽는다.
     #   실제로 도는 경로(`fallback_lex` 의 isolated_off_slack · 가중치 30만)에는 제외를
     #   넣었다. 이쪽은 `SKIP_PRIMARY` 기본값이 "1" 이라 비활성이어서 손대지 않았다 —
     #   **primary 를 되살릴 때 같은 제외를 반드시 함께 넣어야 한다**
     #   (`fixed_type_by_cell` 을 인자로 받아 (d-1, d, d+1) 중 휴가·공가면 스킵).
-    if getattr(cfg, "sequential_offs", True):
+    if getattr(cfg, "avoid_isolated_off_and_work", True):
         for n in range(N):
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 iso = m.NewIntVar(0, 1, f"iso_{n}_{d}")
@@ -941,8 +941,8 @@ def build_main_objective_terms(
                 obj.append(-ISOLATED_OFF_PENALTY * iso)
 
     # (4-5c) 고립 근무 (O W O: 단일 근무가 OFF 사이에 낀 "퐁당퐁당") — N 제외.
-    # 단일 N(O N O)은 not_one_night(1N 금지)이 별도 관리하고 n_max==1 면제와 충돌하므로 제외.
-    if getattr(cfg, "sequential_offs", True):
+    # 단일 N(O N O)은 ban_single_night(1N 금지)이 별도 관리하고 n_max==1 면제와 충돌하므로 제외.
+    if getattr(cfg, "avoid_isolated_off_and_work", True):
         # 고립근무 벌점 — `fallback_objectives` 의 동명 항과 **같은 규약**으로 주입한다
         # (값이 실리는 자리가 둘이므로 한쪽만 고치면 반쪽 검증이 된다).
         import os as _os_isw
@@ -981,8 +981,8 @@ def build_main_objective_terms(
     except Exception:
         pass
 
-    # (4-5a) OFF 연속 배정 보너스 (sequential_offs)
-    if getattr(cfg, "sequential_offs", True):
+    # (4-5a) OFF 연속 배정 보너스 (avoid_isolated_off_and_work)
+    if getattr(cfg, "avoid_isolated_off_and_work", True):
         SEQUENTIAL_OFF_BONUS = 50000  # 연속 휴무 보너스 가중치 (KLD 균등과 균형)
         for n in range(N):
             T0, T1 = join[n], leave[n]

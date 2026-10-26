@@ -105,8 +105,8 @@ def _collect_preceptee_facts(rs, active_days_by_nurse: dict[int, set[int]], cove
     """
     follow_days_raw = getattr(rs, "preceptee_follow_days", {}) or {}
     preceptor_idx_map = getattr(rs, "preceptee_preceptor_idx", {}) or {}
-    preceptee_shift_count = bool(getattr(rs.config, "preceptee_shift_count", True))
-    follow_enabled = bool(getattr(rs.config, "preceptee_on", registry_default("preceptee_on")))
+    count_preceptee_in_staffing = bool(getattr(rs.config, "count_preceptee_in_staffing", True))
+    follow_enabled = bool(getattr(rs.config, "preceptee_follows_preceptor", registry_default("preceptee_follows_preceptor")))
     pte_fw = getattr(rs, "_preceptee_fixed_wanted_map", {}) or {}
     out: list[PrecepteeFact] = []
     for idx, days in follow_days_raw.items():
@@ -122,7 +122,7 @@ def _collect_preceptee_facts(rs, active_days_by_nurse: dict[int, set[int]], cove
             pn = rs.nurses[p_idx]
             preceptor_id = str(getattr(pn, "db_id", getattr(pn, "nurse_id", p_idx)))
         override_days = {d for (n, d), _ in pte_fw.items() if n == idx}
-        counts_to_coverage = preceptee_shift_count and not any((idx, d) in coverage_exclude_cells for d in active_days_by_nurse.get(idx, set()))
+        counts_to_coverage = count_preceptee_in_staffing and not any((idx, d) in coverage_exclude_cells for d in active_days_by_nurse.get(idx, set()))
         out.append(
             PrecepteeFact(
                 nurse_index=idx,
@@ -218,8 +218,8 @@ def _base_constraint_modes(rs, snapshot: SemanticsSnapshot) -> list[ConstraintMo
         out.append(ConstraintModeFact("recovery_2n2o", "two_offs_after_two_nig", "hard", "enforced", "app/services/cp_sat_basic.py", "2N 후 2OFF 활성"))
     if bool(getattr(cfg, "two_offs_after_three_nig", registry_default("two_offs_after_three_nig"))):
         out.append(ConstraintModeFact("recovery_3n2o", "two_offs_after_three_nig", "hard", "enforced", "app/services/cp_sat_basic.py", "3N 후 2OFF 활성"))
-    if bool(getattr(cfg, "not_one_night", False)):
-        out.append(ConstraintModeFact("consecutive_night", "not_one_night", "hard", "enforced", "app/services/cp_sat_basic.py", "1N 금지 활성"))
+    if bool(getattr(cfg, "ban_single_night", False)):
+        out.append(ConstraintModeFact("consecutive_night", "ban_single_night", "hard", "enforced", "app/services/cp_sat_basic.py", "1N 금지 활성"))
     if bool(getattr(cfg, "weekend_off_only_enable", True)):
         out.append(ConstraintModeFact("weekend_only", "weekend_off_only", "hard", "enforced", "app/services/cp_sat_basic.py", "주말휴무 hard 활성"))
     team_mode = "soft_fallback" if bool(getattr(cfg, "team_min_soft_fallback", False)) else "enforced"
@@ -244,9 +244,9 @@ def _base_constraint_modes(rs, snapshot: SemanticsSnapshot) -> list[ConstraintMo
 def _config_payload(rs) -> dict[str, Any]:
     cfg = rs.config
     keys = [
-        "preceptee_on", "preceptee_shift_count", "use_mid", "off_first", "weekend_off_only_enable",
+        "preceptee_follows_preceptor", "count_preceptee_in_staffing", "use_mid", "staffing_first", "weekend_off_only_enable",
         "team_min_soft_fallback", "team_handoff_soft_fallback", "two_offs_after_two_nig",
-        "two_offs_after_three_nig", "not_one_night", "ban_n_to_d", "ban_e_to_d", "ban_n_to_e",
+        "two_offs_after_three_nig", "ban_single_night", "ban_n_to_d", "ban_e_to_d", "ban_n_to_e",
         "max_consecutive_work_days", "max_consecutive_nights", "max_night_shifts_per_month", "off_days",
         "daily_shift_requirements", "daily_shift_requirements_by_day", "daily_shift_requirements_max_by_day",
         "team_min_by_team", "team_handoff_policy_by_team",

@@ -7,7 +7,9 @@ import 하지 않는다. 조사 산출물(조사 메모·근거 file:line·열�
 그 조사의 결론만 옮긴 것이다.
 
 필드 규칙(§2.2)
-  key              정본 키. DB 에 있는 설정은 DB 컬럼명(D9).
+  key              정본 키. DB 에 있는 설정은 ORM 속성 이름(D9 — 물리 컬럼명이 다르면 `column`).
+  column           바깥 이름(물리 컬럼·API·저장 JSON) — 파이썬 key 와 다를 때만 · names.EXTERNAL_TO_INTERNAL 과
+                   같아야 함(시험이 강제) · NM D58.
   rule_keys        `rules.py` RuleSpec.governing_keys 표기와 맞는 철자 전부(대개 key 와
                    같지만 `runtime.`·`env.` 접두가 붙은 경우가 섞인 행도 있다).
   aliases          구 이름(dataclass 필드명·카드·온톨로지 서술 등). 입력에서만 받는다.
@@ -104,6 +106,9 @@ class SettingSpec:
     #: 요청(config_override)에 그 별칭이 있으면 값과 무관하게 차단한다는 표지다(`policy.hard_lock
     #: .override_violations` 가 읽는다 · EI-11 11b D13 ③).
     derived_inputs: dict | None = None
+    #: 바깥 이름(물리 DB 컬럼·API·저장 JSON) — 파이썬 `key` 와 다를 때만(NM D58 · 14칸). `aliases` 에 넣지 않는다:
+    #: `normalize_aliases` 는 None 값을 버리는데 바깥 이름은 None 도 뜻이 있다(`names.to_internal` 이 따로 옮긴다).
+    column: str | None = None
 
 
 SETTINGS: tuple[SettingSpec, ...] = (
@@ -273,12 +278,13 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes='저장 스키마는 int 필수라 NULL 은 레거시·SQL·에이전트 setattr 행에서만 생긴다. GET 무행 시드가 6(하드락 #1 위반값)을 INSERT 한다. | default_site=services/cp_sat_basic.py:456',
     ),
     SettingSpec(
-        key='banned_day_after_eve',
-        rule_keys=('banned_day_after_eve',),
+        key='ban_shift_transitions',
+        column='banned_day_after_eve',  # nm:external
+        rule_keys=('ban_shift_transitions',),
         aliases=(),
         source=DB_COLUMN,
         current_default='True',
-        null_behavior='None→cfg.banned_day_after_eve=None 그대로 유지(setattr 없이 생성자 인자로만 들어가 '
+        null_behavior='None→cfg.ban_shift_transitions=None 그대로 유지(setattr 없이 생성자 인자로만 들어가 '
                       '코드 판독 없음) · `if not x` 판정만 거짓 → ban_* 4종 False(4종 해제) [실험] '
                       '@cp_sat_basic.py:673-677 · 월경계·월중 경계도 bool(None)=False→3종 해제(:2465-2472·:2674-2677). '
                       "EI-6 반박 검토(LOW) 반영 — 문자열 'false' 는 Python 에서 참(bool('false')=True) 이라 "
@@ -294,8 +300,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes='엔진은 이 키를 직접 쓰지 않고 ban_* 4종으로 내려 쓴다(engine_consumers 는 ban_* 경유). | default_site=services/cp_sat_basic.py:464',
     ),
     SettingSpec(
-        key='three_seq_nig',
-        rule_keys=('three_seq_nig', 'runtime.max_consecutive_nights',),
+        key='allow_three_consecutive_nights',
+        column='three_seq_nig',  # nm:external
+        rule_keys=('allow_three_consecutive_nights', 'runtime.max_consecutive_nights',),
         aliases=('max_consecutive_nights',),
         source=DB_COLUMN,
         current_default='True',
@@ -311,12 +318,12 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes="True 쓰기는 상대 완화이나 절대 상한(3) 안 — 요청 허용(EI-11 §3 Q12). 화면 모달 '나이트 3연속' 토글. | default_site=services/cp_sat_basic.py:465",
         derived_inputs={
             'max_consecutive_nights': {
-                'domain': 'bool(정본 three_seq_nig) 대 int 상한(별칭) — 값 영역이 다르다',
+                'domain': 'bool(정본 allow_three_consecutive_nights) 대 int 상한(별칭) — 값 영역이 다르다',
                 'to_canonical': 'x>=3 (정수 상한을 bool 로 접는다)',
                 'precedence': 'canonical_wins',
                 'runtime': 'forbidden',
                 'relax_if': '요청(config_override)에 이 별칭이 있으면 값과 무관하게 금지(D13 ③ — runtime_key_forbidden)',
-                'note': '월경계·월중 경계(roster_create_service.py:2513·2708)는 D13 ① 뒤 정본 three_seq_nig 만 읽는다'
+                'note': '월경계·월중 경계(roster_create_service.py:2513·2708)는 D13 ① 뒤 정본 allow_three_consecutive_nights 만 읽는다'
                         '(별칭 무시). 런타임 유입 통로는 config_override 뿐이고 11b 가드가 400 으로 막는다.',
             },
         },
@@ -370,8 +377,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes='대체근무 추천은 기본 8(replacement_recommend_service.py:671·:2256). | default_site=services/cp_sat_basic.py:479',
     ),
     SettingSpec(
-        key='not_one_night',
-        rule_keys=('not_one_night',),
+        key='ban_single_night',
+        column='not_one_night',  # nm:external
+        rule_keys=('ban_single_night',),
         aliases=(),
         source=DB_COLUMN,
         current_default='False',
@@ -380,12 +388,12 @@ SETTINGS: tuple[SettingSpec, ...] = (
         hard_lock=HardLock(rule_no=7, kind='bool_on', cap=None, relax_when='실효 True→False · 실효 N 상한 ==1(n_max=1·n_exact=1·일괄)'),
         editor=USER_SCREEN,
         hidden_no=None,
-        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first#not_one_night@4651', 'lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first.build_model#not_one_night@2116', 'primary:cp_sat_basic.py:_build_full_model#not_one_night@4001', 'common:roster_system.py:RosterSystem._find_violations#not_one_night@435',),
+        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first#ban_single_night@4651', 'lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first.build_model#ban_single_night@2116', 'primary:cp_sat_basic.py:_build_full_model#ban_single_night@4001', 'common:roster_system.py:RosterSystem._find_violations#ban_single_night@435',),
         engine_path='common',
         c2_target=True,
         notes='EI-6 반박 검토(LOW) 반영 — source=DB_COLUMN 이지만 REQUEST 가 생성 시점에 덮는 통로가 '
               '있다: RosterRequest.not_one_night(roster_schema.py:181) 가 not None 이면 '
-              'config_dict["not_one_night"]=bool(req.not_one_night) 로 DB 값을 덮는다'
+              'config_dict["ban_single_night"]=bool(req.not_one_night) 로 DB 값을 덮는다'
               '(roster_create_service.py:5735-5736). 하드락 #7 을 끄는 또 다른 통로라 EI-7 '
               'override_violations 가 이 경로도 찾을 수 있어야 한다. | default_site=services/cp_sat_basic.py:468',
     ),
@@ -422,8 +430,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes="cfg 에는 off_days 속성이 없다 → getattr(cfg,'off_days',X) 3곳은 늘 기본값: fallback_lex.py:699 None(로그) · objective_terms.py:519 10(KLD 기준 — D15 KLD 상수 10) · cp_sat_basic.py:4306 9(primary MaxCov). GET 무행 시드는 11(=global 3+standard 8). | hard_lock: §4.2 인접. precheck 는 일부러 soft 로 본다(C8' 제외 사유) | default_site=services/cp_sat_basic.py:579",
     ),
     SettingSpec(
-        key='nod_noe',
-        rule_keys=('nod_noe',),
+        key='avoid_nod_noe_eod',
+        column='nod_noe',  # nm:external
+        rule_keys=('avoid_nod_noe_eod',),
         aliases=(),
         source=DB_COLUMN,
         current_default='True',
@@ -432,14 +441,15 @@ SETTINGS: tuple[SettingSpec, ...] = (
         hard_lock=ADJACENT,
         editor=OPERATOR,
         hidden_no=11,
-        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first.build_model#nod_noe@3050', 'primary:cp_sat/objective_terms.py:build_main_objective_terms#nod_noe@904',),
+        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first.build_model#avoid_nod_noe_eod@3050', 'primary:cp_sat/objective_terms.py:build_main_objective_terms#avoid_nod_noe_eod@904',),
         engine_path='common',
         c2_target=True,
         notes='GET 무행 시드는 False(routers/roster.py:498) — 엔진 기본 True 와 반대. | hard_lock: §4.2 인접(N-O-D/E 패턴 최소화 — 목적식 벌점이지만 하드락 인접으로 분류) | default_site=services/cp_sat_basic.py:575',
     ),
     SettingSpec(
-        key='preceptee_on',
-        rule_keys=('preceptee_on',),
+        key='preceptee_follows_preceptor',
+        column='preceptee_on',  # nm:external
+        rule_keys=('preceptee_follows_preceptor',),
         aliases=(),
         source=DB_COLUMN,
         current_default='True',
@@ -448,14 +458,15 @@ SETTINGS: tuple[SettingSpec, ...] = (
         hard_lock=AFFECTS,
         editor=OPERATOR,
         hidden_no=18,
-        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first#preceptee_on@855', 'entry:cp_sat_basic.py:CPSATBasicEngine.generate_roster#preceptee_on@1561,1898', 'primary:cp_sat_basic.py:_build_full_model#preceptee_on@2817,3193',),
+        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first#preceptee_follows_preceptor@855', 'entry:cp_sat_basic.py:CPSATBasicEngine.generate_roster#preceptee_follows_preceptor@1561,1898', 'primary:cp_sat_basic.py:_build_full_model#preceptee_follows_preceptor@2817,3193',),
         engine_path='common',
         c2_target=True,
         notes="기본값이 4벌: ORM False · 엔진 True(:593) · dataclass False · 엔진 getattr False/True/'MISSING'(cp_sat_basic.py:2817·1561·3193) — getattr 은 필드가 늘 있어 죽은 기본값. | hard_lock: Q30(c) 하드락 영향 스위치(N09 — 프리셉티 월경계 하드락 생략과 연동) | default_site=services/cp_sat_basic.py:593",
     ),
     SettingSpec(
-        key='fixed_wanted_use_yn',
-        rule_keys=('fixed_wanted_use_yn',),
+        key='apply_confirmed_wanted',
+        column='fixed_wanted_use_yn',  # nm:external
+        rule_keys=('apply_confirmed_wanted',),
         aliases=(),
         source=DB_COLUMN,
         current_default='False',
@@ -486,8 +497,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes='사다리 4단(ban_night_minimize)이 위반칸 최소화로 전환한다. | hard_lock: §4.2 인접(NULL=꺼짐, W42). 하드락 #4·#5 와 부딪힘(roster_config.py:146-147) | default_site=services/cp_sat_basic.py:473',
     ),
     SettingSpec(
-        key='min_exp_per_shift',
-        rule_keys=('min_exp_per_shift',),
+        key='senior_min_years',
+        column='min_exp_per_shift',  # nm:external
+        rule_keys=('senior_min_years',),
         aliases=('min_experience_per_shift',),
         source=DB_COLUMN,
         current_default='3',
@@ -502,8 +514,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes='default_site=services/cp_sat_basic.py:493',
     ),
     SettingSpec(
-        key='req_exp_nurses',
-        rule_keys=('req_exp_nurses',),
+        key='senior_nurses_per_shift',
+        column='req_exp_nurses',  # nm:external
+        rule_keys=('senior_nurses_per_shift',),
         aliases=('required_experienced_nurses',),
         source=DB_COLUMN,
         current_default='1',
@@ -518,8 +531,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes='default_site=services/cp_sat_basic.py:494',
     ),
     SettingSpec(
-        key='two_offs_per_week',
-        rule_keys=('two_offs_per_week',),
+        key='prefer_two_offs_per_7days',
+        column='two_offs_per_week',  # nm:external
+        rule_keys=('prefer_two_offs_per_7days',),
         aliases=('enforce_two_offs_per_week',),
         source=DB_COLUMN,
         current_default='True',
@@ -534,8 +548,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes='off_swap 후처리도 읽는다(cp_sat/off_swap.py:112, 기본 False). | default_site=services/cp_sat_basic.py:495',
     ),
     SettingSpec(
-        key='max_conseq_off',
-        rule_keys=('max_conseq_off',),
+        key='soft_max_conseq_off',
+        column='max_conseq_off',  # nm:external
+        rule_keys=('soft_max_conseq_off',),
         aliases=(),
         source=DB_COLUMN,
         current_default='3',
@@ -544,7 +559,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
         hard_lock=None,
         editor=USER_SCREEN,
         hidden_no=None,
-        engine_consumers=('lex:cp_sat/fallback_objectives.py:build_fallback_stage3_objective_terms#max_conseq_off@320', 'primary:cp_sat/objective_terms.py:build_main_objective_terms#max_conseq_off@715',),
+        engine_consumers=('lex:cp_sat/fallback_objectives.py:build_fallback_stage3_objective_terms#soft_max_conseq_off@320', 'primary:cp_sat/objective_terms.py:build_main_objective_terms#soft_max_conseq_off@715',),
         engine_path='common',
         c2_target=False,
         notes='default_site=services/cp_sat_basic.py:608(int(get(…) or 3))',
@@ -566,8 +581,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes='primary 전용(D14=② — build_main_objective_terms objective_terms.py:1038). lex 는 읽지 않는다. | default_site=services/cp_sat_basic.py:582',
     ),
     SettingSpec(
-        key='sequential_offs',
-        rule_keys=('sequential_offs',),
+        key='avoid_isolated_off_and_work',
+        column='sequential_offs',  # nm:external
+        rule_keys=('avoid_isolated_off_and_work',),
         aliases=(),
         source=DB_COLUMN,
         current_default='True',
@@ -576,14 +592,15 @@ SETTINGS: tuple[SettingSpec, ...] = (
         hard_lock=None,
         editor=OPERATOR,
         hidden_no=12,
-        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first.build_model#sequential_offs@1943', 'lex:cp_sat/fallback_objectives.py:build_fallback_stage3_objective_terms#sequential_offs@462', 'primary:cp_sat/objective_terms.py:build_main_objective_terms#sequential_offs@933,945,985',),
+        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first.build_model#avoid_isolated_off_and_work@1943', 'lex:cp_sat/fallback_objectives.py:build_fallback_stage3_objective_terms#avoid_isolated_off_and_work@462', 'primary:cp_sat/objective_terms.py:build_main_objective_terms#avoid_isolated_off_and_work@933,945,985',),
         engine_path='common',
         c2_target=False,
         notes='default_site=services/cp_sat_basic.py:496',
     ),
     SettingSpec(
-        key='preceptee_shift_count',
-        rule_keys=('preceptee_shift_count',),
+        key='count_preceptee_in_staffing',
+        column='preceptee_shift_count',  # nm:external
+        rule_keys=('count_preceptee_in_staffing',),
         aliases=(),
         source=DB_COLUMN,
         current_default='True',
@@ -592,7 +609,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
         hard_lock=None,
         editor=USER_SCREEN,
         hidden_no=None,
-        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first#preceptee_shift_count@880', 'primary:cp_sat_basic.py:_build_full_model#preceptee_shift_count@3194,3233',),
+        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first#count_preceptee_in_staffing@880', 'primary:cp_sat_basic.py:_build_full_model#count_preceptee_in_staffing@3194,3233',),
         engine_path='common',
         c2_target=False,
         notes='default_site=services/cp_sat_basic.py:594',
@@ -646,8 +663,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         notes='근무표 표시 옵션.',
     ),
     SettingSpec(
-        key='off_first',
-        rule_keys=('off_first',),
+        key='staffing_first',
+        column='off_first',  # nm:external
+        rule_keys=('staffing_first',),
         aliases=(),
         source=DB_COLUMN,
         current_default='False',
@@ -656,14 +674,15 @@ SETTINGS: tuple[SettingSpec, ...] = (
         hard_lock=None,
         editor=USER_SCREEN,
         hidden_no=None,
-        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first.build_model#off_first@1709,3238,3303,3383', 'primary:cp_sat_basic.py:_build_full_model#off_first@3269,4354,4441',),
+        engine_consumers=('lex:cp_sat/fallback_lex.py:optimize_fallback_lex_hard_first.build_model#staffing_first@1709,3238,3303,3383', 'primary:cp_sat_basic.py:_build_full_model#staffing_first@3269,4354,4441',),
         engine_path='common',
         c2_target=False,
         notes='True 면 생성 서비스가 간호사 o_min·o_max·o_exact 를 비운다(roster_create_service.py:3453-3456). | default_site=services/cp_sat_basic.py:475',
     ),
     SettingSpec(
-        key='off_swap_enabled',
-        rule_keys=('off_swap_enabled',),
+        key='convert_excess_off_to_leave',
+        column='off_swap_enabled',  # nm:external
+        rule_keys=('convert_excess_off_to_leave',),
         aliases=(),
         source=DB_COLUMN,
         current_default='False',
@@ -1035,8 +1054,8 @@ SETTINGS: tuple[SettingSpec, ...] = (
         aliases=(),
         source=ENGINE_KNOB,
         current_default='True',
-        null_behavior='None→False [실험] · banned_day_after_eve 거짓이면 값과 무관하게 False',
-        coerce='bool() 후 banned_day_after_eve 로 마스킹',
+        null_behavior='None→False [실험] · ban_shift_transitions 거짓이면 값과 무관하게 False',
+        coerce='bool() 후 ban_shift_transitions 로 마스킹',
         hard_lock=HardLock(rule_no=2, kind='bool_on', cap=None, relax_when='실효 True→False — ED(E→D)'),
         editor=RUNTIME_ONLY,
         hidden_no=39,
@@ -1051,8 +1070,8 @@ SETTINGS: tuple[SettingSpec, ...] = (
         aliases=(),
         source=ENGINE_KNOB,
         current_default='True',
-        null_behavior='None→False [실험] · banned_day_after_eve 거짓이면 값과 무관하게 False',
-        coerce='bool() 후 banned_day_after_eve 로 마스킹',
+        null_behavior='None→False [실험] · ban_shift_transitions 거짓이면 값과 무관하게 False',
+        coerce='bool() 후 ban_shift_transitions 로 마스킹',
         hard_lock=HardLock(rule_no=2, kind='bool_on', cap=None, relax_when='실효 True→False — ND(N→D)'),
         editor=RUNTIME_ONLY,
         hidden_no=39,
@@ -1067,8 +1086,8 @@ SETTINGS: tuple[SettingSpec, ...] = (
         aliases=(),
         source=ENGINE_KNOB,
         current_default='True',
-        null_behavior='None→False [실험] · banned_day_after_eve 거짓이면 값과 무관하게 False',
-        coerce='bool() 후 banned_day_after_eve 로 마스킹',
+        null_behavior='None→False [실험] · ban_shift_transitions 거짓이면 값과 무관하게 False',
+        coerce='bool() 후 ban_shift_transitions 로 마스킹',
         hard_lock=HardLock(rule_no=2, kind='bool_on', cap=None, relax_when='실효 True→False — NE(N→E)'),
         editor=RUNTIME_ONLY,
         hidden_no=39,
@@ -1084,14 +1103,14 @@ SETTINGS: tuple[SettingSpec, ...] = (
         source=ENGINE_KNOB,
         current_default='True',
         null_behavior='None→False [실험]',
-        coerce='bool() 후 banned_day_after_eve 로 마스킹',
+        coerce='bool() 후 ban_shift_transitions 로 마스킹',
         hard_lock=ADJACENT,
         editor=RUNTIME_ONLY,
         hidden_no=39,
         engine_consumers=('common:roster_system.py:RosterSystem._find_violations#ban_d_to_n@425',),
         engine_path='common',
         c2_target=True,
-        notes='엔진 소비는 RosterSystem._find_violations(roster_system.py:425)·후처리(postprocess_off.py:531)뿐 — solve 모델이 D→N 을 거는 곳은 [확인 필요]. | hard_lock: D→N 전이 금지 — CLAUDE.md #2(ND·ED·NE) 밖이지만 banned_day_after_eve 가 함께 끈다 | default_site=services/cp_sat_basic.py:671',
+        notes='엔진 소비는 RosterSystem._find_violations(roster_system.py:425)·후처리(postprocess_off.py:531)뿐 — solve 모델이 D→N 을 거는 곳은 [확인 필요]. | hard_lock: D→N 전이 금지 — CLAUDE.md #2(ND·ED·NE) 밖이지만 ban_shift_transitions 가 함께 끈다 | default_site=services/cp_sat_basic.py:671',
     ),
     SettingSpec(
         key='ban_night_before_fixed_off',
@@ -1837,7 +1856,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
         engine_consumers=(),
         engine_path='none',
         c2_target=False,
-        notes='inventory 에서 unused. 확정 원티드 사용은 fixed_wanted_use_yn 이 정한다.',
+        notes='inventory 에서 unused. 확정 원티드 사용은 apply_confirmed_wanted 이 정한다.',
     ),
     SettingSpec(
         key='daily_shift_requirements',

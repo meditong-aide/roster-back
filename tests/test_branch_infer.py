@@ -5,7 +5,7 @@ from __future__ import annotations
 from services.ontology_graph.branch_infer import diagnose_night_axis, verified_repairs
 from services.ontology_graph.certificate import FEASIBLE, INFEASIBLE, UNKNOWN, render_explanation
 
-_RULES = {"two_offs_after_three_nig": True, "not_one_night": True,
+_RULES = {"two_offs_after_three_nig": True, "ban_single_night": True,
           "daily_shift_requirements": {"D": 2, "E": 1, "N": 1}}
 
 

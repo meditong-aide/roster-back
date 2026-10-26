@@ -5,21 +5,22 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from db.models import RosterConfig, RosterGradeConfig, ShiftManage
+from services.engine_contract.names import EXTERNAL_TO_INTERNAL
 
 
 # 에이전트가 update-constraint 로 설정 가능한 RosterConfig 필드 화이트리스트.
 # ★스코프/식별/타임스탬프 컬럼(config_id/office_id/group_id/version/created_at/updated_at)은
 #   의도적으로 제외 — 에이전트/온톨로지가 프리셋 정체성·테넌트 스코프를 손상시키지 못하게.
 # ★신규 정책 필드는 여기에 명시적으로 추가해야만 설정 가능(fail-safe: 무가드 자유 setattr 방지).
-# 하드락 토글(banned_day_after_eve/three_seq_nig/not_one_night 등)은 HN 정당 설정이라 허용.
+# 하드락 토글(ban_shift_transitions/allow_three_consecutive_nights/ban_single_night 등)은 HN 정당 설정이라 허용.
 _AGENT_SETTABLE_FIELDS = frozenset({
-    "day_req", "eve_req", "nig_req", "min_exp_per_shift", "req_exp_nurses",
-    "two_offs_per_week", "max_nig_per_month", "three_seq_nig",
-    "two_offs_after_three_nig", "two_offs_after_two_nig", "banned_day_after_eve",
-    "max_conseq_work", "off_days", "sequential_offs",
-    "nod_noe", "not_one_night", "use_mid", "preceptee_on", "preceptee_shift_count",
-    "weekly_off_group", "fixed_wanted_use_yn",
-    "show_level", "show_preceptor", "off_first", "off_swap_enabled",
+    "day_req", "eve_req", "nig_req", "senior_min_years", "senior_nurses_per_shift",
+    "prefer_two_offs_per_7days", "max_nig_per_month", "allow_three_consecutive_nights",
+    "two_offs_after_three_nig", "two_offs_after_two_nig", "ban_shift_transitions",
+    "max_conseq_work", "off_days", "avoid_isolated_off_and_work",
+    "avoid_nod_noe_eod", "ban_single_night", "use_mid", "preceptee_follows_preceptor", "count_preceptee_in_staffing",
+    "weekly_off_group", "apply_confirmed_wanted",
+    "show_level", "show_preceptor", "staffing_first", "convert_excess_off_to_leave",
     "config_name", "config_memo",
 })
 # ★제외(상수-live): shift_priority(prod 전량 0.8)·ban_night_before_fixed_off(prod 전량 True·
@@ -28,13 +29,16 @@ _AGENT_SETTABLE_FIELDS = frozenset({
 # 숫자 필드 sane 범위(비정상값·타입오류 차단). 정책(하드락)이 아니라 데이터 무결성용.
 _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     "day_req": (0, 50), "eve_req": (0, 50), "nig_req": (0, 50),
-    "min_exp_per_shift": (0, 50), "req_exp_nurses": (0, 50),
+    "senior_min_years": (0, 50), "senior_nurses_per_shift": (0, 50),
     "max_nig_per_month": (0, 31), "max_conseq_work": (1, 7), "off_days": (0, 31),
 }
 
 
 def _validate_config_field(field: str, new_val) -> str | None:
     """에이전트 config 쓰기 검증. 통과 시 None, 실패 시 에러 메시지."""
+    if field in EXTERNAL_TO_INTERNAL:
+        # 에이전트는 파이썬 이름으로만 읽고 쓴다 — 옛 이름은 DB·API 바깥 이름이라 거절하고 새 이름을 알려 준다(NM).
+        return f"'{field}' 은(는) DB·API 바깥 이름입니다 — 에이전트는 '{EXTERNAL_TO_INTERNAL[field]}' 로 보냅니다"
     if field not in _AGENT_SETTABLE_FIELDS:
         return f"'{field}' 은(는) 에이전트로 설정할 수 없는 필드입니다(식별/스코프 컬럼 등)."
     bounds = _NUMERIC_BOUNDS.get(field)
@@ -215,25 +219,29 @@ def _config_dict(row: RosterConfig) -> dict:
         "day_req": row.day_req,
         "eve_req": row.eve_req,
         "nig_req": row.nig_req,
-        "min_exp_per_shift": row.min_exp_per_shift,
-        "req_exp_nurses": row.req_exp_nurses,
-        "two_offs_per_week": bool(row.two_offs_per_week) if row.two_offs_per_week is not None else None,
+        "senior_min_years": row.senior_min_years,
+        "senior_nurses_per_shift": row.senior_nurses_per_shift,
+        "prefer_two_offs_per_7days": bool(row.prefer_two_offs_per_7days) if row.prefer_two_offs_per_7days is not None else None,
         "max_nig_per_month": row.max_nig_per_month,
-        "three_seq_nig": bool(row.three_seq_nig) if row.three_seq_nig is not None else None,
+        "allow_three_consecutive_nights": bool(row.allow_three_consecutive_nights) if row.allow_three_consecutive_nights is not None else None,
         "two_offs_after_three_nig": bool(row.two_offs_after_three_nig) if row.two_offs_after_three_nig is not None else None,
         "two_offs_after_two_nig": bool(row.two_offs_after_two_nig) if row.two_offs_after_two_nig is not None else None,
-        "banned_day_after_eve": bool(row.banned_day_after_eve) if row.banned_day_after_eve is not None else None,
+        "ban_shift_transitions": bool(row.ban_shift_transitions) if row.ban_shift_transitions is not None else None,
         "max_conseq_work": row.max_conseq_work,
         "off_days": row.off_days,
+        # NULL 이면 화면(GET /roster/config)·엔진과 같은 실효값 3 — 에이전트가 '설정 안 됨'으로 읽지 않게
+        "soft_max_conseq_off": row.soft_max_conseq_off if row.soft_max_conseq_off is not None else 3,
         "shift_priority": row.shift_priority,
-        "sequential_offs": bool(row.sequential_offs) if row.sequential_offs is not None else None,
-        "nod_noe": bool(row.nod_noe) if row.nod_noe is not None else None,
-        "not_one_night": bool(row.not_one_night),
+        "avoid_isolated_off_and_work": bool(row.avoid_isolated_off_and_work) if row.avoid_isolated_off_and_work is not None else None,
+        "avoid_nod_noe_eod": bool(row.avoid_nod_noe_eod) if row.avoid_nod_noe_eod is not None else None,
+        "ban_single_night": bool(row.ban_single_night),
         "use_mid": bool(row.use_mid),
-        "preceptee_on": bool(row.preceptee_on),
-        "preceptee_shift_count": bool(row.preceptee_shift_count),
+        "preceptee_follows_preceptor": bool(row.preceptee_follows_preceptor),
+        "count_preceptee_in_staffing": bool(row.count_preceptee_in_staffing),
         "weekly_off_group": bool(row.weekly_off_group) if row.weekly_off_group is not None else None,
-        "fixed_wanted_use_yn": bool(row.fixed_wanted_use_yn),
+        "apply_confirmed_wanted": bool(row.apply_confirmed_wanted),
         "show_level": bool(row.show_level),
         "show_preceptor": bool(row.show_preceptor),
+        "staffing_first": bool(row.staffing_first),
+        "convert_excess_off_to_leave": bool(row.convert_excess_off_to_leave),
     }

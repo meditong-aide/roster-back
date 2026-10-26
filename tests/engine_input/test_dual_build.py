@@ -37,7 +37,7 @@ argument 이름이 사라진다) 그 4개 사다리 시나리오의 L1 캡처 �
     `_build_code_to_main_map`/`_build_shift_normalizer` 를 다시 돌린다(새 조회는 0 이지만
     계산은 독립). 나이트 블록(L0', `detect_night_forced_oversupply` 호출 인자)의 값과 대조한다.
   - `roster.nurses`: 빌더가 `stage_a.weekend_ids`(캐시) 로 `is_weekend_off` 를 다시 주입하고
-    `off_first` 규칙을 다시 적용한 명단이 L1 `nurses_data`(프로덕션 자신이 지은 값)와 같은가.
+    `staffing_first` 규칙을 다시 적용한 명단이 L1 `nurses_data`(프로덕션 자신이 지은 값)와 같은가.
   - `settings_eff`: 빌더가 지은 `config_data`(차감 뒤 demand·team·shift_definitions 병합)로
     `CPSATBasicEngine.create_config_from_db` 를 **다시** 불러 L2(`settings_eff`, 프로덕션이
     첫 시도 안에서 같은 함수를 부른 결과)와 같은가. S3(모든 nullable NULL)은 프로덕션도

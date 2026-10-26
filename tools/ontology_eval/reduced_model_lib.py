@@ -94,7 +94,7 @@ class Reduced:
                 # N 이면 인접일 중 하나도 N 이어야 (단일 N 금지)
                 self._add(f"NotOneNight:n{n}:d{d}",
                           self.X(n, d, "N") <= self.X(n, d - 1, "N") + self.X(n, d + 1, "N"),
-                          "NotOneNight", f"단일N금지 n{n}d{d}", "not_one_night")
+                          "NotOneNight", f"단일N금지 n{n}d{d}", "not_one_night")  # nm:external
 
     # ── night recovery 2N->2O ──
     def night_recovery(self):

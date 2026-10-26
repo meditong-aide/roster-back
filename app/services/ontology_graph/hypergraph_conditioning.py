@@ -11,7 +11,7 @@ monolithic DP 보다 이득.
   ③ 의미 재구성: factor graph solver 판정 == 독립 oracle (누락 factor 면 반드시 불일치)
 
 변수: x[i,d] ∈ 정적 허용 shift. factor:
-  · Nf(i): per-nurse 시퀀스 전체(회복=실제 OFF·max run·not_one_night·전이·max연속근무).
+  · Nf(i): per-nurse 시퀀스 전체(회복=실제 OFF·max run·ban_single_night·전이·max연속근무).
            frontier_dp._options/_step 를 그대로 시뮬레이션 → 검증된 엔진과 동일 semantics.
   · Cf(d): 그날 D/E/N 커버리지.
   (banned/forced 는 x 도메인 정적 제약 + Nf 시뮬레이션에 반영.)

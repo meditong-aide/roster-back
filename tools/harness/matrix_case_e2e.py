@@ -78,7 +78,7 @@ def _base_config() -> Dict[str, Any]:
         "max_night_shifts_per_month": 8,
         "max_consecutive_work": 5,
         "max_consecutive_night": 3,
-        "not_one_night": False,
+        "ban_single_night": False,
         "two_offs_after_two_nig": False,
         "two_offs_after_three_nig": False,
         "ban_night_before_fixed_off": False,
@@ -745,7 +745,7 @@ def case_win_006(client: RosterClient) -> Dict[str, Any]:
 
     body = dict(snapshot or {})
     body.pop("config_id", None)  # 새 version 으로 저장
-    body["three_seq_nig"] = False
+    body["three_seq_nig"] = False  # nm:external
     body["max_nig_per_month"] = 3
     body["nig_req"] = 10
     body["day_req"] = body.get("day_req", 6)

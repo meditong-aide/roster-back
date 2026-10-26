@@ -73,7 +73,7 @@ SCENARIOS: list[dict] = [
         "complexity": "simple",
         "query": "주2회 오프 보장 설정 어떻게 되어있어?",
         "expected_action": (
-            "query_schedule(scope=constraint_config) 호출. two_offs_per_week (bool) 값 응답."
+            "query_schedule(scope=constraint_config) 호출. prefer_two_offs_per_7days (bool) 값 응답."
         ),
         "turns": [{
             "user": "주2회 오프 보장 설정 어떻게 되어있어?",
@@ -192,13 +192,13 @@ SCENARIOS: list[dict] = [
         "complexity": "simple",
         "query": "이브닝 다음날 데이 금지 해제해줘",
         "expected_action": (
-            "update_constraint(field=banned_day_after_eve, value=false, preview_only=True). "
+            "update_constraint(field=ban_shift_transitions, value=false, preview_only=True). "
             "기존이 true 라면 false 로 전환 안내."
         ),
         "turns": [{
             "user": "이브닝 다음날 데이 금지 해제해줘",
             "expected_skill_calls": [{"name": "update_constraint",
-                "args_subset": {"field": "banned_day_after_eve", "value": False, "preview_only": True}}],
+                "args_subset": {"field": "ban_shift_transitions", "value": False, "preview_only": True}}],
             "expected_awaiting_approval": True,
         }],
         "mode": "preview", "permission": "hn_only", "notes": None,
@@ -608,13 +608,13 @@ SCENARIOS: list[dict] = [
         "complexity": "simple",
         "query": "최소 경력자 시프트당 2명 이상으로",
         "expected_action": (
-            "update_constraint(field=min_exp_per_shift, value=2, preview_only=True). "
+            "update_constraint(field=senior_min_years, value=2, preview_only=True). "
             "병동 정책 — 모든 시프트에 grade ≥2 인 nurse 최소 2명 필수. confirm 후 적용."
         ),
         "turns": [{
             "user": "최소 경력자 시프트당 2명 이상으로",
             "expected_skill_calls": [{"name": "update_constraint",
-                "args_subset": {"field": "min_exp_per_shift", "value": 2, "preview_only": True}}],
+                "args_subset": {"field": "senior_min_years", "value": 2, "preview_only": True}}],
             "expected_awaiting_approval": True,
         }],
         "mode": "preview", "permission": "hn_only", "notes": None,

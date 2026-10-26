@@ -9,6 +9,7 @@ from sqlalchemy import desc
 
 from db.models import RosterJob
 from agents_v2.tools.narrative_formatter import format_infeasibility, format_infeasibility_response
+from services.engine_contract.names import to_internal_config_slots
 
 
 def get_job_status(db: Session, job_id: str) -> dict | None:
@@ -103,8 +104,9 @@ def _job_dict(row: RosterJob) -> dict:
                 d["infeasibility"] = narrative
                 # 사용자에게 노출되는 한국어 자연어 응답 (raw enum 코드 미노출)
                 d["infeasibility_response"] = format_infeasibility_response(payload)
-                # raw payload 는 debug/trace 용도로 격리
-                d["debug_payload"] = payload
+                # raw payload 는 debug/trace 용도로 격리. 저장본은 바깥(옛) 설정 이름이라, 에이전트가 보는 설정 자리
+                # (카드 apply·config_key)만 파이썬 이름으로 되돌린다(NM) — 같은 대화의 설정 읽기와 이름이 섞이지 않게.
+                d["debug_payload"] = to_internal_config_slots(payload)
         except (json.JSONDecodeError, ValueError):
             pass
     return d

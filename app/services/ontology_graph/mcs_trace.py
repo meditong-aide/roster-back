@@ -117,9 +117,9 @@ FAMILY_CONFIG_RELAX: dict[str, dict[str, Any]] = {
     "night_cap":     {"max_nig_per_month": 40},
     "2n2off":        {"two_offs_after_two_nig": False},
     "night_recovery":{"two_offs_after_two_nig": False, "two_offs_after_three_nig": False},
-    "not_one_night": {"not_one_night": False},
+    "not_one_night": {"ban_single_night": False},  # nm:external — 앞 "not_one_night" 는 family id(바깥 식별자), 효과 dict 키만 새 이름
     "consecutive":   {"max_conseq_work": 40},
-    "transition":    {"banned_day_after_eve": False, "ban_n_to_d": False, "ban_n_to_e": False},
+    "transition":    {"ban_shift_transitions": False, "ban_n_to_d": False, "ban_n_to_e": False},
 }
 _NURSE_LIMIT_KEYS = ("n_exact", "n_max", "n_min", "d_exact", "d_max", "e_exact", "e_max")
 
@@ -181,7 +181,7 @@ def build_family_resolver(
 _FAMILY_KO = {
     "off_budget": "OFF 일수", "night_cap": "야간 상한", "monthly_limit": "월 야간 한도",
     "weekend_off": "주말 휴무", "2n2off": "야간 후 2일 휴식", "night_recovery": "야간 회복 휴무",
-    "not_one_night": "고립 야간 금지", "consecutive": "연속근무 상한", "transition": "근무 전환 규칙",
+    "not_one_night": "고립 야간 금지", "consecutive": "연속근무 상한", "transition": "근무 전환 규칙",  # nm:external — family id
     "preceptee": "프리셉티 동반", "cross_month": "전월 경계", "coverage": "필요 인원",
     "grade": "등급 최소", "team": "팀 최소", "fixed_cell": "고정 근무(원티드/휴가)",
 }
@@ -198,7 +198,7 @@ FAMILY_PRESENTATION: dict[str, dict[str, Any]] = {
                       "where": "원티드 조정판"},
     "2n2off":        {"bucket": "tradeoff", "tradeoff": "야간 후 휴식(2OFF) 보장이 약화됩니다."},
     "night_recovery":{"bucket": "tradeoff", "tradeoff": "야간 후 회복 휴무 보장이 약화됩니다."},
-    "not_one_night": {"bucket": "tradeoff", "tradeoff": "하루짜리 고립 야간이 생길 수 있습니다."},
+    "not_one_night": {"bucket": "tradeoff", "tradeoff": "하루짜리 고립 야간이 생길 수 있습니다."},  # nm:external — family id
     "consecutive":   {"bucket": "tradeoff", "tradeoff": "연속근무가 늘어 피로가 누적될 수 있습니다."},
     "transition":    {"bucket": "tradeoff", "tradeoff": "야간 다음날 주간 전환이 생길 수 있습니다."},
     "preceptee":     {"bucket": "tradeoff", "tradeoff": "프리셉티 교육 동반이 약화됩니다."},

@@ -48,7 +48,7 @@ def _norm_bounds(min_v: Any, max_v: Any, exact_v: Any) -> tuple[int | None, int 
 def collect_single_n_allowed_nurse_indices(rs: RosterSystem) -> set[int]:
     """nurse_monthly_limit 의 n_max == 1 인 nurse 의 nurse_index set 을 반환.
 
-    1N 금지(not_one_night) hard 제약에서 면제 대상 — 운영자가 월간 한도로 N=1 을
+    1N 금지(ban_single_night) hard 제약에서 면제 대상 — 운영자가 월간 한도로 N=1 을
     명시한 의도는 default 1N 금지 정책보다 우선한다.
 
     면제 조건:

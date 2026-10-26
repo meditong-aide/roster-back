@@ -112,7 +112,7 @@ def postprocess_health_leave(db: Session, schedule, generated: dict,
     dim = calendar.monthrange(year, month)[1]
     fixed = {str(x) for x in (fixed_ids or set())}
     # 확정 원티드 OFF 보호 — off_swap 과 같은 헬퍼를 쓴다(판정이 갈리면 안 된다).
-    # ★ `fixed_wanted_use_yn` 은 **보지 않는다.** 이 보호는 솔버 제약의 연장이 아니라
+    # ★ `apply_confirmed_wanted` 은 **보지 않는다.** 이 보호는 솔버 제약의 연장이 아니라
     #   "사용자가 날짜를 지정해 받은 휴일을 다른 코드로 덮지 않는다" 는 것이고,
     #   그 사실은 하드 고정 여부와 무관하다. off_swap 도 같은 이유로 이 플래그를 안 본다.
     #   과잉 보호도 아니다 — 후보는 애초에 생성 결과가 OFF 인 날뿐이라,

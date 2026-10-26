@@ -399,6 +399,9 @@ class RosterConfigCreate(RosterConfigBase):
     # pass
 
 
+# ★ NM — 지금 쓰이지 않는 응답 모델이다(routers/roster.py 의 이 이름 import 는 뒤의 ORM RosterConfig import 에 가려진다).
+#   ORM 으로 채우지 말 것: 필드가 옛(바깥) 이름이라 from_attributes 가 ORM 의 옛 이름 호환 심을 읽는다 —
+#   운영은 경고 1회, 시험(strict)은 OldConfigNameError. 설정 조회 응답은 routers/roster.py `_roster_config_to_dict` 가 낸다.
 class RosterConfig(RosterConfigBase):
     config_id: int
     office_id: str

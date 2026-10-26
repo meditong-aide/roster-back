@@ -2,7 +2,7 @@
 
 정책 (HanJongjun, 2026-05-12 + 사용자 확인 2026-05-17):
   nurse_monthly_limit 에서 **N 상한이 1로 명시** 될 때 (n_exact=1 또는 n_max=1)
-  해당 nurse 는 not_one_night hard 제약에서 면제.
+  해당 nurse 는 ban_single_night hard 제약에서 면제.
 
   → "정확히 1번" 또는 "최대 1번" 인 경우만. n_min=1 만 있는 경우는 상한이 더
     클 수 있어 (예: n_min=1, n_max=5) solver 가 1로 풀지 다중으로 풀지 자유 →

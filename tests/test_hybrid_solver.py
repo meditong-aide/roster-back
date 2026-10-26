@@ -55,7 +55,7 @@ def test_hybrid_matches_oracle():
 def test_dense_recovery_solved_by_component_frontier():
     """dense 회복 starvation: 1 component → frontier DP → INFEASIBLE (conditioning 은 UNKNOWN)."""
     r = solve_hybrid(_pool(5), _cfg({"D": 1, "E": 1, "N": 2},
-                                    {"two_offs_after_two_nig": True, "not_one_night": True}), 6)
+                                    {"two_offs_after_two_nig": True, "ban_single_night": True}), 6)
     assert r.status == "INFEASIBLE_CERTIFIED"
     assert r.components == 1
 
@@ -63,7 +63,7 @@ def test_dense_recovery_solved_by_component_frontier():
 def test_sparse_splits_into_two_component_frontier_dps():
     fo = {f"n{i}": [3, 4, 5] for i in range(3)}
     fo.update({f"n{i}": [0, 1, 2] for i in range(3, 6)})
-    r = solve_hybrid(_pool(6), _cfg({"D": 1, "E": 0, "N": 1}, {"not_one_night": True}, fo=fo), 6)
+    r = solve_hybrid(_pool(6), _cfg({"D": 1, "E": 0, "N": 1}, {"ban_single_night": True}, fo=fo), 6)
     assert r.components == 2
     assert r.component_sizes == (3, 3)
 
@@ -71,7 +71,7 @@ def test_sparse_splits_into_two_component_frontier_dps():
 def test_no_double_count_of_in_component_forced_nurse():
     """회귀: component 안 강제(singleton) 간호사 기여를 req 에서 이중차감하면 안 됨(과거 falseFEAS)."""
     nu = _pool(5, allowed=[["N"], None, None, None, ["N"]])
-    cfg = _cfg({"D": 0, "E": 2, "N": 2}, {"not_one_night": True, "two_offs_after_three_nig": True},
+    cfg = _cfg({"D": 0, "E": 2, "N": 2}, {"ban_single_night": True, "two_offs_after_three_nig": True},
                fb={"n1": {4: ["N"]}, "n4": {2: ["O"]}},
                fo={"n2": [1], "n3": [2], "n4": [3]})
     assert is_feasible(nu, cfg, 6) is False
@@ -79,7 +79,7 @@ def test_no_double_count_of_in_component_forced_nurse():
 
 
 def test_empty_domain():
-    r = solve_hybrid(_pool(4), _cfg({"D": 1, "E": 1, "N": 1}, {"not_one_night": True},
+    r = solve_hybrid(_pool(4), _cfg({"D": 1, "E": 1, "N": 1}, {"ban_single_night": True},
                                     fb={"n0": {2: ["O"]}}, fo={"n0": [2]}), 5)
     assert r.status == "INFEASIBLE_CERTIFIED"
     assert r.certificate.kind == "empty_domain"

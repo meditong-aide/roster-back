@@ -29,7 +29,7 @@ _EXACT = ProductionCpSatVerifier(lambda nu, c, d: is_feasible(nu, c, d))
 
 def _banned_case():
     nu = [{"nurse_id": "x", "allowed_shifts": ["N"]}] + [{"nurse_id": f"n{i}"} for i in range(4)]
-    cfg = {"two_offs_after_three_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_three_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
            "initial_constraints": {"forbidden": {"x": {2: ["O"], 3: ["O"], 4: ["O"], 5: ["O"]}},
                                    "forced_off": {}}}
@@ -57,7 +57,7 @@ def test_full_cycle_certificate_and_verified_repairs():
 
 def test_feasible_case_ends_cycle():
     nu = [{"nurse_id": f"n{i}"} for i in range(6)]
-    cfg = {"not_one_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
+    cfg = {"ban_single_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     res = core_guided_diagnosis(nu, cfg, 6, verifier=_EXACT)
     assert res.solver_feasible is True
@@ -66,7 +66,7 @@ def test_feasible_case_ends_cycle():
 
 def test_schedule_validator_catches_sequence_and_coverage():
     nu = [{"nurse_id": f"n{i}"} for i in range(5)]
-    cfg = {"two_offs_after_two_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_two_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     # 고립 N (n2 day1 O after single N) → sequence 위반
@@ -78,7 +78,7 @@ def test_schedule_validator_catches_sequence_and_coverage():
 
 def test_schedule_validator_accepts_valid():
     nu = [{"nurse_id": f"n{i}"} for i in range(4)]
-    cfg = {"not_one_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
+    cfg = {"ban_single_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     # 매일 D/E/N 각 1 + 1명 OFF (시퀀스 위반 없음: N 은 n2 가 연속)
     good = {"n0": "DDDD", "n1": "EEEE", "n2": "NNNN", "n3": "OOOO"}

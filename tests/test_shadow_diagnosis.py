@@ -9,7 +9,7 @@ def _nu(k):
     return [{"nurse_id": f"n{i}", "allowed_shifts": []} for i in range(k)]
 
 
-_CFG = {"two_offs_after_two_nig": True, "not_one_night": True,
+_CFG = {"two_offs_after_two_nig": True, "ban_single_night": True,
         "daily_shift_requirements": {"D": 1, "E": 1, "N": 2},
         "initial_constraints": {"forbidden": {}, "forced_off": {}}}
 

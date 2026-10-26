@@ -379,7 +379,7 @@ def _call_banned_eves(
     #   엄격**해져 멀쩡한 콜 후보를 빼 버린다.
     #   ① 축(휴가·공가)은 special_fixed 경로라 이 플래그와 무관하다.
     if by_wanted and not _read_config_flag(
-        db, group_id, "fixed_wanted_use_yn", config_id=config_id, default=False
+        db, group_id, "fixed_wanted_use_yn", config_id=config_id, default=False  # nm:external
     ):
         by_wanted = False
     if not (by_type or by_wanted):

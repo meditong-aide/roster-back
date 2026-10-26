@@ -25,6 +25,7 @@ from agents_v2.middleware import SkillResult, execute_skill
 from agents_v2.schemas.session_context import SessionContext
 from agents_v2.skills.descriptions import SKILL_TOOLS
 from agents_v2.variable_memory import VariableMemory
+from services.engine_contract.names import internal_key, to_internal
 from services.memory.extractor import MemoryExtractor
 from services.memory.user_repo import UserMemoryRepo
 
@@ -649,8 +650,10 @@ class SchedulingAgent:
             return AgentResult(answer="승인 대기 중인 작업이 없습니다.", messages=messages)
 
         # Re-execute with preview_only=false
-        args = {**approval.get("args", {}), "preview_only": False}
         skill_name = approval.get("skill_name", "bulk_mutation")
+        args = {**approval.get("args", {}), "preview_only": False}
+        if skill_name.replace("-", "_") == "update_constraint":
+            args = _approval_args_with_internal_names(args)
 
         trace: list[Stage] = []
         result = execute_skill(db, skill_name, args, ctx)
@@ -742,6 +745,20 @@ _DENY_WORDS = frozenset({
 
 
 _CONFIRM_MAX_LEN = 20  # confirmation 으로 보려는 메시지의 최대 길이 (짧은 ack 가정)
+
+
+def _approval_args_with_internal_names(args: dict) -> dict:
+    """NM — 배포 전에 저장된 승인 대기(세션 저장소에 최대 24시간)는 옛(바깥) 설정 이름을 담고 있을 수 있다.
+    재실행은 LLM 이 아니라 코드가 하므로 설정 이름 자리(field·mutation.target_field·updates 키)만 새 이름으로 잇는다."""
+    out = dict(args)
+    if isinstance(out.get("field"), str):
+        out["field"] = internal_key(out["field"])
+    mutation = out.get("mutation")
+    if isinstance(mutation, dict) and isinstance(mutation.get("target_field"), str):
+        out["mutation"] = {**mutation, "target_field": internal_key(mutation["target_field"])}
+    if isinstance(out.get("updates"), dict):
+        out["updates"] = to_internal(out["updates"])
+    return out
 
 
 def _is_denial(msg: str) -> bool:

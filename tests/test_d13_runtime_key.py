@@ -1,8 +1,8 @@
 """EI-11 11b — D13 ①③(`.omc/aide_docs/v2/engine_input/ei11/EI11_SPEC_v2.md` §2.4 · 사용자 결정 D13=①, 10-20).
 
-`max_consecutive_nights`(정본 `three_seq_nig` 의 int 별칭)는 런타임에 금지한다.
-- ① 월경계(`build_cross_month_constraints`)·월중 경계(`build_mid_month_boundary_constraints`)는 정본 `three_seq_nig` 만 읽는다
-  (`L = 3 if three_seq_nig else 2` · 부재 기본값 False→2 는 그대로 — 엔진 부재 기본 True 와의 비대칭은 EI-16 큐).
+`max_consecutive_nights`(정본 `allow_three_consecutive_nights` 의 int 별칭)는 런타임에 금지한다.
+- ① 월경계(`build_cross_month_constraints`)·월중 경계(`build_mid_month_boundary_constraints`)는 정본 `allow_three_consecutive_nights` 만 읽는다
+  (`L = 3 if allow_three_consecutive_nights else 2` · 부재 기본값 False→2 는 그대로 — 엔진 부재 기본 True 와의 비대칭은 EI-16 큐).
 - ③ 요청(`config_override`)에 이 별칭이 있으면 값과 무관하게 400(`runtime_key_forbidden` — 레지스트리 표지
   `derived_inputs['max_consecutive_nights']['runtime'] == 'forbidden'` 를 판정이 매번 읽는다).
 - ② 카드가 이 키를 내지 않는 것은 11a-1 몫이다 — 여기서는 카드·처방·control·fix_location 어디서도 못 낸다는 것을 다시 본다.
@@ -72,21 +72,21 @@ def test_boundary_functions_have_no_alias_literal(name):
 
 def test_registry_and_rule_tags_say_the_canonical_key_wins():
     """레지스트리 표지(정본 우선 · 런타임 금지)와 규칙 이름표가 ① 과 같은 사실을 말한다 — 경계를 쓰는 두 규칙
-    (`initial_forbidden`·`fixed_assignment:*`)의 governing_keys 는 정본 `three_seq_nig` 를 들고 별칭 런타임 키는 없다."""
+    (`initial_forbidden`·`fixed_assignment:*`)의 governing_keys 는 정본 `allow_three_consecutive_nights` 를 들고 별칭 런타임 키는 없다."""
     from services.engine_contract.rules import RULE_PREFIXES, RULES
 
-    info = S.lookup("three_seq_nig").derived_inputs[ALIAS]
+    info = S.lookup("allow_three_consecutive_nights").derived_inputs[ALIAS]
     assert (info["precedence"], info["runtime"]) == ("canonical_wins", "forbidden")
     specs = [*RULES.values(), *RULE_PREFIXES.values()]
     assert [s.id for s in specs if f"runtime.{ALIAS}" in s.governing_keys] == []
     boundary_rules = [s for s in specs if s.id in ("initial_forbidden", "fixed_assignment:*")]
-    assert len(boundary_rules) == 2 and all("three_seq_nig" in s.governing_keys for s in boundary_rules)
+    assert len(boundary_rules) == 2 and all("allow_three_consecutive_nights" in s.governing_keys for s in boundary_rules)
 
 
 @pytest.mark.parametrize("name", _BOUNDARY_FUNCS)
 @pytest.mark.parametrize(("config_dict", "want"), [
-    ({"three_seq_nig": False, ALIAS: 7}, 2),
-    ({"three_seq_nig": True, ALIAS: 2}, 3),
+    ({"allow_three_consecutive_nights": False, ALIAS: 7}, 2),
+    ({"allow_three_consecutive_nights": True, ALIAS: 2}, 3),
     ({}, 2),
     ({ALIAS: 7}, 2),
 ], ids=["alias_cannot_loosen", "alias_cannot_tighten", "absent_default_2", "alias_only_ignored"])
@@ -139,14 +139,14 @@ def test_config_change_violations_keep_the_old_classification():
 
 
 def test_removing_the_registry_marker_breaks_the_rule_immediately(monkeypatch):
-    spec = S.lookup("three_seq_nig")
+    spec = S.lookup("allow_three_consecutive_nights")
     info = dict(spec.derived_inputs[ALIAS])
     assert info.pop("runtime") == "forbidden"
     patched = replace(spec, derived_inputs={ALIAS: info})
     new_settings = tuple(patched if s is spec else s for s in S.SETTINGS)
     monkeypatch.setattr(S, "SETTINGS", new_settings)
     monkeypatch.setattr(hl, "SETTINGS", new_settings)
-    monkeypatch.setitem(S.SETTINGS_BY_KEY, "three_seq_nig", patched)
+    monkeypatch.setitem(S.SETTINGS_BY_KEY, "allow_three_consecutive_nights", patched)
     assert _guard_detail({ALIAS: 2}) is None, "표지가 없으면 상한 안 값은 통과(옛 동작)"
     assert [v.reason_code for v in hl.override_violations({ALIAS: 7})] == ["exceeds_cap"]
     assert _guard_detail({ALIAS: 7}) != _MESSAGE
@@ -156,7 +156,7 @@ def test_removing_the_registry_marker_breaks_the_rule_immediately(monkeypatch):
 
 
 def test_no_producer_emits_the_alias():
-    samples = [cf.strict_base(), {}, {**cf.strict_base(), "three_seq_nig": False, "max_conseq_work": 3}]
+    samples = [cf.strict_base(), {}, {**cf.strict_base(), "allow_three_consecutive_nights": False, "max_conseq_work": 3}]
     catalog_keys = {(item.get("search") or {}).get("key") for item in RELAX_CATALOG}
     catalog_keys |= {key for base in samples for item in RELAX_CATALOG for key in item["apply"](dict(base))}
     assert ALIAS not in catalog_keys

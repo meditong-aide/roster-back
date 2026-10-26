@@ -95,9 +95,9 @@ VARIANTS = [
     {},
     {"n2n_min_gap": 8},
     {"n2n_min_gap": 0, "max_conseq_work": 4},
-    {"three_seq_nig": False, "n2n_min_gap": 5},
+    {"allow_three_consecutive_nights": False, "n2n_min_gap": 5},
     {"two_offs_after_two_nig": True, "ban_n_to_e": False},
-    {"n2n_min_gap": 3, "banned_day_after_eve": True, "not_one_night": True},
+    {"n2n_min_gap": 3, "ban_shift_transitions": True, "ban_single_night": True},
 ]
 
 

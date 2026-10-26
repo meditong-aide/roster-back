@@ -242,6 +242,7 @@ def process_job(payload: dict) -> dict:
     from db.models import RosterConfig
     from schemas.roster_schema import RosterRequest
     from services.roster_create_service import generate_roster_service
+    from services.engine_contract.names import to_external_deep, to_internal
     from services.job_status_service import (
         STATUS_FAILED,
         STATUS_RUNNING,
@@ -312,7 +313,9 @@ def process_job(payload: dict) -> dict:
         # ontology 옵션은 treatment_ids 로. 일반 생성이면 둘 다 None → 기존 동작 동일.
         roster_data = generate_roster_service(
             req, current_user, db,
-            config_override=getattr(req, "config_override", None) or None,
+            # SQS params 의 config_override 는 바깥(옛) 이름이다 — 파이썬 이름으로 바꿔 넘긴다(NM).
+            #   서비스 입구도 다시 바꾸므로 멱등이다. 하드락 관문은 옛·새 이름을 다 판정한다.
+            config_override=to_internal(getattr(req, "config_override", None) or None),
             treatment_ids=(getattr(req, "treatment_ids", None) or None),
             weekend_off_release=(getattr(req, "weekend_off_release", None) or None),
             monthly_limit_release=(getattr(req, "monthly_limit_release", None) or None),
@@ -394,7 +397,9 @@ def process_job(payload: dict) -> dict:
         _has_struct_detail = isinstance(exc_obj, _HTTPException) and isinstance(exc_obj.detail, dict)
         if _has_struct_detail:
             try:
-                err_msg = _json.dumps(exc_obj.detail, ensure_ascii=False)
+                # roster_jobs.error_message 는 저장 JSON 이다 — jobs.py 가 그대로 응답에 싣고 프론트가 여기서
+                #   resolution_options 를 읽으므로 바깥(옛) 이름이어야 한다(NM). 서비스 래퍼가 이미 바꿨어도 멱등이다.
+                err_msg = _json.dumps(to_external_deep(exc_obj.detail), ensure_ascii=False)
             except (TypeError, ValueError):
                 err_msg = str(exc_obj.detail)
         else:

@@ -60,7 +60,7 @@ _POLICY_DIFF_EXCLUDE = frozenset({
 #: mcs 원인 가족 중 `FAMILY_CONFIG_RELAX` 에 효과가 없는 둘의 보충 효과(§2.0.3).
 _CAUSE_FAMILY_EXTRA_EFFECT = {
     "cross_month": {"cross_month_hard_rules_enable": False},
-    "preceptee": {"preceptee_on": False},
+    "preceptee": {"preceptee_follows_preceptor": False},
 }
 
 #: 카드가 설정을 바꾸는 통로 — 전역 판정 실패 때 이 중 하나라도 비지 않은 카드는 뺀다(§2.0.6 ②).

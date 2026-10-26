@@ -49,7 +49,7 @@ def compute_soft_penalties(
     n_counts = [sum(1 for c in s if c == "N") for s in seqs.values()]
     night_dev = (max(n_counts) - min(n_counts)) if n_counts else 0
 
-    iso_work = iso_off = nod_noe = 0
+    iso_work = iso_off = nod_noe_count = 0   # nod_noe_count: 설정이 아니라 N-O-D/E 패턴 개수
     for s in seqs.values():
         for i in range(1, len(s) - 1):
             prev, cur, nxt = s[i - 1], s[i], s[i + 1]
@@ -60,20 +60,20 @@ def compute_soft_penalties(
                 iso_off += 1
         for i in range(len(s) - 2):
             if s[i] == "N" and s[i + 1] == "O" and s[i + 2] in {"D", "E"}:
-                nod_noe += 1
+                nod_noe_count += 1
 
     return {
         "night_deviation": int(night_dev),
         "isolated_work": int(iso_work),
         "isolated_off": int(iso_off),
-        "nod_noe": int(nod_noe),
+        "nod_noe": int(nod_noe_count),  # nm:external — soft family id
     }
 
 
 # 소프트 family → constrains 대상 shift (없으면 전체 work shift)
 _SOFT_SHIFT = {
     "night_deviation": ["N"],
-    "nod_noe": ["N"],
+    "nod_noe": ["N"],  # nm:external — soft family id
 }
 
 

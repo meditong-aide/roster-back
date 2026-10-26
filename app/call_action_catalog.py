@@ -165,14 +165,14 @@ _CATALOG_RAW = [
      "fields": {"config_id": "프리셋ID", "config_name": "프리셋이름",
                 "day_req": "D요구", "eve_req": "E요구", "nig_req": "N요구", "max_nig_per_month": "월나이트상한",
                 "max_conseq_work": "최대연속근무", "off_days": "OFF수", "use_mid": "MID사용",
-                "not_one_night": "1N금지", "off_first": "OFF우선"}, "masked": {}},
+                "not_one_night": "1N금지", "off_first": "근무인원우선"}, "masked": {}},  # nm:external
     {"m": "DELETE", "p": "/roster/config/{config_id}", "page": "근무표만들기", "section": "설정 프리셋 관리",
      "action": "저장 설정 프리셋 미노출", "shape": "none", "fields": {}, "masked": {}},
     {"m": "POST", "p": "/roster_create/async", "page": "근무표만들기", "section": "생성 실행",
      "action": "근무표 생성 요청(비동기)", "shape": "dict",
      "fields": {"year": "연도", "month": "월", "group_id": "병동", "config_id": "설정ID",
                 "grade_strategy": "직급전략", "distribution_mode": "분배모드", "advanced_inference": "고급추론",
-                "not_one_night": "1N금지", "use_fixed_wanted": "확정원티드"}, "masked": {}},
+                "not_one_night": "1N금지", "use_fixed_wanted": "확정원티드"}, "masked": {}},  # nm:external
     {"m": "POST", "p": "/roster_create/generate", "page": "근무표만들기", "section": "생성 실행",
      "action": "근무표 생성(동기)", "shape": "dict",
      "fields": {"year": "연도", "month": "월", "group_id": "병동", "config_id": "설정ID",

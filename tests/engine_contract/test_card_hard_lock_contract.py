@@ -73,7 +73,7 @@ def _b2_below_cap() -> dict:
     base = cf.strict_base()
     base.update(dict.fromkeys(_keys("max_conseq_work"), 4))
     base.update(dict.fromkeys(_keys("max_nig_per_month"), 10))
-    base["three_seq_nig"] = False
+    base["allow_three_consecutive_nights"] = False
     return base
 
 
@@ -115,7 +115,7 @@ def test_strict_base_is_new_dict_every_call():
 
 def test_samples_b1_to_b4_and_zero():
     b2, b3, zero = _b2_below_cap(), _b3_registry_defaults(), SAMPLES["B1-0"]()
-    assert b2["max_conseq_work"] == 4 and b2["max_night_shifts_per_month"] == 10 and b2["three_seq_nig"] is False
+    assert b2["max_conseq_work"] == 4 and b2["max_night_shifts_per_month"] == 10 and b2["allow_three_consecutive_nights"] is False
     bool_keys = [s.key for s in S.SETTINGS if isinstance(s.hard_lock, S.HardLock) and s.hard_lock.kind == "bool_on"]
     assert [k for k in bool_keys if b3[k] is False], "B3 는 일부 하드락 bool 이 꺼진 표본이어야 한다"
     assert all(b2[k] is True for k in bool_keys)
@@ -256,7 +256,7 @@ _E5 = {
     "consecutive": ([[1]], []),
     "transition": ([[2], [2], [2]], []),
     "cross_month": ([[1, 2, 3, 4, 5, 7]], []),
-    "preceptee": ([], ["preceptee_on"]),
+    "preceptee": ([], ["preceptee_follows_preceptor"]),
     "off_budget": ([], ["off_days"]),
 }
 
@@ -454,7 +454,7 @@ def test_finalize_sole_option_dict_shares_marks_and_blocks():
 
 
 def test_finalize_sole_option_list_partial_and_all_blocked():
-    ok, bad = _card("cause:banned_release", source="cause"), _card("cause:x", apply={"not_one_night": False})
+    ok, bad = _card("cause:banned_release", source="cause"), _card("cause:x", apply={"ban_single_night": False})
     inf = {"resolution_options": [ok, bad], "_sole_option": [ok, bad]}
     cf.finalize_infeasibility(inf)
     assert inf["_sole_option"] == [ok] and inf["resolution_options"] == [ok]
@@ -468,7 +468,7 @@ def test_finalize_policy_forbidden_is_kind_id_union_after_previous():
              "message_ko": "앞 기록"}]
     inf = {"policy_forbidden": copy.deepcopy(prev), "resolution_options": [
         _card("lever:max_conseq_work", apply={"max_conseq_work": 6}),
-        _card("probe:disable_not_one_night", apply={"not_one_night": False})]}
+        _card("probe:disable_not_one_night", apply={"ban_single_night": False})]}
     cf.finalize_infeasibility(inf)
     assert [(p["kind"], p["id"]) for p in inf["policy_forbidden"]] == [
         ("card", "lever:max_conseq_work"), ("card", "probe:disable_not_one_night")]
@@ -505,7 +505,7 @@ def test_finalize_json_roundtrip_dict_gives_same_result():
     assert json.dumps(roundtrip, sort_keys=True, ensure_ascii=False) == json.dumps(direct, sort_keys=True, ensure_ascii=False)
 
 
-@pytest.mark.parametrize("value", [None, "x", {"a": 1}, ({"option_id": "t", "apply": {"not_one_night": False}},)])
+@pytest.mark.parametrize("value", [None, "x", {"a": 1}, ({"option_id": "t", "apply": {"ban_single_night": False}},)])
 def test_finalize_leaves_non_list_resolution_options_untouched(value):
     inf = {"resolution_options": value}
     cf.finalize_infeasibility(inf)
@@ -592,7 +592,7 @@ def test_fault_last_resort_when_filtering_path_itself_fails(monkeypatch):
 
 @pytest.mark.parametrize("inf", [
     {"resolution_options": [None, 1, "s", ["a"], {"apply": [("off_days", 1)]}]},
-    {"resolution_options": [{"option_id": ["unhashable"], "apply": {"not_one_night": False}}]},
+    {"resolution_options": [{"option_id": ["unhashable"], "apply": {"ban_single_night": False}}]},
     {"resolution_options": [{"treatment_ids": [["x"]]}], "_sole_option": "weird"},
     {"policy_forbidden": "garbage", "policy_filter_error": "x", "resolution_options": [{"family": 3, "source": "cause"}]},
     {"_sole_option": [None, {"apply": {"use_mid": False}}]},
@@ -609,14 +609,14 @@ def test_fault_finalize_never_raises(inf):
 def test_no_cache_registry_change_is_seen_immediately(monkeypatch):
     pair = ("ConsecutiveNightLimit", "set_threshold")
     assert cf.family_action_policy()[pair]["mode"] == "blocked"  # 11b(D13 ③) — 옛 capped
-    spec = S.lookup("three_seq_nig")
+    spec = S.lookup("allow_three_consecutive_nights")
     patched = replace(spec, hard_lock=None)
     new_settings = tuple(patched if s is spec else s for s in S.SETTINGS)
     monkeypatch.setattr(S, "SETTINGS", new_settings)
     monkeypatch.setattr(hl, "SETTINGS", new_settings)
-    monkeypatch.setitem(S.SETTINGS_BY_KEY, "three_seq_nig", patched)
+    monkeypatch.setitem(S.SETTINGS_BY_KEY, "allow_three_consecutive_nights", patched)
     assert cf.family_action_policy()[pair] == {"mode": "ok", "rule_nos": []}
-    assert "three_seq_nig" not in cf.strict_base()
+    assert "allow_three_consecutive_nights" not in cf.strict_base()
 
 
 def test_normal_path_leaves_no_warning_or_failure_line(caplog, capsys):
@@ -1081,19 +1081,20 @@ _ADVERSARIAL_VALUES = (None, True, False, 0, 1, -1, 2, 3, 4, 5, 6, 15, 16, " 16 
 
 
 def _guard_table_keys() -> list[str]:
-    """§2.4-6 방향 표의 키 — 레지스트리 하드락 행(8종·월경계 스위치)과 인접·영향 행의 정본·별칭 + 엔진 내부 금지 키."""
-    keys = [key for spec in S.SETTINGS if spec.hard_lock is not None for key in (spec.key, *spec.aliases)]
+    """§2.4-6 방향 표의 키 — 레지스트리 하드락 행(8종·월경계 스위치)과 인접·영향 행의 정본·별칭·바깥(옛) 이름(NM) + 엔진 내부 금지 키."""
+    keys = [key for spec in S.SETTINGS if spec.hard_lock is not None
+            for key in (spec.key, *spec.aliases, *((spec.column,) if spec.column else ()))]
     return [*keys, *hl._FORBIDDEN_INTERNAL_KEYS]
 
 
 def test_guard_table_keys_cover_every_row_of_the_direction_table():
     """표본 무의미 방지 — 키 목록에 8종 정본·별칭·D13 별칭·월경계 스위치·내부 키·인접 키가 모두 든다."""
     keys = set(_guard_table_keys())
-    assert {"max_conseq_work", "max_consecutive_work_days", "max_consecutive_work", "banned_day_after_eve", "ban_e_to_d",
-            "ban_n_to_d", "ban_n_to_e", "two_offs_after_three_nig", "two_offs_after_two_nig", "not_one_night", "use_mid",
-            "three_seq_nig", "max_consecutive_nights", "max_nig_per_month", "max_night_shifts_per_month",
+    assert {"max_conseq_work", "max_consecutive_work_days", "max_consecutive_work", "ban_shift_transitions", "ban_e_to_d",
+            "ban_n_to_d", "ban_n_to_e", "two_offs_after_three_nig", "two_offs_after_two_nig", "ban_single_night", "use_mid",
+            "allow_three_consecutive_nights", "max_consecutive_nights", "max_nig_per_month", "max_night_shifts_per_month",
             "cross_month_hard_rules_enable", "cross_month_lookback_days", "_inbound_source_map", "off_days",
-            "preceptee_on", "n2n_min_gap"} <= keys
+            "preceptee_follows_preceptor", "n2n_min_gap"} <= keys
 
 
 @pytest.mark.parametrize("key", _guard_table_keys())
@@ -1109,9 +1110,11 @@ def test_guard_400_iff_option_violations_block_for_every_hard_lock_key(key):
     assert mismatched == [], (key, mismatched)
 
 
+#: `preceptee_on`·`three_seq_nig` 는 바깥(옛) 이름(요청 X2) — 끝의 두 항목은 파이썬 이름이다. 옛·새 이름이 섞인 delta 에서도 같다(NM).
 _MIXED_ITEMS = (("off_days", 3), ("preceptee_on", False), ("max_nig_per_month", 15), ("max_conseq_work", 5),
                 ("three_seq_nig", True), ("two_offs_after_two_nig", False), ("max_consecutive_nights", 3),
-                ("cross_month_lookback_days", 2), ("max_nig_per_month", 16), ("use_mid", "false"))
+                ("cross_month_lookback_days", 2), ("max_nig_per_month", 16), ("use_mid", "false"),
+                ("allow_three_consecutive_nights", True), ("preceptee_follows_preceptor", False))
 
 
 @pytest.mark.parametrize(("first", "second"), [(a, b) for i, a in enumerate(_MIXED_ITEMS) for b in _MIXED_ITEMS[i + 1:]

@@ -43,8 +43,8 @@ BANNED_PAIRS = {("N", "D"): "ban_n_to_d", ("E", "D"): "ban_e_to_d", ("N", "E"): 
 CFG = {
     "X": {"two_offs_after_two_nig": False, "two_offs_after_three_nig": True},
     "Y": {"two_offs_after_two_nig": True, "two_offs_after_three_nig": True},
-    "Z": {"three_seq_nig": False, "two_offs_after_two_nig": True, "two_offs_after_three_nig": True},
-    "W": {"two_offs_after_two_nig": True, "two_offs_after_three_nig": True, "not_one_night": True},
+    "Z": {"allow_three_consecutive_nights": False, "two_offs_after_two_nig": True, "two_offs_after_three_nig": True},
+    "W": {"two_offs_after_two_nig": True, "two_offs_after_three_nig": True, "ban_single_night": True},
 }
 
 
@@ -282,7 +282,7 @@ def build_ward(case: BoundaryCase):
     if case.g1_oct is not None:
         ward.extras.append(_schedule_seed("g1oct0000001", GROUP_ID, 10, "issued", case.g1_oct, "g1o"))
     if case.fixed_wanted:
-        ward.config.update(fixed_wanted_use_yn=True)
+        ward.config.update(apply_confirmed_wanted=True)
         ward.extras.append(_rows("FixedWantedEntry", _fixed_wanted_rows(case.fixed_wanted)))
     ward.config.update(case.config)
     return ward
@@ -406,11 +406,11 @@ def _runs(seq: list[str], members) -> list[tuple[int, int]]:
 
 
 def _rules(cfg: dict) -> dict:
-    ban = bool(cfg.get("banned_day_after_eve"))
-    return {"K": int(cfg.get("max_conseq_work") or 5), "L": 3 if cfg.get("three_seq_nig") else 2,
+    ban = bool(cfg.get("ban_shift_transitions"))
+    return {"K": int(cfg.get("max_conseq_work") or 5), "L": 3 if cfg.get("allow_three_consecutive_nights") else 2,
             "bans": {pair for pair, key in BANNED_PAIRS.items() if ban and cfg.get(key, True)},
             "two3": bool(cfg.get("two_offs_after_three_nig")), "two2": bool(cfg.get("two_offs_after_two_nig")),
-            "one": bool(cfg.get("not_one_night")), "n_cap": int(cfg.get("max_nig_per_month") or 15)}
+            "one": bool(cfg.get("ban_single_night")), "n_cap": int(cfg.get("max_nig_per_month") or 15)}
 
 
 def hard_violations(outside: dict[int, str], mine: dict[int, str], cfg: dict) -> list[str]:

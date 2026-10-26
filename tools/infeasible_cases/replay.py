@@ -20,6 +20,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "app"))
 
+from services.engine_contract.names import to_internal  # noqa: E402
 from services.ontology_graph.lagrangian import (  # noqa: E402
     detect_banned_off_conflict,
     explain_infeasibility_from_config,
@@ -32,7 +33,10 @@ CASES_DIR = os.path.join(HERE, "cases")
 
 def _load(path):
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        case = json.load(f)
+    # 사례 JSON 은 바깥(옛) 설정 이름으로 저장된다(NM X4) — 진단 스택은 파이썬 이름을 읽으므로 설정 dict 만 바꾼다.
+    case["config"] = to_internal(case["config"])
+    return case
 
 
 def replay(path, verbose=False):

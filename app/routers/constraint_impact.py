@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from db.client2 import get_db
 from db.models import RosterConfig, Team
 from routers.auth import get_current_user_from_cookie, require_current_user
+from services.engine_contract.names import to_external_deep
 from services.group_access import resolve_home_group_id
 from schemas.auth_schema import User as UserSchema
 from services.constraint_impact.control import (
@@ -195,14 +196,15 @@ def get_modules(
         grouped: dict[str, list[dict[str, Any]]] = {}
         for m in modules:
             grouped.setdefault(m.parent or "Other", []).append(asdict(m))
-        return {
+        # 모듈의 하드락 정보({action: {key}})는 파이썬 이름이다 — 응답은 바깥 이름으로(NM)
+        return to_external_deep({
             "year": year,
             "month": month,
             "group_id": resolve_home_group_id(db, current_user),
             "module_count": len(modules),
             "modules": [asdict(m) for m in modules],
             "grouped_by_parent": grouped,
-        }
+        })
     except HTTPException:
         raise
     except Exception as e:
@@ -238,7 +240,7 @@ def preview_adjustments(
         watched = (
             "team_min_by_team", "team_min_soft_fallback", "team_handoff_soft_fallback",
             "ban_n_to_d", "ban_e_to_d", "ban_n_to_e",
-            "max_conseq_work", "three_seq_nig", "max_nig_per_month",
+            "max_conseq_work", "allow_three_consecutive_nights", "max_nig_per_month",
             "two_offs_after_two_nig", "two_offs_after_three_nig",
             "_force_grade_max_soft_fallback", "_force_grade_min_soft_fallback",
             "grade_config",
@@ -246,11 +248,12 @@ def preview_adjustments(
         for k in watched:
             if before.get(k) != after.get(k):
                 diff[k] = {"before": before.get(k), "after": after.get(k)}
-        return {
+        # diff 키·applied[].blocked_by_hard_lock[].key 는 파이썬 이름이다 — 응답은 바깥 이름으로(NM)
+        return to_external_deep({
             "applied": after.get("_applied_constraint_adjustments") or [],
             "diff": diff,
             "diff_count": len(diff),
-        }
+        })
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except HTTPException:
@@ -288,14 +291,14 @@ def get_instances(
         instances = find_constraint_instances(
             snapshot, family=family, scope_filter=scope_filter or None
         )
-        return {
+        return to_external_deep({
             "year": year,
             "month": month,
             "family": family,
             "scope_filter": scope_filter,
             "instance_count": len(instances),
             "instances": [asdict(i) for i in instances],
-        }
+        })
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except HTTPException:

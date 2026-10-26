@@ -16,16 +16,17 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "app"))
 
+from services.engine_contract.names import to_external  # noqa: E402
 from services.ontology_graph.case_export import build_case  # noqa: E402
 
 OUT = os.path.join(HERE, "cases")
 
-# 실병동 기본 규칙(부산 CCR 계열): 3N2OFF + not_one_night.
+# 실병동 기본 규칙(부산 CCR 계열): 3N2OFF + ban_single_night.
 _BASE_CONFIG = {
     "daily_shift_requirements": {"D": 2, "E": 1, "N": 1},
     "off_days": 9, "max_nig_per_month": 15,
     "two_offs_after_three_nig": True, "two_offs_after_two_nig": False,
-    "not_one_night": True, "use_mid": False,
+    "ban_single_night": True, "use_mid": False,
 }
 
 
@@ -67,7 +68,7 @@ add("banned_recovery_blocked",
     [_nurse("n1", "장세현", allowed=["N"])] + _pool(5),
     _cfg(initial_forbidden={"n1": {10: ["O"], 11: ["O"], 12: ["O"], 14: ["O"]}}))
 
-# ③ banned 고립1N — 11 O금지(강제N) + 10·12 강제OFF → 고립 1N → not_one_night 위반
+# ③ banned 고립1N — 11 O금지(강제N) + 10·12 강제OFF → 고립 1N → ban_single_night 위반
 add("banned_isolated_single_night",
     [_nurse("n1", "장세현", allowed=["N"])] + _pool(5),
     _cfg(initial_forbidden={"n1": {11: ["O"]}}, initial_forced_off={"n1": [10, 12]}))
@@ -109,7 +110,8 @@ def main():
         case["meta"] = {"group_id": "SYNTH", "source": "synthetic", "name": name}
         path = os.path.join(OUT, f"synth-{name}.json")
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(case, f, ensure_ascii=False, indent=2)
+            # 사례 파일은 바깥(옛) 설정 이름으로 저장한다(NM X4) — replay 가 읽을 때 `to_internal` 로 푼다.
+            json.dump({**case, "config": to_external(case["config"])}, f, ensure_ascii=False, indent=2)
         print(f"  ✎ {os.path.basename(path)}  (nurses={len(case['nurses'])})")
     print(f"\n{len(CASES)}개 합성 케이스 → {OUT}")
 

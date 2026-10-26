@@ -100,13 +100,13 @@ def config_row(**over) -> dict:
     """roster_config 한 행 — 운영 행처럼 칸을 채운다. None 을 넘기면 그 칸은 NULL."""
     row = {
         "config_id": CONFIG_ID, "office_id": OFFICE_ID, "group_id": GROUP_ID, "day_req": 2,
-        "eve_req": 2, "nig_req": 2, "min_exp_per_shift": 3, "req_exp_nurses": 1,
-        "two_offs_per_week": True, "max_nig_per_month": 15, "three_seq_nig": True,
+        "eve_req": 2, "nig_req": 2, "senior_min_years": 3, "senior_nurses_per_shift": 1,
+        "prefer_two_offs_per_7days": True, "max_nig_per_month": 15, "allow_three_consecutive_nights": True,
         "two_offs_after_three_nig": True, "two_offs_after_two_nig": False,
-        "banned_day_after_eve": True, "max_conseq_work": 5, "off_days": 8, "max_conseq_off": 3,
-        "shift_priority": 0.7, "sequential_offs": True, "nod_noe": True, "weekly_off_group": False,
-        "not_one_night": False, "use_mid": False, "preceptee_on": False,
-        "fixed_wanted_use_yn": False, "off_first": False, "version": 1, "config_name": "합성 설정",
+        "ban_shift_transitions": True, "max_conseq_work": 5, "off_days": 8, "soft_max_conseq_off": 3,
+        "shift_priority": 0.7, "avoid_isolated_off_and_work": True, "avoid_nod_noe_eod": True, "weekly_off_group": False,
+        "ban_single_night": False, "use_mid": False, "preceptee_follows_preceptor": False,
+        "apply_confirmed_wanted": False, "staffing_first": False, "version": 1, "config_name": "합성 설정",
         **stamp(),
     }
     row.update(over)

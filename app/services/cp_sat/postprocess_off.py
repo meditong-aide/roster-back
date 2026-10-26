@@ -247,9 +247,9 @@ def postprocess_trim_extra_offs(
         return 0
 
     ############## preceptee 추가 ##############
-    # 프리셉티 인덱스 사전 계산 (preceptee_on 무관하게 항상 빌드 — 커버리지 제외에 필요)
-    preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
-    _pte_shift_count = bool(getattr(cfg, 'preceptee_shift_count', True))
+    # 프리셉티 인덱스 사전 계산 (preceptee_follows_preceptor 무관하게 항상 빌드 — 커버리지 제외에 필요)
+    preceptee_follow = bool(getattr(cfg, 'preceptee_follows_preceptor', False))
+    _pte_shift_count = bool(getattr(cfg, 'count_preceptee_in_staffing', True))
     id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
     # 멤버십: nurse_preceptee_period 맵 있으면 그것만(종료자 제외), 없으면 캐시 폴백. 설계 §6.
     _pp_fd = getattr(roster_system, "preceptee_follow_days", {}) or {}
@@ -260,7 +260,7 @@ def postprocess_trim_extra_offs(
             n for n, nu in enumerate(roster_system.nurses)
             if getattr(nu, 'preceptor_id', None) and getattr(nu, 'preceptor_id', None) in id_to_idx
         }
-    # preceptee_shift_count=False → 커버리지 계산에서 프리셉티 제외
+    # count_preceptee_in_staffing=False → 커버리지 계산에서 프리셉티 제외
     exclude_preceptee_from_coverage = (not _pte_shift_count) and bool(preceptee_indices)
     # 후처리 OFF 변경 스킵 조건: 팔로우 모드 또는 커버리지 제외
     protect_preceptee = (preceptee_follow or exclude_preceptee_from_coverage) and bool(preceptee_indices)
@@ -577,7 +577,7 @@ def postprocess_trim_extra_offs(
 
         예외: nurse_monthly_limit.n_max == 1 nurse 는 1N 금지 면제.
         """
-        if not bool(getattr(cfg, "not_one_night", False)):
+        if not bool(getattr(cfg, "ban_single_night", False)):
             return False
         if "N" not in cfg.shift_types:
             return False

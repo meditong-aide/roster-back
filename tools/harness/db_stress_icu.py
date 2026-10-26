@@ -208,24 +208,24 @@ def main() -> int:
             for k, v in {
                 "max_nig_per_month": 1,
                 "off_days": 22.0,
-                "req_exp_nurses": 99,
-                "min_exp_per_shift": 99,
+                "req_exp_nurses": 99,  # nm:external
+                "min_exp_per_shift": 99,  # nm:external
                 "use_mid": True,
                 "preceptor_gauge": 0.9,
                 "patient_amount": 99.0,
                 "team_balance_enable": True,
                 "team_balance_gauge": 10,
-                "off_swap_enabled": True,
-                "off_first": True,
-                "fixed_wanted_use_yn": True,
-                "sequential_offs": True,
-                "three_seq_nig": True,
+                "off_swap_enabled": True,  # nm:external
+                "off_first": True,  # nm:external
+                "fixed_wanted_use_yn": True,  # nm:external
+                "sequential_offs": True,  # nm:external
+                "three_seq_nig": True,  # nm:external
                 "two_offs_after_three_nig": True,
                 "two_offs_after_two_nig": True,
-                "banned_day_after_eve": True,
+                "banned_day_after_eve": True,  # nm:external
                 "weekend_shift_ratio": 1.0,
                 "even_nights": True,
-                "not_one_night": True,
+                "not_one_night": True,  # nm:external
             }.items():
                 d[k] = {"old": c.get(k), "new": v}
                 c[k] = v
@@ -267,8 +267,8 @@ def main() -> int:
             c["max_nig_per_month"] = 1
             c["off_days"] = 30.0
             c["preceptor_gauge"] = 1.0
-            c["req_exp_nurses"] = 100
-            c["min_exp_per_shift"] = 100
+            c["req_exp_nurses"] = 100  # nm:external
+            c["min_exp_per_shift"] = 100  # nm:external
             return {"absurd": True}
         def mg5(g):
             g["constraints"] = {sh: {"1": 99, "2": 99, "3": 99, "4": 99} for sh in ("D", "E", "N")}

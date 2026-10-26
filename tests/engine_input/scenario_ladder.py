@@ -7,8 +7,8 @@
   통과시키고 presolve 는 기본 요구(E3)로 부족을 본다"가 성립하지 않게 됐다. 이제 부족은 **Hall 결합**으로 만든다: 비주말휴무 9명 중
   E·N 가능자를 정확히 3명(N04~N06)으로 두고 나머지 6명(N07~N12)은 D 전담, 주말도 기본 요구(D4/E3/N2)와 같게 둔다. 시프트별 자격
   인원(E 3 ≥ 3 · N 3 ≥ 2)과 총 가용(9 = 9)은 precheck 를 통과하고, presolve max-flow 는 E+N 수요 5 > 가능자 3 → 주말 부족 2 를 낸다.
-  월 야간 상한은 12(N 가능자가 6명이라 8 이면 월 야간 용량 48 < 60 으로 precheck 차단)·`off_first=True`(OFF 하한 min_off 가 precheck
-  용량에 안 들어가게 — 원인 진단의 정책 과제약 산술은 off_first 와 무관하게 off_days 를 쓴다). 기준본(`golden_base/dev4ec454e/S1-L*`)은
+  월 야간 상한은 12(N 가능자가 6명이라 8 이면 월 야간 용량 48 < 60 으로 precheck 차단)·`staffing_first=True`(OFF 하한 min_off 가 precheck
+  용량에 안 들어가게 — 원인 진단의 정책 과제약 산술은 staffing_first 와 무관하게 off_days 를 쓴다). 기준본(`golden_base/dev4ec454e/S1-L*`)은
   순수 dev(`redev_4ec454e/pure_harness`)에서 새 시나리오로 다시 떴다.
 S1-L — 사다리 모드. `config_override` 없이 부르는 탐색 3곳(:7680·:7707·:7895)까지 닿게 하는 데이터.
   설계서 §7.1 의 조건(주말휴무 2명 이상 + `weekend_off_load` · `weekend_release_needed ≥ 2` ·
@@ -154,9 +154,9 @@ def s1l_ward() -> Ward:
     ward.shift_manage = [shift_manage_row(1, "D", ["D"], LADDER_BASE_REQ["D"]),
                          shift_manage_row(2, "E", ["E"], LADDER_BASE_REQ["E"]),
                          shift_manage_row(3, "N", ["N"], LADDER_BASE_REQ["N"])]
-    # off_first=True: OFF 하한(min_off)이 precheck 용량 바닥에 들어가지 않게 한다(EI-14r3) — 원인 진단(explain)의 정책 과제약 산술은
-    #   off_first 와 무관하게 off_days 를 쓰므로 '용량은 통과 · 산술은 과제약'(아래 docstring ①)이 성립한다.
-    ward.config.update(max_nig_per_month=LADDER_MAX_NIG, off_first=True)
+    # staffing_first=True: OFF 하한(min_off)이 precheck 용량 바닥에 들어가지 않게 한다(EI-14r3) — 원인 진단(explain)의 정책 과제약 산술은
+    #   staffing_first 와 무관하게 off_days 를 쓰므로 '용량은 통과 · 산술은 과제약'(아래 docstring ①)이 성립한다.
+    ward.config.update(max_nig_per_month=LADDER_MAX_NIG, staffing_first=True)
     ward.raw = {"n2n_min_gap": 4, "fixed_holiday_off_yn": 0}
     limit = {"nurse_id": LADDER_NIGHT_CAP_NURSE, "group_id": GROUP_ID, "year": 2026, "month": 11,
              "n_max": LADDER_N_MAX, **stamp()}
@@ -195,7 +195,7 @@ def s1l3_ward() -> Ward:
         shift_row("연", 10, "연차", None, "휴가", None, 10, off_swap_target=True),
     ]
     ward.config.update(health_leave_enabled=True, sleep_off_enabled=True, sleep_off_cycle=3,
-                       off_swap_enabled=True)
+                       convert_excess_off_to_leave=True)
     return ward
 
 

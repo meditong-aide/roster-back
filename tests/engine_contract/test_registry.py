@@ -26,6 +26,7 @@ from engine_input.engine_env import engine_env_names
 from services.engine_contract import env as E
 from services.engine_contract import nurse_attrs as N
 from services.engine_contract import settings as S
+from services.engine_contract.names import EXTERNAL_TO_INTERNAL, INTERNAL_TO_EXTERNAL
 from services.engine_contract.rules import RULE_PREFIXES, RULES
 
 APP_ROOT = Path(__file__).resolve().parents[2] / "app"
@@ -42,9 +43,28 @@ def test_c1_orm_columns_subset_of_settings():
     """roster_config 의 모든 ORM 매핑 컬럼은 SETTINGS 에 행이 있어야 한다(DEAD 포함)."""
     import db.models as models
 
-    orm_cols = {c.name for c in models.RosterConfig.__table__.columns}
+    # 파이썬 이름(c.key)으로 비교한다 — 14칸은 물리 컬럼 이름(c.name)이 옛 이름이라 레지스트리 정본 키와 다르다(NM).
+    orm_cols = {c.key for c in models.RosterConfig.__table__.columns}
     missing = orm_cols - set(S.SETTINGS_BY_KEY)
     assert not missing, f"roster_config ORM 컬럼이 레지스트리에 없다: {sorted(missing)}"
+
+
+def test_c1_settings_column_matches_names_table():
+    """`SettingSpec.column`(바깥 이름)은 `names.EXTERNAL_TO_INTERNAL` 과 같다 — 이름 표가 두 벌로 갈라지지 않게(NM D58)."""
+    assert {s.column: s.key for s in S.SETTINGS if s.column} == dict(EXTERNAL_TO_INTERNAL)
+    # 바깥 이름은 정본 키·별칭과 겹치지 않는다 — 겹치면 `effective.canonical_key` 의 해석이 모호해진다.
+    columns = {s.column for s in S.SETTINGS if s.column}
+    assert not columns & (set(S.SETTINGS_BY_KEY) | {a for s in S.SETTINGS for a in s.aliases})
+
+
+def test_c1_orm_physical_column_names_unchanged():
+    """14칸의 ORM 물리 컬럼 이름(`Column.name`)은 `SettingSpec.column`(옛 이름) 그대로다 — DB 컬럼은 바꾸지 않는다(DDL 없음).
+    바뀌는 것은 파이썬 속성 이름(`Column.key`)뿐이다."""
+    import db.models as models
+
+    physical = {c.key: c.name for c in models.RosterConfig.__table__.columns}
+    want = {s.key: s.column for s in S.SETTINGS if s.column}
+    assert {key: physical.get(key) for key in want} == want
 
 
 def test_c1_orm_column_count_matches_investigation():
@@ -86,11 +106,17 @@ def _scan_raw_roster_config_columns() -> set[str]:
 def test_c1_raw_columns_registered():
     """raw SQL 로 `roster_config` 컬럼을 읽는 모든 리터럴 이름이 SETTINGS 에 있어야 한다.
 
-    (코드 스캔 → SETTINGS, 예전처럼 SETTINGS → SETTINGS 가 아니다.)
+    (코드 스캔 → SETTINGS, 예전처럼 SETTINGS → SETTINGS 가 아니다.) 이름은 물리 컬럼 이름 그대로여야 한다 —
+    14칸은 옛 이름이고, 파이썬 이름을 쓰면 실패한다(NM).
     """
     scanned = _scan_raw_roster_config_columns()
     assert scanned, "raw SQL 컬럼 스캔이 하나도 못 찾았다 — 패턴이 깨졌을 수 있다"
-    missing = scanned - set(S.SETTINGS_BY_KEY)
+    # raw SQL 은 물리 컬럼 이름만 쓴다(NM) — 14칸은 옛 이름이다. 파이썬(새) 이름은 DB 에 없는 컬럼이라 직접 SELECT 는 운영·개발
+    # 쿼리가 깨지고, `_read_config_flag` 는 컬럼이 없으면 예외 없이 default 로 조용히 빠져 동작이 바뀐다.
+    # 정본 키로 풀어서 비교하면 이 실수가 통과하므로 풀지 않고 물리 이름 그대로 대조한다.
+    wrong = {n: INTERNAL_TO_EXTERNAL[n] for n in sorted(scanned & set(INTERNAL_TO_EXTERNAL))}
+    assert not wrong, f"raw SQL 은 물리(옛) 컬럼 이름만 써야 한다 — 파이썬 이름이 들어갔다(파이썬 이름: 물리 이름): {wrong}"
+    missing = scanned - {s.column or s.key for s in S.SETTINGS}
     assert not missing, (
         f"raw SQL 이 읽는 roster_config 컬럼이 레지스트리에 없다: {sorted(missing)} — "
         "settings.py 에 행을 추가하라(ORM 비매핑이면 source=DB_RAW)"
@@ -104,8 +130,9 @@ def test_c1_raw_columns_source_not_meta_or_derived():
     으로 다루면서 후처리(oncall_postprocess.py)만 옛 raw 컬럼을 계속 읽는 과도기 패턴도 있다
     — 그 경우까지 DB_COLUMN 으로 강제하지 않는다."""
     disallowed = {S.META, S.DERIVED, S.REQUEST}
+    spec_by_physical_name = {s.column or s.key: s for s in S.SETTINGS}  # raw SQL 이 읽는 물리 컬럼 이름 → 레지스트리 행(NM)
     for key in _scan_raw_roster_config_columns():
-        spec = S.SETTINGS_BY_KEY[key]
+        spec = spec_by_physical_name[key]
         assert spec.source not in disallowed, f"{key}: source={spec.source!r} 가 raw SQL 읽기 출처로 부적절하다"
 
 
@@ -133,19 +160,19 @@ def test_c1_raw_columns_includes_known_dual_path_keys():
 #: C2' 는 DB 를 실행하지 않는다는 원칙을 지키기로 하고 raw 헬퍼 검증은 의도적으로 보류했다).
 _C2_SITES: dict[str, tuple[tuple[str, int], ...]] = {
     "max_conseq_work": (("services/cp_sat_basic.py", 456),),
-    "banned_day_after_eve": (("services/cp_sat_basic.py", 464),),
-    "three_seq_nig": (("services/cp_sat_basic.py", 465),),
+    "ban_shift_transitions": (("services/cp_sat_basic.py", 464),),
+    "allow_three_consecutive_nights": (("services/cp_sat_basic.py", 465),),
     "two_offs_after_three_nig": (("services/cp_sat_basic.py", 466),),
     "two_offs_after_two_nig": (("services/cp_sat_basic.py", 467),),
     "max_nig_per_month": (("services/cp_sat_basic.py", 479),),
-    "not_one_night": (("services/cp_sat_basic.py", 468),),
+    "ban_single_night": (("services/cp_sat_basic.py", 468),),
     # EI-6 반박 검토(LOW) 반영 — 611 은 `max_same_shift` 를 읽는 자리였다(use_mid 읽기가
     # 아니다). 가장 가까운 실제 use_mid 자리인 595 로 정정.
     "use_mid": (("services/cp_sat_basic.py", 589),),
     "off_days": (("services/cp_sat_basic.py", 573),),
-    "nod_noe": (("services/cp_sat_basic.py", 569),),
-    "preceptee_on": (("services/cp_sat_basic.py", 587),),
-    "fixed_wanted_use_yn": (("services/roster_create_service.py", 6078),),
+    "avoid_nod_noe_eod": (("services/cp_sat_basic.py", 569),),
+    "preceptee_follows_preceptor": (("services/cp_sat_basic.py", 587),),
+    "apply_confirmed_wanted": (("services/roster_create_service.py", 6078),),
     "ban_night_before_fixed_wanted_off": (("services/cp_sat_basic.py", 473),),
     "n2n_min_gap": (("services/cp_sat_basic.py", 629),),
     "ban_e_to_d": (("services/cp_sat_basic.py", 663),),
@@ -272,11 +299,11 @@ def test_hard_lock_boundary_switch_rule_nos_match_notes():
 #: 같은 엔진 클래스를 직접 import 하는 선례와 같은 방식).
 _PURE_FN_ABSENT_EXPECT: dict[str, tuple[str, object]] = {
     "max_conseq_work": ("max_consecutive_work_days", 5),
-    "banned_day_after_eve": ("banned_day_after_eve", True),
-    "three_seq_nig": ("max_consecutive_nights", 3),
+    "ban_shift_transitions": ("ban_shift_transitions", True),
+    "allow_three_consecutive_nights": ("max_consecutive_nights", 3),
     "two_offs_after_three_nig": ("two_offs_after_three_nig", True),
     "two_offs_after_two_nig": ("two_offs_after_two_nig", False),
-    "not_one_night": ("not_one_night", False),
+    "ban_single_night": ("ban_single_night", False),
     "max_nig_per_month": ("max_night_shifts_per_month", 15),
     "use_mid": ("use_mid", False),
     "ban_night_before_fixed_off": ("ban_night_before_fixed_off", True),
@@ -333,7 +360,7 @@ def test_c2_pure_function_cross_month_disabled_short_circuits_without_db():
 #: 쪽은 순수 함수 실측(위)으로 걸리지만, 월경계·월중 경계 폴백(roster_create_service.py 안,
 #: 별도의 하드코딩 리터럴)은 그 쪽과 다른 자리라 따로 AST 로 고정한다.
 _BOUNDARY_K_FALLBACK_LINES: tuple[int, ...] = (2461, 2667)  # `K = 5`(연속근무 상한 cap, #1)
-_BOUNDARY_THREE_SEQ_DEFAULT_LINES: tuple[int, ...] = (2473, 2668)  # `three_seq_nig` 부재 기본값
+_BOUNDARY_THREE_SEQ_DEFAULT_LINES: tuple[int, ...] = (2473, 2668)  # `allow_three_consecutive_nights` 부재 기본값
 
 
 def test_c2_boundary_k_fallback_is_5():
@@ -358,16 +385,16 @@ def test_c2_boundary_k_fallback_is_5():
         assert value == 5, f"K 폴백({found_line}) = {value!r} != 5(하드락 #1 cap)"
 
 
-def test_c2_boundary_three_seq_nig_default_is_false():
-    """월경계·월중 경계의 `three_seq_nig` 부재 기본값이 False(더 엄격한 2연속)인지 AST 로
-    고정한다 — settings.py 의 three_seq_nig.null_behavior '월경계·월중 경계 키 부재→False(2)'
+def test_c2_boundary_allow_three_consecutive_nights_default_is_false():
+    """월경계·월중 경계의 `allow_three_consecutive_nights` 부재 기본값이 False(더 엄격한 2연속)인지 AST 로
+    고정한다 — settings.py 의 allow_three_consecutive_nights.null_behavior '월경계·월중 경계 키 부재→False(2)'
     서술의 근거(roster_create_service.py:2473·2668)."""
     tree = ast.parse(_read("services/roster_create_service.py"))
     for near_line in _BOUNDARY_THREE_SEQ_DEFAULT_LINES:
-        found = _find_default(tree, "three_seq_nig", near_line)
-        assert found is not None, f"{near_line} 근처에서 'three_seq_nig' get 호출을 못 찾았다"
+        found = _find_default(tree, "allow_three_consecutive_nights", near_line)
+        assert found is not None, f"{near_line} 근처에서 'allow_three_consecutive_nights' get 호출을 못 찾았다"
         value, found_line = found
-        assert value is False, f"three_seq_nig 폴백({found_line}) = {value!r} != False"
+        assert value is False, f"allow_three_consecutive_nights 폴백({found_line}) = {value!r} != False"
 
 
 def test_c2_pure_function_mid_month_lookback_none_raises_before_db():

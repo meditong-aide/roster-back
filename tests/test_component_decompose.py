@@ -31,7 +31,7 @@ def _cfg(dsr, rules, fb=None, fo=None):
     return c
 
 
-_R = {"two_offs_after_two_nig": True, "not_one_night": True}
+_R = {"two_offs_after_two_nig": True, "ban_single_night": True}
 
 
 def test_symmetry_matches_plain_and_oracle_small():

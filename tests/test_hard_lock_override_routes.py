@@ -95,12 +95,14 @@ def _counts(db) -> tuple[int, int]:
 # ── /roster_create/async ─────────────────────────────────────────────────────────
 
 
-def test_async_rejects_hard_lock_override_before_queue(db, seed_data, user, sqs_calls):
-    """`config_override` 의 #2 끄기 → 400 · SQS 0 · job 행 0."""
+@pytest.mark.parametrize("override", [{"banned_day_after_eve": False}, {"ban_shift_transitions": False}],
+                         ids=["external_name", "internal_name"])
+def test_async_rejects_hard_lock_override_before_queue(db, seed_data, user, sqs_calls, override):
+    """`config_override` 의 #2 끄기 → 400 · SQS 0 · job 행 0. 바깥(옛) 이름이든 파이썬(새) 이름이든 같은 400 이고
+    문구의 키는 바깥 이름이다(NM)."""
     before = _counts(db)
     with pytest.raises(HTTPException) as exc_info:
-        _async(RosterRequest(year=2026, month=11, group_id="GRP001", config_override={"banned_day_after_eve": False}),
-               user, db)
+        _async(RosterRequest(year=2026, month=11, group_id="GRP001", config_override=override), user, db)
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == f"{_RELAX_PREFIX}하드락 #2(ND·ED·NE 전이 금지) — banned_day_after_eve=False"
     assert sqs_calls == [] and _counts(db) == before

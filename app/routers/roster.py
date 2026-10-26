@@ -129,37 +129,37 @@ def _roster_config_to_dict(config) -> dict:
         "day_req": config.day_req,
         "eve_req": config.eve_req,
         "nig_req": config.nig_req,
-        "min_exp_per_shift": config.min_exp_per_shift,
-        "req_exp_nurses": config.req_exp_nurses,
-        "two_offs_per_week": config.two_offs_per_week,
+        "min_exp_per_shift": config.senior_min_years,  # nm:external
+        "req_exp_nurses": config.senior_nurses_per_shift,  # nm:external
+        "two_offs_per_week": config.prefer_two_offs_per_7days,  # nm:external
         "max_nig_per_month": config.max_nig_per_month,
-        "three_seq_nig": config.three_seq_nig,
+        "three_seq_nig": config.allow_three_consecutive_nights,  # nm:external
         "two_offs_after_three_nig": config.two_offs_after_three_nig,
         "two_offs_after_two_nig": config.two_offs_after_two_nig,
-        "banned_day_after_eve": config.banned_day_after_eve,
+        "banned_day_after_eve": config.ban_shift_transitions,  # nm:external
         "max_conseq_work": config.max_conseq_work,
         "off_days": config.off_days,
         # 연속 OFF 상한(nullable) — NULL 이면 앱 기본 3 적용(models.py 주석과 일치)
-        "max_conseq_off": config.max_conseq_off
-        if config.max_conseq_off is not None
+        "max_conseq_off": config.soft_max_conseq_off  # nm:external
+        if config.soft_max_conseq_off is not None
         else 3,
         "shift_priority": config.shift_priority,
-        "sequential_offs": config.sequential_offs,
+        "sequential_offs": config.avoid_isolated_off_and_work,  # nm:external
         "created_at": config.created_at.isoformat() if config.created_at else None,
         "updated_at": config.updated_at.isoformat()
         if getattr(config, "updated_at", None)
         else None,
-        "nod_noe": config.nod_noe,
-        "preceptee_on": config.preceptee_on,
-        "preceptee_shift_count": config.preceptee_shift_count,
+        "nod_noe": config.avoid_nod_noe_eod,  # nm:external
+        "preceptee_on": config.preceptee_follows_preceptor,  # nm:external
+        "preceptee_shift_count": config.count_preceptee_in_staffing,  # nm:external
         "weekly_off_group": config.weekly_off_group,
-        "not_one_night": config.not_one_night,
+        "not_one_night": config.ban_single_night,  # nm:external
         "use_mid": bool(getattr(config, "use_mid", False)),
-        "fixed_wanted_use_yn": config.fixed_wanted_use_yn,
+        "fixed_wanted_use_yn": config.apply_confirmed_wanted,  # nm:external
         "show_level": config.show_level,
         "show_preceptor": config.show_preceptor,
-        "off_first": bool(getattr(config, "off_first", False)),
-        "off_swap_enabled": bool(getattr(config, "off_swap_enabled", False)),
+        "off_first": bool(getattr(config, "staffing_first", False)),  # nm:external
+        "off_swap_enabled": bool(getattr(config, "convert_excess_off_to_leave", False)),  # nm:external
         # 확정 원티드 O 직전일 N 금지 — NULL(미설정) = 꺼짐.
         # 기존 ban_night_before_fixed_off 는 NULL→True 규약인데 이쪽은 **반대**다.
         "ban_night_before_fixed_wanted_off": bool(
@@ -296,7 +296,7 @@ def get_config_versions(
     try:
         # ★ 생성에 실패한 설정은 목록에서 뺀다 — 프리셋으로 남으면 다시 선택돼
         #   같은 실패를 반복한다(2026-09-04 남촌 중환자실1: max_nig_per_month=1 과
-        #   not_one_night=True 가 양립 불가인 설정이 프리셋으로 계속 노출).
+        #   ban_single_night=True 가 양립 불가인 설정이 프리셋으로 계속 노출).
         #   **편집 저장으로는 되살리지 않는다** — 저장은 검증이 아니기 때문이다.
         #   다시 생성해서 성공하면 그때 success 로 덮여 복귀한다(검증된 것이므로).
         #   새로 쓰려면 config_id 없이 저장하면 신규 행이라 NULL 에서 시작한다.
@@ -360,7 +360,7 @@ def get_config_versions(
                     "nig_req": p.nig_req,
                     "off_days": p.off_days,
                     "weekly_off_group": p.weekly_off_group,
-                    "fixed_wanted_use_yn": p.fixed_wanted_use_yn,
+                    "fixed_wanted_use_yn": p.apply_confirmed_wanted,  # nm:external
                     "use_mid": bool(getattr(p, "use_mid", False)),
                 },
                 "last_saved_at": ts.isoformat() if ts else None,
@@ -497,29 +497,29 @@ def get_config_by_version(
                 # day_req=cfg.daily_shift_requirements.get('D', 3),
                 # eve_req=cfg.daily_shift_requirements.get('E', 3),
                 # nig_req=cfg.daily_shift_requirements.get('N', 2),
-                min_exp_per_shift=cfg.min_experience_per_shift,
-                req_exp_nurses=cfg.required_experienced_nurses,
-                two_offs_per_week=getattr(cfg, "enforce_two_offs_per_week", False),
+                senior_min_years=cfg.min_experience_per_shift,
+                senior_nurses_per_shift=cfg.required_experienced_nurses,
+                prefer_two_offs_per_7days=getattr(cfg, "enforce_two_offs_per_week", False),
                 max_nig_per_month=cfg.max_night_shifts_per_month,
-                three_seq_nig=getattr(cfg, "max_consecutive_nights", 3) >= 3,
+                allow_three_consecutive_nights=getattr(cfg, "max_consecutive_nights", 3) >= 3,
                 two_offs_after_three_nig=_rd("two_offs_after_three_nig"),
                 two_offs_after_two_nig=getattr(cfg, "two_offs_after_two_nig", False),
-                banned_day_after_eve=getattr(cfg, "banned_day_after_eve", True),
+                ban_shift_transitions=getattr(cfg, "ban_shift_transitions", True),
                 max_conseq_work=_rd("max_conseq_work"),
                 off_days=_rd("off_days"),
                 shift_priority=getattr(cfg, "shift_requirement_priority", 0.8),
-                sequential_offs=getattr(cfg, "sequential_offs", True),
-                nod_noe=_rd("nod_noe"),
-                preceptee_on=_rd("preceptee_on"),
-                preceptee_shift_count=getattr(cfg, "preceptee_shift_count", True),
+                avoid_isolated_off_and_work=getattr(cfg, "avoid_isolated_off_and_work", True),
+                avoid_nod_noe_eod=_rd("avoid_nod_noe_eod"),
+                preceptee_follows_preceptor=_rd("preceptee_follows_preceptor"),
+                count_preceptee_in_staffing=getattr(cfg, "count_preceptee_in_staffing", True),
                 weekly_off_group=getattr(cfg, "weekly_off_group", False),
-                not_one_night=getattr(cfg, "not_one_night", False),
+                ban_single_night=getattr(cfg, "ban_single_night", False),
                 use_mid=False,
-                fixed_wanted_use_yn=getattr(cfg, "fixed_wanted_use_yn", False),
+                apply_confirmed_wanted=getattr(cfg, "apply_confirmed_wanted", False),
                 show_level=getattr(cfg, "show_level", True),
                 show_preceptor=getattr(cfg, "show_preceptor", True),
-                off_first=getattr(cfg, "off_first", False),
-                off_swap_enabled=getattr(cfg, "off_swap_enabled", False),
+                staffing_first=getattr(cfg, "staffing_first", False),
+                convert_excess_off_to_leave=getattr(cfg, "convert_excess_off_to_leave", False),
             )
             db.add(new_config)
 
@@ -3231,7 +3231,7 @@ def validate_roster(
             daily_shift_requirements=daily_shift_requirements,
             max_consecutive_work_days=_max_conseq if _max_conseq is not None else _rd("max_conseq_work"),
             max_night_shifts_per_month=max_nig,
-            max_consecutive_nights=3 if latest_config_db.three_seq_nig else 2,
+            max_consecutive_nights=3 if latest_config_db.allow_three_consecutive_nights else 2,
         )
 
         days_in_month = get_days_in_month(year, month)

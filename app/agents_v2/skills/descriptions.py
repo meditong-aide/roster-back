@@ -327,7 +327,7 @@ SKILL_TOOLS: list[dict] = [
             "검사 항목 (config 기반 자동 적용):\n"
             "- consecutive_night_exceeded — 야간 연속 한도(2 또는 3) 초과\n"
             "- max_consecutive_work_exceeded — 연속 근무일(max_conseq_work) 초과\n"
-            "- grade_coverage_missing — 시프트별 최소 경력자(min_exp_per_shift) 미충족\n\n"
+            "- grade_coverage_missing — 시프트별 최소 경력자(senior_min_years) 미충족\n\n"
 
             "출력: violation_count, violations 배열, status('pass'|'fail'). "
             "각 위반에는 nurse_id/nurse_name·shift_id·날짜 정보 포함.\n\n"
@@ -535,28 +535,30 @@ SKILL_TOOLS: list[dict] = [
             "[B] **연속·휴무 규칙**\n"
             "  • max_nig_per_month — 월 야간 최대 횟수 (정수)\n"
             "  • max_conseq_work — 연속 근무 최대 일수 (정수)\n"
-            "  • three_seq_nig — 3연속 야간 허용 여부 (bool)\n"
+            "  • allow_three_consecutive_nights — 3연속 야간 허용 여부 (bool)\n"
             "  • two_offs_after_three_nig / two_offs_after_two_nig — 야간 후 2일 휴무 (bool)\n"
-            "  • two_offs_per_week — 주 2회 오프 보장 (bool)\n"
-            "  • banned_day_after_eve — 이브닝 다음날 데이 금지 (bool)\n"
-            "  • sequential_offs — 오프 연속 배치 선호 (bool)\n\n"
+            "  • prefer_two_offs_per_7days — 1일부터 7일 블록마다 OFF 2개 미만 벌점(soft) (bool)\n"
+            "  • ban_shift_transitions — E→D·N→D·N→E 전이 금지(하드락 #2 · 풀이 하드). 끄면 이 셋과 D→N 사후 검사가 함께 꺼진다 (bool)\n"
+            "  • avoid_isolated_off_and_work — 고립 OFF·고립 근무 벌점(soft) (bool)\n\n"
             "[C] **구조 정책**\n"
-            "  • preceptee_on — 프리셉터-프리셉티 매칭 활성 (bool)\n\n"
+            "  • preceptee_follows_preceptor — 프리셉티가 프리셉터와 같은 근무(하드) (bool)\n\n"
             "[D] **시프트 슬롯별 인원 (ShiftManage)** — 슬롯 단위 미세 조정\n"
             "  • field='manpower' + nurse_class('RN'/'AN') + shift_slot(정수) + value=정수\n"
             "  • 사용자가 'RN 데이 슬롯 인원 4명으로'처럼 슬롯을 특정할 때.\n\n"
 
             "─────────── 그라운딩 ───────────\n"
             "사용자의 자연어를 위 영역 [A]~[D] 중 어디에 속하는지 의미적으로 판단하고, "
-            "DB 필드명을 `field`에, 정규화 값을 `value`에 넣으세요. "
-            "bool 필드의 '켜줘/허용/적용' → true, '꺼줘/금지/해제' → false. "
+            "위 목록에 적힌 필드명 그대로(DB 컬럼명과 다른 칸이 있다) `field`에, 정규화 값을 `value`에 넣으세요. "
+            "bool 필드는 **필드 이름이 가리키는 동작을 켜면 true, 끄면 false** "
+            "(allow_ 필드는 '허용'=true·'금지'=false, ban_ 필드는 '금지 적용'=true·'금지 해제'=false). "
             "필드명이 모호한 표현('야간 최대'='max_nig_per_month' vs '야간 필요인원'='nig_req')은 "
             "사용자에게 의미를 한 번 더 확인.\n\n"
 
             "─────────── 예시 ───────────\n"
             "- '야간 최대 7회로' → field='max_nig_per_month', value=7\n"
             "- '연속 근무 5일 제한' → field='max_conseq_work', value=5\n"
-            "- '이브닝 다음날 데이 금지 해제' → field='banned_day_after_eve', value=false\n"
+            "- '이브닝 다음날 데이 금지 해제' → field='ban_shift_transitions', value=false "
+            "(E→D 만이 아니라 N→D·N→E 전이 금지와 D→N 사후 검사도 함께 풀리는 통째 스위치)\n"
             "- '데이 필요인원 4명' → field='day_req', value=4\n"
             "- 'RN 데이 1슬롯 인원 5명' → field='manpower', nurse_class='RN', shift_slot=1, value=5\n\n"
 
@@ -571,7 +573,7 @@ SKILL_TOOLS: list[dict] = [
                     "type": "string",
                     "description": (
                         "변경 대상 정책 필드. RosterConfig 필드명(예: max_nig_per_month, "
-                        "max_conseq_work, banned_day_after_eve, day_req 등) "
+                        "max_conseq_work, ban_shift_transitions, day_req 등) "
                         "또는 'manpower'(ShiftManage 갱신용)."
                     ),
                 },

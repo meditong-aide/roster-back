@@ -41,7 +41,7 @@ def validate_schedule(db: Session, params: dict) -> Any:
 
     # Check: consecutive night shifts
     if night_shift_ids and config:
-        max_allowed = 3 if config.get("three_seq_nig") else 2
+        max_allowed = 3 if config.get("allow_three_consecutive_nights") else 2
         for nid in night_shift_ids:
             streaks = analysis_tools.detect_consecutive_pattern(
                 db, schedule_id, nid, min_streak=max_allowed + 1,
@@ -74,10 +74,10 @@ def validate_schedule(db: Session, params: dict) -> Any:
                 })
 
     # Check: grade coverage per shift
-    if config and config.get("min_exp_per_shift"):
+    if config and config.get("senior_min_years"):
         for sid in [s["shift_id"] for s in shifts if s.get("is_working")]:
             missing = analysis_tools.dates_missing_grade(
-                db, schedule_id, group_id, sid, config["min_exp_per_shift"],
+                db, schedule_id, group_id, sid, config["senior_min_years"],
             )
             for m in missing:
                 violations.append({

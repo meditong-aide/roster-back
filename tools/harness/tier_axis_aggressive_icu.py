@@ -135,22 +135,22 @@ def main():
     try:
         # H: req_exp_nurses=99 (definitely impossible)
         def h(c):
-            c["req_exp_nurses"] = 99
-            return {"req_exp_nurses": 99}
+            c["req_exp_nurses"] = 99  # nm:external
+            return {"req_exp_nurses": 99}  # nm:external
         results.append(run(s, baseline, "H_req_exp_99", h))
 
         # I: min_exp_per_shift=99
         def i(c):
-            c["min_exp_per_shift"] = 99
-            return {"min_exp_per_shift": 99}
+            c["min_exp_per_shift"] = 99  # nm:external
+            return {"min_exp_per_shift": 99}  # nm:external
         results.append(run(s, baseline, "I_min_exp_99", i))
 
         # J: monthly_n=1 + off_days=20 + req_exp=15 (triple stress)
         def j(c):
             c["max_nig_per_month"] = 1
             c["off_days"] = 20.0
-            c["req_exp_nurses"] = 15
-            return {"max_nig_per_month": 1, "off_days": 20, "req_exp_nurses": 15}
+            c["req_exp_nurses"] = 15  # nm:external
+            return {"max_nig_per_month": 1, "off_days": 20, "req_exp_nurses": 15}  # nm:external
         results.append(run(s, baseline, "J_triple_aggressive", j))
 
         # K: max_nig=0 disable + use_mid (extra stress)
@@ -163,18 +163,18 @@ def main():
         # L: use_mid + req_exp=99 (T0 + multi T2)
         def l(c):
             c["use_mid"] = True
-            c["req_exp_nurses"] = 99
-            c["min_exp_per_shift"] = 50
-            return {"use_mid": True, "req_exp_nurses": 99, "min_exp_per_shift": 50}
+            c["req_exp_nurses"] = 99  # nm:external
+            c["min_exp_per_shift"] = 50  # nm:external
+            return {"use_mid": True, "req_exp_nurses": 99, "min_exp_per_shift": 50}  # nm:external
         results.append(run(s, baseline, "L_mid_plus_extreme_exp", l))
 
         # M: off_days=29 + req_exp_nurses=12 + use_mid=True (max stress, all axes)
         def m(c):
             c["off_days"] = 29.0
-            c["req_exp_nurses"] = 12
+            c["req_exp_nurses"] = 12  # nm:external
             c["use_mid"] = True
             c["max_nig_per_month"] = 1
-            return {"off_days": 29, "req_exp_nurses": 12, "use_mid": True, "max_nig_per_month": 1}
+            return {"off_days": 29, "req_exp_nurses": 12, "use_mid": True, "max_nig_per_month": 1}  # nm:external
         results.append(run(s, baseline, "M_all_axes_stress", m))
 
     finally:

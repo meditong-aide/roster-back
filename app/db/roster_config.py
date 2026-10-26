@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import numpy as np
 
+from services.engine_contract.names import EXTERNAL_TO_INTERNAL, OldNameDescriptor
+
 @dataclass
 class NurseRosterConfig:
     """간호사 근무표 시스템 설정."""
@@ -15,22 +17,22 @@ class NurseRosterConfig:
     # 야간 근무 제약 조건
     max_night_shifts_per_month: int = 15  # 월별 최대 야간 근무 수
     max_consecutive_nights: int = 3  # 최대 연속 야간 근무 수
-    not_one_night: bool = False  # 야간 단발성(1N) 금지 여부
+    ban_single_night: bool = False  # 1N(나이트 단독 배정) 금지 — 하드락 #7 (바깥 이름 not_one_night)
     two_offs_after_three_nig: bool = False  # N 3회 후 OFF 2회 연속 필수
     two_offs_after_two_nig: bool = False  # N 2회 후 OFF 2회 연속 필수
     
     # 근무 패턴 제약 조건
     max_consecutive_work_days: int = 6  # 최대 연속 근무일 수
     enforce_two_offs_per_week: bool = False  # 주당 2일 휴무 적용 여부
-    banned_day_after_eve: bool = True  # E → D 근무 금지 (법규)
+    ban_shift_transitions: bool = True  # E→D·N→D·N→E 전이 금지 스위치(하드락 #2) — False 면 ban_* 넷(D→N 사후 검사 포함)이 한꺼번에 풀린다(바깥 이름 banned_day_after_eve)
     # 야간 전이 금지(기본 True). cp_sat_basic/fallback_lex 가 config_data/getattr 로 읽음.
     # dataclass 필드로 선언해 apply-resolution config_override 화이트리스트에 포함(비-DB-컬럼).
     ban_n_to_d: bool = True  # N → D 전이 금지
     ban_n_to_e: bool = True  # N → E 전이 금지
     
     # 병원 내규 (소프트 제약)
-    sequential_offs: bool = True  # OFF 연속 배정
-    nod_noe: bool = True  # N-O-D/E 패턴 최소화 적용 여부
+    avoid_isolated_off_and_work: bool = True  # 고립 OFF(근무-OFF-근무)·고립 근무(OFF-근무-OFF) 벌점(바깥 이름 sequential_offs)
+    avoid_nod_noe_eod: bool = True  # N-O-D·N-O-E·E-O-D 패턴 벌점(바깥 이름 nod_noe)
     
     # 휴무일 관리
     global_monthly_off_days: int = 3  # 모든 간호사에게 적용되는 전체 휴무일(공휴일, 특별 휴무일)
@@ -50,10 +52,10 @@ class NurseRosterConfig:
     shift_cap_weight: int = 500000
     soft_max_consecutive_work_days: Optional[int] = None  # 소프트 연속근무 상한(없으면 hard와 동일)
     soft_consecutive_work_penalty_weight: int = 180  # 소프트 연속근무 위반 패널티 가중치
-    # 연속 OFF 최대 개수(max_conseq_off). 기본 3 = 4연속+ OFF만 벌점, 3 이하는 전부 무차별.
+    # 연속 OFF 최대 개수(soft_max_conseq_off). 기본 3 = 4연속+ OFF만 벌점, 3 이하는 전부 무차별.
     # (k+1)연속 OFF마다 고weight 벌점 → hard처럼 억제하되, OFF 과잉 등으로 불가피하면
-    # 양보한다(soft라 절대 infeasible 유발 안 함). ORM 컬럼 max_conseq_off 와 동명.
-    max_conseq_off: int = 3
+    # 양보한다(soft라 절대 infeasible 유발 안 함). ORM 속성 soft_max_conseq_off(DB 컬럼 max_conseq_off)와 같은 이름.
+    soft_max_conseq_off: int = 3
     max_conseq_off_penalty_weight: int = 5000
     # 같은 시프트(D/E/N) 연속 ≤3 soft. True면 4연속 같은 시프트 (예: D D D D)에 패널티.
     max_same_shift: bool = True
@@ -98,7 +100,10 @@ class NurseRosterConfig:
     # 수렴된 균등해가 stage3 warm-start hint로 상속되어 X축(D/E 1.5배) 균형을 안정화한다.
     de_balance_enable: bool = True
     de_balance_tolerance: int = 2  # |D-E| 허용 밴드(일). 초과분만 soft 벌점.
-    off_first: bool = False  # off_first=False(default): OFF 규칙 우선(OFF cap 충족 + max coverage 무시 + 남는 셀 근무 배정 + fixed_wanted 차감) / off_first=True: 근무 규칙 우선(현행 min-max coverage 균등화 유지, min 근접 배정)
+    # True=근무 인원 우선(필요 인원만 채우고 남는 칸을 OFF 로 · 월 OFF 수·개인 OFF 한도는 보지 않음) /
+    # False(기본)=OFF 규칙 우선(월 OFF 수를 맞추고 남는 칸에 근무 배정 · fixed_wanted 차감).
+    # 바깥 이름 off_first 는 이름과 뜻이 반대라(True 가 'OFF 우선'이 아니다) 파이썬 안에서는 이 이름을 쓴다.
+    staffing_first: bool = False
     distribution_mode: str = "hybrid"  # auto|hybrid|balanced|preference|off
     monthly_preference_weight: int = 60  # 월단위 선호(개인 입력) 보너스 가중치(soft)
     enforce_clustered_offs: bool = False  # 고립 OFF 금지 하드 제약 사용 여부
@@ -130,8 +135,8 @@ class NurseRosterConfig:
     preceptor_min_pair_weight: float = 5.0          # 쌍 가중치 하한 필터
     preceptor_focus_shifts: Optional[List[str]] = None  # 특정 교대만 고려(e.g., ['N','E'])
     # ── 프리셉티 팔로우/커버리지 제어 ──
-    preceptee_on: bool = False                          # 프리셉티 팔로우 모드 (ON 시 프리셉티는 프리셉터 근무 따라감)
-    preceptee_shift_count: bool = True                  # 프리셉티 커버리지 포함 여부 (ON: DEN에 포함, OFF: DEN에서 제외, preceptee_on=True일 때만 유효)
+    preceptee_follows_preceptor: bool = False           # 프리셉티가 프리셉터 근무를 그대로 따라감(하드 · 바깥 이름 preceptee_on)
+    count_preceptee_in_staffing: bool = True            # 프리셉티를 근무 인원(DEN 커버리지)에 셈 · False 면 DEN 에서 뺀다(바깥 이름 preceptee_shift_count)
     # ── 미드(M) 시프트 사용 여부 ──
     use_mid: bool = False                               # True 시 DENO → DENMO 커버리지 전환
 
@@ -199,6 +204,12 @@ class NurseRosterConfig:
             월별 할당된 총 휴무일 수
         """
         return self.global_monthly_off_days + self.standard_personal_off_days + personal_off_adjustment
+
+# ── NM — 옛(바깥) 이름 호환 심: 엔진 설정 필드를 옛 이름으로 읽고 쓰면 새 필드로 잇는다 ──
+#   운영은 동작 유지 + 경고 1회, 시험(ROSTER_NM_STRICT=1)은 OldConfigNameError(services/engine_contract/names.py).
+for _old_name, _new_name in EXTERNAL_TO_INTERNAL.items():
+    if _new_name in NurseRosterConfig.__dataclass_fields__:
+        setattr(NurseRosterConfig, _old_name, OldNameDescriptor(_old_name))
 
 # 기본 설정
 DEFAULT_CONFIG = NurseRosterConfig() 

@@ -134,16 +134,16 @@ def load_criteria(db, gid, y, m, user):
     _mn = g("max_nig_per_month", 15)
     if _mn is None or _mn <= 0:
         _mn = 15                                    # cp_sat_basic.py:471-478 과 동일 보정
-    _bde = g("banned_day_after_eve", True)          # ★ 이 하나가 ND/NE/ED 셋을 다 끈다
+    _bde = g("ban_shift_transitions", True)          # ★ 이 하나가 ND/NE/ED 셋을 다 끈다
     return {
         "cfg_id": getattr(cfg, "config_id", None),
         "max_conseq": g("max_conseq_work", 5) or 5,
         "trans_on": bool(_bde),                     # falsy(NULL 포함)면 전이 3종 미적용
-        # ★ three_seq_nig 가 NULL 이면 L=3 이 아니라 L=2 다(falsy).
-        "n_run_max": 3 if g("three_seq_nig", True) else 2,
+        # ★ DB 컬럼 three_seq_nig(파이썬 allow_three_consecutive_nights)가 NULL 이면 L=3 이 아니라 L=2 다(falsy).
+        "n_run_max": 3 if g("allow_three_consecutive_nights", True) else 2,
         "rec2": bool(g("two_offs_after_two_nig", False)),
         "rec3": bool(g("two_offs_after_three_nig", True)),
-        "one_n": bool(g("not_one_night", False)),
+        "one_n": bool(g("ban_single_night", False)),
         "max_night": int(_mn),
         "use_mid": bool(g("use_mid", False)),
         "off_days": resolve_effective_off_days(cd),
@@ -238,7 +238,7 @@ def check_nurse(seq, T0, T1, c, n_tail, offs_after):
         if all(x in WORK for x in wnd):
             v[f"A5_연속근무{K + 1}일"] += 1
 
-    # A6~A8. 전이 금지 — ★ banned_day_after_eve 하나가 셋을 다 끈다(NULL 이어도 꺼짐)
+    # A6~A8. 전이 금지 — ★ ban_shift_transitions(DB 컬럼 banned_day_after_eve) 하나가 셋을 다 끈다(NULL 이어도 꺼짐)
     if c["trans_on"]:
         for d in range(T0 + 1, T1 + 1):
             p, q = seq[d - 1], seq[d]

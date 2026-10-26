@@ -57,7 +57,7 @@ def s_mask_team():           # N전담 마스크 ↔ 팀 D 최소
     return r
 
 def s_not_one_night():       # 단일N금지 + N cap1 → N 불가
-    r = base(); r.not_one_night(); r.monthly_night_cap(1); return r
+    r = base(); r.not_one_night(); r.monthly_night_cap(1); return r  # nm:external
 
 def s_recovery_cov():        # 야간회복 + N 높은 수요
     r = Reduced(nurses=6, days=4); r.coverage_min("N", 3); r.coverage_min("D", 2)

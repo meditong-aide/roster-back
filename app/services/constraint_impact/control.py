@@ -174,7 +174,7 @@ def _module_mode_estimate(family: str, snapshot: SemanticsSnapshot) -> str:
     if family == "ConsecutiveWorkLimit":
         return "enforced" if int(cfg.get("max_conseq_work") or 0) > 0 else "inactive"
     if family == "ConsecutiveNightLimit":
-        return "enforced"  # 정본 three_seq_nig 는 bool — 켜면 3·꺼도 2 라 연속 나이트 상한이 늘 있다
+        return "enforced"  # 정본 allow_three_consecutive_nights 는 bool — 켜면 3·꺼도 2 라 연속 나이트 상한이 늘 있다
     if family == "CoverageMin":
         return "enforced"
     return "enforced"
@@ -379,17 +379,17 @@ class RuntimeKeyForbidden(ValueError):
 
 def _apply_consec_nights(cfg: dict[str, Any], adj: ConstraintAdjustment) -> None:
     """연속 나이트 상한 — 레지스트리가 런타임 조정을 금지(D13)하면 쓰지 않고 '적용 불가'로 기록한다. 금지 표지가 없으면 정본 bool
-    `three_seq_nig`(3 if x else 2)에 접어 쓴다 — 3 을 넘는 값도 True(=3)라 절대 상한(하드락 #3)을 못 넘는다."""
+    `allow_three_consecutive_nights`(3 if x else 2)에 접어 쓴다 — 3 을 넘는 값도 True(=3)라 절대 상한(하드락 #3)을 못 넘는다."""
     from services.policy.hard_lock import runtime_forbidden_violation
 
     if adj.action != "set_threshold":
         raise ValueError(f"unsupported ConsecutiveNightLimit action: {adj.action}")
     if not isinstance(adj.target_value, int) or adj.target_value < 0:
         raise ValueError("ConsecutiveNightLimit set_threshold target_value must be non-negative int")
-    violation = runtime_forbidden_violation("three_seq_nig")
+    violation = runtime_forbidden_violation("allow_three_consecutive_nights")
     if violation is not None:
         raise RuntimeKeyForbidden(violation)
-    cfg["three_seq_nig"] = adj.target_value >= 3  # 표지가 없으면 정본 bool 로 접어 쓴다(레지스트리 `to_canonical` x>=3)
+    cfg["allow_three_consecutive_nights"] = adj.target_value >= 3  # 표지가 없으면 정본 bool 로 접어 쓴다(레지스트리 `to_canonical` x>=3)
 
 
 def _apply_night_recovery(cfg: dict[str, Any], adj: ConstraintAdjustment) -> None:

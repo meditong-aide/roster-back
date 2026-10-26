@@ -32,12 +32,12 @@ def _cfg(**extra):
     """엔진 기본에 가까운 설정 — 연속근무 상한은 운영에 많은 6."""
     base = {
         "daily_shift_requirements": {"D": 1, "E": 1, "N": 1}, "max_conseq_work": 6,
-        "max_nig_per_month": 15, "banned_day_after_eve": True, "three_seq_nig": True,
-        "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "not_one_night": False,
+        "max_nig_per_month": 15, "ban_shift_transitions": True, "allow_three_consecutive_nights": True,
+        "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "ban_single_night": False,
         "use_mid": False, "off_days": 8, "shift_priority": 0.7,
-        # EI-14r3 — 이 파일은 연속근무·주휴·퇴사 용량을 따로 잰다. OFF 하드 하한(min_off — off_first=False 병동)은 별개 제약이라 끈다
+        # EI-14r3 — 이 파일은 연속근무·주휴·퇴사 용량을 따로 잰다. OFF 하드 하한(min_off — staffing_first=False 병동)은 별개 제약이라 끈다
         # (그 하한은 test_precheck_min_off_floor.py · test_precheck_vs_engine_stage1.py::test_s7e* 가 본다).
-        "off_first": True,
+        "staffing_first": True,
     }
     base.update(extra)
     return base

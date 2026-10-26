@@ -393,7 +393,7 @@ def _overlay_engine_keys(cfg: dict[str, Any], pin: PrecheckCall, num_days: int, 
     """정본 키 → 그래프가 읽는 이름(EI-14b2a1).
 
     그래프(`roster_ir`·`frontier_dp`·`lagrangian`)는 `max_consecutive_work`·`max_consecutive_nights`·`forbid_night_to_day` 를
-    읽는데 DB 정본 키는 `max_conseq_work`·`three_seq_nig`·`ban_n_to_d` 라 운영 config 에서 그 규칙이 안 켜졌다.
+    읽는데 레지스트리 정본 키는 `max_conseq_work`·`allow_three_consecutive_nights`·`ban_n_to_d` 라 운영 config 에서 그 규칙이 안 켜졌다.
     번역은 새로 쓰지 않고 EI-8 `engine_hard_lock`(엔진 실효값)을 한 곳에서만 쓴다. 엔진 `create_config_from_db` 의
     print 7~9줄은 삼킨다(precheck 마다 한 번 더 나오지 않게). 못 읽는 설정은 번역 없이 기본 입력(fail-open).
     """
@@ -403,12 +403,12 @@ def _overlay_engine_keys(cfg: dict[str, Any], pin: PrecheckCall, num_days: int, 
     # 이 호출끼리는 락으로 직렬화한다(EI-14C1r). 켜 있는 동안(수 ms) 다른 스레드 로그가 삼켜질 수 있는 점은 남는다.
     with _STDOUT_LOCK, contextlib.redirect_stdout(io.StringIO()):
         eff = engine_hard_lock(cfg)
-    if not eff or any(k not in eff for k in ("max_conseq_work", "three_seq_nig", "ban_n_to_d")):
+    if not eff or any(k not in eff for k in ("max_conseq_work", "allow_three_consecutive_nights", "ban_n_to_d")):
         notes.append("engine_hard_lock 못 읽음 — 정본 키 번역 생략")
         return False
     cfg["max_consecutive_work"] = eff["max_conseq_work"]
-    cfg["max_consecutive_nights"] = eff["three_seq_nig"]      # 엔진 값 3|2 정수
-    cfg["forbid_night_to_day"] = bool(eff["ban_n_to_d"])      # banned_day_after_eve 마스킹이 이미 반영됨
+    cfg["max_consecutive_nights"] = eff["allow_three_consecutive_nights"]      # 엔진 값 3|2 정수
+    cfg["forbid_night_to_day"] = bool(eff["ban_n_to_d"])      # ban_shift_transitions 마스킹이 이미 반영됨
     return True
 
 
@@ -430,17 +430,17 @@ def _fixed_cells_by_nurse(
     return out
 
 
-def _exempt_adjacent(days: dict[int, str], not_one_night: bool) -> bool:
+def _exempt_adjacent(days: dict[int, str], ban_single_night: bool) -> bool:
     """엔진이 전이 금지를 면제하는 인접 고정 쌍을 가진 간호사인가.
 
     (a) 고정 N 바로 다음 날이 고정 D/E — 두 칸이 모두 고정이면 N→D/E 를 면제한다(`fallback_lex.py:2000·2026·2052`).
-    (b) 월 1일(day 0) 고정 N 이고 not_one_night — 엔진은 1일 고정 N 의 1N 금지를 면제한다.
+    (b) 월 1일(day 0) 고정 N 이고 ban_single_night — 엔진은 1일 고정 N 의 1N 금지를 면제한다.
     그래프 DP 는 N 뒤를 N/O 로만 허용해 이 쌍을 표현하지 못한다 — 겹치면 엔진이 푸는 병동에 INFEASIBLE_CERTIFIED 가 나온다.
     """
     for day, shift in days.items():
         if shift == "N" and days.get(day + 1) in ("D", "E"):
             return True
-    return bool(not_one_night) and days.get(0) == "N"
+    return bool(ban_single_night) and days.get(0) == "N"
 
 
 def _overlay_fixed_cells(cfg: dict[str, Any], pin: PrecheckCall, num_days: int, notes: list[str]) -> bool:
@@ -456,11 +456,11 @@ def _overlay_fixed_cells(cfg: dict[str, Any], pin: PrecheckCall, num_days: int, 
     ic = copy.deepcopy(cfg.get("initial_constraints") or {})
     forbidden = ic.setdefault("forbidden", {})
     forced_off = ic.setdefault("forced_off", {})
-    not_one_night = bool(cfg.get("not_one_night"))
+    ban_single_night = bool(cfg.get("ban_single_night"))
     exempt = 0
     changed = False
     for nid, days in by_nurse.items():
-        if _exempt_adjacent(days, not_one_night):
+        if _exempt_adjacent(days, ban_single_night):
             exempt += 1
             continue
         for day, shift in days.items():

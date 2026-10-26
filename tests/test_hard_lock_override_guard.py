@@ -15,6 +15,7 @@ import math
 
 import pytest
 from fastapi import HTTPException
+from services.engine_contract.names import INTERNAL_TO_EXTERNAL
 from services.engine_contract.settings import ADJACENT, AFFECTS, RUNTIME_DATA_NOT_SETTINGS, SETTINGS, HardLock
 from services.policy.hard_lock import _FORBIDDEN_INTERNAL_KEYS, rule_label
 from services.roster_create_service import assert_night_caps_within_hard_lock as guard
@@ -25,10 +26,10 @@ _RUNTIME_MESSAGE = "max_consecutive_nights 는 요청으로 보낼 수 없는 �
 
 
 def _hard_lock_rows(kind: str) -> list[tuple[str, HardLock]]:
-    """그 하드락 분류의 (키, HardLock) — 정본 키와 별칭 모두."""
+    """그 하드락 분류의 (키, HardLock) — 정본 키·별칭·바깥(옛) 이름(`spec.column` · NM)이 모두. 옛 이름 요청도 표 전체로 막는다."""
     return [(key, spec.hard_lock) for spec in SETTINGS
             if isinstance(spec.hard_lock, HardLock) and spec.hard_lock.kind == kind
-            for key in (spec.key, *spec.aliases)]
+            for key in (spec.key, *spec.aliases, *((spec.column,) if spec.column else ()))]
 
 
 _CAP_ROWS = [(k, lock) for k, lock in _hard_lock_rows("int_cap") if lock.rule_no != _RULE6]     # #1
@@ -39,7 +40,8 @@ _DERIVED_CANON = [spec.key for spec in SETTINGS
 _RUNTIME_ALIASES = [alias for spec in SETTINGS for alias, info in (spec.derived_inputs or {}).items()
                     if info.get("runtime") == "forbidden"]                                       # D13 ③
 _BOUNDARY_KEYS = [k for k, _lock in _hard_lock_rows("boundary_switch")]
-_ADJACENT_KEYS = [key for spec in SETTINGS if spec.hard_lock in (ADJACENT, AFFECTS) for key in (spec.key, *spec.aliases)]
+_ADJACENT_KEYS = [key for spec in SETTINGS if spec.hard_lock in (ADJACENT, AFFECTS)
+                  for key in (spec.key, *spec.aliases, *((spec.column,) if spec.column else ()))]   # 바깥(옛) 이름 포함(NM)
 
 
 def _detail(delta: dict, release=None) -> str | None:
@@ -57,12 +59,13 @@ def test_direction_table_rows_match_spec():
     assert {k for k, _ in _CAP_ROWS} == {"max_conseq_work", "max_consecutive_work_days", "max_consecutive_work"}
     assert {k for k, _ in _NIGHT_ROWS} == {"max_nig_per_month", "max_night_shifts_per_month"}
     assert {k: lock.rule_no for k, lock in _BOOL_ROWS} == {
-        "banned_day_after_eve": 2, "ban_e_to_d": 2, "ban_n_to_d": 2, "ban_n_to_e": 2,
-        "two_offs_after_three_nig": 4, "two_offs_after_two_nig": 5, "not_one_night": 7, "use_mid": 8}
-    assert _DERIVED_CANON == ["three_seq_nig"] and _RUNTIME_ALIASES == ["max_consecutive_nights"]
+        "ban_shift_transitions": 2, "ban_e_to_d": 2, "ban_n_to_d": 2, "ban_n_to_e": 2,
+        "two_offs_after_three_nig": 4, "two_offs_after_two_nig": 5, "ban_single_night": 7, "use_mid": 8,
+        "banned_day_after_eve": 2, "not_one_night": 7}  # 끝의 둘은 바깥(옛) 이름 — 같은 행으로 막는다(NM)
+    assert _DERIVED_CANON == ["allow_three_consecutive_nights"] and _RUNTIME_ALIASES == ["max_consecutive_nights"]
     assert set(_BOUNDARY_KEYS) == {"cross_month_hard_rules_enable", "cross_month_lookback_days"}
-    assert {"off_days", "nod_noe", "ban_night_before_fixed_off", "ban_night_before_fixed_wanted_off", "preceptee_on",
-            "fixed_wanted_use_yn", "n2n_min_gap"} <= set(_ADJACENT_KEYS)
+    assert {"off_days", "avoid_nod_noe_eod", "ban_night_before_fixed_off", "ban_night_before_fixed_wanted_off", "preceptee_follows_preceptor",
+            "apply_confirmed_wanted", "n2n_min_gap"} <= set(_ADJACENT_KEYS)
 
 
 # ── #1(정수 상한) — > 상한 · 숫자 아님 → 400 / ≤ 상한 · None → 통과 ────────────────────────────
@@ -116,8 +119,9 @@ def test_monthly_night_cap_keeps_messages_verbatim(key, lock):
 def test_bool_hard_lock_off_value_is_400_even_if_already_off(key, lock):
     """끄는 값(False·None·0·"")은 400 — 가드는 기준 설정을 모르므로 이미 꺼진 병동이 같은 값 False 를 보내도 400 이다
     (Q1 의 대가 · 정상 생산자 0 — 수동 API 만)."""
+    shown = INTERNAL_TO_EXTERNAL.get(key, key)  # 400 문구의 키 표기는 바깥(옛) 이름이다 — 지금 화면 문구가 바뀌지 않는다(NM X6)
     for value in (False, None, 0, ""):
-        assert _detail({key: value}) == f"{_RELAX_PREFIX}{rule_label(lock.rule_no)} — {key}={value!r}", value
+        assert _detail({key: value}) == f"{_RELAX_PREFIX}{rule_label(lock.rule_no)} — {shown}={value!r}", value
 
 
 @pytest.mark.parametrize(("key", "lock"), _BOOL_ROWS, ids=[k for k, _ in _BOOL_ROWS])
@@ -131,8 +135,8 @@ def test_bool_hard_lock_truthy_value_passes(key, lock):
 
 
 @pytest.mark.parametrize("key", _DERIVED_CANON)
-def test_canonical_three_seq_nig_passes_every_value(key):
-    """정본 `three_seq_nig` 는 `3 if x else 2` 라 상한(3)을 못 넘는다 — 2N→3N(True)도 통과(Q12: 절대 상한 3 안)."""
+def test_canonical_allow_three_consecutive_nights_passes_every_value(key):
+    """정본 `allow_three_consecutive_nights` 는 `3 if x else 2` 라 상한(3)을 못 넘는다 — 2N→3N(True)도 통과(Q12: 절대 상한 3 안)."""
     for value in (True, False, None, 0, 1, 7, -1, "x", ""):
         assert _detail({key: value}) is None, value
 

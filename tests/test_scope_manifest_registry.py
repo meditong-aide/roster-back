@@ -48,9 +48,9 @@ def test_use_mid_is_unsupported_marker():
     assert sm.unmodeled_active([], {"use_mid": False}) == []
 
 
-def test_preceptee_on_alone_stays_in_scope():
-    """test_scope_manifest.py:87 — preceptee_on 단독은 지원 범위(표에 넣지 않는다)."""
-    assert sm.unmodeled_active([], {"preceptee_on": True}) == []
+def test_preceptee_follows_preceptor_alone_stays_in_scope():
+    """test_scope_manifest.py:87 — preceptee_follows_preceptor 단독은 지원 범위(표에 넣지 않는다)."""
+    assert sm.unmodeled_active([], {"preceptee_follows_preceptor": True}) == []
 
 
 def test_grade_constraints_marker_is_inactive_in_config_dict():

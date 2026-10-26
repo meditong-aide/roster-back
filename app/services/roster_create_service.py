@@ -53,6 +53,7 @@ from services.nurse_monthly_limit_service import fetch_effective_monthly_limits_
 from services.cp_sat.mid_feasibility import validate_mid_hard_feasibility as _validate_mid_hard_feasibility_impl
 from services.semantics import attach_reason_code_ontology
 from services.engine_contract.aliases import normalize_aliases
+from services.engine_contract.names import external_key, to_external_deep, to_internal
 from services.precheck.relaxation_notice import build_relaxation_notice  # EI-14c 자동 완화 안내(순수 함수)
 # EI-5 배관 헬퍼(설계서 §5.3) — precheck 차단·나이트 과공급 차단 두 블록이 공유한다.
 #   이 모듈은 모듈 최상단에서 roster_create_service 를 끌어오지 않는다(함수 안
@@ -202,9 +203,9 @@ def _collect_nurses_and_preferences(db: Session, req, current_user):
     #   아래 DENO 분류가 `shift_id` 를 리터럴 {"D","E","N","O"} 와 **직접 비교**하고 있었다.
     #   병동이 OFF 를 `OF`·`오프` 로 쓰면 `"OF" in {...}` 가 False 라 **원티드 OFF 가 통째로
     #   미분류로 버려진다**(실측 2026-09-17 성남 중환자실-RN: 확정 원티드 168건 중 `OF` 91건이
-    #   미분류. 그 병동은 `fixed_wanted_use_yn=True` 라 다른 경로로 살아나 드러나지 않았다).
+    #   미분류. 그 병동은 `apply_confirmed_wanted=True` 라 다른 경로로 살아나 드러나지 않았다).
     #   지금 26/27 병동이 OFF 코드를 `O` 로 써서 **우연히** 동작할 뿐이다.
-    #   ★ `fixed_wanted_use_yn=True` 경로는 원본 코드를 그대로 넘겨 솔버가 정규화한다 —
+    #   ★ `apply_confirmed_wanted=True` 경로는 원본 코드를 그대로 넘겨 솔버가 정규화한다 —
     #     같은 데이터를 두 경로가 다르게 분류하던 비대칭을 여기서 맞춘다.
     #   ★★ `shifts` 는 PK·UNIQUE 가 없어 같은 `(group_id, shift_id)` 가 **여러 행**일 수 있다.
     #     정렬 없이 `=` 로 대입하면 **DB 반환 순서에 따라 대표 `default_shift` 가 달라져**
@@ -616,7 +617,9 @@ def _build_generate_snapshot(db: Session, config, status: str, year: int, month:
                 return [_key_safe(v) for v in o]
             return o
 
-        return json.dumps(_key_safe(payload), ensure_ascii=False, default=str)
+        # 저장 JSON(roster_config_attempt.snapshot)은 바깥(옛) 이름 — payload["config"] 는 엔진 입력(새 이름)이다(NM).
+        #   `_key_safe` 뒤에 바꾼다: set 이 정렬된 리스트가 되고 튜플 키가 문자열이 된 뒤라 안쪽 문자열까지 같이 본다.
+        return json.dumps(to_external_deep(_key_safe(payload)), ensure_ascii=False, default=str)
     except Exception as _sn_exc:
         # ★ rollback 을 반드시 한다. 위 SELECT 중 하나가 DB 오류로 죽으면 세션이
         #   비활성 상태로 남아, 이어지는 status UPDATE 가 PendingRollbackError 로
@@ -2858,8 +2861,8 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         K = 5
     two_after_three = bool(config_dict.get('two_offs_after_three_nig'))
     two_after_two = bool(config_dict.get('two_offs_after_two_nig'))
-    not_one_night = bool(config_dict.get("not_one_night", False))
-    banned_E_to_D = bool(config_dict.get('banned_day_after_eve'))
+    ban_single_night = bool(config_dict.get("ban_single_night", False))
+    banned_E_to_D = bool(config_dict.get('ban_shift_transitions'))
     ban_e_to_d = bool(config_dict.get('ban_e_to_d', True))
     ban_n_to_d = bool(config_dict.get('ban_n_to_d', True))
     ban_n_to_e = bool(config_dict.get('ban_n_to_e', True))
@@ -2867,7 +2870,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         ban_e_to_d = False
         ban_n_to_d = False
         ban_n_to_e = False
-    L = 3 if bool(config_dict.get('three_seq_nig', False)) else 2  # D13 ①(EI-11 11b) — 정본만 읽는다(요청 별칭은 가드가 400)
+    L = 3 if bool(config_dict.get('allow_three_consecutive_nights', False)) else 2  # D13 ①(EI-11 11b) — 정본만 읽는다(요청 별칭은 가드가 400)
 
     # 간호사별 is_weekend_off 정보 조회 (주말 휴무 대상자 필터링용)
     weekend_off_nurse_ids: set[str] = set()
@@ -2932,7 +2935,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         #   day0 OFF 필수 = off_window [0,0])일 때만 day0 N 을 막고, soft 한 off_window(윈도우 내
         #   OFF≥1)가 day0 를 덮으면 window_end>=1 일 때 [1,end] 로 시프트(휴식은 day1~ 에서 확보)해
         #   day0 N 을 허용한다. (1N 금지=하드락이 월초 휴식 soft 윈도우보다 우선)
-        if not_one_night and cons_n == 1:
+        if ban_single_night and cons_n == 1:
             has_day0_forced = 0 in forced_off.get(nurse_id, [])
             day0_off_window_hard = False
             for _w in list(off_window_constraints.get(nurse_id, []) or []):
@@ -2955,11 +2958,11 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
                 forbidden[nurse_id][0].extend(['D', 'E', 'N'])
                 print(f"[CrossMonth] 간호사 {nurse_id}: 1N tail + day0 주휴 → day0 O 유지(forbidden D/E/N), tail={tail_str}")
             else:
-                # day0 N 허용(전월 1N + day0 = 2N). L>=3(3N 허용 설정=three_seq_nig)이면 day1 도 N 허용 →
+                # day0 N 허용(전월 1N + day0 = 2N). L>=3(3N 허용 설정=allow_three_consecutive_nights)이면 day1 도 N 허용 →
                 #   day0+day1=3N 까지 구조적으로 가능(N 공급↑·미달일 커버리지 도움; 3N 되면 솔버의 3N2O 가
                 #   day2,3 OFF 처리). L==2(3N 불가)면 현재처럼 day0만 N(2N) + 2N2O 면 day1,2 OFF 강제.
                 if L >= 3:
-                    _n1_msg = "day0~day1 N 허용(최대 3N, three_seq_nig)"
+                    _n1_msg = "day0~day1 N 허용(최대 3N, allow_three_consecutive_nights)"
                 else:
                     two_after_two_effective = two_after_two
                     if two_after_two_effective:
@@ -2972,7 +2975,7 @@ def build_cross_month_constraints(db: Session, req: RosterRequest, current_user,
         two_after_two_effective = two_after_two
         two_after_three_effective = two_after_three
         # N 상한(L) 미도달 시: 솔버 prefix cap이 경계를 처리하므로 forced OFF 불필요
-        # 예) three_seq_nig=True(L=3), cons_n=2 → day0에 N 1회 추가 허용
+        # 예) allow_three_consecutive_nights=True(L=3), cons_n=2 → day0에 N 1회 추가 허용
         if L and cons_n < L:
             two_after_two_effective = False
             two_after_three_effective = False
@@ -3075,13 +3078,13 @@ def build_mid_month_boundary_constraints(
     K = _safe_int(config_dict.get('max_conseq_work'), None)
     if K is None:
         K = 5
-    L = 3 if bool(config_dict.get('three_seq_nig', False)) else 2  # D13 ①(EI-11 11b) — 정본만 읽는다(요청 별칭은 가드가 400)
+    L = 3 if bool(config_dict.get('allow_three_consecutive_nights', False)) else 2  # D13 ①(EI-11 11b) — 정본만 읽는다(요청 별칭은 가드가 400)
     two_after_three = bool(config_dict.get('two_offs_after_three_nig'))
     two_after_two = bool(config_dict.get('two_offs_after_two_nig'))
     ban_e_to_d = bool(config_dict.get('ban_e_to_d', True))
     ban_n_to_d = bool(config_dict.get('ban_n_to_d', True))
     ban_n_to_e = bool(config_dict.get('ban_n_to_e', True))
-    if not bool(config_dict.get('banned_day_after_eve')):
+    if not bool(config_dict.get('ban_shift_transitions')):
         ban_e_to_d = False
         ban_n_to_d = False
         ban_n_to_e = False
@@ -3860,14 +3863,14 @@ def _override_block_detail(config_delta: dict | None) -> str | None:
     violations = override_violations(config_delta or {})
     boundary = [v for v in violations if v.reason_code == "boundary_switch_off"]
     if boundary:
-        return "월경계 하드락은 요청으로 끌 수 없습니다(하드락): " + ", ".join(f"{v.key}={v.value!r}" for v in boundary)
+        return "월경계 하드락은 요청으로 끌 수 없습니다(하드락): " + ", ".join(f"{external_key(v.key)}={v.value!r}" for v in boundary)
     runtime = [v for v in violations if v.reason_code == "runtime_key_forbidden"]
     if runtime:
         return " ".join(v.message_ko for v in runtime)
     rest = [v for v in violations if v.kind == BLOCK]
     if rest:
         return "하드락 규칙은 요청으로 완화할 수 없습니다: " + ", ".join(
-            f"{rule_label(v.rule_no)} — {v.key}={v.value!r}" for v in rest)
+            f"{rule_label(v.rule_no)} — {external_key(v.key)}={v.value!r}" for v in rest)
     return None
 
 
@@ -4045,9 +4048,9 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
         config_dict = (config_override.copy() if config_override is not None else (latest_config.__dict__.copy() if latest_config else {}))
         # 월중 경계(파견·복귀) 몫 — 아래 3) 에서 이 시도의 월경계·허용 시프트·금지 원티드와 합친다(EI-11 11r).
         _mid_ic, _mid_ow = _pop_mid_month_parts(config_dict)
-        # 근무 우선(off_first=True)은 월 OFF 수를 하드로 보지 않는 모드라 개인 OFF 한도(o_*)도
+        # 근무 우선(staffing_first=True)은 월 OFF 수를 하드로 보지 않는 모드라 개인 OFF 한도(o_*)도
         #   읽지 않는다(2026-10-12 사용자 결정). 사본으로 바꿔 간호사 객체(재시도가 공유)는 그대로 둔다.
-        if bool(config_dict.get("off_first", False)):
+        if bool(config_dict.get("staffing_first", False)):
             nurses_dict = [{**nd, "o_min": None, "o_max": None, "o_exact": None} for nd in nurses_dict]
         # ShiftManage 요구인원은 호출부에서 주입한다
 
@@ -4236,7 +4239,7 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
             off_pen = config_dict.get("extra_off_penalty_weight")
             soft_k = config_dict.get("soft_max_consecutive_work_days")
             soft_w = config_dict.get("soft_consecutive_work_penalty_weight")
-            soft_off_k = config_dict.get("max_conseq_off")
+            soft_off_k = config_dict.get("soft_max_conseq_off")
             soft_off_w = config_dict.get("max_conseq_off_penalty_weight")
             print(
                 "[ShiftDistributionPolicy] "
@@ -4336,17 +4339,17 @@ def _run_cp_sat_basic(db: Session, current_user, nurses_in_group, preferences, l
                         ),
                         "forced_grade_soft_fallback": bool(config_dict.get("_force_grade_max_soft_fallback")),
                         "config_flags": {
-                            "preceptee_on": bool(config_dict.get("preceptee_on", True)),
-                            "preceptee_shift_count": bool(config_dict.get("preceptee_shift_count", True)),
+                            "preceptee_follows_preceptor": bool(config_dict.get("preceptee_follows_preceptor", True)),
+                            "count_preceptee_in_staffing": bool(config_dict.get("count_preceptee_in_staffing", True)),
                             "use_mid": bool(config_dict.get("use_mid", False)),
-                            "off_first": bool(config_dict.get("off_first", False)),
+                            "staffing_first": bool(config_dict.get("staffing_first", False)),
                             "weekend_off_only_enable": bool(config_dict.get("weekend_off_only_enable", True)),
                             "team_min_soft_fallback": bool(config_dict.get("team_min_soft_fallback", False)),
                             "team_handoff_soft_fallback": bool(config_dict.get("team_handoff_soft_fallback", True)),
                             "grade_allow_soft_fallback": bool((engine_grade_config or {}).get("allow_soft_fallback", False)) if isinstance(engine_grade_config, dict) else False,
                             "two_offs_after_two_nig": bool(config_dict.get("two_offs_after_two_nig", False)),
                             "two_offs_after_three_nig": bool(config_dict.get("two_offs_after_three_nig", False)),
-                            "not_one_night": bool(config_dict.get("not_one_night", False)),
+                            "ban_single_night": bool(config_dict.get("ban_single_night", False)),
                             "ban_n_to_d": bool(config_dict.get("ban_n_to_d", True)),
                             "ban_e_to_d": bool(config_dict.get("ban_e_to_d", True)),
                             "ban_n_to_e": bool(config_dict.get("ban_n_to_e", True)),
@@ -5200,17 +5203,17 @@ def _build_roster_response(db: Session, schedule, req, nurses_in_group):
 def _preceptee_coverage_skipper(roster_system, cfg):
     """커버리지 회계에서 제외할 프리셉티 판별기를 만든다.
 
-    preceptee_shift_count=False 면 프리셉티는 커버리지상 '없는 인력'이다. 솔버의
+    count_preceptee_in_staffing=False 면 프리셉티는 커버리지상 '없는 인력'이다. 솔버의
     need/supply 와 같은 기준으로 세지 않으면 부족 리포트가 솔버와 어긋나 phantom
     부족·과소보고의 씨앗이 된다.
-    ★ 이 설정은 roster_config 상 preceptee_on=True 일 때만 유효하므로 여기서
-      preceptee_on 을 다시 보지 않는다.
+    ★ 이 설정은 roster_config 상 preceptee_follows_preceptor=True 일 때만 유효하므로 여기서
+      preceptee_follows_preceptor 을 다시 보지 않는다.
     ★ 판별 규칙은 cp_sat_basic 의 _is_preceptee_at 과 동일하다
       (SSOT = nurse_preceptee_period, 설계: docs/NURSE_PRECEPTEE_PERIOD_DESIGN.md §6).
         맵 있음(권위)  → 그 사람의 follow day 집합에 d 가 있을 때만 프리셉티
         맵 없음(폴백)  → preceptor_id 보유자를 전체월 프리셉티로(기존 동작 보존)
     """
-    if bool(getattr(cfg, "preceptee_shift_count", True)):
+    if bool(getattr(cfg, "count_preceptee_in_staffing", True)):
         return lambda n, d: False
     if bool(getattr(roster_system, "preceptee_period_authoritative", False)):
         follow_days = getattr(roster_system, "preceptee_follow_days", {}) or {}
@@ -5817,7 +5820,7 @@ def _apply_cross_ward_night_caps(nurses: list, other_nights: dict[str, int], act
     except (TypeError, ValueError):
         cap = _hard
     cap = _hard if cap <= 0 else min(cap, _hard)
-    not_one_night = bool(config_dict.get("not_one_night", False))
+    ban_single_night = bool(config_dict.get("ban_single_night", False))
     changed: dict[str, int] = {}
     for nurse in nurses:
         nid = str(getattr(nurse, "nurse_id", "") or "")
@@ -5832,7 +5835,7 @@ def _apply_cross_ward_night_caps(nurses: list, other_nights: dict[str, int], act
             attrs["n_min"], attrs["n_exact"] = int(exact), None
         current = attrs.get("n_max")
         new = room if current is None else min(int(current), room)
-        if new == 1 and not_one_night and current != 1:
+        if new == 1 and ban_single_night and current != 1:
             new = 0
         attrs["n_max"] = new
         changed[nid] = new
@@ -6031,12 +6034,14 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
     from services.cp_sat import gen_deadline
     _dl_token = gen_deadline.start()
     try:
-        return _generate_roster_service_impl(
+        # 응답은 바깥(옛) 이름으로 내보낸다(NM) — 본체는 새 이름으로 만든 카드·처방 apply·changes[].config_key·
+        #   constraint_impact 등을 싣는다. 호출자(라우터·워커)가 한 번 더 바꿔도 같은 결과다(멱등).
+        return to_external_deep(_generate_roster_service_impl(
             req, current_user, db, treatment_ids, config_override,
             weekend_off_release, monthly_limit_release, banned_wanted_release,
             allowed_shift_add, job_id, column_delta_mode, _ctx,
-        )
-    except HTTPException:
+        ))
+    except HTTPException as _http_exc:
         # ★ HTTPException 이라고 다 기록된 건 아니다. blocked/infeasible 은 낙인 후
         #   던지지만, MID 하드 검증 실패 같은 다른 HTTPException 은 기록 없이 나간다
         #   (실측: use_mid=False 인데 fixed_shift='MID' 인 간호사가 있으면 여기로 빠진다).
@@ -6045,6 +6050,10 @@ def generate_roster_service(req: RosterRequest, current_user, db: Session, treat
         #   자연히 걸러진다 — 그건 "이 설정으로 생성이 안 된다" 가 아니다.
         if not _ctx.get("recorded"):
             _record_unclassified_failure(db, req, job_id, _ctx)
+        # 구조화 detail(infeasibility·precheck 차단 payload)도 같은 이유로 바깥 이름으로 바꿔 다시 던진다(NM) —
+        #   프론트가 opt.apply 를 설정에 다시 병합해 보내므로 새 이름이 나가면 그 키가 버려진다. 문자열 detail 은 그대로 둔다.
+        if isinstance(_http_exc.detail, (dict, list)):
+            _http_exc.detail = to_external_deep(_http_exc.detail)
         raise
     except Exception as _gen_exc:
         print(f"[RosterGenerate] 미분류 실패 — {type(_gen_exc).__name__}: {_gen_exc}")
@@ -6077,9 +6086,12 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     assert_treatments_allowed(treatment_ids)
     # 판정이 `int()` 로 읽어 통과시킨 정수 상한 키의 문자열·실수를 그 정수로 바꿔 엔진에 넘긴다(EI-11 11r — 예전엔 엔진 TypeError).
     config_override = _normalize_int_cap_override(config_override)
-    # 별칭(dataclass 이름) → 정본 키(DB 컬럼명) — 판정이 원래 이름을 본 뒤에 바꾼다(EI-12 · D9).
+    # 별칭(dataclass 이름) → 정본 키(레지스트리 정본 이름 — 설정 14칸은 물리 컬럼 이름이 아니라 파이썬 이름) — 판정이 원래 이름을 본 뒤에 바꾼다(EI-12 · D9).
     _override_given = bool(config_override)  # 값 없는 별칭만 보냈어도 '개입'이다 — 정규화 결과가 비어도 낙인 판정은 그대로(EI-12 12r)
-    config_override = normalize_aliases(config_override)
+    # 바깥(옛) 이름 키 → 파이썬 이름(NM, `to_internal`) — 관문(위)은 옛·새 이름 모두 판정하고 400 문구는 바깥 이름이라 변환은
+    #   관문 뒤다. 별칭 정규화보다 먼저 바꾼다: 옛 이름과 별칭이 함께 와도 정본이 먼저 서서 별칭이 버려진다. 라우터 sync·
+    #   apply-resolution·워커가 모두 이 입구를 지나고, 이미 새 이름이면 그대로다(멱등 · None 값도 그대로 둔다).
+    config_override = normalize_aliases(to_internal(config_override))
     # per-nurse 주말휴무 해제(검증된 resolution 원클릭). 해당 월 발효로 period 에 해제(0) write
     #   = 개인 속성 변경(영구). nurse_weekendoff_period SSOT. 컬럼 미조회.
     _wor = weekend_off_release or getattr(req, "weekend_off_release", None)
@@ -6602,9 +6614,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     #   컬럼이 없는 환경에서는 0(해제)이라 동작 불변. `config_override` 가 아래에서 덮으므로
     #   A/B·완화 재시도가 이 값을 이긴다(4차 완화가 0 으로 내려 재생성하는 경로).
     config_dict["n2n_min_gap"] = _n2n_min_gap_setting(db, current_user.group_id)
-    # 요청에서 not_one_night가 들어오면 우선 적용 (없으면 DB 설정 유지)
-    if getattr(req, "not_one_night", None) is not None:
-        config_dict["not_one_night"] = bool(req.not_one_night)
+    # 요청(바깥 이름 not_one_night)에서 들어오면 config_dict 의 ban_single_night 에 우선 적용 (없으면 DB 설정 유지)
+    if getattr(req, "not_one_night", None) is not None:  # nm:external
+        config_dict["ban_single_night"] = bool(req.not_one_night)  # nm:external
     # 런타임 config override(비-DB-컬럼 solver 파라미터 포함) — apply-resolution의 probe/비컬럼 옵션이
     # DB 커밋 없이 이번 생성에만 완화값을 주입할 때 사용. config_dict 최종 병합(가장 우선).
     if config_override:
@@ -6936,11 +6948,11 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 filtered_map[str(nurse_id)] = clipped
         weekly_off_map = filtered_map
 
-    # ── 프리셉티 주휴 처리 (preceptee_on=True 일 때) ──
+    # ── 프리셉티 주휴 처리 (preceptee_follows_preceptor=True 일 때) ──
     # 프리셉티는 프리셉터를 100% 팔로우하므로 별도 주휴 고정 셀이 불필요.
     # 고정 셀이 있으면 result_mapping에서 fixed_lookup이 우선하여 "주" 코드가 그대로 노출됨.
     # → 프리셉티를 weekly_off_map에서 제거하여 고정 셀 미생성 + 팔로우 동기화로 OFF 처리.
-    if config_dict.get('preceptee_on', True):
+    if config_dict.get('preceptee_follows_preceptor', True):
         # 프리셉티 판정 = nurse_preceptee_period(SSOT) 그 달 as-of 맵(캐시 preceptor_id 안 봄).
         _pte_month_ids = set((config_dict.get("preceptee_period_by_nurse_id") or {}).keys())
         for nurse in nurses_for_engine:
@@ -6994,14 +7006,14 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     if special_fixed_cells:
         combined_fixed_cells.extend(special_fixed_cells)
 
-    # ── fixed_wanted_use_yn 설정에 따른 확정 원티드 하드 고정 처리 ──
-    _fw_use_yn = bool(getattr(latest_config, 'fixed_wanted_use_yn', False))
+    # ── apply_confirmed_wanted 설정에 따른 확정 원티드 하드 고정 처리 ──
+    _fw_use_yn = bool(getattr(latest_config, 'apply_confirmed_wanted', False))
     _fw_source = "FixedWantedEntry" if db.query(FixedWantedEntry).filter(
         FixedWantedEntry.group_id == current_user.group_id,
         FixedWantedEntry.year == req.year,
         FixedWantedEntry.month == req.month,
     ).first() is not None else "WantedRequest"
-    print(f"[RosterCreate] fixed_wanted_use_yn={_fw_use_yn}, 데이터 출처={_fw_source}")
+    print(f"[RosterCreate] apply_confirmed_wanted={_fw_use_yn}, 데이터 출처={_fw_source}")
     if _fw_use_yn:
         all_fixed_entries = db.query(FixedWantedEntry).filter(
             FixedWantedEntry.group_id == current_user.group_id,
@@ -7059,17 +7071,17 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         if fw_fixed_cells:
             combined_fixed_cells.extend(fw_fixed_cells)
         print(
-            f"[RosterCreate] fixed_wanted_use_yn=True 결과: "
+            f"[RosterCreate] apply_confirmed_wanted=True 결과: "
             f"총 조회={len(all_fixed_entries)}건, "
             f"하드 고정={len(fw_fixed_cells)}건 {dict(_fw_code_counts)}, "
             f"스킵(특수코드 중복={_fw_skip_special}, 엔진 미포함 간호사={_fw_skip_nurse}, 활동범위 밖={_fw_skip_range})"
         )
         # 정책(사용자 지시): preceptee 팔로우 기본 활성. 값 없으면 True (우발적 False 방지).
-        _preceptee_on_val = config_dict.get("preceptee_on", True)
+        _preceptee_follows_val = config_dict.get("preceptee_follows_preceptor", True)
         print(
-            f"[RosterCreate] 프리셉티 fixed_wanted 맵 구성 조건: preceptee_on={_preceptee_on_val}, all_fixed_entries={len(all_fixed_entries)}건"
+            f"[RosterCreate] 프리셉티 fixed_wanted 맵 구성 조건: preceptee_follows_preceptor={_preceptee_follows_val}, all_fixed_entries={len(all_fixed_entries)}건"
         )
-        if _preceptee_on_val:
+        if _preceptee_follows_val:
             _pte_fw_map: dict[tuple[int, int], str] = {}
             _pte_ids = set()
             _pte_names: dict[str, str] = {}
@@ -7116,11 +7128,11 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                 print("  [DEBUG] 프리셉티 원본 FixedWantedEntry가 없거나 활동범위/엔진 매핑에서 제외됨")
         else:
             print(
-                f"[RosterCreate] preceptee_on=False → 프리셉티 fixed_wanted 맵 구성 스킵"
+                f"[RosterCreate] preceptee_follows_preceptor=False → 프리셉티 fixed_wanted 맵 구성 스킵"
             )
     else:
         print(
-            f"[RosterCreate] fixed_wanted_use_yn=False: "
+            f"[RosterCreate] apply_confirmed_wanted=False: "
             f"특수코드만 하드 고정={len(special_fixed_cells) if special_fixed_cells else 0}건 (출처: {_fw_source}), "
             f"DENO/기타는 선호도로 반영"
         )
@@ -7545,9 +7557,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     #   요구 D=4 인 날 솔버가 4명을 채우고 거기에 고정근무자 1명이 얹혀 **5명**이 됐다
     #   (성남ICU-RN 2026-10 실측: 평일 11일 전부 정확히 +1 · E/N 은 0건 —
     #    고정 코드가 D 뿐이라 D 에만 생겼다).
-    #   ★ `off_first` 와 무관한 결함이다. `off_first=True` 의 `assigned <= need` 하드는
+    #   ★ `staffing_first` 와 무관한 결함이다. `staffing_first=True` 의 `assigned <= need` 하드는
     #     정상 작동하고 있었고, **그 상한이 보는 세계 밖에서** 1명이 더해진 것이다.
-    #     `off_first=False` 일 때도 같은 +1 이 얹히지만 그쪽은 초과가 soft 라 덜 보였다.
+    #     `staffing_first=False` 일 때도 같은 +1 이 얹히지만 그쪽은 초과가 soft 라 덜 보였다.
     # 일자별로 빼야 한다 — 고정근무자는 평일만 근무하고 주말·공휴일은 OFF 다.
     # ★ EI-9-0 — 읽기(`read_fixed_cut_inputs`)·계산(`compute_fixed_cut_demand`)·대입
     #   (`apply_fixed_cut_demand`)세 함수로 나눴다(app/services/engine_input/fixed_cut.py).
@@ -9038,6 +9050,8 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
             try:
                 from services.live_graph_export import dump_live_graph_export
 
+                # 사례 파일(graph_export.json)은 저장 JSON 이라 바깥(옛) 이름이다(NM). 응답으로 던질 `unrecoverable` 은
+                #   그대로 두고 사본만 바꿔 넘긴다. conflict_cores 의 node_id(규칙 id)는 바깥 식별자라 건드리지 않는다.
                 dump_live_graph_export(
                     group_id=str(getattr(current_user, "group_id", "") or ""),
                     year=int(req.year),
@@ -9045,9 +9059,9 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
                     conflict_cores=_conflict_cores,
                     pool_snapshot=_pool_snapshot_dict,
                     violated_constraints=_violated,
-                    applied_relaxations=applied_relaxations,
+                    applied_relaxations=to_external_deep(applied_relaxations),
                     last_error_reason=str(validation_error),
-                    unrecoverable_payload=unrecoverable,
+                    unrecoverable_payload=to_external_deep(unrecoverable),
                 )
             except Exception as _lg_exc:
                 print(f"[LiveGraphExport] hook 실패(무시): {_lg_exc}")
@@ -9062,11 +9076,11 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
         except Exception:
             raise Exception(validation_error)
 
-    # 초과 OFF → 연차 변환 후처리 (off_swap_enabled=True 일 때만 동작, 보호 4종 적용)
+    # 초과 OFF → 연차 변환 후처리 (convert_excess_off_to_leave=True 일 때만 동작, 보호 4종 적용)
     print(
         f"[OffSwap][CALL] schedule_id={schedule.schedule_id} "
         f"latest_config_id={getattr(latest_config, 'config_id', None)} "
-        f"off_swap_enabled={getattr(latest_config, 'off_swap_enabled', None)!r} "
+        f"convert_excess_off_to_leave={getattr(latest_config, 'convert_excess_off_to_leave', None)!r} "
         f"off_days={getattr(latest_config, 'off_days', None)!r}"
     )
     # ── 수면OFF 부여 후처리 (sleep_off_enabled=True 일 때만) ──

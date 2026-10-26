@@ -13,6 +13,7 @@ import calendar
 from datetime import date
 
 import pytest
+from services.engine_contract.names import to_internal
 from services.precheck import run_runtime_precheck
 from services.precheck.payload import has_blocking_issues
 from services.precheck.runtime_bridge import build_precheck_input
@@ -30,7 +31,8 @@ def s5_call():
 
 def _kwargs(call):
     return {
-        "nurses_dict": call["nurses_dict"], "config_dict": call["config_dict"],
+        # 골든의 설정 dict 는 옛(바깥) 이름일 수 있다(재생성 전) — precheck 는 파이썬 이름을 읽으므로 맞춰 넣는다.
+        "nurses_dict": call["nurses_dict"], "config_dict": to_internal(call["config_dict"]),
         "grade_config": call["grade_config"], "fixed_cells": call["fixed_cells"],
         "year": call["year"], "month": call["month"],
     }

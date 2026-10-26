@@ -254,7 +254,7 @@ def test_cross_ward_night_cap_rules(cap, used, active, n_max, exact, one, expect
     nurse = SimpleNamespace(nurse_id="X01", n_max=n_max, n_exact=exact, n_min=None)
     before = dict(vars(nurse))
     changed = _apply_cross_ward_night_caps([nurse], {"X01": used}, {"X01": active},
-                                           {"max_nig_per_month": cap, "not_one_night": one})
+                                           {"max_nig_per_month": cap, "ban_single_night": one})
     if expected is None:
         assert (changed, vars(nurse)) == ({}, before)
     else:
@@ -390,7 +390,7 @@ def test_cross_month_code_supplement_failure_is_raised():
     req = SimpleNamespace(year=2026, month=11)
     user = SimpleNamespace(group_id="G1", office_id="O1")
     with pytest.raises(RuntimeError, match="11q 주입"):
-        build_cross_month_constraints(_ShiftQueryFails(Shift, Schedule), req, user, [], {"three_seq_nig": True}, ["N01"])
+        build_cross_month_constraints(_ShiftQueryFails(Shift, Schedule), req, user, [], {"allow_three_consecutive_nights": True}, ["N01"])
 
 
 @pytest.mark.parametrize("direction", ["inbound", "return"])
@@ -404,4 +404,4 @@ def test_mid_month_code_supplement_failure_is_raised(direction):
     inbound, outbound = ([a], []) if direction == "inbound" else ([], [a])
     with pytest.raises(RuntimeError, match="11q 주입"):
         build_mid_month_boundary_constraints(_ShiftQueryFails(Shift, Schedule), inbound, "G1", 2026, 11,
-                                             {"three_seq_nig": True}, {}, outbound_assignments=outbound)
+                                             {"allow_three_consecutive_nights": True}, {}, outbound_assignments=outbound)

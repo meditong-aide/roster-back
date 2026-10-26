@@ -40,7 +40,7 @@ def test_graph_and_production_logs_correlate(monkeypatch):
     """graph 로그와 production 로그가 같은 input_hash → offline join 가능."""
     monkeypatch.setenv("AIDE_SHADOW_DIAGNOSIS", "1")
     nu = [{"nurse_id": f"n{i}", "allowed_shifts": []} for i in range(5)]
-    cfg = {"two_offs_after_two_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_two_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 2},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     g = run_shadow(nu, cfg, 2026, 8, request_id="r1")

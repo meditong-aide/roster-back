@@ -174,14 +174,14 @@ def s1d_ward() -> Ward:
 #: S2 — 하드락 8종 중 NULL 이 들어갈 수 있는 키(not_one_night·use_mid 는 NOT NULL 컬럼, models.py:855-856).
 #: max_conseq_work 는 뺐다 — NULL 이면 L2(create_config_from_db :606)가 TypeError 로 멈춰 나머지 키의
 #: 실효값을 못 남긴다. 그 TypeError 경로는 S3 가 L0·L0'·L1 까지 남긴다.
-S2_NULL_KEYS = ("max_nig_per_month", "three_seq_nig", "two_offs_after_three_nig",
-                "two_offs_after_two_nig", "banned_day_after_eve")
+S2_NULL_KEYS = ("max_nig_per_month", "allow_three_consecutive_nights", "two_offs_after_three_nig",
+                "two_offs_after_two_nig", "ban_shift_transitions")
 #: S3 — roster_config 의 nullable 컬럼 전부(NOT NULL 컬럼은 모델 기본값).
 S3_NULL_KEYS = (
-    "day_req", "eve_req", "nig_req", "min_exp_per_shift", "req_exp_nurses", "two_offs_per_week",
-    "max_nig_per_month", "three_seq_nig", "two_offs_after_three_nig", "two_offs_after_two_nig",
-    "banned_day_after_eve", "max_conseq_work", "off_days", "max_conseq_off", "shift_priority",
-    "sequential_offs", "nod_noe", "weekly_off_group", "ban_night_before_fixed_wanted_off",
+    "day_req", "eve_req", "nig_req", "senior_min_years", "senior_nurses_per_shift", "prefer_two_offs_per_7days",
+    "max_nig_per_month", "allow_three_consecutive_nights", "two_offs_after_three_nig", "two_offs_after_two_nig",
+    "ban_shift_transitions", "max_conseq_work", "off_days", "soft_max_conseq_off", "shift_priority",
+    "avoid_isolated_off_and_work", "avoid_nod_noe_eod", "weekly_off_group", "ban_night_before_fixed_wanted_off",
     "health_leave_enabled", "health_leave_weekend", "sleep_off_enabled", "sleep_off_cycle",
     "version", "config_name", "config_memo", "created_at", "updated_at", "last_generate_status",
 )
@@ -381,7 +381,7 @@ def s7_ward() -> Ward:
     """S7 — 2N·3N 뒤 2OFF · 1N 금지 켬 · raw n2n=5 · 10월 마감본 꼬리."""
     ward = base_ward(10)
     ward.config.update(two_offs_after_two_nig=True, two_offs_after_three_nig=True,
-                       not_one_night=True)
+                       ban_single_night=True)
     ward.raw = {"n2n_min_gap": 5, "fixed_holiday_off_yn": 0}
     ward.extras.append(_s7_prev_schedules)
     return ward
@@ -424,7 +424,7 @@ def s8_ward() -> Ward:
     """S8 — 확정 원티드 사용(T) · 특수코드 '연'(휴가) · 금지 원티드 · raw n2n=4(카드가 0 으로 덮음)."""
     ward = base_ward(10)
     ward.shifts.append(shift_row("연", 8, "연차", None, "휴가", None, 8))
-    ward.config.update(fixed_wanted_use_yn=True)
+    ward.config.update(apply_confirmed_wanted=True)
     ward.raw = {"n2n_min_gap": 4, "fixed_holiday_off_yn": 0}
     ward.extras += [_rows("FixedWantedEntry", _s8_fixed_wanted()),
                     _rows("BannedWantedEntry", _s8_banned_wanted()), _s8_pair]
@@ -479,14 +479,14 @@ def _monthly_limits(floors: dict[str, int], month: int = 10) -> list[dict]:
              "n_exact": floor, **stamp()} for nid, floor in floors.items()]
 
 
-#: S9 — n_exact 합 36 > N 칸 30(하루 N 1명 × 30일, off_first · N 상한 없음) → 나이트 차단.
+#: S9 — n_exact 합 36 > N 칸 30(하루 N 1명 × 30일, staffing_first · N 상한 없음) → 나이트 차단.
 S9_FLOORS = {f"N0{i}": 6 for i in range(1, 7)}
 #: S9-F — 합 16: 차감 전 칸 30 이하 · 차감 뒤 칸 9(평일 21일은 고정 N 이 채움) 초과.
 S9F_FLOORS = {f"N0{i}": 4 for i in range(1, 5)}
 
 
 def s9_ward(floors: dict[str, int] = S9_FLOORS) -> Ward:
-    """S9 — off_first · N 1명/일 · 프리셉티 부분 백필 · 상호배제 · 10월 한도 이월 · 보건휴가."""
+    """S9 — staffing_first · N 1명/일 · 프리셉티 부분 백필 · 상호배제 · 10월 한도 이월 · 보건휴가."""
     ward = base_ward(10)
     for i, row in enumerate(ward.nurses):
         row["team_id"] = 1 if i < 5 or i == 8 else 2
@@ -496,7 +496,7 @@ def s9_ward(floors: dict[str, int] = S9_FLOORS) -> Ward:
     ward.shift_manage = [shift_manage_row(1, "D", ["D"], 2), shift_manage_row(2, "E", ["E"], 2),
                          shift_manage_row(3, "N", ["N"], 1)]
     ward.shifts.append(shift_row("보", 8, "보건", None, "휴가", None, 8, health_leave_target=True))
-    ward.config.update(off_first=True, preceptee_on=True, health_leave_enabled=True)
+    ward.config.update(staffing_first=True, preceptee_follows_preceptor=True, health_leave_enabled=True)
     ward.extras += [_s9_people, _rows("NurseMonthlyLimit", _monthly_limits(floors))]
     return ward
 

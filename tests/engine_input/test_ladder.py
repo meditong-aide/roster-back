@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from services.engine_contract.names import to_internal
 from services.policy.hard_lock import BLOCK, override_violations
 from sqlalchemy import inspect, text
 
@@ -318,10 +319,18 @@ EI11_REMOVED_PROBE_SEQ = {"S1-L": [10, 11, 14, 15, 16, 18], "S1-LT": [10, 11, 14
 
 
 def _base_attempts(name: str) -> list[dict]:
-    """EI 적용 전 동결본(`golden_base/dev4ec454e`)의 사다리 시도 — EI-11 정규화의 기준."""
+    """EI 적용 전 동결본(`golden_base/dev4ec454e`)의 사다리 시도 — EI-11 정규화의 기준.
+
+    동결본은 옛(바깥) 설정 이름으로 남아 있다 — 파이썬 이름인 지금 시도와 정확 비교하므로 시도의 config 차이(`changed`)만 바꾼다.
+    """
     require_golden(GOLDEN_BASE)
     record = json.loads((GOLDEN_BASE.path / f"{name}.json").read_text(encoding="utf-8"))
-    return record["layers"]["attempts"]
+    attempts = record["layers"]["attempts"]
+    for attempt in attempts:
+        config_delta = (attempt.get("delta") or {}).get("config_data")
+        if config_delta:
+            config_delta["changed"] = to_internal(config_delta["changed"])
+    return attempts
 
 
 def _is_hard_lock_probe_attempt(attempt: dict) -> bool:

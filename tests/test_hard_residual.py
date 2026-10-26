@@ -29,7 +29,7 @@ def _cfg(dsr, rules):
     return c
 
 
-_RECOVERY = ({"two_offs_after_two_nig": True, "not_one_night": True},
+_RECOVERY = ({"two_offs_after_two_nig": True, "ban_single_night": True},
              {"D": 1, "E": 1, "N": 2}, 5, 6)
 
 
@@ -59,9 +59,9 @@ def test_frontier_dp_agrees_with_independent_oracle():
     """BFS frontier DP ⟷ DFS 독립 oracle: 같은 semantics, 결론 일치."""
     cases = [
         (_RECOVERY[1], _RECOVERY[0], 5, 6),
-        ({"D": 1, "E": 1, "N": 1}, {"not_one_night": True}, 4, 6),           # feasible
+        ({"D": 1, "E": 1, "N": 1}, {"ban_single_night": True}, 4, 6),           # feasible
         ({"D": 1, "E": 1, "N": 2}, {"two_offs_after_two_nig": True,
-                                    "not_one_night": True,
+                                    "ban_single_night": True,
                                     "forbid_night_to_day": True}, 5, 6),     # infeasible
     ]
     for dsr, rules, k, dd in cases:
@@ -77,6 +77,6 @@ def test_frontier_dp_agrees_with_independent_oracle():
 def test_frontier_dp_large_returns_unknown_not_hang():
     """대형(넓은 separator)은 예산초과로 UNKNOWN 반환(무한루프 아님) — 컴포넌트 분해 대상."""
     nu = _pool(8)
-    cfg = _cfg({"D": 2, "E": 2, "N": 2}, {"two_offs_after_two_nig": True, "not_one_night": True})
+    cfg = _cfg({"D": 2, "E": 2, "N": 2}, {"two_offs_after_two_nig": True, "ban_single_night": True})
     fr = diagnose_frontier(nu, cfg, 31, cap=50_000)
     assert fr.status in ("UNKNOWN", "FEASIBLE_WITNESS", "INFEASIBLE_CERTIFIED")

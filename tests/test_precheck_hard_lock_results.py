@@ -1,7 +1,7 @@
 """EI-10c 결과 테스트 — precheck 가 엔진과 같은 하드락 값을 보게 되어 판정이 바뀌는 사례.
 
-배경(결정 D8 · 설계서 §2.6 C8'): 생성 서비스는 하드락 5키(`three_seq_nig`·`two_offs_after_three_nig`·
-`two_offs_after_two_nig`·`not_one_night`·`banned_day_after_eve`)를 precheck 앞까지 들고 오지만
+배경(결정 D8 · 설계서 §2.6 C8'): 생성 서비스는 하드락 5키(`allow_three_consecutive_nights`·`two_offs_after_three_nig`·
+`two_offs_after_two_nig`·`ban_single_night`·`ban_shift_transitions`)를 precheck 앞까지 들고 오지만
 `runtime_bridge.build_precheck_input` 이 `roster_config` 를 새로 지으며 버렸다. 그래서 precheck 는
 연속 N 상한을 늘 2 로, 회복·1N 규칙을 늘 끈 것으로, 전이 금지를 늘 켠 것으로 봤다.
 10c 는 EI-8 `effective_hard_lock`(엔진 `create_config_from_db` 해석 그대로)을 판정 직전에 싣는다.
@@ -33,12 +33,12 @@ def _cfg(**extra):
     """엔진 기본에 가까운 설정(3연속 N 허용 · 3N→2OFF 켬 · 2N→2OFF 끔 · 1N 허용)."""
     base = {
         "daily_shift_requirements": {"D": 1, "E": 1, "N": 1}, "max_conseq_work": 5,
-        "max_nig_per_month": 15, "banned_day_after_eve": True, "three_seq_nig": True,
-        "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "not_one_night": False,
+        "max_nig_per_month": 15, "ban_shift_transitions": True, "allow_three_consecutive_nights": True,
+        "two_offs_after_three_nig": True, "two_offs_after_two_nig": False, "ban_single_night": False,
         "use_mid": False, "off_days": 8, "shift_priority": 0.7,
-        # EI-14r3 — 이 파일은 연속근무·주휴·퇴사 용량을 따로 잰다. OFF 하드 하한(min_off — off_first=False 병동)은 별개 제약이라 끈다
+        # EI-14r3 — 이 파일은 연속근무·주휴·퇴사 용량을 따로 잰다. OFF 하드 하한(min_off — staffing_first=False 병동)은 별개 제약이라 끈다
         # (그 하한은 test_precheck_min_off_floor.py · test_precheck_vs_engine_stage1.py::test_s7e* 가 본다).
-        "off_first": True,
+        "staffing_first": True,
     }
     base.update(extra)
     return base
@@ -91,14 +91,14 @@ def test_r10c2_two_offs_after_two_with_three_nights_allows_nnn():
 def test_r10c3_forced_single_night_then_fixed_day_blocks():
     """✗ 1N 금지가 강제한 N(5일) 다음 고정 D(6일)는 엔진 불가능 — 전에는 1N 키를 못 받아 놓쳤다."""
     cells = _cells("n0", {3: "O", 4: "N", 6: "D"})
-    result, codes = _run(_nurses(), _cfg(not_one_night=True), cells)
+    result, codes = _run(_nurses(), _cfg(ban_single_night=True), cells)
     assert SEQ in codes and has_blocking_issues(result)
 
 
 def test_r10c3b_same_but_bans_off_passes():
-    """(가드) `banned_day_after_eve=False` 면 엔진은 전이 금지 4종을 다 끈다(마스킹) — 통과."""
+    """(가드) `ban_shift_transitions=False` 면 엔진은 전이 금지 4종을 다 끈다(마스킹) — 통과."""
     cells = _cells("n0", {3: "O", 4: "N", 6: "D"})
-    result, codes = _run(_nurses(), _cfg(not_one_night=True, banned_day_after_eve=False), cells)
+    result, codes = _run(_nurses(), _cfg(ban_single_night=True, ban_shift_transitions=False), cells)
     assert SEQ not in codes
 
 
@@ -107,7 +107,7 @@ def test_r10c4_recovery_cap_catches_night_shortage():
 
     전에는 회복 키를 못 받아 월 상한 15 로만 세어 60 으로 보고 놓쳤다.
     """
-    cfg = _cfg(two_offs_after_two_nig=True, three_seq_nig=False, **_night_demand(2))
+    cfg = _cfg(two_offs_after_two_nig=True, allow_three_consecutive_nights=False, **_night_demand(2))
     result, codes = _run(_night_only_ward(), cfg)
     assert NIGHT in codes and has_blocking_issues(result)
 
@@ -117,7 +117,7 @@ def test_r10c4b_two_offs_after_two_with_three_nights_capacity_not_overstated():
 
     수요 54 는 L 을 무시한 값(11 → 합 52)보다 크고 엔진 상한(56)보다 작다 — 오차단 가드.
     """
-    cfg = _cfg(two_offs_after_two_nig=True, three_seq_nig=True, **_night_demand(2, zero_last_days=3))
+    cfg = _cfg(two_offs_after_two_nig=True, allow_three_consecutive_nights=True, **_night_demand(2, zero_last_days=3))
     _result, codes = _run(_night_only_ward(), cfg)
     assert NIGHT not in codes
 
@@ -171,13 +171,13 @@ def test_r10c7_single_night_allowed_when_monthly_night_cap_is_one():
     nurses = _nurses()
     nurses[0]["n_max"] = 1
     cells = _cells("n0", {4: "O", 5: "N", 6: "O"})
-    _result, codes = _run(nurses, _cfg(not_one_night=True), cells)
+    _result, codes = _run(nurses, _cfg(ban_single_night=True), cells)
     assert SEQ not in codes
 
 
 def test_r10c8_day_one_fixed_single_night_is_exempt():
     """(가드) 1일 고정 N 은 엔진 1N 금지 면제(fallback_lex.py:2136) — 2일이 고정 O 여도 통과."""
-    _result, codes = _run(_nurses(), _cfg(not_one_night=True), _cells("n0", {1: "N", 2: "O"}))
+    _result, codes = _run(_nurses(), _cfg(ban_single_night=True), _cells("n0", {1: "N", 2: "O"}))
     assert SEQ not in codes
 
 
@@ -189,7 +189,7 @@ def test_r10c8b_single_night_exemption_is_only_for_the_first_day_of_the_month():
     """
     nurses = _nurses()
     nurses[0]["joining_date"] = "2026-11-10"
-    result, codes = _run(nurses, _cfg(not_one_night=True), _cells("n0", {10: "N", 11: "O"}))
+    result, codes = _run(nurses, _cfg(ban_single_night=True), _cells("n0", {10: "N", 11: "O"}))
     assert SEQ in codes and has_blocking_issues(result)
 
 
@@ -199,7 +199,7 @@ def test_r10c8c_same_cells_for_a_full_month_nurse_extend_backwards_and_pass():
     입사자와 갈리는 이유는 '앞날이 없다'뿐이다 — 1일 고정 N 면제(r10c8)가 아니라 구간 첫날에 앞 N 을 이을 수 없다는 사실이
     r10c8b 의 차단 원인이다. `join_day == 0` 조건을 지우면 r10c8b 가 빨개진다.
     """
-    result, codes = _run(_nurses(), _cfg(not_one_night=True), _cells("n0", {10: "N", 11: "O"}))
+    result, codes = _run(_nurses(), _cfg(ban_single_night=True), _cells("n0", {10: "N", 11: "O"}))
     assert SEQ not in codes and not has_blocking_issues(result)
 
 
@@ -217,19 +217,19 @@ def _direct_night_input(roster_config, *, nights_per_cycle=3, cycle=5, num_days=
 
 
 def test_r10c10_direct_call_recovery_cap_uses_the_same_night_run_cap_as_the_personal_dp():
-    """✗ 3연속 N 허용(`three_seq_nig`) + 2N→2OFF 인 직접 호출 — 월 나이트 회복 용량도 연속 N 상한 L=3 으로 센다(NNN OO → 30일 19).
+    """✗ 3연속 N 허용(`allow_three_consecutive_nights`) + 2N→2OFF 인 직접 호출 — 월 나이트 회복 용량도 연속 N 상한 L=3 으로 센다(NNN OO → 30일 19).
 
-    전에는 개인 DP 가 L=3(`three_seq_nig`) 인데 회복 용량 DP 는 키가 없다고 L=block(2) 으로 세어(16) 같은 호출 안에서 서로 달랐다.
+    전에는 개인 DP 가 L=3(`allow_three_consecutive_nights`) 인데 회복 용량 DP 는 키가 없다고 L=block(2) 으로 세어(16) 같은 호출 안에서 서로 달랐다.
     NNN OO 무늬 수요 18 은 엔진이 풀 수 있다(n_exact=18 OPTIMAL — 독립 리뷰 실측)고 생성 경로도 통과인데 직접 호출만 부족으로 막혔다.
     """
-    inp = _direct_night_input({"three_seq_nig": True, "two_offs_after_two_nig": True, "two_offs_after_three_nig": True})
+    inp = _direct_night_input({"allow_three_consecutive_nights": True, "two_offs_after_two_nig": True, "two_offs_after_three_nig": True})
     assert precheck_sequence_params(inp.roster_config)["max_consecutive_nights"] == 3
     assert [i["reason_code"] for i in check_monthly_night_capacity(inp)] == []
     assert max_nights_under_recovery(30, 2, max_run=3) == 19
 
 
-def test_r10c10b_direct_call_without_three_seq_nig_keeps_the_two_night_cap():
-    """(가드) `three_seq_nig` 가 없으면 개인 DP 의 옛 기본(L=2)과 회복 용량 L 이 같다 — 16 < 수요 18 이라 부족을 낸다."""
+def test_r10c10b_direct_call_without_allow_three_consecutive_nights_keeps_the_two_night_cap():
+    """(가드) `allow_three_consecutive_nights` 가 없으면 개인 DP 의 옛 기본(L=2)과 회복 용량 L 이 같다 — 16 < 수요 18 이라 부족을 낸다."""
     inp = _direct_night_input({"two_offs_after_two_nig": True})
     assert precheck_sequence_params(inp.roster_config)["max_consecutive_nights"] == 2
     issues = check_monthly_night_capacity(inp)
@@ -238,14 +238,14 @@ def test_r10c10b_direct_call_without_three_seq_nig_keeps_the_two_night_cap():
 
 
 def test_r10c11_direct_call_masks_all_transition_bans_like_the_engine():
-    """✗ 직접 호출부 — `banned_day_after_eve=False` 면 엔진은 전이 금지 4종(E→D·N→D·N→E·D→N)을 모두 끈다(cp_sat_basic.py:673-677).
+    """✗ 직접 호출부 — `ban_shift_transitions=False` 면 엔진은 전이 금지 4종(E→D·N→D·N→E·D→N)을 모두 끈다(cp_sat_basic.py:673-677).
 
     1N 금지 + 3일 O · 4일 N · 6일 D 고정 → 5일 N 이 강제돼 N→D 가 되는데 마스킹으로 금지가 꺼져 엔진은 가능하다.
     전에는 E→D 만 껐고 N→D 는 켜 둔 채라 PER_NURSE 로 막았다.
     """
     nurse = PrecheckNurse(nurse_id="N01", join_day=0, leave_day=29, fixed_off_days={3},
                           fixed_shift_assignments={4: "N", 6: "D"})
-    roster = {"use_mid": False, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1}, "not_one_night": True,
+    roster = {"use_mid": False, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1}, "ban_single_night": True,
               "max_nig_per_month": 15}
 
     def codes(**extra):
@@ -253,7 +253,7 @@ def test_r10c11_direct_call_masks_all_transition_bans_like_the_engine():
                             team_coverage={}, grade_constraints={})
         return {i["reason_code"] for i in run_precheck(inp)["issues"]}
 
-    assert SEQ not in codes(banned_day_after_eve=False)
-    assert SEQ in codes(banned_day_after_eve=True)  # 대조: 마스킹이 없으면 N→D 금지가 켜져 막힌다
-    assert precheck_sequence_params({"banned_day_after_eve": False, "ban_n_to_d": True}) | {} == {
+    assert SEQ not in codes(ban_shift_transitions=False)
+    assert SEQ in codes(ban_shift_transitions=True)  # 대조: 마스킹이 없으면 N→D 금지가 켜져 막힌다
+    assert precheck_sequence_params({"ban_shift_transitions": False, "ban_n_to_d": True}) | {} == {
         **precheck_sequence_params({}), "ban_n_to_d": False, "ban_e_to_d": False, "ban_n_to_e": False}

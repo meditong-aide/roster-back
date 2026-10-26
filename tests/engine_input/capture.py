@@ -50,10 +50,10 @@ from .ladder import RECORDER_MODES, EngineRecorder, install_l3_spies
 from .proto_compat import model_to_pb
 
 #: 탐지기가 config 에서 실제로 읽는 키(lagrangian.py:582·:583·:533-537). 설계서 §7.1 은 '수요 3키'
-#: 라고 적었지만 코드는 off_first·파견 제외·프리셉티 맵도 읽는다 — 코드 사실을 따른다.
+#: 라고 적었지만 코드는 staffing_first·파견 제외·프리셉티 맵도 읽는다 — 코드 사실을 따른다.
 DETECTOR_CONFIG_KEYS = (
     "daily_shift_requirements", "daily_shift_requirements_by_day",
-    "daily_shift_requirements_max_by_day", "off_first",
+    "daily_shift_requirements_max_by_day", "staffing_first",
     "coverage_exclude_nurse_days", "preceptee_period_by_nurse_id",
 )
 

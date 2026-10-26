@@ -275,20 +275,20 @@ def _streak_warnings(seq: list[tuple], cats: dict, config: dict) -> list[str]:
     """연속근무 초과·나이트 연속 초과·단일나이트(1N) 검출."""
     out = []
     max_work = config.get("max_conseq_work") or 5
-    max_nig = 3 if config.get("three_seq_nig") else 2
+    max_nig = 3 if config.get("allow_three_consecutive_nights") else 2
     for length, s, e in _category_runs(seq, cats["work"]):
         if length > max_work:
             out.append(f"연속근무 {length}일({s}~{e}) — 최대 {max_work}일 초과")
     for length, s, e in _category_runs(seq, cats["night"]):
         if length > max_nig:
             out.append(f"연속 나이트 {length}일({s}~{e}) — 최대 {max_nig}일 초과")
-        elif length == 1 and config.get("not_one_night"):
+        elif length == 1 and config.get("ban_single_night"):
             out.append(f"단일 나이트(1N) {s} — 나이트는 2회 이상 연속 배정 필요")
     return out
 
 
 def _adjacency_warnings(seq: list[tuple], cats: dict, config: dict) -> list[str]:
-    """인접일 금지 전환(ND/NE=nod_noe · ED=banned_day_after_eve) 검출."""
+    """인접일 금지 전환(ND/NE=avoid_nod_noe_eod · ED=ban_shift_transitions) 검출."""
     def cat_of(sid):
         if sid in cats["night"]:
             return "N"
@@ -303,9 +303,9 @@ def _adjacency_warnings(seq: list[tuple], cats: dict, config: dict) -> list[str]
         if (cd - pd).days != 1:
             continue
         a, b = cat_of(ps), cat_of(cs)
-        if config.get("nod_noe") and a == "N" and b in ("D", "E"):
+        if config.get("avoid_nod_noe_eod") and a == "N" and b in ("D", "E"):
             out.append(f"{pd}→{cd} 금지전환 {a}→{b}(나이트 직후 데이/이브닝)")
-        if config.get("banned_day_after_eve") and a == "E" and b == "D":
+        if config.get("ban_shift_transitions") and a == "E" and b == "D":
             out.append(f"{pd}→{cd} 금지전환 E→D(이브닝 직후 데이)")
     return out
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from services.engine_contract import nurse_attrs as _nurse_attrs_module
+from services.engine_contract.names import external_key
 from services.engine_contract.rules import RULES
 from services.engine_contract.settings import ADJACENT, AFFECTS, RUNTIME_DATA_NOT_SETTINGS, SETTINGS, HardLock
 from services.engine_contract.settings import lookup as _lookup_setting
@@ -157,26 +158,31 @@ def _coerce_int(raw: object) -> int | None | object:
 
 
 def _present_values(spec, changes: dict) -> list[tuple[str, object]]:
-    """정본 키·별칭 중 `changes` 에 들어 있는 것을 **전부** (키, 값)으로 돌려준다.
+    """정본 키·별칭·바깥 이름(`spec.column`) 중 `changes` 에 들어 있는 것을 **전부** (키, 값)으로 돌려준다.
 
     하나만 골라 보면 다른 이름으로 상한을 넘겨도 통과한다 — 예: `max_conseq_work=None` 과 별칭
     `max_consecutive_work_days=8` 을 함께 보내면 정본만 보고 끝난다. 요청 판정은 원래 이름을 본 뒤 생성 진입이
     정본으로 바꾼다(EI-12 `engine_contract.aliases`). Codex 게이트 2026-10-15.
-    D13(EI-11 11b) 뒤 `max_consecutive_nights` 는 경계가 읽지 않고(정본 `three_seq_nig` 만), 요청 판정
+    바깥(옛) 이름 14칸(NM D58 — 예 `three_seq_nig`)도 찾는다 — 정본 키가 파이썬 이름으로 바뀐 뒤에도 옛 이름으로 온 요청이
+    하드락을 풀지 못하게. 옛·새 이름이 함께 오면 둘 다 판정한다.
+    D13(EI-11 11b) 뒤 `max_consecutive_nights` 는 경계가 읽지 않고(정본 `allow_three_consecutive_nights` 만), 요청 판정
     (`override_violations`)은 이 함수에 넘기기 전에 값과 무관하게 막는다(`runtime_key_forbidden`)."""
-    return [(k, changes[k]) for k in dict.fromkeys((spec.key, *spec.aliases)) if k in changes]
+    names = (spec.key, *spec.aliases, *((spec.column,) if spec.column else ()))
+    return [(k, changes[k]) for k in dict.fromkeys(names) if k in changes]
 
 
+# 메시지 안 키 표기는 `external_key(key)` — 사용자에게 보이는 문구가 파이썬 이름 정리(NM)로 바뀌지 않게 바깥(옛) 이름으로 적는다.
+# `Violation.key` 는 들어온 키 그대로 둔다.
 def _int_cap_violation(lock: HardLock, key: str, raw: object) -> Violation | None:
     value = _coerce_int(raw)
     if value is None:
         return None  # 값 없음 — 엔진 쪽 null_behavior 는 레지스트리 문서로, 여기서 완화로 보지 않는다
     if value is _COERCE_FAIL:
         return Violation(lock.rule_no, key, raw, "non_numeric",
-                          f"{_rule_label(lock.rule_no, lock.cap)}: {key}={raw!r} 는 숫자가 아니어서 판정할 수 없습니다.")
+                          f"{_rule_label(lock.rule_no, lock.cap)}: {external_key(key)}={raw!r} 는 숫자가 아니어서 판정할 수 없습니다.")
     if value > lock.cap:
         return Violation(lock.rule_no, key, raw, "exceeds_cap",
-                          f"{_rule_label(lock.rule_no, lock.cap)}: {key}={raw!r} 는 상한({lock.cap})을 넘습니다.")
+                          f"{_rule_label(lock.rule_no, lock.cap)}: {external_key(key)}={raw!r} 는 상한({lock.cap})을 넘습니다.")
     return None
 
 
@@ -184,7 +190,7 @@ def _bool_on_violation(lock: HardLock, key: str, raw: object) -> Violation | Non
     if raw:  # Python truthy — 'false' 문자열은 truthy 라 완화로 보지 않는다(레지스트리 기록과 동일)
         return None
     return Violation(lock.rule_no, key, raw, "turned_off",
-                      f"{_rule_label(lock.rule_no)}: {key} 를 끄는 값({raw!r})은 하드락 완화입니다.")
+                      f"{_rule_label(lock.rule_no)}: {external_key(key)} 를 끄는 값({raw!r})은 하드락 완화입니다.")
 
 
 #: 월경계 빌더를 깨뜨려 월경계분을 통째로 푸는 입력(엔진 내부 키 `_inbound_source_map` · 설정 변경의 비숫자
@@ -195,7 +201,7 @@ _BOUNDARY_RULE_NOS: tuple[int, ...] = tuple(_lookup_setting("cross_month_hard_ru
 
 def _derived_cap_violation(lock: HardLock, key: str, raw: object, *, boundary_kind: str) -> Violation | None:
     if key != "max_consecutive_nights":
-        return None  # 정본 bool(three_seq_nig) 은 3 if x else 2 라 cap(3) 을 못 넘는다
+        return None  # 정본 bool(allow_three_consecutive_nights) 은 3 if x else 2 라 cap(3) 을 못 넘는다
     value = _coerce_int(raw)
     if value is _COERCE_FAIL:
         # 옛 근거 — 비숫자 값은 월경계 빌더의 `L = int(config_dict.get('max_consecutive_nights') or ...)` 를
@@ -244,10 +250,10 @@ def _boundary_switch_violation(lock: HardLock, key: str, raw: object, kind: str)
 
 
 def _key_violation(lock, key: str, raw: object, *, boundary_kind: str) -> Violation | None:
-    """키 하나(정본 또는 별칭)의 값을 그 설정의 하드락 분류로 판정한다."""
+    """키 하나(정본·별칭·바깥 이름 `spec.column`)의 값을 그 설정의 하드락 분류로 판정한다."""
     if lock in (ADJACENT, AFFECTS):
         return Violation(0, key, raw, "adjacent_changed",
-                         f"인접 설정 {key} 변경 — 하드락 완화 방향일 수 있어 확인이 필요합니다.",
+                         f"인접 설정 {external_key(key)} 변경 — 하드락 완화 방향일 수 있어 확인이 필요합니다.",
                          kind=RELAX_MARK)
     if lock.kind == "boundary_switch":
         return _boundary_switch_violation(lock, key, raw, kind=boundary_kind)
@@ -324,15 +330,23 @@ def _scan_changes(changes: dict, *, boundary_kind: str) -> list[Violation]:
     for spec in SETTINGS:
         if spec.hard_lock is None:
             continue
+        seen: set[tuple] = set()
         for key, raw in _present_values(spec, changes):
             v = _key_violation(spec.hard_lock, key, raw, boundary_kind=boundary_kind)
-            if v is not None:
-                out.append(v)
+            if v is None:
+                continue
+            # 같은 칸이 바깥·파이썬 이름으로 같은 값과 함께 오면 문구까지 같은 위반이 둘 생긴다 — 한 건만 남긴다(NM).
+            #   값이 다르면 문구가 달라 둘 다 남는다(둘 다 막아야 한다).
+            sig = (v.rule_no, v.kind, v.message_ko)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(v)
     return out
 
 
 def config_change_violations(changes: dict) -> list[Violation]:
-    """설정 변경분(해결 카드·설정 저장 등, 정본 키 또는 별칭 → 새 값)이 하드락 8종을
+    """설정 변경분(해결 카드·설정 저장 등, 정본 키·별칭·바깥 이름 → 새 값)이 하드락 8종을
     완화하는지 판정한다. 8종은 완화 방향이면 `kind='block'`, 인접·월경계 스위치는
     `kind='relax_mark'`(D17 ①) — 차단은 `override_violations` 몫이다."""
     return _scan_changes(changes, boundary_kind=RELAX_MARK)
@@ -345,8 +359,10 @@ def override_violations(config_override: dict) -> list[Violation]:
     8종 차단은 `config_change_violations` 와 같다. 여기서만 더하는 것이 둘이다 — ① 월경계 하드락 스위치를 끄는
     방향을 `kind='block'` 으로 올린다(2026-10-15 결정 — '요청으로 끄기 금지'). ② 레지스트리가 요청 금지로 표지한
     별칭(`derived_inputs[별칭]['runtime'] == 'forbidden'` — D13 ③ `max_consecutive_nights`)은 값과 무관하게
-    `runtime_key_forbidden` BLOCK 이다 — D13 ① 뒤 월경계·월중 경계는 정본 `three_seq_nig` 만 읽고, 이 별칭의
-    런타임 유입 통로는 `config_override` 뿐이다. EI-11 11b 부터 가드는 BLOCK 을 모두 400 으로 막는다."""
+    `runtime_key_forbidden` BLOCK 이다 — D13 ① 뒤 월경계·월중 경계는 정본 `allow_three_consecutive_nights` 만 읽고, 이 별칭의
+    런타임 유입 통로는 `config_override` 뿐이다. EI-11 11b 부터 가드는 BLOCK 을 모두 400 으로 막는다.
+    입력 키는 파이썬 이름이든 바깥(옛) 이름이든(`three_seq_nig`·`banned_day_after_eve`·`not_one_night` 등 — `spec.column`)
+    같이 판정한다(`_present_values`) — 어느 경로로 와도 옛 이름으로 하드락을 푸는 구멍이 없다."""
     changes = dict(config_override or {})
     runtime = _runtime_key_violations(changes)
     return [*runtime, *_scan_changes(changes, boundary_kind=BLOCK)]

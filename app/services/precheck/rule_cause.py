@@ -59,7 +59,7 @@ RULE_CAUSE: dict[str, str] = {
     'transition_ban': 'cause:transition:nod_pattern_forces_infeasibility',  # app/services/cp_sat/fallback_lex.py:2003 · app/services/cp_sat_basic.py:3760 외 — ★N→D·E→D·N→E 6곳은 MUS 짝이 있으나, W(메인코드 없는 고정근무)로 접힌 E→W·N→W 4곳(fallback_lex.py:2106,2109 외)은 MUS 래핑이 없다 — 그 조합이 만드는 불가능에는 원인이 안 붙는다
     'mid_transition': '없음: 미구현',  # app/services/cp_sat/fallback_lex.py:2081 · app/services/cp_sat_basic.py:3852 외
     'mid_to_day_ban': '없음: 미구현',  # app/services/cp_sat/fallback_lex.py:2090 · app/services/precheck/cause_inferer.py:33-61 외
-    'not_one_night': 'cause:carryover:fixed_n_isolated_by_off_neighbors',  # app/services/cp_sat_basic.py:4005(primary) · app/services/precheck/cause_inferer.py:35 외 — ★primary 전용 MUS. lex(fallback_lex.py 약 2155행)는 MUS 짝이 없어 기본 경로에서는 MUS 를 켜도 원인 0(SKIP_PRIMARY 기본값 '1' — cp_sat_basic.py:1511). 원인 이름도 '월경계 고정 N 이 OFF 이웃에 고립'이라 일반 1N 금지(월중 전체)보다 좁다 — GAPS 의 '✓' 표기에 두 사정 모두 괄호로 적을 것
+    'not_one_night': 'cause:carryover:fixed_n_isolated_by_off_neighbors',  # app/services/cp_sat_basic.py:4005(primary) · app/services/precheck/cause_inferer.py:35 외 — ★primary 전용 MUS. lex(fallback_lex.py 약 2155행)는 MUS 짝이 없어 기본 경로에서는 MUS 를 켜도 원인 0(SKIP_PRIMARY 기본값 '1' — cp_sat_basic.py:1511). 원인 이름도 '월경계 고정 N 이 OFF 이웃에 고립'이라 일반 1N 금지(월중 전체)보다 좁다 — GAPS 의 '✓' 표기에 두 사정 모두 괄호로 적을 것 · nm:external
     'ban_night_before_fixed_off': '없음: 미구현',  # app/services/cp_sat/fallback_lex.py:2227 · app/services/cp_sat_basic.py:4115 외
     'ban_night_before_fixed_off_slack': '없음: 보조식',  # app/services/cp_sat/fallback_lex.py:2222 · app/services/precheck/cause_inferer.py:33-90
     'lex_freeze_ban_night': '없음: 단계 동결',  # app/services/cp_sat/fallback_lex.py:2245 · app/services/precheck/cause_inferer.py:33-90

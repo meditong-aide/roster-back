@@ -12,7 +12,7 @@ def _nd(nid="N01", **over):
 
 
 def _build(blocked, nurses=None, **cfg):
-    config = {"off_first": True, "daily_shift_requirements": {"D": 1, "E": 0, "N": 0}, "blocked_by_nurse_id": blocked, **cfg}
+    config = {"staffing_first": True, "daily_shift_requirements": {"D": 1, "E": 0, "N": 0}, "blocked_by_nurse_id": blocked, **cfg}
     return build_precheck_input(nurses_dict=nurses or [_nd()], config_dict=config, grade_config=None, fixed_cells=None,
                                 year=2026, month=11)
 
@@ -42,8 +42,8 @@ def test_capacity_drops_by_blocked_days_but_the_closed_form_uses_the_calendar_sp
 
 def test_min_off_floor_uses_the_engine_avail_days_including_out_of_span_blocked_days():
     """엔진은 구간 밖 차단일도 `len()` 으로 센다(OFF 하한 avail_days) — precheck 하한이 그보다 커지면 오차단이다."""
-    base = _build({}, off_first=False, off_days=8).nurses[0].min_off_required
-    blocked = _build({"N01": set(range(5, 17))}, off_first=False, off_days=8).nurses[0].min_off_required
+    base = _build({}, staffing_first=False, off_days=8).nurses[0].min_off_required
+    blocked = _build({"N01": set(range(5, 17))}, staffing_first=False, off_days=8).nurses[0].min_off_required
     assert blocked < base
 
 
@@ -56,7 +56,7 @@ def test_blocked_day_overlapping_a_weekend_is_not_counted_as_a_hard_off_twice():
 
 def test_dp_blocked_day_rests_and_releases_the_single_night_requirement():
     """개인 DP — 차단일은 쉬는 날이다. 1N 금지에서 N(3일) 바로 뒤 차단일(4일)이어도 다음 날 N 요구가 풀려 불가능이 아니다."""
-    kwargs = {"num_days": 8, "allowed": {"D", "E", "N"}, "fixed": {3: "N"}, "not_one_night": True}
+    kwargs = {"num_days": 8, "allowed": {"D", "E", "N"}, "fixed": {3: "N"}, "ban_single_night": True}
     assert nurse_sequence_infeasible(**kwargs) is False  # 4·5일 N 으로 이어 갈 수 있다
     assert nurse_sequence_infeasible(**kwargs, blocked={4, 2}) is False
     # 차단일은 연속근무를 끊는다 — 연속근무 상한 2 에서 고정 D 3칸(0·1·2)은 불가능, 2일이 차단일이면 그 칸이 쉬는 날이라 가능

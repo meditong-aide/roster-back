@@ -1901,7 +1901,7 @@ def main() -> None:
             "max_team_id": nurse_team_map.get(str(fx.get("max_nurse_id") or "")),
         }
         # 로그 파이프라인 미연동인 환경에서는 offswap 자체 비활성 여부로 최소 점검
-        offswap_enabled = bool(cfg.get("off_swap_enabled", False))
+        offswap_enabled = bool(cfg.get("off_swap_enabled", False))  # nm:external
         has_target = any(int((row.get("off_swap_target") or 0)) == 1 for row in (shifts if isinstance(shifts, list) else []))
         ci_blob = (r0[1].get("constraint_impact") or {}) if (r0[0] == 200 and isinstance(r0[1], dict)) else {}
         offswap_signal = _contains_offswap_signal(ci_blob)

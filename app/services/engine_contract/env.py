@@ -1153,7 +1153,7 @@ ENV: tuple[EnvSpec, ...] = (
         path='lex(build_model, safety 항)',
         read_at='호출 시점(함수 안)',
         default_effective="미설정 → getattr(cfg, 'off_quota_excess_weight', 100000) — cfg 칸 생산자 0(늘 100000). env 가 사실상 유일한 레버",
-        meaning="off_first=False 일 때 OFF 목표 초과 슬랙 가중(aux off_quota). '0'·'1' 이면 원 슬랙(가중 1).",
+        meaning="staffing_first=False 일 때 OFF 목표 초과 슬랙 가중(aux off_quota). '0'·'1' 이면 원 슬랙(가중 1).",
         readers=('services/cp_sat/fallback_lex.py:3232:optimize_fallback_lex_hard_first.build_model:environ.get',),
         hard_lock_affects=False,
         hard_lock_rule_nos=(),

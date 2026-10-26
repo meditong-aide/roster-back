@@ -27,11 +27,12 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "app"))
 
+from services.engine_contract.names import to_internal  # noqa: E402
 from services.ontology_graph.branch_infer import (  # noqa: E402
     _aggregate_cert, _n_pool, _perday_cert, diagnose_night_axis)
 from services.ontology_graph.certificate import INFEASIBLE  # noqa: E402
 
-_RULE_KEYS = ("two_offs_after_three_nig", "two_offs_after_two_nig", "not_one_night")
+_RULE_KEYS = ("two_offs_after_three_nig", "two_offs_after_two_nig", "ban_single_night")
 
 
 def _constraints(case):
@@ -115,6 +116,8 @@ def main():
     agg = {"qx_calls": 0, "qx_n": 0, "bi_certified": 0, "t1": 0, "n": 0}
     for p in paths:
         case = json.load(open(p))
+        # 사례 JSON 은 바깥(옛) 설정 이름으로 저장된다(NM X4) — 진단 스택은 파이썬 이름을 읽으므로 설정 dict 만 바꾼다.
+        case["config"] = to_internal(case["config"])
         name = os.path.basename(p).replace(".json", "")[:38]
         # N축 원인만 대상(다른 축은 이 실험 밖)
         node = diagnose_night_axis(case["nurses"], case["config"], int(case["num_days"]))

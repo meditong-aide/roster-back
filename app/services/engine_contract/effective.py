@@ -13,7 +13,7 @@
 이 모듈은 **월 안(`create_config_from_db`) 해석만** 낸다. 월경계·월중 경계 빌더
 (`roster_create_service.build_cross_month_constraints`·`build_mid_month_boundary_constraints`)
 는 같은 하드락 키라도 **키 부재를 다른 기본값으로** 읽어
-cfg 단계와 다른 값을 낼 수 있다(연속근무 K 의 별칭 폴백은 EI-12 에서 없앴고, 나이트 연속 L 은 D13 ① 뒤 정본 `three_seq_nig` 만 읽는다 —
+cfg 단계와 다른 값을 낼 수 있다(연속근무 K 의 별칭 폴백은 EI-12 에서 없앴고, 나이트 연속 L 은 D13 ① 뒤 정본 `allow_three_consecutive_nights` 만 읽는다 —
 `tests/engine_contract/test_effective.py` `test_boundary_builder_ignores_alias_and_diverges_from_effective_only_on_default`).
 별칭 완화·원시값 판정은 EI-7 `policy/hard_lock.py` 가 맡는다 — 이 모듈과 섞지 않는다.
 """
@@ -28,6 +28,10 @@ _MISSING = object()
 
 #: 별칭 → 정본 키. 모듈 import 시 1회 만든다(정본 키가 별칭보다 항상 우선 — `canonical_key`).
 _ALIAS_TO_KEY: dict[str, str] = {alias: spec.key for spec in SETTINGS for alias in spec.aliases}
+
+#: 바깥 이름(물리 컬럼·API·저장 JSON — NM 14칸) → 정본 키. 별칭과 달리 입력 정규화(`normalize_aliases`) 대상이 아니라
+#: 조회만 풀어 준다 — 옛 이름 요청·저장 JSON 이 `registry_default`·하드락 조회에서 `UnknownSettingKey` 가 나지 않게.
+_COLUMN_TO_KEY: dict[str, str] = {spec.column: spec.key for spec in SETTINGS if spec.column}
 
 #: 하드락 11키(cfg 를 거치는 것) — 월경계 스위치 2키(`kind='boundary_switch'`)는 뺀다.
 HARD_LOCK_CFG_KEYS: tuple[str, ...] = tuple(
@@ -49,11 +53,11 @@ class EffectiveLookupError(KeyError):
 
 
 class UnknownSettingKey(EffectiveLookupError):
-    """정본 키·별칭 어디에도 없는 키 — `rules.py` 철자·`CODE_CONSTS`·`RUNTIME_DATA_NOT_SETTINGS`
-    키는 받지 않는다."""
+    """정본 키·별칭·바깥 이름(column) 어디에도 없는 키 — `rules.py` 철자·`CODE_CONSTS`·
+    `RUNTIME_DATA_NOT_SETTINGS` 키는 받지 않는다."""
 
     def __str__(self) -> str:
-        return f"{self.args[0]!r}: 정본 키·별칭만 받는다(레지스트리 SETTINGS 에 없음)"
+        return f"{self.args[0]!r}: 정본 키·별칭·바깥 이름만 받는다(레지스트리 SETTINGS 에 없음)"
 
 
 class NotInConfig(EffectiveLookupError):
@@ -69,13 +73,14 @@ class NotInConfig(EffectiveLookupError):
 
 
 def canonical_key(key: str) -> str:
-    """정본 키 또는 별칭을 받아 정본 키를 돌려준다.
+    """정본 키·별칭·바깥 이름(`SettingSpec.column` — 물리 컬럼·API·저장 JSON 의 옛 이름)을 받아 정본 키를 돌려준다.
 
-    정본 키가 별칭보다 우선한다. 레지스트리 SETTINGS·별칭 어디에도 없으면 `UnknownSettingKey`.
+    정본 키가 별칭·바깥 이름보다 우선한다(셋은 서로 겹치지 않는다). 레지스트리 SETTINGS·별칭·바깥 이름
+    어디에도 없으면 `UnknownSettingKey`.
     """
     if key in SETTINGS_BY_KEY:
         return key
-    owner = _ALIAS_TO_KEY.get(key)
+    owner = _ALIAS_TO_KEY.get(key) or _COLUMN_TO_KEY.get(key)
     if owner is None:
         raise UnknownSettingKey(key)
     return owner
@@ -117,7 +122,7 @@ def cfg_field_name(cfg: object, key: str) -> str | None:
 
 
 def effective(cfg: object, key: str, default: object = _MISSING) -> object:
-    """정본 키 또는 별칭으로 cfg 단계 실효값을 돌려준다(§2.2 해석 규칙).
+    """정본 키 또는 별칭(바깥 이름 포함)으로 cfg 단계 실효값을 돌려준다(§2.2 해석 규칙).
 
     `cfg` 는 `create_config_from_db` 결과(`NurseRosterConfig`)를 전제한다. 값은 복사·변환 없이
     `getattr(cfg, name)` 그대로 돌려준다 — 별칭으로 물어도 결과는 정본 키와 같다. 반환된
@@ -128,7 +133,7 @@ def effective(cfg: object, key: str, default: object = _MISSING) -> object:
         TypeError: `cfg` 가 Mapping(= config dict)이거나, `NurseRosterConfig` 가 아닌 다른
             객체(ORM 행·pydantic 모델 등)이면(`_require_nurse_roster_config`) — 둘 다
             config dict 는 `effective_hard_lock` 을 쓴다는 뜻이다.
-        UnknownSettingKey: 정본 키·별칭 어디에도 없는 키.
+        UnknownSettingKey: 정본 키·별칭·바깥 이름 어디에도 없는 키.
         NotInConfig: 레지스트리 키지만 이 cfg 에 대응 속성이 없고, `default` 도 주지 않았을 때.
     """
     if isinstance(cfg, Mapping):
@@ -167,7 +172,7 @@ def effective_hard_lock(config_data: Mapping[str, object]) -> dict[str, object]:
     돌릴 워커 프로세스의 env 가 다르면(MS-5) 이 함수가 돌려주는 값도 다르다 — 완화 판정에
     쓸 때는 EI-7 원시값 판정과 같이 써야 한다(리뷰 반영).
 
-    `three_seq_nig` 값은 bool 이 아니라 int `3`/`2` 다(`== True` 비교 금지). bool 하드락
+    `allow_three_consecutive_nights` 값은 bool 이 아니라 int `3`/`2` 다(`== True` 비교 금지). bool 하드락
     값은 변환 없이 원시값(`None`·`0`·`'false'`·`-1`)이 그대로 나올 수 있다 — 엔진은 이 값을
     `is True` 가 아니라 **truthiness** 로 읽는다(예: 문자열 `'false'` 는 참). 첫 호출은
     `create_config_from_db` 의 모듈 수준 `dotenv`·`db.client2` 로딩 때문에 약 1.6초가 든다

@@ -453,7 +453,7 @@ def _effective_off_window_constraints(
     precheck **앞**에서 돌아, `config` 캡처 시점에 이미 그 결과가 들어 있다). 실효값은 **⑤ 의 창과
     `config` 의 창을 간호사별로 합친 것**이다(EI-11 11r — 예전 rcs 는 ⑤ 의 값이 있으면 `config` 의 값을
     통째로 바꿔 월중 경계 하드락 창이 엔진에 안 닿았고, 이 함수도 그 조건부 대입을 재현했다).
-    `config` 는 단계 B 의 다른 계산(④⑤·team·off_first)과 같은 원천이다(리뷰 지적 L16 — production 모드에선
+    `config` 는 단계 B 의 다른 계산(④⑤·team·staffing_first)과 같은 원천이다(리뷰 지적 L16 — production 모드에선
     `first_attempt_config`, offline 모드는 `config == prelude.config_dict`). S6(병동이동, X01·N07)으로 실측:
     ⑤ 만 재조회하면 `{}` 인데 `config`(precheck 캡처)는 `{'X01': [[19, 19]], 'N07': [[14, 17]]}` 를 이미 담고 있다.
     반환은 **깊은 사본**이다(BR-6, 리뷰 지적 — 이전엔 `config`/`cross_month` 의 리스트를 그대로 돌려줘
@@ -574,7 +574,7 @@ def _build_roster(
     재사용' 그대로)로 주입한다. 실패하면 rcs :3490-3491 처럼 **삼키고** 명단은 그대로 돌려준다
     (리뷰 지적 LOW — 이전엔 바깥 `_safe_call` 이 함수 전체를 감싸 명단까지 함께 비었다. 운영은
     주말휴무 주입만 못 할 뿐 명단·index 맵은 그대로 돈다). `nid` 는 `nurse_id or db_id`(rcs
-    :3481·:3484 그대로 — 이전엔 `nurse_id` 만 봤다). `off_first` 면 개인 OFF 한도(`o_min`/
+    :3481·:3484 그대로 — 이전엔 `nurse_id` 만 봤다). `staffing_first` 면 개인 OFF 한도(`o_min`/
     `o_max`/`o_exact`)를 지운다(:3491-3492 그대로, 새 dict 로 — 간호사 객체 자체는 건드리지
     않는다). `work_shifts`·`health_leave_extra_off`·`is_inbound`(MS-7)는 이미 각 간호사 dict
     에 들어 있다 — 전부 프렐류드 캡처 **이전**에 ORM `__dict__` 에 직접 쓰인 값이라(rcs
@@ -591,7 +591,7 @@ def _build_roster(
                 nurse_dict["is_weekend_off"] = nid in weekend_ids
     except Exception:  # noqa: BLE001 — rcs 원문과 같은 폭("삼키고 무시", :3490-3491)
         pass
-    if bool(config.get("off_first", False)):
+    if bool(config.get("staffing_first", False)):
         nurses = [{**n, "o_min": None, "o_max": None, "o_exact": None} for n in nurses]
     views = _as_nurse_views(prelude.nurses_for_engine)
     index_map = _build_engine_nurse_index_map(views)

@@ -19,7 +19,7 @@ def _cert(kind):
 
 
 _NU = [{"nurse_id": f"n{i}"} for i in range(4)]
-_CFG = {"not_one_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
+_CFG = {"ban_single_night": True, "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
         "initial_constraints": {"forbidden": {}, "forced_off": {}}}
 
 

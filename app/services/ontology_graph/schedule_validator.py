@@ -26,7 +26,7 @@ def validate_schedule(schedule: dict, nurses: list, config: dict,
                       num_days: int) -> ValidationResult:
     """schedule={nurse_id: [shift per day]} 를 검증. shift ∈ {D,E,N,O}.
 
-    검사: ① 개인 시퀀스(회복·max run·not_one_night·전이·max연속근무 = 공통 automaton)
+    검사: ① 개인 시퀀스(회복·max run·ban_single_night·전이·max연속근무 = 공통 automaton)
          ② per-day D/E/N 커버리지  ③ 셀 제약(banned/forced_off).
     """
     prepped = _prep(nurses, config)

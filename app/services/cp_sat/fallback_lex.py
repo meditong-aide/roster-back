@@ -852,7 +852,7 @@ def optimize_fallback_lex_hard_first(
     # ── 프리셉티 인덱스/기간 (cp_sat_basic 와 동일 정책 — nurse_preceptee_period SSOT) ──
     # 맵 있음=권위 모드(맵만 신뢰, default=follow 없음), 맵 없음=전환 폴백(캐시 기반 무회귀).
     # 설계: docs/NURSE_PRECEPTEE_PERIOD_DESIGN.md §6.
-    preceptee_follow = bool(getattr(cfg, 'preceptee_on', False))
+    preceptee_follow = bool(getattr(cfg, 'preceptee_follows_preceptor', False))
     _fb_id_to_idx = {nu.db_id: n for n, nu in enumerate(roster_system.nurses)}
     preceptee_follow_days: dict[int, set[int]] = getattr(roster_system, "preceptee_follow_days", {}) or {}
     _has_preceptee_period = bool(getattr(roster_system, "preceptee_period_authoritative", False))
@@ -877,7 +877,7 @@ def optimize_fallback_lex_hard_first(
             return False  # nurse-level: day별 판별 필요
         return d in days
 
-    exclude_preceptee_from_den = (not getattr(cfg, 'preceptee_shift_count', True)) and bool(preceptee_indices)
+    exclude_preceptee_from_den = (not getattr(cfg, 'count_preceptee_in_staffing', True)) and bool(preceptee_indices)
     coverage_exclude_cells: set[tuple[int, int]] = getattr(roster_system, "coverage_exclude_cells", set()) or set()
     # 외부 스코프에서 로깅용으로 사용 (build_model 내부에서도 별도 정의)
     weekly_off_by_idx = (
@@ -1705,9 +1705,9 @@ def optimize_fallback_lex_hard_first(
             any(int(v or 0) > 0 for v in dm.values())
             for dm in _fb_max_by_day if isinstance(dm, dict)
         )
-        # off_first=True: max coverage 미설정 코드/일에 대해 min을 max로 강제(=잔여 셀 OFF 회수)
-        _fb_off_first_cfg = bool(getattr(cfg, "off_first", False))
-        print(f"{logger_prefix} [OffFirstCoverage] off_first={_fb_off_first_cfg}, _fb_has_any_max={_fb_has_any_max} → force_min_as_max={_fb_off_first_cfg and not _fb_has_any_max}")
+        # staffing_first=True: max coverage 미설정 코드/일에 대해 min을 max로 강제(=잔여 셀 OFF 회수)
+        _fb_staffing_first_cfg = bool(getattr(cfg, "staffing_first", False))
+        print(f"{logger_prefix} [OffFirstCoverage] staffing_first={_fb_staffing_first_cfg}, _fb_has_any_max={_fb_has_any_max} → force_min_as_max={_fb_staffing_first_cfg and not _fb_has_any_max}")
         short_terms, over_terms = [], []
         over_vars_by_day = {}
         short_vars_by_day_code: Dict[tuple[int, str], cp_model.IntVar] = {}
@@ -1828,8 +1828,8 @@ def optimize_fallback_lex_hard_first(
                 elif req_max_raw > 0 and _relax_coverage:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                     aux_add(m, "coverage_over", ov >= assigned - need_max)
-                elif _fb_off_first_cfg:
-                    # off_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
+                elif _fb_staffing_first_cfg:
+                    # staffing_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
                     # relax_coverage / need=0 무관 강제 — fixed_wanted 가 min 다 채워도 추가 근무 차단.
                     hard_add(m, "off_first_coverage_cap", assigned <= max(0, need))
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
@@ -1844,16 +1844,16 @@ def optimize_fallback_lex_hard_first(
                 short_vars_by_day_code[(d, code)] = sh
                 over_vars_by_day_code[(d, code)] = ov
 
-        # 1-B) Max coverage / off_first OFF 균등 분배
-        # off_first=True: max coverage 미설정이라도 OFF가 잔여 셀로 회수되므로
+        # 1-B) Max coverage / staffing_first OFF 균등 분배
+        # staffing_first=True: max coverage 미설정이라도 OFF가 잔여 셀로 회수되므로
         # 일반 간호사 사이에 균등 분배 유도 (전담/주말휴무/preceptee 제외)
         _fb_max_cov_off_equalize_terms = []
-        if _fb_has_any_max or _fb_off_first_cfg:
+        if _fb_has_any_max or _fb_staffing_first_cfg:
             _fb_nurse_off_vars = []
             for n in range(N):
                 if n in preceptee_indices:
                     continue
-                if _fb_off_first_cfg:
+                if _fb_staffing_first_cfg:
                     # 주말휴무자·N 전담은 cap 관리 대상 아님 → 풀에서 제외
                     _nu = roster_system.nurses[n] if n < len(roster_system.nurses) else None
                     if _nu is not None and bool(getattr(_nu, "is_weekend_off", False)):
@@ -1861,14 +1861,14 @@ def optimize_fallback_lex_hard_first(
                     _raw_nn = getattr(_nu, "allowed_shifts", None) if _nu is not None else None
                     if isinstance(_raw_nn, (set, list, tuple)) and set(_raw_nn) == {"N"}:
                         continue
-                # off_first=False 경로의 nonvac_offs 식과 동일한 도메인:
+                # staffing_first=False 경로의 nonvac_offs 식과 동일한 도메인:
                 #   range(T0, T1+1) 중 vacation_off_cells 제외, 고정 OFF는 X(n,d,off)=1 자동
                 T0, T1 = join[n], leave[n]
-                # off_first=True HARD 풀 가드: 풀먼스 active window 아닌 간호사는 제외
+                # staffing_first=True HARD 풀 가드: 풀먼스 active window 아닌 간호사는 제외
                 #   - 중도 가입자(T0>0) / 중도 퇴사자(T1<D_phys-1) → 최대 OFF 용량 상이
                 #   - blocked_by_nurse 보유자 → 출장/연수 등으로 OFF 가용량 비대칭
                 _fb_blk_set_n = blocked_by_nurse.get(n, set()) if blocked_by_nurse else set()
-                if _fb_off_first_cfg:
+                if _fb_staffing_first_cfg:
                     if T0 > 0 or T1 < D_phys - 1 or _fb_blk_set_n:
                         continue
                 _phys_days_n = [d for d in range(T0, T1 + 1) if (n, d) not in vacation_off_cells]
@@ -1884,13 +1884,13 @@ def optimize_fallback_lex_hard_first(
                 aux_call(m, "max_cov_off_equalize", "AddMinEquality", _fb_off_min, _fb_nurse_off_vars)
                 _fb_off_range = m.NewIntVar(0, D_phys, "fb_mc_off_range")
                 aux_add(m, "max_cov_off_equalize", _fb_off_range == _fb_off_max - _fb_off_min)
-                # off_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
+                # staffing_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
                 # (사용자 명세: off_days 무시 + daily 커버리지 우선 → OFF 균등은 차순위)
-                if _fb_off_first_cfg:
-                    print(f"{logger_prefix} [MaxCoverage/OffFirst] OFF range는 SOFT (off_first=True)")
-                _fb_off_eq_w = -100000 if _fb_off_first_cfg else -200
+                if _fb_staffing_first_cfg:
+                    print(f"{logger_prefix} [MaxCoverage/OffFirst] OFF range는 SOFT (staffing_first=True)")
+                _fb_off_eq_w = -100000 if _fb_staffing_first_cfg else -200
                 _fb_max_cov_off_equalize_terms.append(_fb_off_eq_w * _fb_off_range)
-                if _fb_off_first_cfg and len(_fb_nurse_off_vars) >= 3:
+                if _fb_staffing_first_cfg and len(_fb_nurse_off_vars) >= 3:
                     _fbN = len(_fb_nurse_off_vars)
                     _fb_off_sum = m.NewIntVar(0, D_phys * _fbN, "fb_mc_off_sum")
                     aux_add(m, "max_cov_off_equalize", _fb_off_sum == sum(_fb_nurse_off_vars))
@@ -1938,9 +1938,9 @@ def optimize_fallback_lex_hard_first(
             int(getattr(cfg, "fallback_off_cap_bounded_slack_weight", 10) or 1),
         )
 
-        # 고립 OFF 금지(슬랙 허용): sequential_offs 활성 + 옵션 켜졌을 때만 적용
+        # 고립 OFF 금지(슬랙 허용): avoid_isolated_off_and_work 활성 + 옵션 켜졌을 때만 적용
         if (
-            bool(getattr(cfg, "sequential_offs", True))
+            bool(getattr(cfg, "avoid_isolated_off_and_work", True))
         ):
             slack_penalty = int(getattr(cfg, "isolated_off_slack_penalty", 300000) or 0)
             # ★★ 휴가·공가가 낀 자리는 **고립 OFF 판정에서 뺀다.**
@@ -2113,8 +2113,8 @@ def optimize_fallback_lex_hard_first(
 
         # 1N 금지 (day0 N 고정인 경우 해당일만 스킵)
         # nurse_monthly_limit.n_max==1 nurse 는 사용자 명시 의도 우선으로 면제.
-        not_one_night_val = getattr(cfg, "not_one_night", False)
-        print(f"{logger_prefix} [1N금지] not_one_night={not_one_night_val!r} (type={type(not_one_night_val).__name__})")
+        ban_single_night_val = getattr(cfg, "ban_single_night", False)
+        print(f"{logger_prefix} [1N금지] ban_single_night={ban_single_night_val!r} (type={type(ban_single_night_val).__name__})")
         try:
             from services.constraints.monthly_limit_constraints import (
                 collect_single_n_allowed_nurse_indices,
@@ -2123,7 +2123,7 @@ def optimize_fallback_lex_hard_first(
         except Exception as _e_sn:
             print(f"{logger_prefix} [1N금지] single_n allowed set 계산 실패(무시): {_e_sn}")
             _single_n_allowed_lex = set()
-        if bool(not_one_night_val):
+        if bool(ban_single_night_val):
             _pte_fw_1n = getattr(roster_system, '_preceptee_fixed_wanted_map', {}) or {}
             for n in range(N):
                 if n in _single_n_allowed_lex:
@@ -2152,7 +2152,7 @@ def optimize_fallback_lex_hard_first(
                         neighbors.append(X(n, d + 1, night_idx))
                     if not neighbors:
                         continue
-                    hard_add(m, "not_one_night", X(n, d, night_idx) <= sum(neighbors))
+                    hard_add(m, "not_one_night", X(n, d, night_idx) <= sum(neighbors))  # nm:external
 
         # 고정 셀의 직전일 N 금지 (하드). 대상을 고르는 축이 **둘**이다.
         #   ① type  : 휴가·공가        → ban_night_before_fixed_off      (기본 True)
@@ -2509,7 +2509,7 @@ def optimize_fallback_lex_hard_first(
                 sum_n = sum(X(n, d0 + t, night_idx) for t in range(L + 1))
                 exc = m.NewIntVar(0, L + 1, f"cnight_exc_{n}_{d0}")
                 aux_add(m, "cnight_excess", exc >= sum_n - L)
-                # 연속 N 상한 L 하드: three_seq_nig False면 L=2(3N 금지), True면 L=3(3N 허용)
+                # 연속 N 상한 L 하드: allow_three_consecutive_nights False면 L=2(3N 금지), True면 L=3(3N 허용)
                 _cn_expr_fb = (sum_n <= L)
                 if _assume_registry_fb is not None and _add_hard_fb is not None:
                     _add_hard_fb(
@@ -3047,7 +3047,7 @@ def optimize_fallback_lex_hard_first(
                       + (", 위반칸 방식" if _gap_slacks else "") + ")")
 
         # 금지 패턴 N-O-D/E
-        if getattr(cfg, "nod_noe", True):
+        if getattr(cfg, "avoid_nod_noe_eod", True):
             for n in range(N):
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 - 2):
@@ -3095,10 +3095,10 @@ def optimize_fallback_lex_hard_first(
 
         # 월 최소 OFF 부족량(가능일수 클램프)
         # max coverage 설정 시: min/max coverage 기반 OFF cap 자동 조정
-        # off_first=True: max coverage 미설정이라도 동일한 자동 조정 수행 (단일 cap 소스)
+        # staffing_first=True: max coverage 미설정이라도 동일한 자동 조정 수행 (단일 cap 소스)
         _fb_auto_min_off = None
         _fb_auto_max_off = None
-        if _fb_has_any_max or _fb_off_first_cfg:
+        if _fb_has_any_max or _fb_staffing_first_cfg:
             import math as _math
             _fb_blocked_set = set(blocked_by_nurse.keys()) if blocked_by_nurse else set()
             _fb_total_capacity = 0
@@ -3220,7 +3220,7 @@ def optimize_fallback_lex_hard_first(
                     aux_add(m, "off_quota", target_o - assigned_o <= slack_short)
                     aux_add(m, "off_quota", assigned_o - target_o <= slack_excess)
                     safety["off_quota_short"].append(slack_short)
-                    # [OffLevelLock] off_first=False(=근무 oversupply 의도) 실효화:
+                    # [OffLevelLock] staffing_first=False(=근무 oversupply 의도) 실효화:
                     # OFF 상한(target 초과=잉여)을 floor와 대칭으로 가중한다. 기존엔 excess만
                     # raw(weight 1)라, stage2 safety의 pre-scaled 항(isolated_off 300K,
                     # min_off_lower 100K 등)에 묻혀 OFF가 cap까지 드리프트했다. scaled 슬랙을
@@ -3235,7 +3235,7 @@ def optimize_fallback_lex_hard_first(
                         )
                         or 0
                     )
-                    if _oqx_w > 1 and not bool(getattr(cfg, "off_first", False)):
+                    if _oqx_w > 1 and not bool(getattr(cfg, "staffing_first", False)):
                         _ex_scaled = m.NewIntVar(0, D * _oqx_w, f"off_quota_excess_cost_{n}")
                         aux_add(m, "off_quota", _ex_scaled == slack_excess * _oqx_w)
                         safety["off_quota_excess"].append(_ex_scaled)
@@ -3299,8 +3299,8 @@ def optimize_fallback_lex_hard_first(
                 # N전담 예외: offcap 고정값 적용 제외 (max는 avail_days-15 공식)
                 if is_n_only:
                     min_off_required = 0
-                # off_first=True: 사용자 명세상 월 OFF 수(off_days) 무시 → min_off HARD 해제.
-                if bool(getattr(cfg, "off_first", False)):
+                # staffing_first=True: 사용자 명세상 월 OFF 수(off_days) 무시 → min_off HARD 해제.
+                if bool(getattr(cfg, "staffing_first", False)):
                     min_off_required = 0
                 if min_off_required > 0 and not is_weekend_off:
                     # 휴가/공가는 최소 OFF 충족에서 제외
@@ -3311,8 +3311,8 @@ def optimize_fallback_lex_hard_first(
                     )
                     hard_lower = int(min_off_required)
                     # ★★ OFF 하한은 HARD 다 — per-nurse 1일 slack 을 쓰지 않는다.
-                    #   이 블록은 off_first=False 일 때만 실행된다(True 면 위에서
-                    #   min_off_required=0 이 되어 건너뛴다). off_first=False 는
+                    #   이 블록은 staffing_first=False 일 때만 실행된다(True 면 위에서
+                    #   min_off_required=0 이 되어 건너뛴다). staffing_first=False 는
                     #   "근무 oversupply 허용 · OFF tight" 모드이므로 OFF 를 정확히
                     #   지키는 것이 설계 의도다.
                     #
@@ -3323,9 +3323,9 @@ def optimize_fallback_lex_hard_first(
                     #   다른 제약을 맞추는 쪽을 택했다. 실무 근무표는 한 시트 안에서
                     #   22~29/26~29명이 같은 OFF 수를 갖는다 — 균일이 정상이다.
                     #
-                    #   ★ 구 주석의 회복 대상(9B 2026-07 min_off=11)은 현재 off_first=1
+                    #   ★ 구 주석의 회복 대상(9B 2026-07 min_off=11)은 현재 staffing_first=1
                     #     이라 이 블록에 들어오지 않는다. 되살릴 때는 그 그룹의
-                    #     off_first 를 먼저 확인할 것.
+                    #     staffing_first 를 먼저 확인할 것.
                     _lower_slack_max = 0
                     _lower_slack_weight = 100000
                     if _lower_slack_max > 0:
@@ -3379,9 +3379,9 @@ def optimize_fallback_lex_hard_first(
                         # 4O 월경계 제약으로 월초 OFF 배치 제한된 간호사는 max_off +1 보정
                         if n in _4o_cross_affected_fb:
                             _extra_off_fb += 1
-                        # off_first 분기: False=근무 oversupply(OFF tight) / True=OFF oversupply(dev HEAD)
-                        _off_first_fb = bool(getattr(cfg, "off_first", False))
-                        if _off_first_fb:
+                        # staffing_first 분기: False=근무 oversupply(OFF tight) / True=OFF oversupply(dev HEAD)
+                        _staffing_first_fb = bool(getattr(cfg, "staffing_first", False))
+                        if _staffing_first_fb:
                             base_cap = max_off_allowed_from_policy
                             base_cap += _extra_off_fb
                             if n in per_nurse_off_cap_override:
@@ -3395,7 +3395,7 @@ def optimize_fallback_lex_hard_first(
                                 _scaled_max_fb = max(min_off_required, int(_fb_auto_max_off * _ratio_fb))
                                 total_cap_effective = min(total_cap_effective, _scaled_max_fb)
                         else:
-                            # off_first=False: 근무 oversupply 를 허용하는 모드다(위 분기 주석).
+                            # staffing_first=False: 근무 oversupply 를 허용하는 모드다(위 분기 주석).
                             # ★★ 그러므로 OFF 는 **하한으로 고정**한다 — _extra_off_fb 를 더하지 않는다.
                             #   더하면 상한이 하한+2 로 열려 사람마다 OFF 가 흩어진다.
                             #   실측(2026-08-04):
@@ -4672,7 +4672,7 @@ def optimize_fallback_lex_hard_first(
                         except Exception:
                             continue
                     # 1N 금지가 켜지면 N 은 최소 2일 연속이라 자유 셀도 그만큼 이어져야 한다.
-                    _n_block_min = 2 if bool(getattr(cfg, "not_one_night", False)) else 1
+                    _n_block_min = 2 if bool(getattr(cfg, "ban_single_night", False)) else 1
 
                     def _count_bounds(_n: int, _sidx: int) -> tuple[int, int]:
                         """(lo, hi) — 그 사람이 그 시프트를 받을 수 있는 최소·최대 개수.
@@ -5047,7 +5047,7 @@ def optimize_fallback_lex_hard_first(
                           교환되기 때문이다. 코드 주석도 '하드 고정 아님' 이라 자인한다.
                         ★ off_range 와 역할이 다르다 — off_range 는 사람 간 격차라 전원이
                           균등하게 초과해도 만족하지만, 이 패스는 설정값으로 끌어내린다.
-                        ★ off_first=True 는 근무 상한이 하드(assigned <= need)라 남는 셀이
+                        ★ staffing_first=True 는 근무 상한이 하드(assigned <= need)라 남는 셀이
                           OFF 로 갈 수밖에 없다 — 초과가 구조적이라 줄일 여지가 없다.
                           다만 그 판단은 실측으로 확인한다(지금은 대상에 넣어 둔다).
                         """

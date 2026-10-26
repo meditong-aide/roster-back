@@ -85,7 +85,7 @@ class PrecheckNurse:
     join_day: int = 0  # 0-based day index
     leave_day: int = 0  # inclusive
     personal_off_adjustment: int = 0
-    # 엔진 OFF 하드 하한(min_off) 하한값 — 0 이면 하한 없음(off_first·N 전담·주말휴무·프리셉티 등). EI-14r3.
+    # 엔진 OFF 하드 하한(min_off) 하한값 — 0 이면 하한 없음(staffing_first·N 전담·주말휴무·프리셉티 등). EI-14r3.
     min_off_required: int = 0
     fixed_off_days: Set[int] = field(default_factory=set)
     fixed_shift_assignments: Dict[int, str] = field(default_factory=dict)  # {day: shift}
@@ -192,7 +192,7 @@ def _required_off_days(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
 def _hard_off_floor(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     """근무가능일을 '하드하게' 줄이는 off 만 합산한다.
 
-    ★ 개인 월 휴무(off_days / standard_personal_off_days)를 단순 감산하지 않는다. 엔진은 off_first=False 이고
+    ★ 개인 월 휴무(off_days / standard_personal_off_days)를 단순 감산하지 않는다. 엔진은 staffing_first=False 이고
       N 전담·주말휴무·프리셉티가 아닌 간호사에게 OFF **하드 하한**(min_off — 휴가 제외·구조 OFF 계산,
       fallback_lex.py:3253-3345)을 건다. 단순 off_days 를 빼면 휴가·구조 OFF 와 이중 감산돼 엔진보다 엄해져
       false CAPACITY_TOTAL_SHORTAGE 가 난다. cf. 8d2c2a9 회귀: off_days 를 하드 감산해 연속근무 3/5 로도 capacity 가 갇혔음.
@@ -260,7 +260,7 @@ def _off_floor_binding(inp: PrecheckInput, total_need: int, total_cap: int,
 
     14r3 이후 `off_days` 는 용량 바닥(`min_off_required`)에 들어가 `CAPACITY_TOTAL_SHORTAGE` 를 만들 수 있다.
     `off_days` 를 얼마까지 낮추면 수요를 채우는지(최대값)를 구한다. 현재 값에서의 재계산이 실제 용량과 안 맞거나(다른 입력이
-    섞인 경우) 0 으로도 못 채우면 None(진짜 인원 부족 — 레버 아님). `min_off_required` 가 0 인 간호사(off_first·N 전담·
+    섞인 경우) 0 으로도 못 채우면 None(진짜 인원 부족 — 레버 아님). `min_off_required` 가 0 인 간호사(staffing_first·N 전담·
     주말휴무·프리셉티)는 그대로 둔다.
     """
     from dataclasses import replace
@@ -1053,7 +1053,7 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
             return None
         span = max(0, n.leave_day - n.join_day + 1)
         # EI-10c: 연속 N 상한 L 은 개인 DP 와 같은 한 곳(`_consecutive_night_cap`)에서 읽는다 — bridge 가 엔진 값을
-        # 실었으면 그것, 직접 호출부는 `three_seq_nig` 로 3/2. 블록은 L 까지 허용하고 끝날 때만 2OFF 가 걸린다.
+        # 실었으면 그것, 직접 호출부는 `allow_three_consecutive_nights` 로 3/2. 블록은 L 까지 허용하고 끝날 때만 2OFF 가 걸린다.
         return max_nights_under_recovery(
             span, _rec_block, max_run=_consecutive_night_cap(inp.roster_config))
 
@@ -1310,7 +1310,7 @@ def check_preceptee_sync_mismatch(inp: PrecheckInput) -> List[Dict]:
 
 def _consecutive_night_cap(cfg: dict[str, Any]) -> int:
     """연속 N 상한 — bridge 가 엔진 실효값(`max_consecutive_nights`)을 실었으면 그것, 없으면 옛 규칙."""
-    fallback = 3 if cfg.get("three_seq_nig") else 2
+    fallback = 3 if cfg.get("allow_three_consecutive_nights") else 2
     try:
         return int(cfg["max_consecutive_nights"])
     except (KeyError, TypeError, ValueError):
@@ -1321,13 +1321,13 @@ def precheck_sequence_params(cfg: dict[str, Any]) -> dict[str, Any]:
     """개인 시퀀스 DP 가 쓰는 하드락 규칙 값 — 한 곳에서만 읽는다(EI-10c C8' 비교 대상).
 
     bridge(`hard_lock_view`)가 엔진 실효값을 실었으면 그 값이 이긴다(전이 금지 3종은 엔진이
-    `banned_day_after_eve` 로 마스킹한 값이다). 키가 없을 때의 옛 기본값은 bridge 를 거치지 않는
+    `ban_shift_transitions` 로 마스킹한 값이다). 키가 없을 때의 옛 기본값은 bridge 를 거치지 않는
     직접 호출부(라우터 `POST /groups/{id}/roster/precheck`·테스트)용으로 남긴다.
     연속 N 상한 L(`max_consecutive_nights`)은 월 나이트 회복 용량(`_recovery_night_cap`)도 같은 값을 쓴다 — L 의 출처는 한 곳이다.
     """
-    # 엔진은 `banned_day_after_eve` 가 거짓이면 전이 금지를 모두 끈다(cp_sat_basic.py:673-677) — 직접 호출부도 같은 결과
+    # 엔진은 `ban_shift_transitions` 가 거짓이면 전이 금지를 모두 끈다(cp_sat_basic.py:673-677) — 직접 호출부도 같은 결과
     # (이 한 줄은 엔진 규칙의 미러다. C8' 직접 호출부 행렬이 엔진 값과 같음을 묶어 둔다).
-    masked = not cfg.get("banned_day_after_eve", True)
+    masked = not cfg.get("ban_shift_transitions", True)
     return {
         "max_consecutive_work": cfg.get("max_conseq_work"),
         "max_consecutive_nights": _consecutive_night_cap(cfg),
@@ -1336,7 +1336,7 @@ def precheck_sequence_params(cfg: dict[str, Any]) -> dict[str, Any]:
         "ban_n_to_e": not masked and bool(cfg.get("ban_n_to_e", True)),
         "two_offs_after_two_nig": bool(cfg.get("two_offs_after_two_nig")),
         "two_offs_after_three_nig": bool(cfg.get("two_offs_after_three_nig")),
-        "not_one_night": bool(cfg.get("not_one_night")),
+        "ban_single_night": bool(cfg.get("ban_single_night")),
     }
 
 

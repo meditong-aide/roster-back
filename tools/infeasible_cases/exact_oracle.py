@@ -159,10 +159,13 @@ if __name__ == "__main__":
     import glob
     import json
     import os
+    from services.engine_contract.names import to_internal
     from services.ontology_graph.axis_diagnose import multi_axis_diagnose
     print("독립 exact oracle vs 우리 진단 스택 (exact 는 소형 인스턴스 전용)\n")
     for p in sorted(glob.glob(os.path.join(_HERE, "cases", "*.json"))):
         d = json.load(open(p))
+        # 사례 JSON 은 바깥(옛) 설정 이름으로 저장된다(NM X4) — 진단 스택·oracle 은 파이썬 이름을 읽으므로 설정 dict 만 바꾼다.
+        d["config"] = to_internal(d["config"])
         name = os.path.basename(p).replace(".json", "")[:38]
         nd, k = int(d["num_days"]), len(d["nurses"])
         our = multi_axis_diagnose(d["nurses"], d["config"], nd,

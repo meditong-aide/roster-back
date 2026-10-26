@@ -9,7 +9,7 @@ feasible 이 난다. 따라서 "지원 제약 목록"을 두고, 목록 밖 hard
 
 지원(모델링됨):
   · allowed_shifts / forbidden(N·O) / forced_off
-  · 야간 run 상한(max_consecutive_nights) · 회복 OFF(2N2OFF·3N2OFF) · not_one_night
+  · 야간 run 상한(max_consecutive_nights) · 회복 OFF(2N2OFF·3N2OFF) · ban_single_night
   · max_consecutive_work · forbid_night_to_day
   · per-day D/E/N coverage (daily_shift_requirements / nig_req)
 
@@ -90,11 +90,11 @@ def unmodeled_active(nurses: list, config: dict) -> list[str]:
             if _active(val):
                 out.append(f"nurse.{key}")
                 seen_nurse.add(key)
-    # 프리셉티 커버리지 제외(preceptee_shift_count=False)는 **negative flag**: 솔버는 프리셉티를
+    # 프리셉티 커버리지 제외(count_preceptee_in_staffing=False)는 **negative flag**: 솔버는 프리셉티를
     # 커버리지에서 빼는데 그래프는 전원 카운트 → 그래프 과다(낙관). INFEASIBLE 은 sound 유지되나
     # FEASIBLE 은 불확실 → 미지원 표시(FEASIBLE 주장만 차단). 기본 True(둘 다 카운트)면 일치=미표시.
-    if config.get("preceptee_on", registry_default("preceptee_on")) and config.get("preceptee_shift_count", True) is False:
-        out.append("config.preceptee_shift_count=False")
+    if config.get("preceptee_follows_preceptor", registry_default("preceptee_follows_preceptor")) and config.get("count_preceptee_in_staffing", True) is False:
+        out.append("config.count_preceptee_in_staffing=False")
     return out
 
 

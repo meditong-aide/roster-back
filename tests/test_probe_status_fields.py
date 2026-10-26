@@ -52,8 +52,8 @@ def _toggle(item_id: str, key: str, value: object) -> dict:
 
 #: 실제 카탈로그의 하드락 밖 토글 두 키로 지은 가짜 카탈로그 — 탐색 기계만 본다.
 CATALOG = (_toggle("soften_team_min", "team_min_soft_fallback", True),
-           _toggle("disable_preceptee_sync", "preceptee_on", False))
-BASE = {"team_min_soft_fallback": False, "preceptee_on": True}
+           _toggle("disable_preceptee_sync", "preceptee_follows_preceptor", False))
+BASE = {"team_min_soft_fallback": False, "preceptee_follows_preceptor": True}
 
 
 def _team(cfg: dict) -> bool:
@@ -61,7 +61,7 @@ def _team(cfg: dict) -> bool:
 
 
 def _both(cfg: dict) -> bool:
-    return _team(cfg) and cfg.get("preceptee_on") is False
+    return _team(cfg) and cfg.get("preceptee_follows_preceptor") is False
 
 
 def _never(_cfg: dict) -> bool:
@@ -272,7 +272,7 @@ def test_post_path_leaves_three_nulls_when_probe_does_not_run(monkeypatch, capsy
 
 #: A1 기준 스냅샷 — 실제 카탈로그에서 '팀 최소 soft 완화'만 풀리게 둔다(월N·연속근무는 이미 상한이라 건너뜀).
 _A1_BASE = {"team_min_soft_fallback": False, "max_nig_per_month": 15, "max_conseq_work": 5, "off_days": 8,
-            "preceptee_on": True, "ban_night_before_fixed_off": True, "ban_night_before_fixed_wanted_off": True}
+            "preceptee_follows_preceptor": True, "ban_night_before_fixed_off": True, "ban_night_before_fixed_wanted_off": True}
 _A1_UNUSED = ("db", "current_user", "nurses_for_engine", "preferences", "latest_config", "shift_manage_data",
               "combined_fixed_cells", "_assignments", "_inbound_assignments", "_outbound_assignments", "_attempt_src")
 

@@ -24,8 +24,8 @@ _APPLIED = "_applied_constraint_adjustments"
 _DEMAND = {"D": 3, "E": 3, "N": 2}
 BASES = {
     "strict": cf.strict_base(),
-    "typical": {"max_conseq_work": 4, "max_nig_per_month": 8, "three_seq_nig": True, "off_days": 8, "daily_shift_requirements": _DEMAND},
-    "two_n": {"max_conseq_work": 3, "max_nig_per_month": 6, "three_seq_nig": False, "off_days": 8, "daily_shift_requirements": _DEMAND},
+    "typical": {"max_conseq_work": 4, "max_nig_per_month": 8, "allow_three_consecutive_nights": True, "off_days": 8, "daily_shift_requirements": _DEMAND},
+    "two_n": {"max_conseq_work": 3, "max_nig_per_month": 6, "allow_three_consecutive_nights": False, "off_days": 8, "daily_shift_requirements": _DEMAND},
     "empty": {},
 }
 
@@ -123,4 +123,4 @@ def test_consecutive_night_fold_without_forbidden_mark(monkeypatch):
         cfg: dict = {}
         control._apply_consec_nights(cfg, control.ConstraintAdjustment(
             family="ConsecutiveNightLimit", action="set_threshold", target_value=value))
-        assert cfg == {"three_seq_nig": expected}
+        assert cfg == {"allow_three_consecutive_nights": expected}

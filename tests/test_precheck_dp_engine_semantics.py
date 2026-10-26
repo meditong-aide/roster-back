@@ -93,7 +93,7 @@ def _dp_infeasible(n, fixed, rules) -> bool:
         num_days=n, allowed=set(), fixed=fixed, max_consecutive_work=rules["K"],
         max_consecutive_nights=rules["L"], ban_n_to_d=rules["bans"][0], ban_e_to_d=rules["bans"][1],
         ban_n_to_e=rules["bans"][2], two_offs_after_two_nig=(rules["rec"] == 2),
-        two_offs_after_three_nig=(rules["rec"] == 3), not_one_night=rules["not_one"],
+        two_offs_after_three_nig=(rules["rec"] == 3), ban_single_night=rules["not_one"],
         n_min=0, n_max=rules["n_cap"], single_n_allowed=rules["single_ok"],
         day0_single_n_ok=fixed.get(0) == "N")
 
@@ -173,7 +173,7 @@ def test_transition_ban_exempt_only_when_both_cells_fixed():
 
 def test_single_night_exemptions():
     """1N 금지 면제 3종 — 월 N 상한 1 · 1일 고정 N · 하루짜리 구간. 면제가 없으면 막힌다."""
-    fixed_pair = {"allowed": set(), "not_one_night": True}
+    fixed_pair = {"allowed": set(), "ban_single_night": True}
     assert nurse_sequence_infeasible(num_days=5, fixed={2: "N", 1: "O", 3: "O"}, **fixed_pair) is True
     assert nurse_sequence_infeasible(
         num_days=5, fixed={2: "N", 1: "O", 3: "O"}, single_n_allowed=True, **fixed_pair) is False

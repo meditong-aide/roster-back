@@ -32,7 +32,7 @@ from services.semantics.ontology import (
 # 값은 cp_sat_basic.py + constraints/*.py 의 add_hard meta 에서 추출.
 _PATTERN_TO_CAUSE: dict[str, str] = {
     "carryover_boundary":      "cause:carryover:prev_month_n_tail_blocks_start",
-    "not_one_night":           "cause:carryover:fixed_n_isolated_by_off_neighbors",
+    "not_one_night":           "cause:carryover:fixed_n_isolated_by_off_neighbors",  # nm:external
     "transition_ban":          "cause:transition:nod_pattern_forces_infeasibility",
     "recovery_2n2off":         "cause:recovery:two_n_two_off_blocks_demand",
     "recovery_3n2off":         "cause:recovery:three_n_two_off_blocks_demand",

@@ -29,12 +29,12 @@ _DEMAND = {"D": 3, "E": 3, "N": 2}
 
 
 def _base(**kw) -> dict:
-    return {"max_conseq_work": 4, "max_nig_per_month": 8, "three_seq_nig": True, "off_days": 8,
+    return {"max_conseq_work": 4, "max_nig_per_month": 8, "allow_three_consecutive_nights": True, "off_days": 8,
             "daily_shift_requirements": _DEMAND, **kw}
 
 
 BASES = {"typical": _base(), "at_cap": _base(max_conseq_work=5, max_nig_per_month=15), "near_cap": _base(max_conseq_work=5, max_nig_per_month=14),
-         "two_n": _base(max_conseq_work=3, max_nig_per_month=6, three_seq_nig=False)}
+         "two_n": _base(max_conseq_work=3, max_nig_per_month=6, allow_three_consecutive_nights=False)}
 
 
 def test_forbidden_and_marked_treatment_sets_are_unchanged():

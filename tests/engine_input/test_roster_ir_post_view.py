@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from services.engine_contract.names import to_internal
 from services.engine_input import views
 from services.engine_input.views import RosterIRInput, to_roster_ir_post
 
@@ -82,7 +83,7 @@ def test_overlay_registry_order_is_the_stage_order():
 
 def test_k_p1_keys_overlay_adds_graph_keys_to_a_copy_and_leaves_the_snapshot_alone():
     nurses = [SimpleNamespace(nurse_id="N01")]
-    snapshot = {"max_conseq_work": 2, "three_seq_nig": True, "ban_n_to_d": True, "initial_constraints": None}
+    snapshot = {"max_conseq_work": 2, "allow_three_consecutive_nights": True, "ban_n_to_d": True, "initial_constraints": None}
     before = dict(snapshot)
     ir = to_roster_ir_post(None, nurses, snapshot, year=2026, month=11)
     assert "keys" in ir.applied and ir.config is not snapshot
@@ -288,7 +289,7 @@ def test_d_p4_s1_lt_snapshot_demand_is_not_flat_so_the_overlay_would_hit_the_lam
     from services.ontology_graph.demand import IR_BY_DAY_KEY
 
     record = _read_s1_lt_golden()
-    l1_cfg = record["layers"]["L1"][0]["config_data"]
+    l1_cfg = to_internal(record["layers"]["L1"][0]["config_data"])   # 골든은 옛(바깥) 이름일 수 있다(재생성 전)
     assert l1_cfg["daily_shift_requirements_by_day"] == record["layers"]["L0"][0]["config_dict"]["daily_shift_requirements_by_day"]
     ir = to_roster_ir_post(None, [SimpleNamespace(nurse_id="N01")], l1_cfg, year=2026, month=11)
     assert "by_day" in ir.applied and IR_BY_DAY_KEY in ir.config

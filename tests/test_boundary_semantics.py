@@ -47,7 +47,7 @@ def test_message_composition_is_exact():
 
 def test_terminal_ok_closed_horizon():
     """closed-horizon: 열린 run(r>0) 도 회복빚(k>0) 도 없어야 종료 허용(자기완결)."""
-    cfg = {"not_one_night": True}
+    cfg = {"ban_single_night": True}
     assert terminal_ok(((0, 0, 0, ""),), cfg) is True
     assert terminal_ok(((1, 0, 0, ""),), cfg) is False    # 열린 야간 run
     assert terminal_ok(((0, 1, 0, ""),), cfg) is False    # 회복 OFF 빚
@@ -55,9 +55,9 @@ def test_terminal_ok_closed_horizon():
 
 
 def test_closed_terminal_rejects_lone_night_end():
-    """1명·1일·N수요1·not_one_night: lenient=feasible(다음달로 전달), closed=infeasible."""
+    """1명·1일·N수요1·ban_single_night: lenient=feasible(다음달로 전달), closed=infeasible."""
     nu = [{"nurse_id": "n0", "name": "N0", "grade": 1, "team_id": "A", "allowed_shifts": ["N"]}]
-    cfg = {"not_one_night": True, "daily_shift_requirements": {"D": 0, "E": 0, "N": 1},
+    cfg = {"ban_single_night": True, "daily_shift_requirements": {"D": 0, "E": 0, "N": 1},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     assert diagnose_frontier(nu, cfg, 1, terminal="lenient").status == "FEASIBLE_WITNESS"
     assert diagnose_frontier(nu, cfg, 1, terminal="closed").status == "INFEASIBLE_CERTIFIED"
@@ -66,7 +66,7 @@ def test_closed_terminal_rejects_lone_night_end():
 def test_rejection_trace_embedded_in_collapse():
     """붕괴 cert 에 최소 rejection trace(day·dead/live·best_cov·binding)가 처음부터 실려있다."""
     nu = [{"nurse_id": f"n{i}", "name": f"N{i}", "grade": 1, "team_id": "A"} for i in range(5)]
-    cfg = {"two_offs_after_two_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_two_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 2},
            "initial_constraints": {"forbidden": {}, "forced_off": {}}}
     r = diagnose_frontier(nu, cfg, 6)
@@ -83,7 +83,7 @@ def test_rejection_trace_attributes_personal_sequence_collapse():
     """N전담 banned 4연속: 모든 상태가 **개인 시퀀스 factor**로 사망(personal_dead)."""
     nu = [{"nurse_id": "x", "name": "X", "grade": 1, "team_id": "A", "allowed_shifts": ["N"]}]
     nu += [{"nurse_id": f"n{i}", "name": f"N{i}", "grade": 1, "team_id": "A"} for i in range(4)]
-    cfg = {"two_offs_after_three_nig": True, "not_one_night": True,
+    cfg = {"two_offs_after_three_nig": True, "ban_single_night": True,
            "daily_shift_requirements": {"D": 1, "E": 1, "N": 1},
            "initial_constraints": {"forbidden": {"x": {2: ["O"], 3: ["O"], 4: ["O"], 5: ["O"]}},
                                    "forced_off": {}}}

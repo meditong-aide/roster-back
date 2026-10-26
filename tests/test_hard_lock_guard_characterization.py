@@ -175,6 +175,11 @@ def test_unrelated_hard_lock_relax_is_rejected_with_400():
     assert ei.value.status_code == 400
     assert ei.value.detail == ("하드락 규칙은 요청으로 완화할 수 없습니다: 하드락 #2(ND·ED·NE 전이 금지)"
                                " — banned_day_after_eve=False")
+    # 파이썬 이름(새 이름)으로 와도 같은 400·같은 문구 — 문구의 키 표기는 바깥(옛) 이름이라 화면 문구가 바뀌지 않는다(NM X6)
+    with pytest.raises(HTTPException) as ei_new:
+        assert_night_caps_within_hard_lock({"ban_shift_transitions": False}, None)
+    assert ei_new.value.status_code == 400
+    assert ei_new.value.detail == ei.value.detail
     with pytest.raises(HTTPException) as ei:
         assert_night_caps_within_hard_lock({"use_mid": False}, None)
     assert ei.value.status_code == 400 and "하드락 #8" in ei.value.detail and "use_mid=False" in ei.value.detail

@@ -123,13 +123,13 @@ def test_int_cap_override_violations_same_as_config_change_for_non_boundary_keys
 
 
 def test_derived_cap_primary_bool_key_never_blocks_regardless_of_value():
-    """정본 bool(`three_seq_nig`)은 `3 if x else 2`라 cap(3)을 못 넘는다 — 값과 무관하게 통과."""
+    """정본 bool(`allow_three_consecutive_nights`)은 `3 if x else 2`라 cap(3)을 못 넘는다 — 값과 무관하게 통과."""
     for v in (True, False, None, 0, 1, -1, "abc", ""):
-        assert config_change_violations({"three_seq_nig": v}) == []
+        assert config_change_violations({"allow_three_consecutive_nights": v}) == []
 
 
 def test_derived_cap_alias_max_consecutive_nights_value_variants():
-    spec = _DIRECT_SPECS["three_seq_nig"]
+    spec = _DIRECT_SPECS["allow_three_consecutive_nights"]
     cap = spec.hard_lock.cap
     rule_no = spec.hard_lock.rule_no
     alias = spec.aliases[0]
@@ -150,7 +150,7 @@ def test_derived_cap_alias_non_numeric_is_boundary_switch_off_not_plain_non_nume
     `boundary_switch_off`(옛 `non_numeric` 이 아니라)로 분류한다(그대로 둔다 — 설정 저장은 `RosterConfigCreate` 가
     이 키를 버린다). EI-11 11b(D13 ③) 뒤 요청 판정(`override_violations`)은 이 별칭을 값과 무관하게
     `runtime_key_forbidden`(#3) BLOCK 으로 막는다 — D13 ① 뒤 경계는 이 별칭을 읽지 않는다."""
-    spec = _DIRECT_SPECS["three_seq_nig"]
+    spec = _DIRECT_SPECS["allow_three_consecutive_nights"]
     alias = spec.aliases[0]
 
     v = _only(config_change_violations({alias: bad_value}))
@@ -299,10 +299,10 @@ def test_relax_catalog_producer_deltas_never_classified_as_boundary_switch_off()
     bases = [
         {},
         {"max_nig_per_month": 10, "max_conseq_work": 4, "max_consecutive_nights": 2,
-         "three_seq_nig": False, "two_offs_after_two_nig": True,
+         "allow_three_consecutive_nights": False, "two_offs_after_two_nig": True,
          "two_offs_after_three_nig": True, "off_days": 9},
         {"max_nig_per_month": HARD_MAX_NIGHTS_PER_MONTH, "max_conseq_work": 5,
-         "max_consecutive_nights": 3, "three_seq_nig": True},
+         "max_consecutive_nights": 3, "allow_three_consecutive_nights": True},
     ]
     for base in bases:
         for item in RELAX_CATALOG:
@@ -331,10 +331,10 @@ def test_both_number6_and_boundary_switch_violations_are_both_reported_by_policy
 
 
 def test_codex_regression_alias_violation_caught_even_when_canonical_looks_fine():
-    """Codex 지적 원 사례: `three_seq_nig=True`(정본, 멀쩡해 보임) + `max_consecutive_nights=4`
+    """Codex 지적 원 사례: `allow_three_consecutive_nights=True`(정본, 멀쩡해 보임) + `max_consecutive_nights=4`
     (별칭, 위반) — 정본만 보고 끝내면 이 위반을 놓친다."""
-    spec = _DIRECT_SPECS["three_seq_nig"]
-    changes = {"three_seq_nig": True, "max_consecutive_nights": spec.hard_lock.cap + 1}
+    spec = _DIRECT_SPECS["allow_three_consecutive_nights"]
+    changes = {"allow_three_consecutive_nights": True, "max_consecutive_nights": spec.hard_lock.cap + 1}
     violations = config_change_violations(changes)
     hit = [v for v in violations if v.key == "max_consecutive_nights"]
     assert hit and hit[0].rule_no == spec.hard_lock.rule_no
@@ -467,5 +467,5 @@ def test_registry_numbers_match_claude_md_hard_lock_table():
     이 모듈에서 유일하게 숫자를 그대로 적은 단언이다(R3-06 예외 — '정책 두 벌 비교'가
     아니라 정본 문서 대조용)."""
     assert _CAP_SPECS["max_conseq_work"].hard_lock.cap == 5
-    assert _DIRECT_SPECS["three_seq_nig"].hard_lock.cap == 3
+    assert _DIRECT_SPECS["allow_three_consecutive_nights"].hard_lock.cap == 3
     assert _CAP_SPECS["max_nig_per_month"].hard_lock.cap == 15

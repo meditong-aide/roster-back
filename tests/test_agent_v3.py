@@ -1260,12 +1260,12 @@ class TestConstraintUpdate:
 
         result = run_skill(db, "update-constraint", {
             "group_id": seed_data["group_id"],
-            "field": "banned_day_after_eve",
+            "field": "ban_shift_transitions",
             "value": False,
             "preview_only": True,
         })
         assert result.get("preview") is True
-        change = result["changes"]["banned_day_after_eve"]
+        change = result["changes"]["ban_shift_transitions"]
         assert change["old"] is True
         assert change["new"] is False
 
@@ -1274,11 +1274,11 @@ class TestConstraintUpdate:
 
         result = run_skill(db, "update-constraint", {
             "group_id": seed_data["group_id"],
-            "field": "sequential_offs",
+            "field": "avoid_isolated_off_and_work",
             "value": False,
             "preview_only": False,
         })
-        assert result["changes"]["sequential_offs"]["new"] is False
+        assert result["changes"]["avoid_isolated_off_and_work"]["new"] is False
 
     def test_unknown_field_error(self, db, seed_data):
         from agents_v2.skills import run_skill

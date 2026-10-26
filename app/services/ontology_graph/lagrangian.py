@@ -392,7 +392,7 @@ def lambda_priority_from_config(nurses: list, config: dict, num_days: int,
 
 
 def _effective_off_floor(nurses: list, config: dict) -> int | None:
-    """실제 강제 OFF 하한(간호사당). off_first 자동조정(auto_min)에 근접하도록 config
+    """실제 강제 OFF 하한(간호사당). staffing_first 자동조정(auto_min)에 근접하도록 config
     off_days 를 기본으로, 없으면 standard_personal_off_days 사용."""
     off_raw = int(config.get("off_days") or config.get("standard_personal_off_days") or 0)
     return off_raw if off_raw > 0 else None
@@ -411,7 +411,7 @@ def _night_rules(config: dict) -> tuple[int, int, int]:
 
     · 최대연속N: 3N2OFF→3, 2N2OFF→2, max_consecutive_nights 중 최소.
     · 회복트리거런: run 이 이 값 이상으로 끝나면 **2 OFF** 필요(2N2OFF→2, 3N2OFF→3).
-    · 최소런: not_one_night 이면 2(고립 1N 금지), 아니면 1.
+    · 최소런: ban_single_night 이면 2(고립 1N 금지), 아니면 1.
     """
     two2 = bool(config.get("two_offs_after_two_nig"))
     three2 = bool(config.get("two_offs_after_three_nig"))
@@ -429,7 +429,7 @@ def _night_rules(config: dict) -> tuple[int, int, int]:
             pass
     max_run = min(caps) if caps else 6
     recovery_trigger = 2 if two2 else (3 if three2 else 99)   # run>=trigger → 2 OFF
-    min_run = 2 if bool(config.get("not_one_night")) else 1
+    min_run = 2 if bool(config.get("ban_single_night")) else 1
     return max_run, recovery_trigger, min_run
 
 
@@ -560,15 +560,15 @@ def _fixed_n_by_day(fixed_cells, nurse_ids: set[str], code2main: dict[str, str],
 def _night_slot_cap(config: dict, num_days: int, fixed_counted: list[int]) -> int | None:
     """대상 간호사들의 그 달 N 배정 수의 **위쪽 한계**. 판정할 수 없으면 None.
 
-    ★ **off_first 이고 일별 최대 인원(N)을 하나도 두지 않은 달만** 판정한다. 이 경우 두 엔진
+    ★ **staffing_first 이고 일별 최대 인원(N)을 하나도 두지 않은 달만** 판정한다. 이 경우 두 엔진
       (`cp_sat_basic`·`fallback_lex`) 모두 **모든 단계에서** 그 날 고정 아닌 N ≤ max(0, 필요인원 −
       고정N) 를 hard 로 건다. 최대 인원이 있는 날은 fallback 의 커버리지 완화(`_relax_coverage`)
-      때 soft 가 되고, off_first 가 아니면 상한이 아예 없을 수 있어 판정하지 않는다.
+      때 soft 가 되고, staffing_first 가 아니면 상한이 아예 없을 수 있어 판정하지 않는다.
     대상 간호사(합계에 넣은 사람)의 그 날 N 은 `max(대상 고정N, 필요인원)` 을 넘지 못한다
     (전체 고정N ≥ 대상 고정N 이라 `대상고정 + max(0, 필요 − 전체고정) ≤ max(대상고정, 필요)`).
     그 날 요구표에 N 이 없으면 그 날 N 은 위가 열려 있어 판정하지 않는다.
     """
-    if not bool(config.get("off_first")):
+    if not bool(config.get("staffing_first")):
         return None
     by_day = config.get("daily_shift_requirements_by_day")
     max_by_day = config.get("daily_shift_requirements_max_by_day")
@@ -602,14 +602,14 @@ def detect_night_forced_oversupply(nurses: list, config: dict, num_days: int, *,
     솔버 **전**에 엔진과 같은 입력(고정근무자 차감 뒤 설정·엔진 간호사·고정 칸)으로 부른다.
     개인 n_exact/n_min 은 그 달 N 코드 개수의 하한이다(`monthly_limit_constraints` — 고정 칸 포함).
     실사례: 102598edcd0e 2026-11 — 11월 한도 행이 없어 10월 값(5·5·5·5·5·6=31)이 이월됐는데
-    30일 × 하루 N 1명(off_first) = 30칸. 진단이 개인 단위만 봐서 UNDIAGNOSED·카드 0장이었다.
+    30일 × 하루 N 1명(staffing_first) = 30칸. 진단이 개인 단위만 봐서 UNDIAGNOSED·카드 0장이었다.
     ★ 생성을 막는 판정이라 **틀리면 안 된다** — 모르는 것은 크게 잡거나 판정하지 않는다.
       · 일별 인원에서 빠지는 칸이 있는 간호사(파견 기간 `coverage_exclude_nurse_days`,
         프리셉티 — 기간 맵·캐시 둘 다)는 합에서 뺀다(그들의 N 은 칸을 차지하지 않을 수 있다).
       · 고정 칸은 `_fixed_n_by_day` 로 엔진과 같은 순서로 정규화해 세고(`code2main` = 근무코드
         목록 `_build_code_to_main_map`, `id_to_main` = 근무코드 정의 `build_shift_normalizer`),
         해석할 수 없는 칸이 있거나 매핑이 없으면 판정하지 않는다.
-      · **off_first 이고 일별 최대 인원(N)을 두지 않은 달만** 판정한다(`_night_slot_cap`) —
+      · **staffing_first 이고 일별 최대 인원(N)을 두지 않은 달만** 판정한다(`_night_slot_cap`) —
         그때만 두 엔진이 모든 단계에서 일별 N 상한을 hard 로 건다.
 
     Returns:

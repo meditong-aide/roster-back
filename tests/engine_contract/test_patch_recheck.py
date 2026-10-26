@@ -12,7 +12,7 @@ from services.policy import card_filter as cf
 from services.treatment_applicator import apply_treatments
 
 _APPLIED = "_applied_constraint_adjustments"
-BASE = {"max_conseq_work": 4, "max_nig_per_month": 8, "three_seq_nig": True, "off_days": 8, "banned_day_after_eve": True,
+BASE = {"max_conseq_work": 4, "max_nig_per_month": 8, "allow_three_consecutive_nights": True, "off_days": 8, "ban_shift_transitions": True,
         "two_offs_after_two_nig": True, "two_offs_after_three_nig": True, "daily_shift_requirements": {"D": 3, "E": 3, "N": 2}}
 
 

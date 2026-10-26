@@ -5,7 +5,7 @@ from __future__ import annotations
 from services.ontology_graph.axis_diagnose import multi_axis_diagnose, render_axis
 from services.ontology_graph.certificate import INFEASIBLE
 
-_RULES = {"two_offs_after_three_nig": True, "not_one_night": True}
+_RULES = {"two_offs_after_three_nig": True, "ban_single_night": True}
 
 
 def _cfg(dsr, forbidden=None):
