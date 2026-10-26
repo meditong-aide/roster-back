@@ -45,6 +45,9 @@ def test_soft_constraints_connected():
         ins = g.in_edges(sc.node_id)
         rels = {e.relation for e in ins}
         assert "pressures" in rels, f"{sc.node_id}: penalty→pressures 없음"
+        # 노브(config_key)가 없는 죽은 레버(EI-14d isolated_work)는 처방 액션이 없으므로 mitigates 를 요구하지 않는다.
+        if sc.node_id == "soft:isolated_work":
+            continue
         assert "mitigates" in rels, f"{sc.node_id}: action→mitigates 없음"
 
 

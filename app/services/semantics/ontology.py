@@ -119,6 +119,7 @@ CONFIG_KEY_LABELS_KO: dict[str, str] = {
     "max_night_shifts_per_month":     "월 야간 한도",
     "max_nig_per_month":              "월 야간 한도(개인)",
     "max_consecutive_work_days":      "최대 연속 근무일",
+    "max_conseq_work":                "최대 연속 근무일",
     "ban_n_to_d":                     "야간→주간 전이 금지",
     "ban_night_before_fixed_off":     "휴가·공가 직전 N 금지",
     "ban_night_before_fixed_wanted_off": "확정 원티드 OFF 직전 N 금지",

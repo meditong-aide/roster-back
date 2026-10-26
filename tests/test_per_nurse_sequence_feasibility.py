@@ -29,6 +29,8 @@ def _bf_exists(num_days, allowed, fixed, K, L, ban_nd, ban_ed, ban_ne, rec_block
             if s != "O" and s not in aset:
                 return False
         for i in range(1, len(seq)):
+            if i in fixed and i - 1 in fixed:
+                continue  # 엔진: 두 칸 다 고정이면 전이 금지 면제(EI-10c)
             p, s = seq[i - 1], seq[i]
             if s == "D" and ((p == "N" and ban_nd) or (p == "E" and ban_ed)):
                 return False
@@ -47,6 +49,9 @@ def _bf_exists(num_days, allowed, fixed, K, L, ban_nd, ban_ed, ban_ne, rec_block
                 if run > L:
                     return False
         if rec_block:
+            # 엔진(fallback_lex 2N2OFF·3N2OFF): 길이 rec_block 이상 N 블록이 끝나면(끝 e ≤ n-3) e+1·e+2 OFF.
+            # 연속 N 상한이 없으면(L=None) 블록 길이는 rec_block 까지(10c 전 의미와 같다).
+            cap_run = L if L is not None else rec_block
             i, n = 0, len(seq)
             while i < n:
                 if seq[i] == "N":
@@ -54,16 +59,13 @@ def _bf_exists(num_days, allowed, fixed, K, L, ban_nd, ban_ed, ban_ne, rec_block
                     while i < n and seq[i] == "N":
                         run += 1
                         i += 1
-                    if run > rec_block:
+                    if run > cap_run:
                         return False
-                    if run == rec_block:
-                        if i < n and seq[i] != "O":
-                            return False
-                        if i + 1 < n and seq[i + 1] != "O":
-                            return False
+                    if run >= rec_block and i - 1 <= n - 3 and (seq[i] != "O" or seq[i + 1] != "O"):
+                        return False
                 else:
                     i += 1
-        if not_one:
+        if not_one and len(seq) > 1:  # 하루짜리 구간은 이웃이 없어 제약이 없다
             for i in range(len(seq)):
                 if seq[i] == "N":
                     left = i > 0 and seq[i - 1] == "N"
@@ -120,15 +122,17 @@ def test_dp_matches_bruteforce_with_fixed():
 
 
 def test_fixed_cell_transition_conflict():
-    # day0=N(고정), day1=D(고정), N→D 금지 → 혼자서 불가능
+    # day1=D(고정) · n_min=1 → day0 은 N 이어야 한다(자유칸) → N→D 금지와 충돌 → 혼자서 불가능
     assert nurse_sequence_infeasible(
-        num_days=3, allowed=set(), fixed={0: "N", 1: "D"},
-        ban_n_to_d=True,
+        num_days=2, allowed={"N", "D"}, fixed={1: "D"}, ban_n_to_d=True, n_min=1,
     ) is True
     # 금지 해제하면 가능
     assert nurse_sequence_infeasible(
-        num_days=3, allowed=set(), fixed={0: "N", 1: "D"},
-        ban_n_to_d=False,
+        num_days=2, allowed={"N", "D"}, fixed={1: "D"}, ban_n_to_d=False, n_min=1,
+    ) is False
+    # 두 칸 다 고정(day0=N·day1=D)이면 엔진은 전이 금지를 면제한다(EI-10c)
+    assert nurse_sequence_infeasible(
+        num_days=3, allowed=set(), fixed={0: "N", 1: "D"}, ban_n_to_d=True,
     ) is False
 
 

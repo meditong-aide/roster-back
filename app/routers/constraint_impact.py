@@ -238,7 +238,7 @@ def preview_adjustments(
         watched = (
             "team_min_by_team", "team_min_soft_fallback", "team_handoff_soft_fallback",
             "ban_n_to_d", "ban_e_to_d", "ban_n_to_e",
-            "max_consecutive_work_days", "max_consecutive_nights",
+            "max_conseq_work", "three_seq_nig", "max_nig_per_month",
             "two_offs_after_two_nig", "two_offs_after_three_nig",
             "_force_grade_max_soft_fallback", "_force_grade_min_soft_fallback",
             "grade_config",

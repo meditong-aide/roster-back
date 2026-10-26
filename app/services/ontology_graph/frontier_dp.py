@@ -26,6 +26,7 @@ from services.ontology_graph.certificate import (
     Certificate,
     ProofNode,
 )
+from services.ontology_graph.demand import demand_by_day, has_by_day
 from services.ontology_graph.lagrangian import _night_rules, _nurse_attr
 
 _CAP = 200_000            # |frontier| 상한 — 넘으면 separator 폭 초과 → UNKNOWN
@@ -304,6 +305,8 @@ def frontier_message(prepped: list, config: dict, day_lo: int, day_hi: int,
     track_prev = bool(config.get("forbid_night_to_day"))
     reqD0, reqE0, reqN0 = _req(config, "D"), _req(config, "E"), _req(config, "N")
     reqs = (reqD0, reqE0, reqN0)
+    if day_reqs is None and has_by_day(config):      # EI-14b2a3 — 뷰가 준 일자별 수요(없으면 평탄 = 지금과 같다)
+        day_reqs = {d: (r["D"], r["E"], r["N"]) for d, r in enumerate(demand_by_day(config, day_hi))}
     k = len(prepped)
     if symmetry is None:
         symmetry = _interchangeable(prepped, day_lo, day_hi)
@@ -381,7 +384,8 @@ def diagnose_frontier(nurses: list, config: dict, num_days: int,
         return FrontierResult(UNKNOWN, width_max=mr.width_max, reqs=reqs)
     if mr.collapse is not None:
         rej = mr.collapse
-        cert = _collapse_cert(rej.frontier, rej.day, config, prepped, reqs, max_run, min_run)
+        cert_reqs = rej.reqs if (has_by_day(config) and not rej.terminal and rej.reqs) else reqs
+        cert = _collapse_cert(rej.frontier, rej.day, config, prepped, cert_reqs, max_run, min_run)
         trace = {"day": rej.day, "dead_states": rej.dead_states, "live_states": rej.live_states,
                  "best_cov": rej.best_cov, "binding": list(rej.binding), "terminal": rej.terminal}
         if not rej.terminal and rej.frontier:

@@ -211,6 +211,7 @@ parity 유지"를 요구로 박아둔 탓에 제약 하나 바꿀 때마다 두 
   잘못 자르면 폴백 stage3 목적항이 조용히 빠지고, 실패가 예외가 아니라 "근무표가 조금 나빠짐"으로 나타난다.
 - `probe_only=True` 는 `SKIP_PRIMARY` 를 **우회해** primary 를 강제로 돈다(`cp_sat_basic.py:1454-1479`).
   `probe_feasibility()` 는 저장소 안 호출자가 0건이지만 오프라인 하네스용 API 표면이다.
+  `probe_feasibility(config_data=…)` 는 `daily_shift_requirements` 필수(EI-13d — 구 필드 day_req/eve_req/nig_req 폴백 삭제). 단 `[WInjectFix]`(cp_sat_basic.py ~969, W 주입 때 dsr 가 비면 구 필드로 재구성)는 예외로 남아 있다.
 - `SKIP_PRIMARY=0` 은 사실상 당길 수 없는 레버다 — `deploy-lambda.yml` 이 `update-function-code` 만
   부르고 `update-function-configuration` 은 안 불러 운영 Lambda 에 env 를 넣을 자리가 레포에 없다.
 

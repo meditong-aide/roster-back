@@ -9,10 +9,15 @@ v2: ontology 4-tier (T0/T1/T2/T3) + axis_registry 기반 axis-decomposed actions
   - T2 (운영 hard): axis_actions (최대 5개), relaxation_priority 오름차순
   - T3 (품질 soft): quality_hints (현재 v1 family 미정의)
 기존 actions[] 는 backward-compat 유지.
+
+EI-11 11c — T2 축도 CLAUDE.md 하드락 판정(`policy.card_filter.family_modes`)을 지난다. 막힌(blocked) family 의 축
+(전월 경계 전이 — #2)은 axis_actions 에서 빼 protected_axes 로 옮기고, 상한형(capped) family 의 축(월간 N 한도 #6 ·
+연속근무 #1)은 안내 문구 끝에 '(최대 N — 하드락 #n)' 을 붙인다. 판정이 실패하면 하드락 family 의 T2 축을 모두 보호한다.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List
 
 from services.semantics.axis_registry import (
@@ -22,8 +27,12 @@ from services.semantics.axis_registry import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 _MAX_AXIS_ACTIONS = 5
 _MAX_AXIS_TARGETS = 5
+#: EI-11 11c — 하드락 판정을 못 할 때 하드락 family T2 축을 보호하며 다는 이유(§2.0.6 ⑥).
+_HARD_LOCK_CHECK_ERROR_KO = "하드락 판정을 지금 할 수 없어 자동 완화 안내에서 뺐습니다."
 
 
 # Stage taxonomy (S4): solver/validator의 어느 단계에서 막혔는지를
@@ -222,6 +231,16 @@ def _axis_targets_for_capacity_axis(
     return out[:_MAX_AXIS_TARGETS]
 
 
+def _object_particle(label: str) -> str:
+    """목적격 조사 — 라벨 마지막 글자가 받침 없는 한글이면 '를', 그 밖(받침 있음·한글 아님)은 '을'(예전 동작).
+
+    EI-11 11r(리뷰 LOW) — '월간 N 한도을 1 늘려보세요' 처럼 받침 없는 축 라벨 7개가 모두 '을' 로 붙었다."""
+    last = (label or "").rstrip()[-1:]
+    if "가" <= last <= "힣" and (ord(last) - ord("가")) % 28 == 0:
+        return "를"
+    return "을"
+
+
 def _build_axis_action(
     *,
     axis: AxisDefinition,
@@ -230,6 +249,7 @@ def _build_axis_action(
     validator_evidence: Dict[str, Any],
     shortages: List[Dict[str, Any]],
     priority: int,
+    hard_lock_suffix: str = "",
 ) -> Dict[str, Any]:
     tier = registry.tier_of(axis)
     relax_prio = registry.relaxation_priority_of(axis)
@@ -262,9 +282,9 @@ def _build_axis_action(
             for t in deduped[:3]
             if t.get("day") or t.get("shift")
         ) or "해당 항목"
-        msg = f"{axis.label_ko}을 {direction_phrase} (예: {scope_hint})"
+        msg = f"{axis.label_ko}{_object_particle(axis.label_ko)} {direction_phrase} (예: {scope_hint}){hard_lock_suffix}"
     else:
-        msg = f"{axis.label_ko}을 {direction_phrase}"
+        msg = f"{axis.label_ko}{_object_particle(axis.label_ko)} {direction_phrase}{hard_lock_suffix}"
 
     return {
         "priority": priority,
@@ -322,6 +342,56 @@ def _bounded_step_hint(shortages: List[Dict[str, Any]]) -> Dict[str, int]:
     if max_shortage >= 5:
         return {"min": 1, "max": 2}
     return {"min": 1, "max": 1}
+
+
+def _protected_t2_axis(axis: AxisDefinition, rule_nos: list[int], why_ko: str) -> dict[str, Any]:
+    return {
+        "axis_id": axis.axis_id,
+        "family": axis.family,
+        "tier": "T2",
+        "label_ko": axis.label_ko,
+        "why_protected_ko": why_ko,
+        "hard_lock_rule_nos": list(rule_nos),
+    }
+
+
+def _hard_lock_why_ko(rule_nos: list[int]) -> str:
+    from services.policy.hard_lock import rule_label
+
+    rules = "·".join(rule_label(n) for n in rule_nos) or "하드락"
+    return f"{rules} — 정책상 완화 대상이 아닙니다."
+
+
+def _split_hard_lock_axes(
+    t2_axes: list[AxisDefinition],
+) -> tuple[list[AxisDefinition], list[dict[str, Any]], dict[str, str]]:
+    """EI-11 11c — T2 축의 하드락 판정. (안내에 남는 축, protected_axes 로 옮길 항목, family → 상한 문구)를 돌려준다.
+
+    blocked family 축은 보호 항목(이유 = 규칙 라벨 — 정책상 완화 대상 아님)으로 빼고, capped family 축은 상한 문구를
+    받는다. 판정이 실패하면 `HARD_LOCK_FAMILIES_FALLBACK` family 의 축을 모두 보호한다(§2.0.6 ⑥)."""
+    if not t2_axes:
+        return t2_axes, [], {}
+    from services.policy import card_filter
+
+    try:
+        modes = card_filter.family_modes()
+    except Exception:
+        logger.warning("fix_plan: 하드락 판정 실패 — 하드락 family 의 T2 축을 자동 완화 안내에서 뺍니다(fail-closed).",
+                       exc_info=True)
+        stuck = [a for a in t2_axes if a.family in card_filter.HARD_LOCK_FAMILIES_FALLBACK]
+        return ([a for a in t2_axes if a not in stuck],
+                [_protected_t2_axis(a, [], _HARD_LOCK_CHECK_ERROR_KO) for a in stuck], {})
+    keep: list[AxisDefinition] = []
+    protected: list[dict[str, Any]] = []
+    for a in t2_axes:
+        entry = modes.get(a.family) or {}
+        if entry.get("mode") != "blocked":
+            keep.append(a)
+            continue
+        nos = list(entry.get("rule_nos") or [])
+        why = _HARD_LOCK_CHECK_ERROR_KO if entry.get("error") else _hard_lock_why_ko(nos)
+        protected.append(_protected_t2_axis(a, nos, why))
+    return keep, protected, {a.family: card_filter.mode_suffix(modes.get(a.family)) for a in keep}
 
 
 def build_fix_plan(
@@ -582,9 +652,12 @@ def build_fix_plan(
         }
         for a in t1_axes
     ]
+    # EI-11 11c — T2 축의 하드락 판정: 막힌 family 축은 보호로 옮기고 상한형 family 축은 상한 문구(tier_summary 는 그대로).
+    t2_actionable, hard_lock_protected, hard_lock_suffixes = _split_hard_lock_axes(t2_axes)
+    protected_axes += hard_lock_protected
 
     axis_actions: List[Dict[str, Any]] = []
-    for idx, a in enumerate(t2_axes[:_MAX_AXIS_ACTIONS], start=1):
+    for idx, a in enumerate(t2_actionable[:_MAX_AXIS_ACTIONS], start=1):
         axis_actions.append(
             _build_axis_action(
                 axis=a,
@@ -593,6 +666,7 @@ def build_fix_plan(
                 validator_evidence=validator_evidence,
                 shortages=shortages,
                 priority=idx,
+                hard_lock_suffix=hard_lock_suffixes.get(a.family, ""),
             )
         )
 
@@ -606,7 +680,7 @@ def build_fix_plan(
         {a.family for a in t0_axes} | t0_families
     )
 
-    axis_actions_truncated = max(0, len(t2_axes) - _MAX_AXIS_ACTIONS)
+    axis_actions_truncated = max(0, len(t2_actionable) - _MAX_AXIS_ACTIONS)
 
     plan: Dict[str, Any] = {
         "mode": mode,

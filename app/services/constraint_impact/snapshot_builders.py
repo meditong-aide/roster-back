@@ -16,6 +16,7 @@ from services.constraint_impact.snapshot import (
     SolveAttemptMeta,
 )
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
+from services.engine_contract.defaults import registry_default
 
 
 def _active_days_map(join: list[int], leave: list[int], blocked_by_nurse: dict[int, set[int]], num_days: int) -> dict[int, set[int]]:
@@ -105,7 +106,7 @@ def _collect_preceptee_facts(rs, active_days_by_nurse: dict[int, set[int]], cove
     follow_days_raw = getattr(rs, "preceptee_follow_days", {}) or {}
     preceptor_idx_map = getattr(rs, "preceptee_preceptor_idx", {}) or {}
     preceptee_shift_count = bool(getattr(rs.config, "preceptee_shift_count", True))
-    follow_enabled = bool(getattr(rs.config, "preceptee_on", False))
+    follow_enabled = bool(getattr(rs.config, "preceptee_on", registry_default("preceptee_on")))
     pte_fw = getattr(rs, "_preceptee_fixed_wanted_map", {}) or {}
     out: list[PrecepteeFact] = []
     for idx, days in follow_days_raw.items():
@@ -213,9 +214,9 @@ def _base_constraint_modes(rs, snapshot: SemanticsSnapshot) -> list[ConstraintMo
     if bool(getattr(cfg, "ban_n_to_e", True)):
         out.append(ConstraintModeFact("transition_ban", "ban_n_to_e", "hard", "enforced", "app/services/cp_sat_basic.py", "N→E 금지 활성"))
     out.append(ConstraintModeFact("consecutive_work", "max_consecutive_work", "hard", "enforced", "app/services/cp_sat_basic.py", "K+1 창에서 OFF≥1, fixed_wanted 우회 불가"))
-    if bool(getattr(cfg, "two_offs_after_two_nig", False)):
+    if bool(getattr(cfg, "two_offs_after_two_nig", registry_default("two_offs_after_two_nig"))):
         out.append(ConstraintModeFact("recovery_2n2o", "two_offs_after_two_nig", "hard", "enforced", "app/services/cp_sat_basic.py", "2N 후 2OFF 활성"))
-    if bool(getattr(cfg, "two_offs_after_three_nig", False)):
+    if bool(getattr(cfg, "two_offs_after_three_nig", registry_default("two_offs_after_three_nig"))):
         out.append(ConstraintModeFact("recovery_3n2o", "two_offs_after_three_nig", "hard", "enforced", "app/services/cp_sat_basic.py", "3N 후 2OFF 활성"))
     if bool(getattr(cfg, "not_one_night", False)):
         out.append(ConstraintModeFact("consecutive_night", "not_one_night", "hard", "enforced", "app/services/cp_sat_basic.py", "1N 금지 활성"))

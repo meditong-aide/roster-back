@@ -37,35 +37,39 @@ _ENGINE_MAX_NIGHT_FLOOR = 15
 
 
 @lru_cache(maxsize=None)
-def _rec_go(remaining: int, run: int, off_rem: int, block: int) -> int:
-    """회복 규칙(연속 N `block` 개 후 2 OFF 강제) 하에서 남은 일수로 달성 가능한 최대 N.
+def _rec_go(remaining: int, run: int, off_rem: int, block: int, max_run: int) -> int:
+    """회복 규칙 하에서 남은 일수로 달성 가능한 최대 N — 엔진(fallback_lex 2N2OFF·3N2OFF) 의미.
 
     상태: (남은 일, 현재 N 연속수, 강제 OFF 잔여). day 대신 remaining 을 써서 전역 캐시.
-    - OFF: run 리셋, off_rem 1 감소
-    - N(강제 OFF 없을 때만): run+1==block 이면 2 OFF 강제 + run 리셋, 아니면 run+1
-    월말(remaining=0)에 block-run 을 두면 회복 불필요 → 경계 자연 처리.
+    - N 아님: run 리셋. 길이 `block` 이상 N 블록이 방금 끝났으면(run >= block) 다음 날도 OFF 강제
+    - N(강제 OFF 없을 때만): 연속 N 은 `max_run`(엔진 연속 N 상한)까지
+    `max_run == block` 이면 옛 규칙('block 개 연속 뒤 2 OFF')과 값이 같다. 블록이 월말에 걸치면
+    남은 일수만큼만 OFF 가 걸린다 — 엔진은 블록 끝이 마지막 이틀이면 회복을 요구하지 않지만,
+    N 수만 세는 이 DP 에서는 같은 값이다(블록이 끝난 뒤 이틀은 어차피 N 이 아니다).
     """
     if remaining <= 0:
         return 0
-    best = _rec_go(remaining - 1, 0, max(0, off_rem - 1), block)  # OFF
-    if off_rem == 0 and run + 1 <= block:
-        if run + 1 == block:
-            best = max(best, 1 + _rec_go(remaining - 1, 0, 2, block))
-        else:
-            best = max(best, 1 + _rec_go(remaining - 1, run + 1, 0, block))
+    off_next = 1 if run >= block else max(0, off_rem - 1)
+    best = _rec_go(remaining - 1, 0, off_next, block, max_run)  # N 아님(블록이 끝났으면 OFF)
+    if off_rem == 0 and run + 1 <= max_run:
+        best = max(best, 1 + _rec_go(remaining - 1, run + 1, 0, block, max_run))
     return best
 
 
-def max_nights_under_recovery(span: int, block: int) -> int:
+def max_nights_under_recovery(span: int, block: int, max_run: int | None = None) -> int:
     """span 일 내 회복 규칙(`block`연속 N→2OFF) 하 달성 가능한 **정확한** 최대 N.
 
     닫힌형 근사(예 2·⌈avail/4⌉, 3·⌈avail/5⌉)는 3N→2OFF 처럼 'NN O' 로 트리거를 피해
     2/3 비율을 낼 수 있는 경우를 과소추정 → precheck blocking 에 쓰면 false positive.
     DP 로 정확값을 구해 valid upper bound(=실제 최대)와 tightness 를 동시에 보장한다.
+
+    `max_run`: 연속 N 상한(엔진 `max_consecutive_nights` — 3N 허용이면 3). None 이면 `block`
+    (10c 전 호출부와 같은 값). 상한이 block 보다 크면 블록이 끝날 때만 2 OFF 가 걸린다(NNN OO).
     """
     if span <= 0:
         return 0
-    return _rec_go(int(span), 0, 0, int(block))
+    run_cap = int(block) if max_run is None else int(max_run)
+    return _rec_go(int(span), 0, 0, int(block), run_cap)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +85,8 @@ class PrecheckNurse:
     join_day: int = 0  # 0-based day index
     leave_day: int = 0  # inclusive
     personal_off_adjustment: int = 0
+    # 엔진 OFF 하드 하한(min_off) 하한값 — 0 이면 하한 없음(off_first·N 전담·주말휴무·프리셉티 등). EI-14r3.
+    min_off_required: int = 0
     fixed_off_days: Set[int] = field(default_factory=set)
     fixed_shift_assignments: Dict[int, str] = field(default_factory=dict)  # {day: shift}
     # 프리셉티 — preceptor 와의 동기 페어링.
@@ -93,6 +99,13 @@ class PrecheckNurse:
     night_cap: Optional[int] = None
     # 표시용 이름. 진단 카드가 사번 대신 이름으로 사람을 지목하도록 evidence 에 함께 싣는다.
     name: Optional[str] = None
+    # 배정 차단일(파견·병동이동·휴직 배정 기간 — `config_dict["blocked_by_nurse_id"]`) 중 근무 구간 `[join_day, leave_day]` 안의 날(0-based).
+    # 엔진은 그날 변수를 아예 만들지 않는다(`iter_nurse_days`) — 근무 불가이면서 OFF 예산에도 안 센다. EI-10g1.
+    blocked_days: frozenset = frozenset()
+    # 단계 B 제약(허용근무 기간표 · 전월 경계 · 금지 원티드 — `config_dict["initial_constraints"]`) 중 근무 구간 안·고정 칸 없는 날(0-based). EI-10g4.
+    #   forced_off_days: 엔진이 O 로 박는 날 · forbidden_by_day: 그 날 못 서는 근무코드(D/E/N/M/O 대문자). 고정 칸이 이기므로 고정 칸 있는 날은 없다.
+    forced_off_days: frozenset = frozenset()
+    forbidden_by_day: dict[int, frozenset] = field(default_factory=dict)
 
 
 @dataclass
@@ -139,9 +152,33 @@ def _allowed_set(nurse: PrecheckNurse, S: List[str]) -> Set[str]:
 def _active(nurse: PrecheckNurse, d: int) -> bool:
     if not (nurse.join_day <= d <= nurse.leave_day):
         return False
+    if d in nurse.blocked_days:
+        return False
     if d in nurse.fixed_off_days:
         return False
+    if d in nurse.forced_off_days:   # 단계 B 제약 — 엔진이 O 로 박는 날(고정 칸 없는 날만 들어 있다, EI-10g5)
+        return False
     return True
+
+
+def _codes_on(nurse: PrecheckNurse, d: int, S: list[str]) -> set[str]:
+    """`d` 일에 이 간호사가 설 수 있는 근무코드 — 허용 근무에서 그 날의 금지 코드(금지 원티드·허용근무 기간표·전월 경계)를 뺀다(EI-10g5).
+
+    고정 칸이 있는 날의 금지는 호출부(bridge)가 이미 뺐다(고정이 이긴다). 활동 여부(`_active`)는 따로 본다 — 이 함수는 코드만 정한다.
+    """
+    allowed = _allowed_set(nurse, S)
+    banned = nurse.forbidden_by_day.get(d)
+    return allowed - banned if banned else allowed
+
+
+def _shift_days_available(nurse: PrecheckNurse, shift: str, S: list[str]) -> int:
+    """한 달 안에 이 간호사가 `shift` 를 설 수 있는 날 수 — 활동일(`_active`) 중 `_codes_on` 에 든 날(월 용량의 필요조건 상한)."""
+    return sum(1 for d in range(nurse.join_day, nurse.leave_day + 1) if _active(nurse, d) and shift in _codes_on(nurse, d, S))
+
+
+def _span(nurse: PrecheckNurse) -> int:
+    """근무 구간 일수에서 배정 차단일을 뺀 근무 가능 일수(EI-10g1)."""
+    return max(0, nurse.leave_day - nurse.join_day + 1 - len(nurse.blocked_days))
 
 
 def _required_off_days(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
@@ -155,24 +192,41 @@ def _required_off_days(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
 def _hard_off_floor(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     """근무가능일을 '하드하게' 줄이는 off 만 합산한다.
 
-    ★ 개인 월 휴무(off_days / standard_personal_off_days)는 엔진에서 **소프트**다
-      (fallback_lex: off_quota_short 슬랙 = 목표 미달 시 벌점만, 강제 아님). 따라서
-      hard capacity 상한을 계산할 때 빼면 안 된다(빼면 false CAPACITY_TOTAL_SHORTAGE).
-      cf. 8d2c2a9 회귀: off_days 를 하드 감산해 연속근무 3/5 로도 capacity 가 갇혔음.
-    여기 포함하는 것은 전사 고정 휴무(global)와 개인 하드 조정(personal_off_adjustment)뿐.
+    ★ 개인 월 휴무(off_days / standard_personal_off_days)를 단순 감산하지 않는다. 엔진은 off_first=False 이고
+      N 전담·주말휴무·프리셉티가 아닌 간호사에게 OFF **하드 하한**(min_off — 휴가 제외·구조 OFF 계산,
+      fallback_lex.py:3253-3345)을 건다. 단순 off_days 를 빼면 휴가·구조 OFF 와 이중 감산돼 엔진보다 엄해져
+      false CAPACITY_TOTAL_SHORTAGE 가 난다. cf. 8d2c2a9 회귀: off_days 를 하드 감산해 연속근무 3/5 로도 capacity 가 갇혔음.
+    (EI-14r3) 그래서 `max(global + p, min_off_required)` 로만 반영한다 — `min_off_required` 는 bridge 가 엔진과 같은 순수 함수
+      (`compute_off_bounds`)로 휴가 0·구간 일수 기준으로 구한 하한값이다(진짜 바닥 `휴가 + max(min_off, 구조 OFF)` ≥
+      `max(p, min_off)` 라 용량은 엔진보다 크거나 같다 → 오차단 0, 휴가가 있으면 엔진 최대 근무일보다 크다).
+      global 에 더하지 않고 `max` 로 합치는 이유: 엔진은 `global_monthly_off_days` 를 0 으로 박아 쓰지 않는다(cp_sat_basic.py:578)
+      — min_off 에 global 을 또 더하면 엔진보다 엄해진다(옛 설정은 `standard + global` 이 min_off 안에 이미 있다).
+    여기 포함하는 것은 전사 고정 휴무(global)+개인 하드 바닥(p)과 엔진 OFF 하한(`min_off_required`) 중 큰 값이다.
+    생성 경로에서 `personal_off_adjustment` 는 bridge 가 `max(이월 보정 p, 엔진이 하드 O 로 박는 날 수)` 로
+    만든 값이다 — 엔진이 안 쓰는 p 와 하드 O 날(주휴·주말휴무자의 주말)을 같은 OFF 로 두 번 빼지 않는다.
     """
-    return (
-        int(cfg.get("global_monthly_off_days", 0) or 0)
-        + int(nurse.personal_off_adjustment or 0)
+    return max(
+        int(cfg.get("global_monthly_off_days", 0) or 0) + int(nurse.personal_off_adjustment or 0),
+        int(nurse.min_off_required or 0),
     )
+
+
+def _off_floor_with_forced(nurse: PrecheckNurse, cfg: dict[str, Any]) -> int:
+    """OFF 날 수의 하한 — `_hard_off_floor` 와 단계 B 강제 OFF 날 수 중 큰 값(EI-10g5).
+
+    둘 다 OFF 날 수의 **하한**이다(강제 OFF 는 엔진이 O 로 박는 날, 바닥은 min_off) — 겹칠 수 있으니 합하지 않고 `max` 로 합친다.
+    강제 OFF 날은 근무 구간 안·차단일 밖만 들어 있다(bridge 가 거른다) — 차단일은 `_span` 에서 이미 빠졌다.
+    """
+    return max(_hard_off_floor(nurse, cfg), len(nurse.forced_off_days))
 
 
 def _working_capacity(nurse: PrecheckNurse, cfg: Dict[str, Any]) -> int:
     span = max(0, nurse.leave_day - nurse.join_day + 1)
-    cap = max(0, span - _hard_off_floor(nurse, cfg))
+    cap = max(0, _span(nurse) - _off_floor_with_forced(nurse, cfg))
     # 연속근무 상한(max_consecutive_work=C)은 HARD 제약(K+1 창에 ≥1 OFF, fallback_lex:1730):
     # C일 근무 후 최소 1일 휴식 → span 내 최대 근무일 = span - span//(C+1) (상한).
     # cap 은 항상 상한이어야 하므로(하한이면 false positive) min 으로 결합한다.
+    # (EI-10g1) 이 닫힌형은 차단일을 뺀 일수가 아니라 **달력 구간**으로 센다 — 차단일이 쉬는 날 몫을 대신하므로 더 줄이면 오차단이다.
     mcw = cfg.get("max_conseq_work", cfg.get("max_consecutive_work"))
     if mcw is not None:
         try:
@@ -193,11 +247,52 @@ def _capacity_with_mcw(nurses, cfg: Dict[str, Any], mcw: Optional[int]) -> int:
     total = 0
     for n in nurses:
         span = max(0, n.leave_day - n.join_day + 1)
-        cap = max(0, span - _hard_off_floor(n, cfg))
+        cap = max(0, _span(n) - _off_floor_with_forced(n, cfg))
         if mcw is not None and mcw >= 1:
             cap = min(cap, max(0, span - span // (mcw + 1)))
         total += cap
     return total
+
+
+def _off_floor_binding(inp: PrecheckInput, total_need: int, total_cap: int,
+                       mcw: int | None) -> dict[str, Any] | None:
+    """엔진 OFF 하한(min_off — `off_days`)이 capacity 부족의 원인일 때 그 값을 낮추는 레버(EI-14C1r).
+
+    14r3 이후 `off_days` 는 용량 바닥(`min_off_required`)에 들어가 `CAPACITY_TOTAL_SHORTAGE` 를 만들 수 있다.
+    `off_days` 를 얼마까지 낮추면 수요를 채우는지(최대값)를 구한다. 현재 값에서의 재계산이 실제 용량과 안 맞거나(다른 입력이
+    섞인 경우) 0 으로도 못 채우면 None(진짜 인원 부족 — 레버 아님). `min_off_required` 가 0 인 간호사(off_first·N 전담·
+    주말휴무·프리셉티)는 그대로 둔다.
+    """
+    from dataclasses import replace
+
+    from services.cp_sat.off_policy import compute_off_bounds
+
+    raw = inp.roster_config.get("off_days")
+    try:
+        cur_off = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return None
+    if cur_off <= 0 or not any(n.min_off_required > 0 for n in inp.nurses):
+        return None
+
+    def cap_at(v: int) -> int:
+        ns = []
+        for n in inp.nurses:
+            if n.min_off_required > 0:
+                mo = int(compute_off_bounds(source={"off_days": v}, avail_days=_span(n), vacation_cnt=0,
+                                            reference_days=inp.num_days)["min_off_required"])
+                ns.append(replace(n, min_off_required=mo))
+            else:
+                ns.append(n)
+        return _capacity_with_mcw(ns, inp.roster_config, mcw)
+
+    if cap_at(cur_off) != total_cap:
+        return None
+    for cand in range(cur_off - 1, -1, -1):
+        if cap_at(cand) >= total_need:
+            return {"config_key": "off_days", "current": cur_off, "suggested_value": cand,
+                    "capacity_after": cap_at(cand)}
+    return None
 
 
 def _min_mcw_to_meet(nurses, cfg: Dict[str, Any], total_need: int,
@@ -213,12 +308,20 @@ def _min_mcw_to_meet(nurses, cfg: Dict[str, Any], total_need: int,
     return None
 
 
+#: 엔진은 불가능으로 안 보는 검사 — 경고로 내려간 2종(EI-10d). 이 코드만 `precheck_warning`/`soft` 로 표기한다.
+_WARNING_ONTOLOGY_CODES = frozenset({"FIXED_ASSIGN_EXCEEDS_NEED", "FIXED_OFF_EXCEEDS_SPAN"})
+
+
 def _issue(code: str, evidence: Dict[str, Any], severity: str = "hard") -> Dict[str, Any]:
-    return attach_reason_code_ontology(
+    out = attach_reason_code_ontology(
         reason_code=code,
         evidence=evidence,
         severity=severity,
     )
+    if code in _WARNING_ONTOLOGY_CODES and severity == "warning" and isinstance(out.get("ontology"), dict):
+        # EI-14r1 — EI-10d 에서 경고로 내려간 2종은 온톨로지 표기도 경고다(attach 는 모드를 늘 precheck_blocked/hard 로 붙인다).
+        out["ontology"] = {**out["ontology"], "mode": "precheck_warning", "severity": "soft"}
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +369,7 @@ def check_allowed_shifts_isolates_nurse(inp: PrecheckInput) -> List[Dict]:
         allowed = _allowed_set(n, S)
         if allowed:
             continue  # 공집합이 아니면 스킵
-        span = max(0, n.leave_day - n.join_day + 1)
+        span = _span(n)
         req_off = _required_off_days(n, inp.roster_config)
         if span > req_off:
             issues.append(
@@ -382,6 +485,11 @@ def check_grade_min_exceeds_max(inp: PrecheckInput) -> List[Dict]:
 
 
 def check_fixed_assign_exceeds_need(inp: PrecheckInput) -> List[Dict]:
+    """고정 배정이 그 날 수요보다 많은가 — **경고**(EI-10d).
+
+    엔진은 불가능으로 보지 않는다: 고정 칸을 커버리지 집계에서 빼고(`need = 요구 − 고정`,
+    fallback_lex.py:1732·1738) 초과분을 그대로 둔다. 하드로 막으면 오차단이다.
+    """
     S = set(_apply_shifts(bool(inp.roster_config.get("use_mid", False))))
     counts: Dict[Tuple[str, int], int] = {}
     for n in inp.nurses:
@@ -396,17 +504,25 @@ def check_fixed_assign_exceeds_need(inp: PrecheckInput) -> List[Dict]:
                 _issue(
                     "FIXED_ASSIGN_EXCEEDS_NEED",
                     {"shift": sh, "day": d, "fixed_count": c, "need": nd},
+                    severity="warning",
                 )
             )
     return issues
 
 
 def check_fixed_assign_violates_allowed(inp: PrecheckInput) -> List[Dict]:
+    """고정 칸이 그 간호사의 허용 시프트 밖인가 — 근무 구간 `[join_day, leave_day]` 안 칸만 본다.
+
+    엔진(lex)은 활동일 밖 고정 칸을 건너뛴다(fallback_lex.py:1311 `(n, d) not in active_days: continue`).
+    개인 DP(`check_per_nurse_sequence`)도 같은 구간만 본다.
+    """
     S = _apply_shifts(bool(inp.roster_config.get("use_mid", False)))
     issues: List[Dict] = []
     for n in inp.nurses:
         allowed = _allowed_set(n, S) | {"O"}
         for d, sh in (n.fixed_shift_assignments or {}).items():
+            if not (n.join_day <= d <= n.leave_day):
+                continue
             if sh not in allowed:
                 issues.append(
                     _issue(
@@ -450,7 +566,7 @@ def check_global_shift_allowed_shortage(inp: PrecheckInput) -> List[Dict]:
             for n in inp.nurses:
                 if not _active(n, d):
                     continue
-                if s in _allowed_set(n, S):
+                if s in _codes_on(n, d, S):
                     eligible_ids.append(n.nurse_id)
             avail = len(eligible_ids)
             if nd <= avail:
@@ -463,7 +579,7 @@ def check_global_shift_allowed_shortage(inp: PrecheckInput) -> List[Dict]:
                     continue
                 cross = [
                     n.nurse_id for n in inp.nurses
-                    if _active(n, d) and (other in _allowed_set(n, S)) and (n.nurse_id not in eligible_ids)
+                    if _active(n, d) and (other in _codes_on(n, d, S)) and (n.nurse_id not in eligible_ids)
                 ]
                 if cross:
                     cross_pool[other] = cross
@@ -541,6 +657,10 @@ def check_capacity_total_shortage(inp: PrecheckInput) -> List[Dict]:
                     "capacity_uncapped": cap_uncapped,
                 }
 
+    # OFF 하한(off_days)이 binding 인 경우 — 14r3 로 생긴 차단의 처방(연속근무 상한 레버와 같은 모양).
+    off_floor_binding = _off_floor_binding(
+        inp, total_need, total_cap, _cur_mcw if (_cur_mcw is not None and _cur_mcw >= 1) else None)
+
     # 평균 초과 day → bottleneck (동적 임계값)
     bottleneck_days = sorted(
         [dd for dd in daily_demand if dd["demand"] > avg_daily],
@@ -579,6 +699,8 @@ def check_capacity_total_shortage(inp: PrecheckInput) -> List[Dict]:
                 "demand_uniform": len(bottleneck_days) == 0,
                 # 연속근무 상한(하드)이 원인이고 그것만 올리면 풀릴 때 자동 완화 근거(없으면 None)
                 "conseq_cap_binding": conseq_cap_binding,
+                # OFF 하한(off_days)이 원인이고 그 값을 낮추면 풀릴 때 자동 완화 근거(없으면 None)
+                "off_floor_binding": off_floor_binding,
             },
         )
     ]
@@ -667,7 +789,7 @@ def check_team_shift_allowed_shortage(inp: PrecheckInput) -> List[Dict]:
             for d in range(inp.num_days):
                 count = 0
                 for n in mems:
-                    if _active(n, d) and s in _allowed_set(n, S):
+                    if _active(n, d) and s in _codes_on(n, d, S):
                         count += 1
                 if req > count:
                     # team_min soft → 팀의 해당 시프트 가용 부족도 벌점 흡수. warning.
@@ -707,7 +829,7 @@ def check_grade_max_sum_below_need(inp: PrecheckInput) -> List[Dict]:
             for n in inp.nurses:
                 if not _active(n, d):
                     continue
-                if s not in _allowed_set(n, S):
+                if s not in _codes_on(n, d, S):
                     continue
                 g = n.grade
                 if g is None or int(g) not in capped_grades:
@@ -756,7 +878,7 @@ def check_grade_min_available_shortage(inp: PrecheckInput) -> List[Dict]:
                         continue
                     if not _active(n, d):
                         continue
-                    if s in _allowed_set(n, S):
+                    if s in _codes_on(n, d, S):
                         avail += 1
                 if req > avail:
                     issues.append(
@@ -798,7 +920,7 @@ def check_grade_antipair_forces_shortage(inp: PrecheckInput) -> List[Dict]:
                         continue
                     if not _active(n, d):
                         continue
-                    if s in _allowed_set(n, S):
+                    if s in _codes_on(n, d, S):
                         non_g += 1
                 if nd - max_t > non_g:
                     issues.append(
@@ -858,18 +980,21 @@ def check_fixed_assign_breaks_team_min(inp: PrecheckInput) -> List[Dict]:
 
 
 def check_fixed_off_exceeds_span(inp: PrecheckInput) -> List[Dict]:
-    """Fix 4: 개인 단위 fixed_off 과다.
+    """Fix 4: 개인 단위 fixed_off 과다 — **경고**(EI-10d).
 
     fixed_off_days ∩ [join, leave] 가 근무 기간 전체를 점유하면 근무 불가.
     (E-2 의 fixed_off 버전)
+
+    엔진은 불가능으로 보지 않는다: 강제 OFF 가 OFF 상한을 넘으면 그 간호사의 상한을 강제 OFF 수로
+    올린다(`per_nurse_off_cap_override`, fallback_lex.py:1278-1280). 하드로 막으면 오차단이다.
     """
     issues: List[Dict] = []
     for n in inp.nurses:
-        span = max(0, n.leave_day - n.join_day + 1)
+        span = _span(n)
         if span <= 0:
             continue
         fixed_off = sum(
-            1 for d in n.fixed_off_days if n.join_day <= d <= n.leave_day
+            1 for d in n.fixed_off_days if n.join_day <= d <= n.leave_day and d not in n.blocked_days
         )
         if fixed_off >= span:
             issues.append(
@@ -880,6 +1005,7 @@ def check_fixed_off_exceeds_span(inp: PrecheckInput) -> List[Dict]:
                         "span": span,
                         "fixed_off_count": fixed_off,
                     },
+                    severity="warning",
                 )
             )
     return issues
@@ -926,7 +1052,10 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
         if _rec_block is None:
             return None
         span = max(0, n.leave_day - n.join_day + 1)
-        return max_nights_under_recovery(span, _rec_block)
+        # EI-10c: 연속 N 상한 L 은 개인 DP 와 같은 한 곳(`_consecutive_night_cap`)에서 읽는다 — bridge 가 엔진 값을
+        # 실었으면 그것, 직접 호출부는 `three_seq_nig` 로 3/2. 블록은 L 까지 허용하고 끝날 때만 2OFF 가 걸린다.
+        return max_nights_under_recovery(
+            span, _rec_block, max_run=_consecutive_night_cap(inp.roster_config))
 
     def _night_cap_detail(n: PrecheckNurse) -> tuple[int, str, List[str], Dict[str, int]]:
         """(야간 상한, 대표 병목, **동률 포함 병목 전부**, **축별 값 전부**).
@@ -954,13 +1083,15 @@ def check_monthly_night_capacity(inp: PrecheckInput) -> List[Dict]:
         _rc = _recovery_night_cap(n)
         if _rc is not None:
             cands.append(("recovery", _rc))
+        if n.forced_off_days or n.forbidden_by_day:   # EI-10g5 — 금지·강제 OFF 를 뺀 야간 가능일 수
+            cands.append(("available", _shift_days_available(n, "N", S)))
 
         cap = min(v for _, v in cands)
         binds = [k for k, v in cands if v == cap]
         # 대표는 **고칠 수 있는 축** 우선 — 사람이 손댈 수 없는 working/recovery 를 앞세우면
         # 해결책 없는 원인만 표시된다.
         axis = dict(cands)
-        for pref in ("personal", "config", "recovery", "working"):
+        for pref in ("personal", "config", "recovery", "available", "working"):
             if pref in binds:
                 return cap, pref, binds, axis
         return cap, binds[0], binds, axis
@@ -1049,7 +1180,7 @@ def check_daily_night_shortage(inp: PrecheckInput) -> List[Dict]:
         # 그 날 N 가능하면서 active 한 nurse
         active_n_capable = [
             n.nurse_id for n in inp.nurses
-            if n.nurse_id in n_capable_ids and _active(n, d)
+            if n.nurse_id in n_capable_ids and _active(n, d) and "N" in _codes_on(n, d, S)
         ]
         avail = len(active_n_capable)
         if nd <= avail:
@@ -1060,11 +1191,15 @@ def check_daily_night_shortage(inp: PrecheckInput) -> List[Dict]:
         for n in inp.nurses:
             if n.nurse_id not in n_capable_ids:
                 continue
-            if _active(n, d):
+            if _active(n, d) and "N" in _codes_on(n, d, S):
                 continue
             reason = []
             if d in n.fixed_off_days:
                 reason.append("fixed_off")
+            if d in n.forced_off_days:
+                reason.append("forced_off")
+            if "N" not in _codes_on(n, d, S) and _active(n, d):
+                reason.append("forbidden_night")
             if d < n.join_day:
                 reason.append("not_joined")
             if d > n.leave_day:
@@ -1173,6 +1308,38 @@ def check_preceptee_sync_mismatch(inp: PrecheckInput) -> List[Dict]:
     return issues
 
 
+def _consecutive_night_cap(cfg: dict[str, Any]) -> int:
+    """연속 N 상한 — bridge 가 엔진 실효값(`max_consecutive_nights`)을 실었으면 그것, 없으면 옛 규칙."""
+    fallback = 3 if cfg.get("three_seq_nig") else 2
+    try:
+        return int(cfg["max_consecutive_nights"])
+    except (KeyError, TypeError, ValueError):
+        return fallback
+
+
+def precheck_sequence_params(cfg: dict[str, Any]) -> dict[str, Any]:
+    """개인 시퀀스 DP 가 쓰는 하드락 규칙 값 — 한 곳에서만 읽는다(EI-10c C8' 비교 대상).
+
+    bridge(`hard_lock_view`)가 엔진 실효값을 실었으면 그 값이 이긴다(전이 금지 3종은 엔진이
+    `banned_day_after_eve` 로 마스킹한 값이다). 키가 없을 때의 옛 기본값은 bridge 를 거치지 않는
+    직접 호출부(라우터 `POST /groups/{id}/roster/precheck`·테스트)용으로 남긴다.
+    연속 N 상한 L(`max_consecutive_nights`)은 월 나이트 회복 용량(`_recovery_night_cap`)도 같은 값을 쓴다 — L 의 출처는 한 곳이다.
+    """
+    # 엔진은 `banned_day_after_eve` 가 거짓이면 전이 금지를 모두 끈다(cp_sat_basic.py:673-677) — 직접 호출부도 같은 결과
+    # (이 한 줄은 엔진 규칙의 미러다. C8' 직접 호출부 행렬이 엔진 값과 같음을 묶어 둔다).
+    masked = not cfg.get("banned_day_after_eve", True)
+    return {
+        "max_consecutive_work": cfg.get("max_conseq_work"),
+        "max_consecutive_nights": _consecutive_night_cap(cfg),
+        "ban_n_to_d": not masked and bool(cfg.get("ban_n_to_d", True)),
+        "ban_e_to_d": not masked and bool(cfg.get("ban_e_to_d", True)),
+        "ban_n_to_e": not masked and bool(cfg.get("ban_n_to_e", True)),
+        "two_offs_after_two_nig": bool(cfg.get("two_offs_after_two_nig")),
+        "two_offs_after_three_nig": bool(cfg.get("two_offs_after_three_nig")),
+        "not_one_night": bool(cfg.get("not_one_night")),
+    }
+
+
 def check_per_nurse_sequence(inp: PrecheckInput) -> List[Dict]:
     """개인축: 각 간호사가 혼자서 고정셀 + 시퀀스 규칙(전이금지/연속근무/연속야간/회복/1N)을
     다 지키는 유효한 근무 배열을 만들 수 있는가. 혼자 불가능 = 전체 불가능(증명).
@@ -1184,14 +1351,7 @@ def check_per_nurse_sequence(inp: PrecheckInput) -> List[Dict]:
 
     cfg = inp.roster_config
     S = _apply_shifts(bool(cfg.get("use_mid", False)))
-    ban_n_to_d = bool(cfg.get("ban_n_to_d", True))
-    ban_e_to_d = bool(cfg.get("banned_day_after_eve", True))
-    ban_n_to_e = bool(cfg.get("ban_n_to_e", True))
-    two2 = bool(cfg.get("two_offs_after_two_nig"))
-    two3 = bool(cfg.get("two_offs_after_three_nig"))
-    not_one = bool(cfg.get("not_one_night"))
-    max_k = cfg.get("max_conseq_work")
-    max_l = 3 if cfg.get("three_seq_nig") else 2
+    params = precheck_sequence_params(cfg)
 
     issues: List[Dict] = []
     for n in inp.nurses:
@@ -1206,17 +1366,25 @@ def check_per_nurse_sequence(inp: PrecheckInput) -> List[Dict]:
         for d in (n.fixed_off_days or set()):
             if n.join_day <= d <= n.leave_day and (d - n.join_day) not in fixed:
                 fixed[d - n.join_day] = "O"
-        # 고정셀이 없으면 all-OFF 완성이 항상 가능 → 개인 단독 불가능 없음(스킵, 비용 절약)
-        if not fixed:
+        # 단계 B 제약(EI-10g4) — 차단일·고정 칸이 있는 날은 이미 빠져 있다(고정이 이긴다). 상대 인덱스로 옮긴다.
+        forced_rel = frozenset(d - n.join_day for d in n.forced_off_days if n.join_day <= d <= n.leave_day)
+        forbidden_rel = {d - n.join_day: codes for d, codes in n.forbidden_by_day.items() if n.join_day <= d <= n.leave_day}
+        # 고정셀이 없으면 all-OFF 완성이 항상 가능(강제 OFF 도 만족) → 개인 단독 불가능 없음(스킵, 비용 절약).
+        # 단 OFF 자체를 금지한 날이 있으면 all-OFF 가 아니므로 계속 본다.
+        if not fixed and not any("O" in codes for d, codes in forbidden_rel.items() if d not in forced_rel):
             continue
-        allowed_work = {c for c in _allowed_set(n, S) if c in ("D", "E", "N")}
+        # (EI-10g1) 배정 차단일 — 엔진은 그날 변수가 없어 쉬는 날이다. 차단일 위 고정 칸은 번역 단계에서 이미 버려졌다.
+        blocked = frozenset(d - n.join_day for d in n.blocked_days if n.join_day <= d <= n.leave_day)
+        fixed = {d: sh for d, sh in fixed.items() if d not in blocked}
+        use_mid = bool(cfg.get("use_mid", False))
+        allowed_work = {c for c in _allowed_set(n, S) if c in ("D", "E", "N") or (use_mid and c == "M")}
         if nurse_sequence_infeasible(
-            num_days=span, allowed=allowed_work, fixed=fixed,
-            max_consecutive_work=max_k, max_consecutive_nights=max_l,
-            ban_n_to_d=ban_n_to_d, ban_e_to_d=ban_e_to_d, ban_n_to_e=ban_n_to_e,
-            two_offs_after_two_nig=two2, two_offs_after_three_nig=two3,
-            not_one_night=not_one,
+            num_days=span, allowed=allowed_work, fixed=fixed, **params, use_mid=use_mid,
             n_min=0, n_max=(n.night_cap if n.night_cap is not None else None),
+            # 엔진 1N 면제: 월 N 상한 1(collect_single_n_allowed_nurse_indices) · 월 1일 고정 N
+            single_n_allowed=(n.night_cap == 1),
+            day0_single_n_ok=(n.join_day == 0 and fixed.get(0) == "N"),
+            blocked=blocked, forced_off=forced_rel, forbidden=forbidden_rel,
         ):
             issues.append(_issue(
                 "PER_NURSE_SEQUENCE_INFEASIBLE",
@@ -1229,13 +1397,12 @@ def check_per_nurse_sequence(inp: PrecheckInput) -> List[Dict]:
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+# EI-10d: FIXED_ASSIGN_EXCEEDS_NEED·FIXED_OFF_EXCEEDS_SPAN 은 경고로 내려 여기서 뺐다(엔진은 둘 다 불가능으로 안 본다).
 _CONFIG_ERROR_CODES = {
     "MID_REQUIRED_MISSING",
     "MID_DISABLED_BUT_USED",
     "ALLOWED_SHIFTS_ISOLATES_NURSE",
-    "FIXED_ASSIGN_EXCEEDS_NEED",
     "FIXED_ASSIGN_VIOLATES_ALLOWED",
-    "FIXED_OFF_EXCEEDS_SPAN",
     "GRADE_MIN_EXCEEDS_MAX",
 }
 
@@ -1271,8 +1438,8 @@ def run_precheck(
 
     Args:
         inp: PrecheckInput
-        stop_on_config_error: True 시 설정성 오류(D, E-2, F-1, F-2)가 발견되면
-            이후 일자별 검사를 스킵한다.
+        stop_on_config_error: True 시 설정성 오류(`_CONFIG_ERROR_CODES` — D, E-2, F-2 등)가 발견되면
+            이후 일자별 검사를 스킵한다. 고정 초과(F-1)·고정 OFF 과다(F-4)는 EI-10d 부터 경고라 스킵하지 않는다.
 
     Returns:
         {"status": "OK" | "HAS_ISSUES", "issues": [...]}

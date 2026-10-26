@@ -486,6 +486,7 @@ def get_config_by_version(
             cfg = DEFAULT_CONFIG
             # DEFAULT 설정으로 RosterConfig 레코드 생성 및 저장
             # ★version 부여: 미부여 시 version=NULL(ad-hoc)로 남아 /config/versions 프리셋 목록서 누락됨
+            from services.engine_contract.defaults import registry_default as _rd
             from services.roster_service import _next_config_version
             new_config = RosterConfigModel(
                 version=_next_config_version(db, target_office_id, target_group_id),
@@ -501,17 +502,15 @@ def get_config_by_version(
                 two_offs_per_week=getattr(cfg, "enforce_two_offs_per_week", False),
                 max_nig_per_month=cfg.max_night_shifts_per_month,
                 three_seq_nig=getattr(cfg, "max_consecutive_nights", 3) >= 3,
-                two_offs_after_three_nig=getattr(
-                    cfg, "two_offs_after_three_nig", False
-                ),
+                two_offs_after_three_nig=_rd("two_offs_after_three_nig"),
                 two_offs_after_two_nig=getattr(cfg, "two_offs_after_two_nig", False),
                 banned_day_after_eve=getattr(cfg, "banned_day_after_eve", True),
-                max_conseq_work=getattr(cfg, "max_consecutive_work_days", 6),
-                off_days=cfg.calculate_total_off_days(0),
+                max_conseq_work=_rd("max_conseq_work"),
+                off_days=_rd("off_days"),
                 shift_priority=getattr(cfg, "shift_requirement_priority", 0.8),
                 sequential_offs=getattr(cfg, "sequential_offs", True),
-                nod_noe=False,
-                preceptee_on=getattr(cfg, "preceptee_on", False),
+                nod_noe=_rd("nod_noe"),
+                preceptee_on=_rd("preceptee_on"),
                 preceptee_shift_count=getattr(cfg, "preceptee_shift_count", True),
                 weekly_off_group=getattr(cfg, "weekly_off_group", False),
                 not_one_night=getattr(cfg, "not_one_night", False),
@@ -3225,9 +3224,12 @@ def validate_roster(
             )
             max_nig = 15
 
+        from services.engine_contract.defaults import registry_default as _rd  # D48: NULL → 엔진 기본(5)
+
+        _max_conseq = latest_config_db.max_conseq_work
         roster_config_for_engine = NurseRosterConfig(
             daily_shift_requirements=daily_shift_requirements,
-            max_consecutive_work_days=latest_config_db.max_conseq_work,
+            max_consecutive_work_days=_max_conseq if _max_conseq is not None else _rd("max_conseq_work"),
             max_night_shifts_per_month=max_nig,
             max_consecutive_nights=3 if latest_config_db.three_seq_nig else 2,
         )

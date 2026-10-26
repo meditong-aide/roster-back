@@ -23,6 +23,7 @@ from typing import Any, Dict, List
 from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
 from services.ontology_graph.blame import score_blame
 from services.ontology_graph.builder import UnifiedGraphInput, build_unified_graph
+from services.ontology_graph.demand import demand_by_day, has_by_day
 from services.ontology_graph.recommender import recommend_actions
 from services.ontology_graph.supply_demand import (
     NurseSupply,
@@ -105,6 +106,11 @@ def presolve_shortage_diagnosis(
     days = calendar.monthrange(year, month)[1]
     use_mid = bool(config_data.get("use_mid", False))
     dem = _demand(config_data)
+    # EI-14b2a4 — 뷰가 준 일자별 수요(`_ir_by_day`)가 있으면 일자별 max-flow·월 수요 합으로 본다(없으면 평탄 = 지금과 같다).
+    #   보고용 `dem`(shortages 의 daily_required 등)은 시프트별 최대값이다.
+    dem_days = demand_by_day(config_data, days) if has_by_day(config_data) else None
+    if dem_days:
+        dem = {s: max(row[s] for row in dem_days) for s in WORK}
     off = _off_days(config_data)
     workdays = max(0, days - off)
     max_nig = int(config_data.get("max_nig_per_month", 15) or 15)
@@ -149,7 +155,7 @@ def presolve_shortage_diagnosis(
         night_cap_by[nid] = min(max_nig, pn) if pn is not None else max_nig
         g_nurses.append({"nurse_id": nid, "grade": nu.get("grade"), "team_id": nu.get("team_id")})
 
-    req_by_day = {d: dict(dem) for d in range(days)}
+    req_by_day = {d: dict(dem_days[d] if dem_days else dem) for d in range(days)}
     gi = UnifiedGraphInput(
         nurses=g_nurses, num_days=days, work_shifts=list(WORK),
         requirements_by_day=req_by_day,
@@ -158,7 +164,9 @@ def presolve_shortage_diagnosis(
 
     per = compute_supply_demand(supplies, req_by_day, work_shifts=WORK)
     mon = compute_monthly_supply_demand(
-        supplies, {s: dem[s] * days for s in WORK if dem[s] > 0},
+        supplies,
+        ({s: sum(row[s] for row in dem_days) for s in WORK if any(row[s] > 0 for row in dem_days)} if dem_days
+         else {s: dem[s] * days for s in WORK if dem[s] > 0}),
         workdays_by_nurse=workdays_by, night_cap_by_nurse=night_cap_by)
 
     graph = build_unified_graph(gi, supply_demand=per, monthly_supply_demand=mon)

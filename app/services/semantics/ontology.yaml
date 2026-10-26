@@ -369,6 +369,11 @@ modes:
     meaning: solver build 이전 precheck 단계에서 차단된 상태
     is_enforced: true
     severity: hard
+  precheck_warning:
+    label: Precheck Warning
+    meaning: precheck 가 경고만 남긴 상태 — 엔진은 이 상황을 불가능으로 보지 않는다(EI-10d)
+    is_enforced: false
+    severity: soft
 
 relations:
   applies_to:
@@ -832,16 +837,6 @@ treatments:
     trade_off_ko: "특정 (day, shift)에서 grade=N 간호사가 max 를 초과 가능. 다음 달 운영에서 보정 권장."
     applies_to_causes: [cause:grade:max_sum_below_need]
 
-  treatment:soft:grade_min:
-    label: "Grade min 을 soft fallback"
-    action_type: force_soft_mode
-    target_family: GradeMin
-    config_key: _force_grade_min_soft_fallback
-    direction: enable
-    rationale_ko: "등급 최저 인원을 soft 화. 특정 day 에서 일부 등급이 1~2명 부족할 수 있음."
-    trade_off_ko: "선임 grade 부족 시프트가 일부 발생 — 위험 시점 manual check 필요."
-    applies_to_causes: [cause:grade:min_sum_over_need]
-
   treatment:soft:team_min:
     label: "팀 최소 인원을 soft fallback"
     action_type: force_soft_mode
@@ -946,6 +941,7 @@ treatments:
       - cause:dispatch:fixed_assign_wrong_group
       - cause:config:monthly_limit_n_exact_unattainable
       - cause:fixed:initial_forbidden_concentration
+      - cause:grade:min_sum_over_need
 
   treatment:data:reduce_fixed:
     label: "고정 셀 / 원티드 정리 (manual)"
@@ -1044,7 +1040,7 @@ treatments:
     label: "max_consecutive_work 상한 조정"
     action_type: set_threshold
     target_family: ConsecutiveWorkLimit
-    config_key: max_consecutive_work_days
+    config_key: max_conseq_work
     direction: increase
     rationale_ko: "연속 근무 한도를 1~2일 상향하여 windowed coverage 풀이 자유도 증가. 예: 5일 → 6일."
     trade_off_ko: "연속 근무일이 늘어나면 개인 피로 누적. 다음 달 OFF 배치로 보정 권장."
@@ -1105,7 +1101,8 @@ soft_constraints:
     label: 고립 근무 (O W O)
     severity: soft
     weight_constant: ISOLATED_WORK_PENALTY
-    config_key: isolated_work_penalty_weight
+    # EI-14d — 생산자 0 인 죽은 레버라 처방(가중치 조정 액션)을 두지 않는다. 엔진은 상수 ISOLATED_WORK_PENALTY(1500)·env AIDE_ISO_WORK_W 만 쓴다
+    config_key: null
     lex_stage: safety
     rationale_ko: "OFF 사이 단일 근무(고립근무)를 억제한다."
     aliases: [ISOLATED_WORK]

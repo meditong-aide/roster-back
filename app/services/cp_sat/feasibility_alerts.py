@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from services.cp_sat.allowed_shift_types import is_code_blocked_by_profile
+from services.engine_contract.defaults import registry_default
 
 
 CORE_CODES = ("D", "E", "N", "M")
@@ -276,7 +277,7 @@ def run_preflight_feasibility_alerts(
                         f"nurse={getattr(nurse, 'name', '?')}({nurse_ids[n_idx]}): weekend_only min_off conflict min={min_off_required}, weekend_slots={weekend_slots}"
                     )
 
-        preceptee_on = bool(config_dict.get("preceptee_on", False))
+        preceptee_on = bool(config_dict.get("preceptee_on", registry_default("preceptee_on")))
         if preceptee_on and use_mid:
             id_to_idx = {nurse_ids[i]: i for i in range(len(nurse_ids))}
             # 멤버십: nurse_preceptee_period 맵 있으면 그 달 active 만(종료자 제외), 없으면 캐시. 설계 §6.

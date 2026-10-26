@@ -33,15 +33,21 @@ def _codes(res):
     return {i["reason_code"] for i in res["issues"]}
 
 
-def test_fixed_n_then_d_conflict_blocks():
-    # 고정 N(5일) 다음날 고정 D(6일) + N→D 금지(기본 True) → 개인 단독 불가능
+def test_fixed_n_then_fixed_d_is_exempt_like_engine():
+    # 고정 N(5일)·고정 D(6일) — 두 칸 다 고정이면 엔진은 N→D 금지를 걸지 않는다(EI-10c)
     res = run_precheck(_inp({5: "N", 6: "D"}, {"ban_n_to_d": True}))
+    assert CODE not in _codes(res)
+
+
+def test_forced_night_then_fixed_day_blocks():
+    # 1N 금지 + 3일 고정 O·4일 고정 N → 5일 N 강제(자유칸) → 6일 고정 D 와 N→D 금지 충돌 → 개인 단독 불가능
+    res = run_precheck(_inp({3: "O", 4: "N", 6: "D"}, {"ban_n_to_d": True, "not_one_night": True}))
     assert CODE in _codes(res)
     assert has_blocking_issues(res)  # blocking 확정
 
 
 def test_conflict_gone_when_ban_off():
-    res = run_precheck(_inp({5: "N", 6: "D"}, {"ban_n_to_d": False}))
+    res = run_precheck(_inp({3: "O", 4: "N", 6: "D"}, {"ban_n_to_d": False, "not_one_night": True}))
     assert CODE not in _codes(res)
 
 
@@ -51,8 +57,7 @@ def test_no_fixed_no_issue():
     assert CODE not in _codes(res)
 
 
-def test_e_then_d_conflict_blocks():
-    # 고정 E→D + E→D 금지(banned_day_after_eve 기본 True)
+def test_fixed_e_then_fixed_d_is_exempt_like_engine():
+    # 고정 E→고정 D — 엔진은 두 칸 다 고정이면 E→D 금지(banned_day_after_eve 기본 True)를 면제한다(EI-10c)
     res = run_precheck(_inp({2: "E", 3: "D"}))
-    assert CODE in _codes(res)
-    assert has_blocking_issues(res)
+    assert CODE not in _codes(res)

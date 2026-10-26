@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from services.ontology_graph.demand import IR_BY_DAY_KEY, demand_by_day, has_by_day
 from services.ontology_graph.lagrangian import _nurse_attr
 from services.ontology_graph.scope_manifest import unmodeled_active
 
@@ -64,7 +65,8 @@ class TransitionBanRule:
 class CoverageRule:
     reqD: int
     reqE: int
-    reqN: int                   # per-day 균일 커버리지(현재 모델)
+    reqN: int                   # per-day 균일 커버리지(평탄 수요)
+    by_day: tuple | None = None  # EI-14b2a3 — 뷰가 준 일자별 수요 ((D,E,N), …). None 이면 평탄(= 지금과 같다)
 
 
 @dataclass(frozen=True)
@@ -102,7 +104,8 @@ def model_signature(nurses: list, config: dict, num_days: int) -> str:
     # ① 비셀 규칙(회복·not_one_night·max_run·전이·커버리지) — 파라미터 포함
     for r in sorted((r for r in ir.rules if not isinstance(r, CellDomainRule)),
                     key=lambda x: type(x).__name__):
-        parts.append(type(r).__name__ + ":" + repr(sorted(vars(r).items())))
+        parts.append(type(r).__name__ + ":" + repr(sorted(
+            (k, v) for k, v in vars(r).items() if not (k == "by_day" and v is None))))
     # ② 개인 allowed(공급구조)
     parts.append("works=" + repr(sorted(repr(sorted(s.allowed)) for s in ir.nurses)))
     # ③ 날짜별 셀 제약(개인·날짜별 forbidden/forced)
@@ -137,8 +140,11 @@ def parse_to_ir(nurses: list, config: dict, num_days: int) -> RosterConstraintIR
     if config.get("forbid_night_to_day"):
         rules.append(TransitionBanRule("N", "D"))
     dsr = config.get("daily_shift_requirements") or {}
+    by_day = None
+    if has_by_day(config):                           # 뷰가 준 사설 키일 때만(raw by_day 는 계속 무시)
+        by_day = tuple((r["D"], r["E"], r["N"]) for r in demand_by_day(config, num_days))
     rules.append(CoverageRule(int(dsr.get("D", 0) or 0), int(dsr.get("E", 0) or 0),
-                              int(dsr.get("N", 0) or int(config.get("nig_req", 0) or 0))))
+                              int(dsr.get("N", 0) or int(config.get("nig_req", 0) or 0)), by_day))
     ic = config.get("initial_constraints") or {}
     fb, fo = ic.get("forbidden") or {}, ic.get("forced_off") or {}
     cells: dict = {}
@@ -176,6 +182,8 @@ def compile_graph(ir: RosterConstraintIR):
             config["forbid_night_to_day"] = True
         elif isinstance(r, CoverageRule):
             config["daily_shift_requirements"] = {"D": r.reqD, "E": r.reqE, "N": r.reqN}
+            if r.by_day is not None:
+                config[IR_BY_DAY_KEY] = [{"D": d, "E": e, "N": n} for d, e, n in r.by_day]
         elif isinstance(r, CellDomainRule):
             if r.banned:
                 fb.setdefault(r.nurse_id, {})[r.day] = sorted(r.banned)

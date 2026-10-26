@@ -48,6 +48,7 @@ from services.cp_sat.m_coverage import compute_main_bucket_indices
 from services.cp_sat.night_distribution_log import log_n_even_distribution
 from services.constraints.team_constraints import add_team_min_constraints
 from services.day_windows import iter_nurse_days, build_active_days
+from services.cp_sat.rule_tag import hard_add, aux_add, hard_call, aux_call
 
 # lex Stage 2 에서 team_min 커버 부족(slack) 1건당 패널티. safety(off-quota 10~30만) 위에
 # 두어 팀 커버를 상위 co-priority 로 만든다(단, 커버리지/안전은 이미 상위 stage 에서 고정).
@@ -1335,7 +1336,7 @@ def optimize_fallback_lex_hard_first(
                     },
                 )
             else:
-                m.Add(_fixed_expr)
+                hard_add(m, _fixed_pattern, _fixed_expr)
             for s in range(S):
                 if s != s_idx:
                     _ban_expr = (X(n, d, s) == 0)
@@ -1360,7 +1361,7 @@ def optimize_fallback_lex_hard_first(
                             },
                         )
                     else:
-                        m.Add(_ban_expr)
+                        hard_add(m, _fixed_pattern, _ban_expr)
         # W(특별 근무)는 고정 셀 외에는 전부 금지
         if has_w and w_idx is not None:
             for n in range(N):
@@ -1390,7 +1391,7 @@ def optimize_fallback_lex_hard_first(
                             },
                         )
                     else:
-                        m.Add(_w_ban_expr)
+                        hard_add(m, "forbidden_shift", _w_ban_expr)
         # 순수 O 4연속 금지 (fixed로 이미 4O면 경고만 남기고 스킵)
         # cfg.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3)
         # cfg.enforce_4o_hard=False 또는 env ROSTER_DISABLE_4O_HARD=1 이면 4O hard 전체 비활성(테스트/완화).
@@ -1428,7 +1429,7 @@ def optimize_fallback_lex_hard_first(
                             f"{logger_prefix} [4O-skip-fixed] nurse_idx={n}, days={d+1},{d+2},{d+3},{d+4} (fixed O x{fixed_o_cnt})"
                         )
                         continue
-                    m.Add(
+                    hard_add(m, "enforce_4o",
                         is_pure_o(n, d)
                         + is_pure_o(n, d + 1)
                         + is_pure_o(n, d + 2)
@@ -1477,7 +1478,7 @@ def optimize_fallback_lex_hard_first(
             if not free_vars:
                 continue
             remaining = 3 - effective_t
-            m.Add(sum(free_vars) <= remaining)
+            hard_add(m, "enforce_4o", sum(free_vars) <= remaining)
             _4o_cross_affected_fb.add(n)
             nu = roster_system.nurses[n] if n < len(roster_system.nurses) else None
             print(
@@ -1522,7 +1523,7 @@ def optimize_fallback_lex_hard_first(
                                 f"nurse_index={n}, day={d+1}, fixed_shift={fixed_code}"
                             )
                             continue
-                        m.Add(X(n, d, off_idx) == 1)
+                        hard_add(m, "weekend_off_only", X(n, d, off_idx) == 1)
                     else:
                         # 평일(월~금): OFF 금지(D/E/N만 가능)
                         # 단, 사용자 고정 OFF는 예외로 허용하고 별도 제약을 걸지 않는다.
@@ -1534,20 +1535,11 @@ def optimize_fallback_lex_hard_first(
                         _ow_ranges_fb = (getattr(roster_system, "off_window_constraints", {}) or {}).get(n, []) or []
                         if any(ws <= d <= we for (ws, we) in _ow_ranges_fb):
                             continue
-                        m.Add(X(n, d, off_idx) == 0)
+                        hard_add(m, "weekend_off_only", X(n, d, off_idx) == 0)
 
-        # raw_off_placement_mode = int(getattr(cfg, "off_placement_mode", 0) or 0)
-        # if raw_off_placement_mode != 0:
-        #     print(f"{logger_prefix} [OffPlacementMode] deprecated: forcing off_placement_mode=0")
-        # off_placement_mode = 0
         weekly_off_by_idx = (
             getattr(roster_system, "weekly_off_by_idx", {})
             if isinstance(getattr(roster_system, "weekly_off_by_idx", {}), dict)
-            else {}
-        )
-        prev_month_last_is_off = (
-            getattr(roster_system, "prev_month_last_is_off", {})
-            if isinstance(getattr(roster_system, "prev_month_last_is_off", {}), dict)
             else {}
         )
         prev_month_n_tail_by_idx = (
@@ -1556,7 +1548,6 @@ def optimize_fallback_lex_hard_first(
             else {}
         )
         # print('hahaha, weekly_off_by_idx', weekly_off_by_idx)
-        # print('hahaha, prev_month_last_is_off', prev_month_last_is_off)
         # forced_off_cells: set[tuple[int, int]] = set(
         #     (n_idx, d_idx) for (n_idx, d_idx), s_idx in fixed.items() if s_idx == off_idx
         # )
@@ -1581,69 +1572,6 @@ def optimize_fallback_lex_hard_first(
                     shortage_days.add(d)
         except Exception:
             shortage_days = set()
-        # if off_placement_mode > 0 and weekly_off_by_idx:
-        #     for n, day_list in weekly_off_by_idx.items():
-        #         if n >= len(join):
-        #             continue
-        #         if _is_preceptee_at(n):
-        #             continue
-        #         T0, T1 = join[n], leave[n]
-        #         for d_raw in day_list or []:
-        #             try:
-        #                 d = int(d_raw)
-        #             except Exception:
-        #                 continue
-        #             if d < T0 or d > T1:
-        #                 continue
-        #             if d == D - 1:
-        #                 continue
-        #             if d == 0:
-        #                 if bool(prev_month_last_is_off.get(n, False)):
-        #                     continue
-        #                 if d + 1 <= T1:
-        #                     m.Add(X(n, d + 1, off_idx) == 1)
-        #                     structural_off_cells.add((n, d + 1))
-        #                 continue
-        #             if off_placement_mode == 1:
-        #                 neighbours = []
-        #                 left_pos = d - 1
-        #                 right_pos = d + 1
-        #                 # if left_pos >= T0 and left_pos not in shortage_days:
-                #                 allow_shortage_off = broad_soft
-
-        #                 if left_pos >= T0 and (allow_shortage_off or left_pos not in shortage_days):
-        #                     neighbours.append(("left", X(n, left_pos, off_idx)))
-        #                 # if right_pos <= T1 and right_pos not in shortage_days:
-        #                 if right_pos <= T1 and (allow_shortage_off or right_pos not in shortage_days):
-        #                     neighbours.append(("right", X(n, right_pos, off_idx)))
-        #                 # 둘 다 부족일이면 스킵
-        #                 if not neighbours:
-        #                     continue
-        #                 vars_only = [v for _, v in neighbours]
-        #                 if len(vars_only) == 1:
-        #                     m.Add(vars_only[0] == 1)
-        #                 else:
-        #                     m.Add(sum(vars_only) >= 1)
-        #                 for direction, _var in neighbours:
-        #                     if direction == "left":
-        #                         structural_off_cells.add((n, left_pos))
-        #                     else:
-        #                         structural_off_cells.add((n, right_pos))
-        #             else:
-        #                 left_pos = d - 1
-        #                 right_pos = d + 1
-        #                 placed = False
-        #                 if left_pos >= T0 and left_pos not in shortage_days:
-        #                     m.Add(X(n, left_pos, off_idx) == 1)
-        #                     structural_off_cells.add((n, left_pos))
-        #                     placed = True
-        #                 elif right_pos <= T1 and right_pos not in shortage_days:
-        #                     m.Add(X(n, right_pos, off_idx) == 1)
-        #                     structural_off_cells.add((n, right_pos))
-        #                     placed = True
-        #                 # 둘 다 부족일이면 스킵 (커버리지 우선)
-        #                 if not placed:
-        #                     continue
 
         # 초기 금지: 고정과 충돌하면 금지 무시(로그만)
         try:
@@ -1681,7 +1609,7 @@ def optimize_fallback_lex_hard_first(
                                 },
                             )
                         else:
-                            m.Add(_if_expr)
+                            hard_add(m, "initial_forbidden", _if_expr)
         except Exception as e:
             print(f"{logger_prefix} 초기 금지 셀 적용 중 오류: {e}")
 
@@ -1690,7 +1618,7 @@ def optimize_fallback_lex_hard_first(
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 if (n, d) in fixed and not _is_preceptee_at(n, d):
                     continue
-                m.AddExactlyOne(X(n, d, s) for s in range(S))
+                hard_call(m, "exactly_one_shift", "AddExactlyOne", (X(n, d, s) for s in range(S)))
 
         # 프리셉티 팔로우 제약 (fallback) — assignment 기간 내에만 적용
         if preceptee_follow and preceptee_indices:
@@ -1733,14 +1661,14 @@ def optimize_fallback_lex_hard_first(
                     if _p_special:
                         _xo = X(n, d, off_idx)
                         if not isinstance(_xo, int):
-                            m.Add(_xo == 1)
+                            hard_add(m, "preceptee_follow", _xo == 1)
                         continue
                     for s in range(S):
                         xn = X(n, d, s)
                         xp = X(p, d, s)
                         if isinstance(xn, int) or isinstance(xp, int):
                             continue
-                        m.Add(xn == xp)
+                        hard_add(m, "preceptee_follow", xn == xp)
             # Option C: 프리셉티 fixed_wanted 프리솔브 하드고정 → fixed일 인접을 솔버가 조율/불가보고
             for (_pte_n, _pte_d), _pte_code in _pte_fw_map.items():
                 if _pte_n not in preceptee_indices:
@@ -1753,7 +1681,7 @@ def optimize_fallback_lex_hard_first(
                 _ci = roster_system.config.shift_types.index(_cu)
                 _xv = X(_pte_n, _pte_d, _ci)
                 if not isinstance(_xv, int):
-                    m.Add(_xv == 1)
+                    hard_add(m, "fixed_assignment:fixed_wanted", _xv == 1)
 
         # DEN 커버리지에서 프리셉티 제외 시 fixed_cnt 보정
         if exclude_preceptee_from_den:
@@ -1830,7 +1758,7 @@ def optimize_fallback_lex_hard_first(
                         else int(_fb_fixed_cnt_adj[d][s] or 0)
                     )
                     if req_raw == 0:
-                        m.Add(assigned_m_bucket == 0)
+                        hard_add(m, "zero_demand_block", assigned_m_bucket == 0)
                         sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
                         ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                         short_terms.append(sh)
@@ -1844,23 +1772,23 @@ def optimize_fallback_lex_hard_first(
                     # M min coverage: max coverage 있으면 hard, 없으면 soft
                     # _relax_coverage 활성 시: 항상 soft (인원 부족 대응)
                     if _fb_has_any_max and not _relax_coverage and m_need > 0:
-                        m.Add(assigned_m_bucket >= m_need)
+                        hard_add(m, "coverage_min", assigned_m_bucket >= m_need)
                         sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
                     else:
                         sh = m.NewIntVar(0, m_need if m_need > 0 else 0, f"short_{d}_{code}")
                         if m_need > 0:
-                            m.Add(assigned_m_bucket + sh >= m_need)
+                            aux_add(m, "coverage_short", assigned_m_bucket + sh >= m_need)
                     # M 상한: max coverage 있으면 hard, 없으면 min으로 hard cap
                     # _relax_coverage 활성 시: max도 soft
                     if m_cap_max > 0 and not _relax_coverage:
-                        m.Add(assigned_m_bucket <= m_cap_max)
+                        hard_add(m, "coverage_max", assigned_m_bucket <= m_cap_max)
                         ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                     elif m_cap_max > 0 and _relax_coverage:
                         ov = m.NewIntVar(0, N, f"over_{d}_{code}")
-                        m.Add(ov >= assigned_m_bucket - m_cap_max)
+                        aux_add(m, "coverage_over", ov >= assigned_m_bucket - m_cap_max)
                     else:
                         m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
-                        m.Add(assigned_m_bucket <= m_cap_non_fixed)
+                        hard_add(m, "coverage_max", assigned_m_bucket <= m_cap_non_fixed)
                         ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                     short_terms.append(sh)
                     over_terms.append(ov)
@@ -1873,7 +1801,7 @@ def optimize_fallback_lex_hard_first(
                     #   need_max 는 최대 미설정이면 0 이라 기존처럼 금지(assigned ≤ 0)로 남는다.
                     #   실측(성남 중환자실-AN 2026-11): N 만 있는 날을 D·E 최소 0·최대 1 로 두자
                     #   전원 OFF 9 + 미달 0 이 됐다(금지일 때 미달 2 가 최적 하한).
-                    m.Add(assigned <= need_max)
+                    hard_add(m, "zero_demand_block", assigned <= need_max)
                     sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                     short_terms.append(sh)
@@ -1887,7 +1815,7 @@ def optimize_fallback_lex_hard_first(
                     sh = m.NewIntVar(0, 0, f"short_{d}_{code}")
                 else:
                     sh = m.NewIntVar(0, N, f"short_{d}_{code}")
-                    m.Add(assigned + sh >= need)
+                    aux_add(m, "coverage_short", assigned + sh >= need)
                 # max 제약: hard (상한 초과 불가), _relax_coverage 시 soft
                 if need_max > 0 and d < D_phys:
                     _fb_daily_assigned_by_code.setdefault(code, []).append((d, assigned, need))
@@ -1895,19 +1823,19 @@ def optimize_fallback_lex_hard_first(
                 #   need_max 가 0 이 되는데, 이를 '최대 없음' 으로 읽으면 상한이 통째로 빠져
                 #   엔진이 더 넣는다(실측: AN 7일 E 최대 1 인데 신청 E 1 + 엔진 E 1 = 2).
                 if req_max_raw > 0 and not _relax_coverage:
-                    m.Add(assigned <= need_max)
+                    hard_add(m, "coverage_max", assigned <= need_max)
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 elif req_max_raw > 0 and _relax_coverage:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
-                    m.Add(ov >= assigned - need_max)
+                    aux_add(m, "coverage_over", ov >= assigned - need_max)
                 elif _fb_off_first_cfg:
                     # off_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
                     # relax_coverage / need=0 무관 강제 — fixed_wanted 가 min 다 채워도 추가 근무 차단.
-                    m.Add(assigned <= max(0, need))
+                    hard_add(m, "off_first_coverage_cap", assigned <= max(0, need))
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 elif need > 0:
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
-                    m.Add(assigned - ov <= need)
+                    aux_add(m, "coverage_over", assigned - ov <= need)
                 else:
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 short_terms.append(sh)
@@ -1947,15 +1875,15 @@ def optimize_fallback_lex_hard_first(
                 if not _phys_days_n:
                     continue
                 _total_off_n = m.NewIntVar(0, len(_phys_days_n), f"fb_mc_off_{n}")
-                m.Add(_total_off_n == sum(X(n, d, off_idx) for d in _phys_days_n))
+                aux_add(m, "max_cov_off_equalize", _total_off_n == sum(X(n, d, off_idx) for d in _phys_days_n))
                 _fb_nurse_off_vars.append(_total_off_n)
             if len(_fb_nurse_off_vars) >= 2:
                 _fb_off_max = m.NewIntVar(0, D_phys, "fb_mc_off_max")
                 _fb_off_min = m.NewIntVar(0, D_phys, "fb_mc_off_min")
-                m.AddMaxEquality(_fb_off_max, _fb_nurse_off_vars)
-                m.AddMinEquality(_fb_off_min, _fb_nurse_off_vars)
+                aux_call(m, "max_cov_off_equalize", "AddMaxEquality", _fb_off_max, _fb_nurse_off_vars)
+                aux_call(m, "max_cov_off_equalize", "AddMinEquality", _fb_off_min, _fb_nurse_off_vars)
                 _fb_off_range = m.NewIntVar(0, D_phys, "fb_mc_off_range")
-                m.Add(_fb_off_range == _fb_off_max - _fb_off_min)
+                aux_add(m, "max_cov_off_equalize", _fb_off_range == _fb_off_max - _fb_off_min)
                 # off_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
                 # (사용자 명세: off_days 무시 + daily 커버리지 우선 → OFF 균등은 차순위)
                 if _fb_off_first_cfg:
@@ -1965,11 +1893,11 @@ def optimize_fallback_lex_hard_first(
                 if _fb_off_first_cfg and len(_fb_nurse_off_vars) >= 3:
                     _fbN = len(_fb_nurse_off_vars)
                     _fb_off_sum = m.NewIntVar(0, D_phys * _fbN, "fb_mc_off_sum")
-                    m.Add(_fb_off_sum == sum(_fb_nurse_off_vars))
+                    aux_add(m, "max_cov_off_equalize", _fb_off_sum == sum(_fb_nurse_off_vars))
                     for _i, _ov in enumerate(_fb_nurse_off_vars):
                         _dev = m.NewIntVar(0, D_phys * _fbN, f"fb_mc_off_dev_{_i}")
-                        m.Add(_dev * _fbN >= _ov * _fbN - _fb_off_sum)
-                        m.Add(_dev * _fbN >= _fb_off_sum - _ov * _fbN)
+                        aux_add(m, "max_cov_off_equalize", _dev * _fbN >= _ov * _fbN - _fb_off_sum)
+                        aux_add(m, "max_cov_off_equalize", _dev * _fbN >= _fb_off_sum - _ov * _fbN)
                         _fb_max_cov_off_equalize_terms.append(-2000 * _dev)
                 print(f"{logger_prefix} [MaxCoverage/OffFirst] OFF 균등 분배 제약 추가: 간호사 {len(_fb_nurse_off_vars)}명, range_weight={_fb_off_eq_w}")
 
@@ -2049,12 +1977,12 @@ def optimize_fallback_lex_hard_first(
                         neighbours.append(X(n, d + 1, off_idx))
                     slack = m.NewBoolVar(f"iso_off_slack_{n}_{d}")
                     if neighbours:
-                        m.Add(X(n, d, off_idx) <= sum(neighbours) + slack)
+                        aux_add(m, "isolated_off_slack", X(n, d, off_idx) <= sum(neighbours) + slack)
                     else:
-                        m.Add(X(n, d, off_idx) <= slack)
+                        aux_add(m, "isolated_off_slack", X(n, d, off_idx) <= slack)
                     if slack_penalty > 0:
                         scaled = m.NewIntVar(0, slack_penalty, f"iso_off_cost_{n}_{d}")
-                        m.Add(scaled == slack * slack_penalty)
+                        aux_add(m, "isolated_off_slack", scaled == slack * slack_penalty)
                         safety["isolated_off_slack"].append(scaled)
                     else:
                         safety["isolated_off_slack"].append(slack)
@@ -2091,7 +2019,7 @@ def optimize_fallback_lex_hard_first(
                                 },
                             )
                         else:
-                            m.Add(_n2d_expr)
+                            hard_add(m, "transition_ban", _n2d_expr)
                 if getattr(cfg, "ban_e_to_d", True):
                     xe = X(n, d - 1, eve_idx)
                     # fixed_cells로 E→D가 명시적으로 고정된 경우 제약 면제
@@ -2117,7 +2045,7 @@ def optimize_fallback_lex_hard_first(
                                 },
                             )
                         else:
-                            m.Add(_e2d_expr)
+                            hard_add(m, "transition_ban", _e2d_expr)
                 if getattr(cfg, "ban_n_to_e", True):
                     xe2 = X(n, d, eve_idx)
                     # fixed_cells로 N→E가 명시적으로 고정된 경우 제약 면제
@@ -2143,11 +2071,14 @@ def optimize_fallback_lex_hard_first(
                                 },
                             )
                         else:
-                            m.Add(_n2e_expr)
+                            hard_add(m, "transition_ban", _n2e_expr)
                 if mid_idx is not None:
-                    # M 은 전날이 D 또는 O 일 때만 — 즉 `D→M` · `O→M` 만 허용한다.
-                    #   (전날이 M 이면 둘 다 0 이라 **연속 M 도 여기서 이미 막힌다**)
-                    m.Add(X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx) + X(n, d - 1, mid_idx))
+                    # M 은 전날이 D · O · M 일 때만 — 즉 `E→M` · `N→M` 을 막는다.
+                    #   ★ `M→M`(연속 M) 허용 (2026-10-12). 종전 식(D+O)은 연속 M 까지 덤으로 막았는데
+                    #     병원 확정본엔 MM 이 있다(성남 중환자실-AN 2026-10 황은미 28·29일).
+                    #     막혀 있으면 금요일 M 을 줄 사람이 없어 OFF-M-OFF 고립근무가 강제됐다
+                    #     (같은 병동 2026-11 · 고립근무 최소 1 → 허용 시 0, 운영 VER4 는 MM 으로 손수정).
+                    hard_add(m, "mid_transition", X(n, d, mid_idx) <= X(n, d - 1, day_idx) + X(n, d - 1, off_idx) + X(n, d - 1, mid_idx))
                     # ★★ 역방향 `M→D` 금지 (2026-09-16). 위 식은 **M 의 앞만** 보고 뒤는 안 봐서
                     #   `M→D` 가 그대로 나왔다(실측 성남 61병동-AN 2026-10 v6 에서 **12건** —
                     #   이 병동의 M 코드는 `D2` 다. 같은 판 `D→M` 14건은 정상이라 그대로 둔다).
@@ -2156,7 +2087,7 @@ def optimize_fallback_lex_hard_first(
                     #     운영 대상은 **4곳**(220병동 · 220병동-AN · 41병동-AN · 61병동-AN).
                     #   ★ 고정 셀로 `M→D` 가 명시된 자리는 면제한다(ND/ED/NE 와 같은 규약).
                     if not (fixed.get((n, d - 1)) == mid_idx and fixed.get((n, d)) == day_idx):
-                        m.Add(X(n, d - 1, mid_idx) + X(n, d, day_idx) <= 1)
+                        hard_add(m, "mid_to_day_ban", X(n, d - 1, mid_idx) + X(n, d, day_idx) <= 1)
                 if w_idx is not None:
                     # ── 메인코드 없는 근무(W)에도 `E→` · `N→` 금지를 건다 ──
                     #   `shift_normalizer` 는 shift_gb·default_shift 가 없는 type='근무' 를
@@ -2172,10 +2103,10 @@ def optimize_fallback_lex_hard_first(
                     #   ★ 양쪽이 모두 고정이면 면제한다 — ND/ED/NE 와 같은 규약.
                     if getattr(cfg, "ban_e_to_d", True):
                         if not (fixed.get((n, d - 1)) == eve_idx and fixed.get((n, d)) == w_idx):
-                            m.Add(X(n, d - 1, eve_idx) + X(n, d, w_idx) <= 1)
+                            hard_add(m, "transition_ban", X(n, d - 1, eve_idx) + X(n, d, w_idx) <= 1)
                     if getattr(cfg, "ban_n_to_d", True):
                         if not (fixed.get((n, d - 1)) == night_idx and fixed.get((n, d)) == w_idx):
-                            m.Add(X(n, d - 1, night_idx) + X(n, d, w_idx) <= 1)
+                            hard_add(m, "transition_ban", X(n, d - 1, night_idx) + X(n, d, w_idx) <= 1)
                 # if getattr(cfg, "ban_d_to_n", True):
                 #     xd_prev = X(n, d - 1, day_idx)
                 #     m.Add(xd_prev + xn <= 1)
@@ -2221,7 +2152,7 @@ def optimize_fallback_lex_hard_first(
                         neighbors.append(X(n, d + 1, night_idx))
                     if not neighbors:
                         continue
-                    m.Add(X(n, d, night_idx) <= sum(neighbors))
+                    hard_add(m, "not_one_night", X(n, d, night_idx) <= sum(neighbors))
 
         # 고정 셀의 직전일 N 금지 (하드). 대상을 고르는 축이 **둘**이다.
         #   ① type  : 휴가·공가        → ban_night_before_fixed_off      (기본 True)
@@ -2288,12 +2219,12 @@ def optimize_fallback_lex_hard_first(
                         continue  # 이미 고정된 셀은 변경 불가
                     if _ban_min:
                         _bg = m.NewBoolVar(f"banslack_{n}_{prev_d}")
-                        m.Add(X(n, prev_d, night_idx) == 0).OnlyEnforceIf(_bg.Not())
+                        aux_add(m, "ban_night_before_fixed_off_slack", X(n, prev_d, night_idx) == 0).OnlyEnforceIf(_bg.Not())
                         _ban_slacks.append(_bg)
                         (_ban_slacks_type if _hit_type else _ban_slacks_wanted).append(_bg)
                         _ban_pairs.append((X(n, prev_d, night_idx), _hit_type))
                     else:
-                        m.Add(X(n, prev_d, night_idx) == 0)
+                        hard_add(m, "ban_night_before_fixed_off", X(n, prev_d, night_idx) == 0)
                     _ban_n_prev_cells.add((n, prev_d))
                     _ban_n_cnt += 1
                     if _hit_wanted and not _hit_type:
@@ -2311,9 +2242,9 @@ def optimize_fallback_lex_hard_first(
                     # (휴가·공가 축 상한, 신청 휴무 축 상한) — 축별로 따로 묶는다
                     _le_t, _le_w = ban_slack_le
                     if _ban_slacks_type:
-                        m.Add(sum(_ban_slacks_type) <= int(_le_t))
+                        hard_add(m, "lex_freeze_ban_night", sum(_ban_slacks_type) <= int(_le_t))
                     if _ban_slacks_wanted:
-                        m.Add(sum(_ban_slacks_wanted) <= int(_le_w))
+                        hard_add(m, "lex_freeze_ban_night", sum(_ban_slacks_wanted) <= int(_le_w))
         else:
             # ★ 두 축이 모두 꺼졌으면 **비워 둔다**. 같은 roster_system 으로 다시 build 할 때
             #   지난 회차의 목록이 남아 있으면, 제약이 없는데도 미러가 그 칸을 OFF 로 눕힌다.
@@ -2376,7 +2307,7 @@ def optimize_fallback_lex_hard_first(
                                 },
                             )
                         else:
-                            m.Add(_ow_expr_fb)
+                            hard_add(m, "off_window_requirement", _ow_expr_fb)
         except Exception as e:
             print(f"{logger_prefix} 월초 OFF 윈도우 적용 실패(fallback): err={e}")
 
@@ -2416,7 +2347,7 @@ def optimize_fallback_lex_hard_first(
                         },
                     )
                 else:
-                    m.Add(_mcw_expr_fb)
+                    hard_add(m, "max_consecutive_work", _mcw_expr_fb)
 
         # 동일 시프트 연속 상한 — `AIDE_SAME_SHIFT_HARD_K=3` 이면 D/E/N 각각
         #   **4연속 이상 금지**를 HARD 로 건다(= (K+1) 창의 합 <= K). 기본 OFF(0).
@@ -2464,7 +2395,7 @@ def optimize_fallback_lex_hard_first(
                         _win_ssh = [d0 + t for t in range(_ssh_k + 1)]
                         if any(d in _blk_ssh for d in _win_ssh):
                             continue
-                        m.Add(sum(X(n, d, _s_idx_ssh) for d in _win_ssh) <= _ssh_k)
+                        hard_add(m, "same_shift_hard_k", sum(X(n, d, _s_idx_ssh) for d in _win_ssh) <= _ssh_k)
                         _ssh_cnt += 1
             print(f"{logger_prefix} [SameShiftHard] k={_ssh_k} 제약 {_ssh_cnt}건 (stage={stage})")
 
@@ -2523,14 +2454,14 @@ def optimize_fallback_lex_hard_first(
                         # 양옆이 **둘 다** 고정이면 손댈 칸이 없다 → 걸면 INFEASIBLE 만 난다
                         if (n, d - 1) in fixed and (n, d + 1) in fixed:
                             continue
-                        m.Add(X(n, d - 1, _ih_off) + X(n, d + 1, _ih_off) <= 1)
+                        hard_add(m, "isolated_work", X(n, d - 1, _ih_off) + X(n, d + 1, _ih_off) <= 1)
                         _ih_fx += 1
                         continue
                     # W 는 커버리지 0 근무라 고립근무로 세지 않는다(위 고정 분기와 같은 기준).
                     _ih_mid = (1 - X(n, d, _ih_off)
                                - (X(n, d, _ih_night) if _ih_has_n else 0)
                                - (X(n, d, _ih_w) if _ih_w is not None else 0))
-                    m.Add(X(n, d - 1, _ih_off) + X(n, d + 1, _ih_off) + _ih_mid <= 2)
+                    hard_add(m, "isolated_work", X(n, d - 1, _ih_off) + X(n, d + 1, _ih_off) + _ih_mid <= 2)
                     _ih_cnt += 1
             print(
                 f"{logger_prefix} [IsolatedWorkHard] 제약 {_ih_cnt}건 "
@@ -2573,11 +2504,11 @@ def optimize_fallback_lex_hard_first(
                                 },
                             )
                         else:
-                            m.Add(_cn_edge_expr_fb)
+                            hard_add(m, "consecutive_night_cap", _cn_edge_expr_fb)
             for d0 in range(T0, T1 - L + 1):
                 sum_n = sum(X(n, d0 + t, night_idx) for t in range(L + 1))
                 exc = m.NewIntVar(0, L + 1, f"cnight_exc_{n}_{d0}")
-                m.Add(exc >= sum_n - L)
+                aux_add(m, "cnight_excess", exc >= sum_n - L)
                 # 연속 N 상한 L 하드: three_seq_nig False면 L=2(3N 금지), True면 L=3(3N 허용)
                 _cn_expr_fb = (sum_n <= L)
                 if _assume_registry_fb is not None and _add_hard_fb is not None:
@@ -2600,7 +2531,7 @@ def optimize_fallback_lex_hard_first(
                         },
                     )
                 else:
-                    m.Add(_cn_expr_fb)
+                    hard_add(m, "consecutive_night_cap", _cn_expr_fb)
                 safety["cnight_excess"].append(exc)
 
         # 월 Night 상한 초과량 — MUS 추출용 assumption literal로 wrap
@@ -2629,7 +2560,7 @@ def optimize_fallback_lex_hard_first(
                     },
                 )
             else:
-                m.Add(_fb_mn_expr)
+                hard_add(m, "max_night", _fb_mn_expr)
 
         # N 전담: D/E 하드 금지 (메인 모델과 동일)
         for n, nu in enumerate(roster_system.nurses):
@@ -2663,7 +2594,7 @@ def optimize_fallback_lex_hard_first(
                             },
                         )
                     else:
-                        m.Add(_allow_d_expr)
+                        hard_add(m, "allowed_shift_mask", _allow_d_expr)
                 if "E" not in allowed:
                     _allow_e_expr = (X(n, d, eve_idx) == 0)
                     if _assume_registry_fb is not None and _add_hard_fb is not None:
@@ -2686,7 +2617,7 @@ def optimize_fallback_lex_hard_first(
                             },
                         )
                     else:
-                        m.Add(_allow_e_expr)
+                        hard_add(m, "allowed_shift_mask", _allow_e_expr)
                 if "N" not in allowed:
                     _allow_n_expr = (X(n, d, night_idx) == 0)
                     if _assume_registry_fb is not None and _add_hard_fb is not None:
@@ -2709,7 +2640,7 @@ def optimize_fallback_lex_hard_first(
                             },
                         )
                     else:
-                        m.Add(_allow_n_expr)
+                        hard_add(m, "allowed_shift_mask", _allow_n_expr)
                 if mid_idx is not None and "M" not in allowed:
                     _allow_m_expr = (X(n, d, mid_idx) == 0)
                     if _assume_registry_fb is not None and _add_hard_fb is not None:
@@ -2732,7 +2663,7 @@ def optimize_fallback_lex_hard_first(
                             },
                         )
                     else:
-                        m.Add(_allow_m_expr)
+                        hard_add(m, "allowed_shift_mask", _allow_m_expr)
 
         # 야간전담의 D/E 금지 위반(OR: D or E) — N전담은 하드로 처리하므로 소프트 미사용
         # for n, nu in enumerate(roster_system.nurses):
@@ -2756,7 +2687,7 @@ def optimize_fallback_lex_hard_first(
                     d0, d1 = w * 7, min(w * 7 + 7, D)
                     offs = sum(X(n, d, off_idx) for d in range(d0, d1) if join[n] <= d <= leave[n])
                     miss = m.NewIntVar(0, 2, f"week_miss_{n}_{w}")
-                    m.Add(miss >= 2 - offs)
+                    aux_add(m, "week_off_missing", miss >= 2 - offs)
                     safety["week_off_missing"].append(miss)
 
         # 회복 규칙: N3→2O, N2→2O 부족량
@@ -2770,7 +2701,7 @@ def optimize_fallback_lex_hard_first(
                 _3n_rem = max(0, 2 - n_offs_after_3n) if n_tail >= 3 else 2
                 if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_3n and (T0 + 1) not in _blocked_3n:
                     end_prev_block = m.NewBoolVar(f"end_3n_prev_soft_{n}")
-                    m.Add(end_prev_block == X(n, T0, night_idx).Not())
+                    aux_add(m, "night_block_end", end_prev_block == X(n, T0, night_idx).Not())
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0, T0 + 1)):
                         if _3n_rem >= 2:
                             _co_3n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2)
@@ -2790,9 +2721,9 @@ def optimize_fallback_lex_hard_first(
                                         "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
                                     },
                                 )
-                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                                hard_add(m, "carryover_boundary", _co_3n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
                             else:
-                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([end_prev_block])
+                                hard_add(m, "carryover_boundary", _co_3n_expr_fb).OnlyEnforceIf([end_prev_block])
                         else:
                             # _3n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
                             _co_3n_expr_fb = (X(n, T0, off_idx) >= 1)
@@ -2812,9 +2743,9 @@ def optimize_fallback_lex_hard_first(
                                         "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                     },
                                 )
-                                m.Add(_co_3n_expr_fb).OnlyEnforceIf([_co_lit_fb])
+                                hard_add(m, "carryover_boundary", _co_3n_expr_fb).OnlyEnforceIf([_co_lit_fb])
                             else:
-                                m.Add(_co_3n_expr_fb)
+                                hard_add(m, "carryover_boundary", _co_3n_expr_fb)
                     print(f"{logger_prefix} [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                           f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
                 elif n_tail >= 3 and _3n_rem == 0:
@@ -2839,9 +2770,9 @@ def optimize_fallback_lex_hard_first(
                                     "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                 },
                             )
-                            m.Add(_expr_3n_tail2_fb).OnlyEnforceIf([X(n, T0, night_idx), _co_lit_fb])
+                            hard_add(m, "carryover_boundary", _expr_3n_tail2_fb).OnlyEnforceIf([X(n, T0, night_idx), _co_lit_fb])
                         else:
-                            m.Add(_expr_3n_tail2_fb).OnlyEnforceIf([X(n, T0, night_idx)])
+                            hard_add(m, "carryover_boundary", _expr_3n_tail2_fb).OnlyEnforceIf([X(n, T0, night_idx)])
                 if n_tail == 1 and n_offs_after_3n < 2 and (T0 + 3) <= T1:
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0 + 2, T0 + 3)):
                         _expr_3n_tail1_fb = (X(n, T0 + 2, off_idx) + X(n, T0 + 3, off_idx) == 2)
@@ -2861,9 +2792,9 @@ def optimize_fallback_lex_hard_first(
                                     "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                 },
                             )
-                            m.Add(_expr_3n_tail1_fb).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx), _co_lit_fb])
+                            hard_add(m, "carryover_boundary", _expr_3n_tail1_fb).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx), _co_lit_fb])
                         else:
-                            m.Add(_expr_3n_tail1_fb).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx)])
+                            hard_add(m, "carryover_boundary", _expr_3n_tail1_fb).OnlyEnforceIf([X(n, T0, night_idx), X(n, T0 + 1, night_idx)])
                 for d in range(T0 + 2, T1 - 1):
                     if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (d + 1, d + 2)):
                         # 회복 OFF 슬롯에 non-OFF fixed_wanted → 3N 블록 자체를 금지
@@ -2888,12 +2819,12 @@ def optimize_fallback_lex_hard_first(
                                 },
                             )
                         else:
-                            m.Add(_guard_3n_expr_fb)
+                            hard_add(m, "carryover_boundary", _guard_3n_expr_fb)
                         continue
                     xn0 = X(n, d, night_idx)
                     xn1 = X(n, d - 1, night_idx)
                     xn2 = X(n, d - 2, night_idx)
-                    m.Add(
+                    hard_add(m, "recovery_3n2off",
                         X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
                     ).OnlyEnforceIf([xn0, xn1, xn2])
         if cfg.two_offs_after_two_nig:
@@ -2907,7 +2838,7 @@ def optimize_fallback_lex_hard_first(
                 _2n_rem = max(0, 2 - n_offs_after) if n_tail >= 2 else 2
                 if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_2n and (T0 + 1) not in _blocked_2n:
                     end_prev_block = m.NewBoolVar(f"end_2n_prev_soft_{n}")
-                    m.Add(end_prev_block == X(n, T0, night_idx).Not())
+                    aux_add(m, "night_block_end", end_prev_block == X(n, T0, night_idx).Not())
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0, T0 + 1)):
                         if _2n_rem >= 2:
                             _co_2n_expr_fb = (X(n, T0, off_idx) + X(n, T0 + 1, off_idx) == 2)
@@ -2927,9 +2858,9 @@ def optimize_fallback_lex_hard_first(
                                         "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
                                     },
                                 )
-                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
+                                hard_add(m, "carryover_boundary", _co_2n_expr_fb).OnlyEnforceIf([end_prev_block, _co_lit_fb])
                             else:
-                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([end_prev_block])
+                                hard_add(m, "carryover_boundary", _co_2n_expr_fb).OnlyEnforceIf([end_prev_block])
                         else:
                             # _2n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
                             _co_2n_expr_fb = (X(n, T0, off_idx) >= 1)
@@ -2949,9 +2880,9 @@ def optimize_fallback_lex_hard_first(
                                         "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                     },
                                 )
-                                m.Add(_co_2n_expr_fb).OnlyEnforceIf([_co_lit_fb])
+                                hard_add(m, "carryover_boundary", _co_2n_expr_fb).OnlyEnforceIf([_co_lit_fb])
                             else:
-                                m.Add(_co_2n_expr_fb)
+                                hard_add(m, "carryover_boundary", _co_2n_expr_fb)
                     print(f"{logger_prefix} [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                           f"offs_after={n_offs_after}, rem={_2n_rem}")
                 elif n_tail >= 2 and _2n_rem == 0:
@@ -2959,7 +2890,7 @@ def optimize_fallback_lex_hard_first(
                           f"offs_after={n_offs_after} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
                 if n_tail >= 1 and n_offs_after < 2 and (T0 + 2) <= T1:
                     end_block_b0 = m.NewBoolVar(f"end_2n_soft_b0_{n}")
-                    m.Add(end_block_b0 == X(n, T0 + 1, night_idx).Not())
+                    aux_add(m, "night_block_end", end_block_b0 == X(n, T0 + 1, night_idx).Not())
                     if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (T0 + 1, T0 + 2)):
                         _expr_2n_b0_fb = (X(n, T0 + 1, off_idx) + X(n, T0 + 2, off_idx) == 2)
                         if _assume_registry_fb is not None and _add_hard_fb is not None:
@@ -2978,24 +2909,24 @@ def optimize_fallback_lex_hard_first(
                                     "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                 },
                             )
-                            m.Add(_expr_2n_b0_fb).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0, _co_lit_fb])
+                            hard_add(m, "carryover_boundary", _expr_2n_b0_fb).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0, _co_lit_fb])
                         else:
-                            m.Add(_expr_2n_b0_fb).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
+                            hard_add(m, "carryover_boundary", _expr_2n_b0_fb).OnlyEnforceIf([X(n, T0, night_idx), end_block_b0])
                 for d in range(T0 + 1, T1 - 1):
                     if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) not in (off_idx, night_idx, None) for d2 in (d + 1, d + 2)):
                         # 회복 OFF 슬롯에 non-OFF fixed_wanted → 이 위치에서 2N 블록 종료 금지
                         xn_prev_fw = X(n, d - 1, night_idx)
                         xn_curr_fw = X(n, d, night_idx)
                         end_block_fw = m.NewBoolVar(f"end_2n_fw_{n}_{d}")
-                        m.Add(end_block_fw == X(n, d + 1, night_idx).Not())
-                        m.Add(xn_prev_fw + xn_curr_fw + end_block_fw <= 2)
+                        aux_add(m, "night_block_end", end_block_fw == X(n, d + 1, night_idx).Not())
+                        hard_add(m, "recovery_2n2off", xn_prev_fw + xn_curr_fw + end_block_fw <= 2)
                         continue
                     xn_prev = X(n, d - 1, night_idx)
                     xn_curr = X(n, d, night_idx)
                     xn_next = X(n, d + 1, night_idx)
                     end_block = m.NewBoolVar(f"end_2n_hard_{n}_{d}")
-                    m.Add(end_block == xn_next.Not())
-                    m.Add(
+                    aux_add(m, "night_block_end", end_block == xn_next.Not())
+                    hard_add(m, "recovery_2n2off",
                         X(n, d + 1, off_idx) + X(n, d + 2, off_idx) == 2
                     ).OnlyEnforceIf([xn_prev, xn_curr, end_block])
 
@@ -3054,11 +2985,11 @@ def optimize_fallback_lex_hard_first(
                 if _n2n_slack_on:
                     _g = m.NewBoolVar(f"n2nslack_{len(_gap_slacks)}")
                     _gap_slacks.append(_g)
-                    m.Add(_x == 0).OnlyEnforceIf(list(_cond or []) + [_g.Not()])
+                    aux_add(m, "n2n_min_gap_slack", _x == 0).OnlyEnforceIf(list(_cond or []) + [_g.Not()])
                 elif _cond:
-                    m.Add(_x == 0).OnlyEnforceIf(list(_cond))
+                    hard_add(m, "n2n_min_gap", _x == 0).OnlyEnforceIf(list(_cond))
                 else:
-                    m.Add(_x == 0)
+                    hard_add(m, "n2n_min_gap", _x == 0)
             for n in range(N):
                 # ★ N전담(N-only)은 야간이 강제라 간격 하한을 걸면 즉시 INFEASIBLE 이다.
                 #   `_prep_n2n` 이 같은 이유로 제외하는 것과 같은 규약.
@@ -3109,7 +3040,7 @@ def optimize_fallback_lex_hard_first(
             if _gap_slacks:
                 m._n2n_gap_slacks = _gap_slacks      # type: ignore[attr-defined]
                 if n2n_slack_le is not None:
-                    m.Add(sum(_gap_slacks) <= int(n2n_slack_le))
+                    hard_add(m, "lex_freeze_n2n_gap", sum(_gap_slacks) <= int(n2n_slack_le))
             if stage == 2:
                 print(f"{logger_prefix} [N2N-MinGap] gap>={_n2n_min_gap} 하드 {_mg_cnt}건 "
                       f"+ 월경계 {_mg_cross}건 (stage1 제외 — 커버리지 우선"
@@ -3121,7 +3052,7 @@ def optimize_fallback_lex_hard_first(
                 T0, T1 = join[n], leave[n]
                 for d in range(T0, T1 - 2):
                     v1 = m.NewIntVar(0, 1, f"nod_{n}_{d}")
-                    m.Add(
+                    aux_add(m, "pattern_nod",
                         v1
                         >= X(n, d, night_idx)
                         + X(n, d + 1, off_idx)
@@ -3130,7 +3061,7 @@ def optimize_fallback_lex_hard_first(
                     )
                     safety["pattern_nod"].append(v1)
                     v2 = m.NewIntVar(0, 1, f"noe_{n}_{d}")
-                    m.Add(
+                    aux_add(m, "pattern_noe",
                         v2
                         >= X(n, d, night_idx)
                         + X(n, d + 1, off_idx)
@@ -3139,7 +3070,7 @@ def optimize_fallback_lex_hard_first(
                     )
                     safety["pattern_noe"].append(v2)
                     v3 = m.NewIntVar(0, 1, f"eod_{n}_{d}")
-                    m.Add(
+                    aux_add(m, "pattern_eod",
                         v3
                         >= X(n, d, eve_idx)
                         + X(n, d + 1, off_idx)
@@ -3286,8 +3217,8 @@ def optimize_fallback_lex_hard_first(
                     )
                     slack_short = m.NewIntVar(0, D, f"off_quota_short_{n}")
                     slack_excess = m.NewIntVar(0, D, f"off_quota_excess_{n}")
-                    m.Add(target_o - assigned_o <= slack_short)
-                    m.Add(assigned_o - target_o <= slack_excess)
+                    aux_add(m, "off_quota", target_o - assigned_o <= slack_short)
+                    aux_add(m, "off_quota", assigned_o - target_o <= slack_excess)
                     safety["off_quota_short"].append(slack_short)
                     # [OffLevelLock] off_first=False(=근무 oversupply 의도) 실효화:
                     # OFF 상한(target 초과=잉여)을 floor와 대칭으로 가중한다. 기존엔 excess만
@@ -3306,7 +3237,7 @@ def optimize_fallback_lex_hard_first(
                     )
                     if _oqx_w > 1 and not bool(getattr(cfg, "off_first", False)):
                         _ex_scaled = m.NewIntVar(0, D * _oqx_w, f"off_quota_excess_cost_{n}")
-                        m.Add(_ex_scaled == slack_excess * _oqx_w)
+                        aux_add(m, "off_quota", _ex_scaled == slack_excess * _oqx_w)
                         safety["off_quota_excess"].append(_ex_scaled)
                     else:
                         safety["off_quota_excess"].append(slack_excess)
@@ -3401,19 +3332,19 @@ def optimize_fallback_lex_hard_first(
                         min_off_lower_slack = m.NewIntVar(
                             0, _lower_slack_max, f"min_off_lower_slack_{n}"
                         )
-                        m.Add(offs + min_off_lower_slack >= hard_lower)
+                        hard_add(m, "min_off", offs + min_off_lower_slack >= hard_lower)
                         _lower_weighted = m.NewIntVar(
                             0,
                             _lower_slack_max * _lower_slack_weight,
                             f"min_off_lower_slack_weighted_{n}",
                         )
-                        m.Add(_lower_weighted == min_off_lower_slack * _lower_slack_weight)
+                        aux_add(m, "min_off_lower_slack", _lower_weighted == min_off_lower_slack * _lower_slack_weight)
                         safety["off_cap_bounded_slack"].append(_lower_weighted)
                         m._off_slack_lower_by_n[n] = min_off_lower_slack  # type: ignore[attr-defined]
                     else:
-                        m.Add(offs >= hard_lower)
+                        hard_add(m, "min_off", offs >= hard_lower)
                     miss = m.NewIntVar(0, D, f"min_off_miss_{n}")
-                    m.Add(miss >= min_off_required - offs)
+                    aux_add(m, "min_off_missing", miss >= min_off_required - offs)
                     min_off_miss_by_n[n] = miss
                     safety["min_off_missing"].append(miss)
                 if extra_allowed >= 0:
@@ -3498,9 +3429,9 @@ def optimize_fallback_lex_hard_first(
                             _slack_max * _slack_weight,
                             f"off_cap_slack_weighted_{n}",
                         )
-                        m.Add(weighted == cap_slack * _slack_weight)
+                        aux_add(m, "off_cap_slack", weighted == cap_slack * _slack_weight)
                         safety["off_cap_bounded_slack"].append(weighted)
-                        m.Add(nonvac_offs <= total_cap_effective + cap_slack)
+                        hard_add(m, "off_cap", nonvac_offs <= total_cap_effective + cap_slack)
                         m._off_slack_upper_by_n[n] = cap_slack  # type: ignore[attr-defined]
                     else:
                         # OFF cap hard branch — MUS 추출용 assumption literal로 wrap
@@ -3523,7 +3454,7 @@ def optimize_fallback_lex_hard_first(
                                 },
                             )
                         else:
-                            m.Add(_fb_oc_expr)
+                            hard_add(m, "off_cap", _fb_oc_expr)
                     if stage == 3:
                         print(
                             f"{logger_prefix} [OffCap][total] n={n}, id={nurse_id}, name={nurse_name}, "
@@ -3672,9 +3603,9 @@ def optimize_fallback_lex_hard_first(
             )
         elif stage == 2:
             if coverage_eq is not None:
-                m.Add(sum(short_terms) == coverage_eq)
+                hard_add(m, "lex_freeze_coverage", sum(short_terms) == coverage_eq)
             if over_le is not None:
-                m.Add(sum(over_terms) <= over_le)
+                hard_add(m, "lex_freeze_coverage", sum(over_terms) <= over_le)
             safety_sum = []
             for k, arr in safety.items():
                 safety_sum.extend(arr)
@@ -3733,9 +3664,9 @@ def optimize_fallback_lex_hard_first(
                           f"{type(_s6_exc).__name__}: {_s6_exc}")
         else:
             if coverage_eq is not None:
-                m.Add(sum(short_terms) == coverage_eq)
+                hard_add(m, "lex_freeze_coverage", sum(short_terms) == coverage_eq)
             if over_le is not None:
-                m.Add(sum(over_terms) <= over_le)
+                hard_add(m, "lex_freeze_coverage", sum(over_terms) <= over_le)
             # ── stage3 INFEASIBLE 원인 추적 (2026-09-08) — 게이트는 걷어냈고 결론만 남긴다
             #   증상: stage3 가 11곳 중 6곳에서 INFEASIBLE. 그때 stage2 해가 그대로
             #     커밋되므로 **선호·공정성이 통째로 버려지는데 오류로는 안 보인다.**
@@ -3757,7 +3688,7 @@ def optimize_fallback_lex_hard_first(
             if stage2_zero_locks:
                 for k, arr in stage2_zero_locks.items():
                     for v in arr:
-                        m.Add(v == 0)
+                        hard_add(m, "lex_freeze_safety", v == 0)
             obj = build_fallback_stage3_objective_terms(
                 m=m,
                 roster_system=roster_system,
@@ -3782,26 +3713,26 @@ def optimize_fallback_lex_hard_first(
                     _eq_vars = []
                     for _eq_d, _eq_assigned, _eq_need in _eq_entries:
                         _eq_v = m.NewIntVar(0, N, f"fb_dcov_{_eq_code}_{_eq_d}")
-                        m.Add(_eq_v == _eq_assigned)
+                        aux_add(m, "daily_coverage_equalize", _eq_v == _eq_assigned)
                         _eq_vars.append(_eq_v)
                         # min 초과분 패널티: min에 가깝게 유도
                         if _eq_need > 0:
                             _eq_excess = m.NewIntVar(0, N, f"fb_dcov_excess_{_eq_code}_{_eq_d}")
-                            m.Add(_eq_excess >= _eq_v - _eq_need)
+                            aux_add(m, "daily_coverage_equalize", _eq_excess >= _eq_v - _eq_need)
                             obj.append(-80 * _eq_excess)
                     # 글로벌 range: 블록 쏠림 방지
                     _eq_max = m.NewIntVar(0, N, f"fb_dcov_max_{_eq_code}")
                     _eq_min = m.NewIntVar(0, N, f"fb_dcov_min_{_eq_code}")
-                    m.AddMaxEquality(_eq_max, _eq_vars)
-                    m.AddMinEquality(_eq_min, _eq_vars)
+                    aux_call(m, "daily_coverage_equalize", "AddMaxEquality", _eq_max, _eq_vars)
+                    aux_call(m, "daily_coverage_equalize", "AddMinEquality", _eq_min, _eq_vars)
                     _eq_range = m.NewIntVar(0, N, f"fb_dcov_range_{_eq_code}")
-                    m.Add(_eq_range == _eq_max - _eq_min)
+                    aux_add(m, "daily_coverage_equalize", _eq_range == _eq_max - _eq_min)
                     obj.append(-150 * _eq_range)
                     # 인접일 평활화: 급변 방지
                     for _i in range(1, len(_eq_vars)):
                         _adj = m.NewIntVar(0, N, f"fb_dcov_adj_{_eq_code}_{_i}")
-                        m.Add(_adj >= _eq_vars[_i] - _eq_vars[_i - 1])
-                        m.Add(_adj >= _eq_vars[_i - 1] - _eq_vars[_i])
+                        aux_add(m, "daily_coverage_equalize", _adj >= _eq_vars[_i] - _eq_vars[_i - 1])
+                        aux_add(m, "daily_coverage_equalize", _adj >= _eq_vars[_i - 1] - _eq_vars[_i])
                         obj.append(-60 * _adj)
             if _fb_max_cov_off_equalize_terms:
                 obj.extend(_fb_max_cov_off_equalize_terms)
@@ -4268,11 +4199,11 @@ def optimize_fallback_lex_hard_first(
             for d in iter_nurse_days(n, join, leave, blocked_by_nurse):
                 for s in range(S):
                     m1.AddHint(X1(n, d, s), int(s1.Value(X1(n, d, s))))
-        m1.Add(sum(short1) == best_short)
-        m1.Add(sum(over1) <= best_over)
+        hard_add(m1, "lex_freeze_coverage", sum(short1) == best_short)
+        hard_add(m1, "lex_freeze_coverage", sum(over1) <= best_over)
         _cs_ban = list(getattr(m1, "_monthly_cap_slacks", []) or [])
         if _cs_ban:
-            m1.Add(sum(_cs_ban) == 0)
+            hard_add(m1, "lex_freeze_monthly_cap", sum(_cs_ban) == 0)
         _bt = list(getattr(m1, "_ban_n_slacks_type", []) or [])
         _bw = list(getattr(m1, "_ban_n_slacks_wanted", []) or [])
         _ban_before = int(sum(s1.Value(v) for v in _bs1))
@@ -4434,7 +4365,7 @@ def optimize_fallback_lex_hard_first(
             #   전체 최소가 아니다(Codex 지적). 자유 풀이가 OPTIMAL 일 때만 '가능한 최소' 로 안내한다.
             roster_system._n2n_gap_proven = (                   # type: ignore[attr-defined]
                 _stA == cp_model.OPTIMAL and not _sA.parameters.fix_variables_to_their_hinted_value)
-            m2.Add(sum(_g2) <= _n2n_frozen)
+            hard_add(m2, "lex_freeze_n2n_gap", sum(_g2) <= _n2n_frozen)
             m2.Minimize(_s2_obj_expr)       # stage2 본 목적으로 되돌린다(proto 복사 안 함)
             roster_system._n2n_gap_violations = _n2n_frozen   # type: ignore[attr-defined]
         if _s2_bestn > 1:
@@ -4651,15 +4582,15 @@ def optimize_fallback_lex_hard_first(
                             if _ub4 < _w_min:
                                 _s4_skip += 1
                                 continue
-                            m2.Add(sum(_arr4) <= sum(int(s2.Value(_v4)) for _v4 in _arr4))
+                            hard_add(m2, "lex_freeze_safety", sum(_arr4) <= sum(int(s2.Value(_v4)) for _v4 in _arr4))
                             _s4_n += 1
                         # ★ 작은 항목은 여전히 총합으로 묶어야 한다 — 안 그러면 무제한이 된다.
                         #   (현행은 항목별/총합이 배타였는데, 하이브리드에서는 **둘 다** 건다.)
-                        m2.Add(sum(flat_safety) <= best_sum2)
+                        hard_add(m2, "lex_freeze_safety", sum(flat_safety) <= best_sum2)
                         print(f"{logger_prefix} [S4-1] stage2 safety 항목별 동결 {_s4_n}개 "
                               f"(가중치<{_w_min} {_s4_skip}개는 총합 동결에 위임)")
                     else:
-                        m2.Add(sum(flat_safety) <= best_sum2)
+                        hard_add(m2, "lex_freeze_safety", sum(flat_safety) <= best_sum2)
                     use_mid_h1 = bool(getattr(cfg, "use_mid", False))
                     # ── 공통 준비: 순서와 무관하게 한 번만 계산한다 ──
                     #   원래는 OFF range 패스 루프 안에서 채워졌고 N range·D/E 가 그걸
@@ -4813,9 +4744,9 @@ def optimize_fallback_lex_hard_first(
                         _mx = m2.NewIntVar(0, D, "lex_max_off")
                         _mn = m2.NewIntVar(0, D, "lex_min_off")
                         for _c in _cnts:
-                            m2.Add(_c <= _mx)
-                            m2.Add(_c >= _mn)
-                        return (_mx - _mn, lambda v: m2.Add(_mx - _mn <= v), 2.0, 0.2)
+                            aux_add(m2, "lex_off_range", _c <= _mx)
+                            aux_add(m2, "lex_off_range", _c >= _mn)
+                        return (_mx - _mn, lambda v: hard_add(m2, "lex_freeze_pass", _mx - _mn <= v), 2.0, 0.2)
 
                     def _prep_grade():
                         # 총량은 그대로 두고 날짜만 옮겨 미달 칸을 줄인다. 목적함수에 항을
@@ -4830,14 +4761,14 @@ def optimize_fallback_lex_hard_first(
                                 if join[_n] <= _gd <= leave[_n]
                             )
                             _sh = m2.NewIntVar(0, int(_gt), f"lex_g_short_d{_gd}_s{_gs}")
-                            m2.Add(_sh >= int(_gt) - _cum)
+                            aux_add(m2, "lex_grade_short", _sh >= int(_gt) - _cum)
                             _shorts.append(_sh)
 
                         def _freeze_grade(v):
                             # stage3 가 이 값을 상한으로 물려받아 재배치 결과를 지킨다.
                             nonlocal lex_grade_short
                             lex_grade_short = int(v)
-                            m2.Add(sum(_shorts) <= int(v))
+                            hard_add(m2, "lex_freeze_pass", sum(_shorts) <= int(v))
 
                         # ★ 설정된 등급이 전부 반영됐는지는 이 개수로만 사후 확인된다.
                         #   (일수 x 값>0 인 (등급,시프트) 쌍 수) 와 일치해야 한다.
@@ -4871,9 +4802,9 @@ def optimize_fallback_lex_hard_first(
                         _mx = m2.NewIntVar(0, D, "lex_max_n")
                         _mn = m2.NewIntVar(0, D, "lex_min_n")
                         for _c in _cnts:
-                            m2.Add(_c <= _mx)
-                            m2.Add(_c >= _mn)
-                        return (_mx - _mn, lambda v: m2.Add(_mx - _mn <= v), 2.0, 0.2)
+                            aux_add(m2, "lex_n_range", _c <= _mx)
+                            aux_add(m2, "lex_n_range", _c >= _mn)
+                        return (_mx - _mn, lambda v: hard_add(m2, "lex_freeze_pass", _mx - _mn <= v), 2.0, 0.2)
 
                     def _prep_d_range():
                         """D 개수 균등(max-min) — `n_range` 의 D 판(2026-09-14).
@@ -4916,9 +4847,9 @@ def optimize_fallback_lex_hard_first(
                         _mx = m2.NewIntVar(0, D, "lex_max_d")
                         _mn = m2.NewIntVar(0, D, "lex_min_d")
                         for _c in _cnts:
-                            m2.Add(_c <= _mx)
-                            m2.Add(_c >= _mn)
-                        return (_mx - _mn, lambda v: m2.Add(_mx - _mn <= v), 2.0, 0.2)
+                            aux_add(m2, "lex_d_range", _c <= _mx)
+                            aux_add(m2, "lex_d_range", _c >= _mn)
+                        return (_mx - _mn, lambda v: hard_add(m2, "lex_freeze_pass", _mx - _mn <= v), 2.0, 0.2)
 
                     def _prep_n2n():
                         # 야간 블록 간 간격(target 미만)을 벌린다. soft 항은 KLD 에 눌려
@@ -4952,12 +4883,12 @@ def optimize_fallback_lex_hard_first(
                                     if any(_b not in _aset for _b in _btw):
                                         continue
                                     _pair = m2.NewBoolVar(f"lex_n2n_{_n}_{_d1}_{_d2}")
-                                    m2.Add(_pair <= X2(_n, _d1, night_idx_h1))
-                                    m2.Add(_pair <= X2(_n, _d2, night_idx_h1))
+                                    aux_add(m2, "lex_n2n_pair", _pair <= X2(_n, _d1, night_idx_h1))
+                                    aux_add(m2, "lex_n2n_pair", _pair <= X2(_n, _d2, night_idx_h1))
                                     for _b in _btw:
-                                        m2.Add(_pair <= 1 - X2(_n, _b, night_idx_h1))
+                                        aux_add(m2, "lex_n2n_pair", _pair <= 1 - X2(_n, _b, night_idx_h1))
                                     _btw_sum = sum(X2(_n, _b, night_idx_h1) for _b in _btw)
-                                    m2.Add(
+                                    aux_add(m2, "lex_n2n_pair",
                                         _pair >= X2(_n, _d1, night_idx_h1)
                                         + X2(_n, _d2, night_idx_h1) - 1 - _btw_sum
                                     )
@@ -4989,11 +4920,11 @@ def optimize_fallback_lex_hard_first(
                                     break              # 이후는 전부 무벌점
                                 _before = [_b for _b in _days_sorted if _b < _d]
                                 _pair_x = m2.NewBoolVar(f"lex_n2n_cross_{_cn}_{_d}")
-                                m2.Add(_pair_x <= X2(_cn, _d, night_idx_h1))
+                                aux_add(m2, "lex_n2n_pair", _pair_x <= X2(_cn, _d, night_idx_h1))
                                 for _b in _before:
-                                    m2.Add(_pair_x <= 1 - X2(_cn, _b, night_idx_h1))
+                                    aux_add(m2, "lex_n2n_pair", _pair_x <= 1 - X2(_cn, _b, night_idx_h1))
                                 _bsum = sum(X2(_cn, _b, night_idx_h1) for _b in _before)
-                                m2.Add(_pair_x >= X2(_cn, _d, night_idx_h1) - _bsum)
+                                aux_add(m2, "lex_n2n_pair", _pair_x >= X2(_cn, _d, night_idx_h1) - _bsum)
                                 _terms.append((_tgt - _gap_x) * _pair_x)
 
                         if _os_lex.environ.get("AIDE_N2N_CROSS_FIX") == "1":
@@ -5015,7 +4946,7 @@ def optimize_fallback_lex_hard_first(
                             return None
                         _frac = float(_os_lex.getenv("N2N_LEX_TIME_FRAC", "0.5"))
 
-                        return (sum(_terms), lambda v: m2.Add(sum(_terms) <= v), 8.0, _frac)
+                        return (sum(_terms), lambda v: hard_add(m2, "lex_freeze_pass", sum(_terms) <= v), 8.0, _frac)
 
                     def _prep_de():
                         # D/E per-nurse 균등(X축). tol 초과분만 벌해 "완전동일" 아님(밴드).
@@ -5063,10 +4994,10 @@ def optimize_fallback_lex_hard_first(
                             _td = sum(X2(_n, _d, _di) for _d in _ad)
                             _te = sum(X2(_n, _d, _ei) for _d in _ad)
                             _df = m2.NewIntVar(0, D, f"lex_de_diff_{_n}")
-                            m2.Add(_df >= _td - _te)
-                            m2.Add(_df >= _te - _td)
+                            aux_add(m2, "lex_de_balance", _df >= _td - _te)
+                            aux_add(m2, "lex_de_balance", _df >= _te - _td)
                             _ex = m2.NewIntVar(0, D, f"lex_de_exc_{_n}")
-                            m2.Add(_ex >= _df - _tol)
+                            aux_add(m2, "lex_de_balance", _ex >= _df - _tol)
                             _excs.append(_ex)
                         # ★★ 제외 인원을 찍는다 — 이 집합이 조용히 커지면 대상이 사라져
                         #   목적값이 0 이 되고 "완벽" 해 보인다(n_range 와 같은 함정의 거울상).
@@ -5075,7 +5006,7 @@ def optimize_fallback_lex_hard_first(
                                   f"{', '.join(str(x) for x in _de_skip)} / 대상 {len(_excs)}명")
                         if not _excs:
                             return None
-                        return (sum(_excs), lambda v: m2.Add(sum(_excs) <= v), 5.0, 0.3)
+                        return (sum(_excs), lambda v: hard_add(m2, "lex_freeze_pass", sum(_excs) <= v), 5.0, 0.3)
 
                     def _prep_iso_off():
                         """고립 OFF(앞뒤가 근무인 하루짜리 OFF) 최소화.
@@ -5090,7 +5021,7 @@ def optimize_fallback_lex_hard_first(
                         _sl = list(safety2.get("isolated_off_slack") or [])
                         if not _sl:
                             return None
-                        return (sum(_sl), lambda v: m2.Add(sum(_sl) <= v), 3.0, 0.3)
+                        return (sum(_sl), lambda v: hard_add(m2, "lex_freeze_pass", sum(_sl) <= v), 3.0, 0.3)
 
                     def _prep_team():
                         """팀 최소 커버 부족(slack) 최소화.
@@ -5105,7 +5036,7 @@ def optimize_fallback_lex_hard_first(
                         if not _tm:
                             return None
                         print(f"{logger_prefix} [TeamSpec] slacks={len(_tm)}")
-                        return (sum(_tm), lambda v: m2.Add(sum(_tm) <= v), 3.0, 0.3)
+                        return (sum(_tm), lambda v: hard_add(m2, "lex_freeze_pass", sum(_tm) <= v), 3.0, 0.3)
 
                     def _prep_off_quota():
                         """개인별 OFF 가 설정값(target)을 넘은 초과분 최소화.
@@ -5124,7 +5055,7 @@ def optimize_fallback_lex_hard_first(
                         if not _ex:
                             return None
                         print(f"{logger_prefix} [OffQuotaSpec] slacks={len(_ex)}")
-                        return (sum(_ex), lambda v: m2.Add(sum(_ex) <= v), 3.0, 0.3)
+                        return (sum(_ex), lambda v: hard_add(m2, "lex_freeze_pass", sum(_ex) <= v), 3.0, 0.3)
 
                     def _prep_pref():
                         """소프트 선호 반영 — 사용자가 낸 요청·기피를 lex 패스로 다룬다.
@@ -5169,7 +5100,7 @@ def optimize_fallback_lex_hard_first(
                         if not _terms:
                             return None
                         print(f"{logger_prefix} [PrefSpec] cells={len(_terms)}")
-                        return (sum(_terms), lambda v: m2.Add(sum(_terms) <= v), 3.0, 0.2)
+                        return (sum(_terms), lambda v: hard_add(m2, "lex_freeze_pass", sum(_terms) <= v), 3.0, 0.2)
 
                     # ── 순서는 데이터다 ──
                     #   lex 는 사전식이라 앞 순위가 절대 우선이다. 즉 이 순서가 곧
@@ -5192,7 +5123,7 @@ def optimize_fallback_lex_hard_first(
                         _neg = -sum(_terms)
                         # tl2 비율로 환산해 tl3 와 같은 시간을 준다(_budget = tl2 * _frac).
                         _frac8 = float(tl3) / float(tl2) if tl2 else 0.5
-                        return (_neg, lambda v: m2.Add(_neg <= v), float(tl3), _frac8)
+                        return (_neg, lambda v: hard_add(m2, "lex_freeze_pass", _neg <= v), float(tl3), _frac8)
 
                     def _prep_d5():
                         """D 5연속(D5) 최소화 — 체인 패스(2026-09-14).
@@ -5217,7 +5148,7 @@ def optimize_fallback_lex_hard_first(
                         _d5v = getattr(m2, "_ms_d5_lex_vars", None) or []
                         if not _d5v:
                             return None
-                        return (sum(_d5v), lambda v: m2.Add(sum(_d5v) <= v), 3.0, 0.15)
+                        return (sum(_d5v), lambda v: hard_add(m2, "lex_freeze_pass", sum(_d5v) <= v), 3.0, 0.15)
 
                     _PASS_PREP = {
                         "s6": _prep_s6,
@@ -5434,7 +5365,7 @@ def optimize_fallback_lex_hard_first(
                     _s4_skipped.append(
                         f"{k}({'항목없음' if not _lhs3 else '값없음'})")
                     continue
-                m3.Add(sum(_lhs3) <= sum(int(_v) for _v in _vals2))
+                hard_add(m3, "lex_freeze_safety", sum(_lhs3) <= sum(int(_v) for _v in _vals2))
                 _s4n3 += 1
                 _s4_frozen.append(k)
                 _s4_caps[k] = sum(int(_v) for _v in _vals2)    # 계측용 상한 보관
@@ -5443,7 +5374,7 @@ def optimize_fallback_lex_hard_first(
             print(f"{logger_prefix} [S4-2] 제외됨: {', '.join(_s4_skipped) or '없음'}")
         else:
             for k in safety3.keys():
-                m3.Add(sum(safety3[k]) == sum(safety2[k]))
+                hard_add(m3, "lex_freeze_safety", sum(safety3[k]) == sum(safety2[k]))
         # grade 도 동결한다. lex 6-pass 가 재배치로 미달을 낮춰 놔도 stage3 는 배치를
         #   새로 계산하므로, 안 걸면 흩어진다(실측: lex short=4 → 최종 14~20).
         #   safety 와 달리 등호가 아니라 상한이다 — 더 좋게 만드는 것은 막지 않는다.
@@ -5467,9 +5398,9 @@ def optimize_fallback_lex_hard_first(
                     if join[_n] <= _gd <= leave[_n]
                 )
                 _sh3 = m3.NewIntVar(0, int(_gt), f"s3_g_short_d{_gd}_s{_gs}")
-                m3.Add(_sh3 >= int(_gt) - _cum3)
+                aux_add(m3, "lex_grade_short", _sh3 >= int(_gt) - _cum3)
                 _g3_shorts.append(_sh3)
-            m3.Add(sum(_g3_shorts) <= int(lex_grade_short))
+            hard_add(m3, "lex_freeze_grade", sum(_g3_shorts) <= int(lex_grade_short))
             print(f"{logger_prefix} 폴백3 grade 동결: short <= {lex_grade_short} "
                   f"(cells={len(_g3_shorts)})")
         # ※ n2n 동결은 여기 있었는데 **기각**했다(2026-09-18 · 24런 교차). grade 와 같은
@@ -5677,7 +5608,7 @@ def optimize_fallback_lex_hard_first(
                         if _mx_before == 0:
                             raise _MxSkipLex  # 위반 0 → 재-solve 불필요(무비용)
                         _gt_val = int(round(s3.Value(sum(_gt_terms))))
-                        m3.Add(sum(_gt_terms) >= _gt_val)   # grade/team 무회귀(penalty=음수 → >= 로 최소보장)
+                        hard_add(m3, "lex_freeze_stage3", sum(_gt_terms) >= _gt_val)   # grade/team 무회귀(penalty=음수 → >= 로 최소보장)
                         m3.Minimize(sum(_mx_vars))
                         m3.ClearHints()
                         for _hn in range(N):
@@ -5708,7 +5639,7 @@ def optimize_fallback_lex_hard_first(
                         if _st3m in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                             _mx_after = sum(int(_s3m.Value(v)) for v in _mx_vars)
                             if _mx_after <= _mx_before:
-                                m3.Add(sum(_mx_vars) <= _mx_after)  # 이후 D5 패스가 mutex 되돌리지 못하게 락
+                                hard_add(m3, "lex_freeze_stage3", sum(_mx_vars) <= _mx_after)  # 이후 D5 패스가 mutex 되돌리지 못하게 락
                                 s3 = _s3m
                                 print(f"{logger_prefix} 폴백3 mutex-lex 패스: "
                                       f"status={_cp_sat_status_to_text(_st3m)} mutex {_mx_before}→{_mx_after}")
@@ -5742,7 +5673,7 @@ def optimize_fallback_lex_hard_first(
                         _d5_before = sum(int(s3.Value(v)) for v in _d5_vars)
                         if _d5_before == 0:
                             raise _SkipLex  # 잔여 DDDDD 없음 → 재-solve 불필요(대형병동 비용 0)
-                        m3.Add(sum(_obj_terms) >= _obj_val)  # maximize 라 품질 무회귀
+                        hard_add(m3, "lex_freeze_stage3", sum(_obj_terms) >= _obj_val)  # maximize 라 품질 무회귀
                         m3.Minimize(sum(_d5_vars))
                         # 직전 stage3 해를 hint 로 seed → 재solve 가 feasible incumbent 에서 출발
                         # (없으면 tight freeze 로 짧은 시간에 UNKNOWN → 개선 실패).

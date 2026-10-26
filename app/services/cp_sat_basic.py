@@ -40,6 +40,7 @@ from services.cp_sat.hardcoded_weights import (
 from services.cp_sat.objective_terms import build_main_objective_terms, _n_forbid_n_set, add_per_nurse_target_distribution_terms
 from services.cp_sat.fallback_lex import optimize_fallback_lex_hard_first
 from services.cp_sat.night_distribution_log import log_n_even_distribution
+from services.cp_sat.rule_tag import aux_add, aux_call, hard_add, hard_call
 from services.cp_sat.lookahead_helpers import (
     get_D_ext,
     compute_leave_ext,
@@ -495,10 +496,7 @@ class CPSATBasicEngine:
         sequential_offs = config_data.get('sequential_offs', True)
         enforce_clustered_offs = bool(config_data.get("enforce_clustered_offs", False))
         isolated_off_slack_penalty = int(config_data.get("isolated_off_slack_penalty", 300000) or 0)
-        # if int(config_data.get('off_placement_mode', 0) or 0) != 0:
-        #     print(f"{self.logger_prefix} [OffPlacementMode] deprecated: forcing off_placement_mode=0")
-        # off_placement_mode = 0
-        
+
         # 가중치 설정 - Night Keep은 E와 차별화
         shift_weights = config_data.get('shift_preference_weights', {
             'D': 5.0, 
@@ -538,14 +536,8 @@ class CPSATBasicEngine:
                         base[key] = 0
             return base
 
-        # 요구치(기본) 방어 처리: 없으면 구 필드(day_req/eve_req/nig_req)에서 폴백
+        # 요구치(기본): daily_shift_requirements 만 읽는다. 구 필드(day_req/eve_req/nig_req) 폴백은 삭제(EI-13d) — 없거나 비면 아래 합 0 검사가 ValueError.
         raw_daily_req = config_data.get("daily_shift_requirements")
-        if not raw_daily_req:
-            raw_daily_req = {
-                "D": config_data.get("day_req", 0),
-                "E": config_data.get("eve_req", 0),
-                "N": config_data.get("nig_req", 0),
-            }
         daily_req = _normalize_requirements(raw_daily_req)
         if sum(daily_req.values()) <= 0:
             raise ValueError("daily_shift_requirements(D/E/N)가 비어있습니다. 설정을 확인해주세요.")
@@ -652,7 +644,6 @@ class CPSATBasicEngine:
             team_handoff_soft_fallback=bool(config_data.get("team_handoff_soft_fallback", True)),
             team_handoff_penalty_weight=int(config_data.get("team_handoff_penalty_weight", 80000) or 0),
             # use_max_coverage 폐기 → min/max 범위 모델로 전환 (daily_shift_requirements_max_by_day)
-            # off_placement_mode=0,
         )
         off_days_eff, off_days_src = resolve_effective_off_days(config_data)
         print(
@@ -720,7 +711,6 @@ class CPSATBasicEngine:
                 setattr(cfg, "daily_shift_requirements_max_by_day", norm_max_list)
         except Exception:
             pass
-        setattr(cfg, "lookahead_days", int(config_data.get("lookahead_days") or 0))
         setattr(
             cfg,
             "next_month_head_requirements",
@@ -802,7 +792,6 @@ class CPSATBasicEngine:
                 'is_weekend_off': bool(nurse_data.get('is_weekend_off', False)),
                 'allowed_shifts': nurse_data.get('allowed_shifts', 0),
                 'personal_off_adjustment': nurse_data.get('personal_off_adjustment', 0),
-                'remaining_off_days': 0,  # 초기화, 나중에 계산됨
                 'joining_date': _to_date(nurse_data.get('joining_date')),
                 'resignation_date': _to_date(nurse_data.get('resignation_date')),
                 'team_id': nurse_data.get('team_id'),
@@ -1050,8 +1039,6 @@ class CPSATBasicEngine:
                     if str(getattr(_nu, 'db_id', None) or getattr(_nu, 'nurse_id', '') or '') in _hl_ids:
                         _nu.health_leave_extra_off = True
                 print(f"[HealthLeave] OFF 하한 +1 대상 {len(_hl_ids)}명 엔진 전달")
-            for nurse in nurses:
-                nurse.initialize_off_days(config)
         # 4. 근무표 시스템 생성
         with Timer("근무표 시스템 초기화"):
             roster_system = RosterSystem(nurses, target_month, config)
@@ -1265,7 +1252,6 @@ class CPSATBasicEngine:
             #     pass
             # ── 경계 제약(강제 OFF/금지) 병합 ──
             initial_constraints = config_data.get('initial_constraints') or {}
-            allow_override_by_law = bool(config_data.get('allow_override_by_law', False))
             # ID 매핑을 문자열 기반으로 통일(입력 dict 키가 str이므로 불일치 방지)
             rs_dbid_to_idx = {str(n.db_id): n.id for n in nurses}
             # 보조: int 키로도 접근 가능하도록 추가
@@ -1279,18 +1265,13 @@ class CPSATBasicEngine:
                     return None
             weekly_off_map_raw = config_data.get("weekly_off_map") or {}
             # weekly_off_settings의 activate가 0이면 weekly_off_map이 비어있음
-            # 이 경우 off_placement_mode도 효력이 없도록 설정
             weekly_off_settings_activate = bool(config_data.get("weekly_off_settings_activate", False))
             if not weekly_off_settings_activate or not weekly_off_map_raw:
                 # activate가 0이거나 weekly_off_map이 비어있으면 주휴 관련 옵션 비활성화
-                # config.off_placement_mode = 0
                 weekly_off_by_idx: dict[int, list[int]] = {}
                 print('weekly_off_by_idx 없는걸로', weekly_off_by_idx)
             else:
                 # 각 nurse 별 주휴 담기
-                # if int(config_data.get("off_placement_mode", 0) or 0) != 0:
-                #     print("[OffPlacementMode] deprecated: forcing off_placement_mode=0")
-                # config.off_placement_mode = 0
                 weekly_off_by_idx: dict[int, list[int]] = {}
                 for dbid, day_list in (weekly_off_map_raw or {}).items():
                     n_idx = rs_dbid_to_idx.get(str(dbid))
@@ -1312,15 +1293,6 @@ class CPSATBasicEngine:
                 )
             else:
                 roster_system.lookahead_weekly_off_cells = set()
-            # 전월 달에 따른 휴무 담기 
-            prev_last_off_raw = config_data.get("prev_month_last_is_off") or {}
-            prev_last_off_by_idx: dict[int, bool] = {}
-            for dbid, flag in (prev_last_off_raw or {}).items():
-                n_idx = _get_nurse_idx(dbid)
-                if n_idx is None:
-                    continue
-                prev_last_off_by_idx[n_idx] = bool(flag)
-            roster_system.prev_month_last_is_off = prev_last_off_by_idx
             # 전월 마지막 근무코드(D/E/N/O) — 월 경계 N-O-D / N-O-E / E-O-D 지표용.
             prev_last_main_raw = config_data.get("prev_month_last_main") or {}
             prev_last_main_by_idx: dict[int, str] = {}
@@ -2900,7 +2872,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 },
             )
         else:
-            m.Add(_fixed_expr)
+            hard_add(m, _fixed_pattern, _fixed_expr)
         for s in range(S):
             if s != s_idx:
                 _ban_expr = (X(n, d, s) == 0)
@@ -2925,7 +2897,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         },
                     )
                 else:
-                    m.Add(_ban_expr)
+                    hard_add(m, _fixed_pattern, _ban_expr)
     # W(특별 근무)는 고정 셀 외에는 전부 금지
     if has_w and w_idx is not None:
         for n in range(N):
@@ -2955,7 +2927,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         },
                     )
                 else:
-                    m.Add(_w_ban_expr)
+                    hard_add(m, "forbidden_shift", _w_ban_expr)
 
     # 순수 O/주 4연속 금지 (예외/강제 포함 시 스킵, fixed로 이미 4O/주면 경고만)
     # config.skip_4o_hard_first_days: 월초 N일 구간에서는 4O Hard 미적용 (기본 3 → 1~3일 시작 윈도우는 4연속 O 허용)
@@ -3000,7 +2972,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     1 if (n, d + k) in off_or_weekly else countable_off(n, d + k)
                     for k in range(4)
                 ]
-                m.Add(sum(off_like) <= 3)
+                hard_add(m, "enforce_4o", sum(off_like) <= 3)
 
     # ── 4O 월경계 제약: 전월 꼬리 연속 OFF + 현월 초 연속 OFF 합산 4 이상 금지 ──
     _4o_cross_affected: set[int] = set()  # OffCap 보정 대상
@@ -3042,7 +3014,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if not free_vars:
                 continue
             remaining = 3 - effective_t
-            m.Add(sum(free_vars) <= remaining)
+            hard_add(m, "enforce_4o", sum(free_vars) <= remaining)
             _4o_cross_affected.add(n)
             nu = rs.nurses[n] if n < len(rs.nurses) else None
             print(
@@ -3069,9 +3041,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 slack_var = m.NewBoolVar(f"iso_off_slack_{n}_{d}")
                 isolated_off_slacks.append((slack_var, slack_penalty))
                 if neighbours:
-                    m.Add(countable_off(n, d) <= sum(neighbours) + slack_var)
+                    aux_add(m, "isolated_off_slack", countable_off(n, d) <= sum(neighbours) + slack_var)
                 else:
-                    m.Add(countable_off(n, d) <= slack_var)
+                    aux_add(m, "isolated_off_slack", countable_off(n, d) <= slack_var)
     
     # # ───────────── 2-A3. 주휴 근처 OFF 배치 제약 (off_placement_mode) ─────────────
     # off_placement_mode = int(getattr(rs.config, "off_placement_mode", 0) or 0)
@@ -3204,7 +3176,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 },
                             )
                         else:
-                            m.Add(_if_expr)
+                            hard_add(m, "initial_forbidden", _if_expr)
     except Exception as e:
         print(f"[CP-SAT-Basic] 초기 금지 셀 적용 중 오류: {e}")
 
@@ -3214,7 +3186,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             # 프리셉티는 고정 셀 스킵되었으므로 ExactlyOne 필요
             if (n,d) in fixed and not (_is_preceptee_at(n, d)):
                 continue
-            m.AddExactlyOne(X(n,d,s) for s in range(S))
+            hard_call(m, "exactly_one_shift", "AddExactlyOne", (X(n,d,s) for s in range(S)))
 
     # ───────────── 2-B-2. 프리셉티 팔로우 제약 추가 (preceptee_on=True 일 때) ──────────
     # preceptee_follow, preceptee_indices 는 위(2-A1 직전)에서 이미 계산됨
@@ -3252,7 +3224,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     xp = X(p, d, s)
                     if isinstance(xn, int) or isinstance(xp, int):
                         continue
-                    m.Add(xn == xp)
+                    hard_add(m, "preceptee_follow", xn == xp)
                     constraint_count += 1
         print(f"[CP-SAT-Basic] 프리셉티 팔로우 모드: {len(preceptee_indices)}명, "
               f"제약 {constraint_count}개 추가, 개별 하드제약 면제 적용")
@@ -3345,33 +3317,33 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     else int(fixed_cnt_adj[d][s] or 0)
                 )
                 if req_raw == 0:
-                    m.Add(assigned_m_bucket == 0)
+                    hard_add(m, "zero_demand_block", assigned_m_bucket == 0)
                     ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                     over_vars_by_day.setdefault(d, {})[code] = ov
                     continue
                 m_cap_max = max(0, int(req_max_raw - fixed_m_bucket)) if req_max_raw > 0 else 0
                 # M 상한: max coverage 있으면 hard, 없으면 min으로 hard cap
                 if m_cap_max > 0:
-                    m.Add(assigned_m_bucket <= m_cap_max)
+                    hard_add(m, "coverage_max", assigned_m_bucket <= m_cap_max)
                 else:
                     m_cap_non_fixed = max(0, int(req_raw - fixed_m_bucket))
-                    m.Add(assigned_m_bucket <= m_cap_non_fixed)
+                    hard_add(m, "coverage_max", assigned_m_bucket <= m_cap_non_fixed)
                 # M min: max coverage 있으면 hard(D/E/N과 동일), 없으면 soft(shortage 허용)
                 if not _has_any_max:
                     m_need = max(0, int(req_raw - fixed_m_bucket))
                     if m_need > 0:
                         m_sh = m.NewIntVar(0, m_need, f"m_short_{d}")
-                        m.Add(assigned_m_bucket + m_sh >= m_need)
+                        aux_add(m, "coverage_short", assigned_m_bucket + m_sh >= m_need)
                         m_coverage_shortage_vars.append(m_sh)
                     ov = m.NewIntVar(0, N, f"over_{d}_{code}")
                     if need > 0:
-                        m.Add(ov >= assigned - need)
+                        aux_add(m, "coverage_over", ov >= assigned - need)
                     over_vars_by_day.setdefault(d, {})[code] = ov
                     continue
                 # max coverage 있으면 아래 일반 하드 로직으로 처리
             if code in zero_demand_block_codes and req_raw == 0:
                 # 최소 0 은 금지, 최대가 1 이상이면 '선택'(0~최대) — fallback_lex 와 같은 규약.
-                m.Add(assigned <= need_max)
+                hard_add(m, "zero_demand_block", assigned <= need_max)
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 continue
@@ -3395,11 +3367,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         },
                     )
                 else:
-                    m.Add(_cov_min_expr)
+                    hard_add(m, "coverage_min", _cov_min_expr)
             # max 제약: hard (상한 초과 불가). 최대 설정 여부는 원값으로 본다 —
             #   고정칸이 최대를 다 채워 need_max 가 0 이 돼도 상한은 남아야 한다(fallback_lex 와 같음).
             if req_max_raw > 0:
-                m.Add(assigned <= need_max)
+                hard_add(m, "coverage_max", assigned <= need_max)
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
                 # 일자별 커버리지 균등화용 수집 (물리일만)
@@ -3408,12 +3380,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             elif _off_first_cfg:
                 # off_first=True 우선: max 미설정 시 assigned <= need 하드 (잔여 셀 OFF로 회수).
                 # need=0 (fixed_wanted 가 min 다 채움) 케이스에도 assigned <= 0 강제 → 추가 근무 차단.
-                m.Add(assigned <= max(0, need))
+                hard_add(m, "off_first_coverage_cap", assigned <= max(0, need))
                 ov = m.NewIntVar(0, 0, f"over_{d}_{code}")
                 over_vars_by_day.setdefault(d, {})[code] = ov
             elif need > 0:
                 ov = m.NewIntVar(0, N, f"over_{d}_{code}")
-                m.Add(ov >= assigned - need)
+                aux_add(m, "coverage_over", ov >= assigned - need)
                 over_vars_by_day.setdefault(d, {})[code] = ov
 
     # ───────────── 2-D. Max coverage Off 균등 분배 ───
@@ -3457,15 +3429,15 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 if T0 > 0 or T1 < D_phys - 1 or _blk_set_n:
                     continue
             total_off_n = m.NewIntVar(0, len(_phys_range_off_eq), f"mc_off_{n}")
-            m.Add(total_off_n == sum(X(n, d, off_idx) for d in _phys_range_off_eq))
+            aux_add(m, "max_cov_off_equalize", total_off_n == sum(X(n, d, off_idx) for d in _phys_range_off_eq))
             nurse_off_vars.append(total_off_n)
         if len(nurse_off_vars) >= 2:
             off_global_max = m.NewIntVar(0, D_phys, "mc_off_max")
             off_global_min = m.NewIntVar(0, D_phys, "mc_off_min")
-            m.AddMaxEquality(off_global_max, nurse_off_vars)
-            m.AddMinEquality(off_global_min, nurse_off_vars)
+            aux_call(m, "max_cov_off_equalize", "AddMaxEquality", off_global_max, nurse_off_vars)
+            aux_call(m, "max_cov_off_equalize", "AddMinEquality", off_global_min, nurse_off_vars)
             off_range = m.NewIntVar(0, D_phys, "mc_off_range")
-            m.Add(off_range == off_global_max - off_global_min)
+            aux_add(m, "max_cov_off_equalize", off_range == off_global_max - off_global_min)
             # off_first=True: OFF range는 SOFT objective(가중치)로만 유도, HARD 제거.
             # (사용자 명세: off_days 무시 + daily 커버리지 우선 → OFF 균등은 차순위)
             if _off_first_cfg:
@@ -3476,11 +3448,11 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             if _off_first_cfg and len(nurse_off_vars) >= 3:
                 _N_eq = len(nurse_off_vars)
                 _off_sum = m.NewIntVar(0, D_phys * _N_eq, "mc_off_sum")
-                m.Add(_off_sum == sum(nurse_off_vars))
+                aux_add(m, "max_cov_off_equalize", _off_sum == sum(nurse_off_vars))
                 for _i, _ov in enumerate(nurse_off_vars):
                     _dev = m.NewIntVar(0, D_phys * _N_eq, f"mc_off_dev_{_i}")
-                    m.Add(_dev * _N_eq >= _ov * _N_eq - _off_sum)
-                    m.Add(_dev * _N_eq >= _off_sum - _ov * _N_eq)
+                    aux_add(m, "max_cov_off_equalize", _dev * _N_eq >= _ov * _N_eq - _off_sum)
+                    aux_add(m, "max_cov_off_equalize", _dev * _N_eq >= _off_sum - _ov * _N_eq)
                     max_cov_off_equalize_terms.append(-2000 * _dev)
             print(f"[MaxCoverage] Off 균등 분배 제약 추가: 간호사 {len(nurse_off_vars)}명, range_weight={_off_eq_weight}")
 
@@ -3493,26 +3465,26 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             assigned_vars = []
             for d, assigned_expr, _need, _need_max in day_entries:
                 av = m.NewIntVar(0, N, f"dcov_{code}_{d}")
-                m.Add(av == assigned_expr)
+                aux_add(m, "daily_coverage_equalize", av == assigned_expr)
                 assigned_vars.append(av)
                 # min 초과분 패널티: min에 가깝게 유도
                 if _need > 0:
                     excess = m.NewIntVar(0, N, f"dcov_excess_{code}_{d}")
-                    m.Add(excess >= av - _need)
+                    aux_add(m, "daily_coverage_equalize", excess >= av - _need)
                     daily_cov_equalize_terms.append(-80 * excess)
             # 글로벌 range: 월 전체에서 최대-최소 편차 최소화 (블록 쏠림 방지)
             cov_max = m.NewIntVar(0, N, f"dcov_max_{code}")
             cov_min = m.NewIntVar(0, N, f"dcov_min_{code}")
-            m.AddMaxEquality(cov_max, assigned_vars)
-            m.AddMinEquality(cov_min, assigned_vars)
+            aux_call(m, "daily_coverage_equalize", "AddMaxEquality", cov_max, assigned_vars)
+            aux_call(m, "daily_coverage_equalize", "AddMinEquality", cov_min, assigned_vars)
             cov_range = m.NewIntVar(0, N, f"dcov_range_{code}")
-            m.Add(cov_range == cov_max - cov_min)
+            aux_add(m, "daily_coverage_equalize", cov_range == cov_max - cov_min)
             daily_cov_equalize_terms.append(-150 * cov_range)
             # 인접일 평활화: 연속된 날 급변 방지
             for i in range(1, len(assigned_vars)):
                 diff = m.NewIntVar(0, N, f"dcov_adj_{code}_{i}")
-                m.Add(diff >= assigned_vars[i] - assigned_vars[i - 1])
-                m.Add(diff >= assigned_vars[i - 1] - assigned_vars[i])
+                aux_add(m, "daily_coverage_equalize", diff >= assigned_vars[i] - assigned_vars[i - 1])
+                aux_add(m, "daily_coverage_equalize", diff >= assigned_vars[i - 1] - assigned_vars[i])
                 daily_cov_equalize_terms.append(-60 * diff)
         if daily_cov_equalize_terms:
             print(f"[MaxCoverage] 일자별 커버리지 균등화 제약 추가: {list(daily_assigned_by_code.keys())}")
@@ -3669,7 +3641,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
                         f"d={d+1}, weekday={wd}(토5/일6)"
                     )
-                    m.Add(X(n, d, off) == 1)
+                    hard_add(m, "weekend_off_only", X(n, d, off) == 1)
                 else:
                     # 평일(월~금): OFF 금지(D/E/N만 가능)
                     # 사용자 고정 OFF는 예외로 허용
@@ -3699,7 +3671,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         f"n={n}, nurse_id={getattr(nu, 'nurse_id', '?')}, name={getattr(nu, 'name', '?')}, "
                         f"d={d+1}, weekday={wd}(월0~금4)"
                     )
-                    m.Add(X(n, d, off) == 0)
+                    hard_add(m, "weekend_off_only", X(n, d, off) == 0)
         # 월초 OFF 윈도우 (전월 꼬리 연속근무 보정): 지정 구간에 OFF ≥ 1
         # 주말 휴무자도 월경계 연속근무 초과 가능 → 동일 적용
         try:
@@ -3738,7 +3710,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 },
                             )
                         else:
-                            m.Add(_ow_expr)
+                            hard_add(m, "off_window_requirement", _ow_expr)
         except Exception as e:
             print(f"[CP-SAT-Basic] 월초 OFF 윈도우 적용 실패: n={n}, err={e}")
         # 연속 근무 K+1 중 OFF ≥1 (HARD: 주말 휴무자 포함, 월경계 연속근무 초과 방지)
@@ -3774,7 +3746,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     },
                 )
             else:
-                m.Add(_mcw_expr)
+                hard_add(m, "max_consecutive_work", _mcw_expr)
 
         # E→D, N→D, N→E
         from services.constraint_impact.solver_emit import get_or_attach_recorder as _get_emit_recorder
@@ -3804,7 +3776,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             },
                         )
                     else:
-                        m.Add(_n2d_expr)
+                        hard_add(m, "transition_ban", _n2d_expr)
                 _emit_rec.emit(
                     family="BoundaryTransitionBan",
                     scope={"nurse_index": n, "day": d + 1, "transition": "N->D"},
@@ -3836,7 +3808,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             },
                         )
                     else:
-                        m.Add(_e2d_expr)
+                        hard_add(m, "transition_ban", _e2d_expr)
                 _emit_rec.emit(
                     family="BoundaryTransitionBan",
                     scope={"nurse_index": n, "day": d + 1, "transition": "E->D"},
@@ -3868,7 +3840,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             },
                         )
                     else:
-                        m.Add(_n2e_expr)
+                        hard_add(m, "transition_ban", _n2e_expr)
                 _emit_rec.emit(
                     family="BoundaryTransitionBan",
                     scope={"nurse_index": n, "day": d + 1, "transition": "N->E"},
@@ -3877,17 +3849,17 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     related_atom_keys=[(n, d - 1), (n, d)],
                 )
             if mid is not None:
-                m.Add(X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
+                hard_add(m, "mid_transition", X(n, d, mid) <= X(n, d - 1, day) + X(n, d - 1, off))
             if w_idx is not None:
                 # 메인코드 없는 근무(W)에도 `E→` · `N→` 금지를 건다. 위 전이 금지는
                 #   day 인덱스만 봐서 W 로 접힌 주간 근무(`DD` 등)가 통과했다.
                 #   lex 쪽(fallback_lex) 과 같은 규약 — 상세 주석은 그쪽에 있다.
                 if getattr(cfg, "ban_e_to_d", True):
                     if not (fixed.get((n, d - 1)) == eve and fixed.get((n, d)) == w_idx):
-                        m.Add(X(n, d - 1, eve) + X(n, d, w_idx) <= 1)
+                        hard_add(m, "transition_ban", X(n, d - 1, eve) + X(n, d, w_idx) <= 1)
                 if getattr(cfg, "ban_n_to_d", True):
                     if not (fixed.get((n, d - 1)) == night and fixed.get((n, d)) == w_idx):
-                        m.Add(X(n, d - 1, night) + X(n, d, w_idx) <= 1)
+                        hard_add(m, "transition_ban", X(n, d - 1, night) + X(n, d, w_idx) <= 1)
             # if getattr(cfg, "ban_d_to_n", True):
             #     m.Add(X(n,d,night)+X(n,d-1,day)<=1)
 
@@ -3920,7 +3892,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             },
                         )
                     else:
-                        m.Add(_allow_d_expr)
+                        hard_add(m, "allowed_shift_mask", _allow_d_expr)
                     _emit_rec.emit(
                         family="AllowedShiftMask",
                         scope={"nurse_index": n, "day": d + 1, "shift": "D"},
@@ -3951,7 +3923,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             },
                         )
                     else:
-                        m.Add(_allow_e_expr)
+                        hard_add(m, "allowed_shift_mask", _allow_e_expr)
                     _emit_rec.emit(
                         family="AllowedShiftMask",
                         scope={"nurse_index": n, "day": d + 1, "shift": "E"},
@@ -3982,7 +3954,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             },
                         )
                     else:
-                        m.Add(_allow_n_expr)
+                        hard_add(m, "allowed_shift_mask", _allow_n_expr)
                     _emit_rec.emit(
                         family="AllowedShiftMask",
                         scope={"nurse_index": n, "day": d + 1, "shift": "N"},
@@ -4013,7 +3985,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             },
                         )
                     else:
-                        m.Add(_allow_m_expr)
+                        hard_add(m, "allowed_shift_mask", _allow_m_expr)
                     _emit_rec.emit(
                         family="AllowedShiftMask",
                         scope={"nurse_index": n, "day": d + 1, "shift": "M"},
@@ -4067,9 +4039,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                     if not neighbors:
                         continue
                     if _assume_no1n is not None:
-                        m.Add(X(n, d, night) <= sum(neighbors)).OnlyEnforceIf(_assume_no1n)
+                        hard_add(m, "not_one_night", X(n, d, night) <= sum(neighbors)).OnlyEnforceIf(_assume_no1n)
                     else:
-                        m.Add(X(n, d, night) <= sum(neighbors))
+                        hard_add(m, "not_one_night", X(n, d, night) <= sum(neighbors))
                     _emit_rec.emit(
                         family="NotOneNight",
                         scope={"nurse_index": n, "day": d + 1},
@@ -4140,7 +4112,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             metadata={"prev_fixed_present": True},
                         )
                         continue  # 이미 고정된 셀은 변경 불가
-                    m.Add(X(n, prev_d, night) == 0)
+                    hard_add(m, "ban_night_before_fixed_off", X(n, prev_d, night) == 0)
                     # ★ 프리셉티 미러가 프리셉터 셀을 그대로 덮어써 이 N 금지를 되살리므로,
                     #   실제로 건 셀을 남겨 미러 단계에서 존중하게 한다(fallback 과 같은 규약).
                     _ban_n_prev_cells.add((n, prev_d))
@@ -4208,7 +4180,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 },
                             )
                         else:
-                            m.Add(_cn_month_edge_expr)
+                            hard_add(m, "consecutive_night_cap", _cn_month_edge_expr)
             for d0 in range(T0, T1 - L + 1):
                 _cn_expr = (sum(X(n, d0 + t, night) for t in range(L + 1)) <= L)
                 if _assume_registry is not None and _add_hard is not None:
@@ -4231,7 +4203,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         },
                     )
                 else:
-                    m.Add(_cn_expr)
+                    hard_add(m, "consecutive_night_cap", _cn_expr)
 
             # 월 Night 상한 (당월 D_phys만 합산) — MUS 추출용 assumption literal로 wrap
             phys_range_night = month_total_day_range(T0, T1, D_phys)
@@ -4258,7 +4230,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                         },
                     )
                 else:
-                    m.Add(_mn_expr)
+                    hard_add(m, "max_night", _mn_expr)
 
             # 월별 개인 shift/off 제한은 모듈에서 한 번에 처리 (인라인 제거)
 
@@ -4382,7 +4354,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                 if bool(getattr(cfg, "off_first", False)):
                     min_off_required = 0
                 if min_off_required > 0 and phys_range_off:
-                    m.Add(
+                    hard_add(m, "min_off",
                         sum(
                             X(n, d, off)
                             for d in phys_range_off
@@ -4439,7 +4411,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 },
                             )
                         else:
-                            m.Add(_off_cap_expr)
+                            hard_add(m, "off_cap", _off_cap_expr)
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
                             f"cap_semantics={off_cap_semantics}, is_n_only=1, vac_cnt={vacation_cnt}, "
@@ -4514,7 +4486,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 },
                             )
                         else:
-                            m.Add(_off_cap_expr_reg)
+                            hard_add(m, "off_cap", _off_cap_expr_reg)
                         print(
                             f"[OffCap][Init] nurse_idx={n}, id={getattr(nu, 'nurse_id', '?')}, "
                             f"cap_semantics={off_cap_semantics}, off_first={_off_first}, vac_cnt={vacation_cnt}, "
@@ -4555,7 +4527,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             _3n_rem = max(0, 2 - n_offs_after_3n) if n_tail >= 3 else 2
             if n_tail >= 3 and _3n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_3n and (T0 + 1) not in _blocked_3n:
                 end_prev_block = m.NewBoolVar(f"end_3n_prev_{n}")
-                m.Add(end_prev_block == X(n, T0, night).Not())
+                aux_add(m, "night_block_end", end_prev_block == X(n, T0, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
                     if _3n_rem >= 2:
                         _co_3n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) == 2)
@@ -4575,9 +4547,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                     "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
                                 },
                             )
-                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                            hard_add(m, "carryover_boundary", _co_3n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
                         else:
-                            m.Add(_co_3n_expr).OnlyEnforceIf([end_prev_block])
+                            hard_add(m, "carryover_boundary", _co_3n_expr).OnlyEnforceIf([end_prev_block])
                     else:
                         # _3n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
                         _co_3n_expr = (countable_off(n, T0) >= 1)
@@ -4597,9 +4569,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                     "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                 },
                             )
-                            m.Add(_co_3n_expr).OnlyEnforceIf([_co_lit])
+                            hard_add(m, "carryover_boundary", _co_3n_expr).OnlyEnforceIf([_co_lit])
                         else:
-                            m.Add(_co_3n_expr)
+                            hard_add(m, "carryover_boundary", _co_3n_expr)
                 print(f"[CP-SAT-Basic] [3N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after_3n}, rem={_3n_rem}")
             elif n_tail >= 3 and _3n_rem == 0:
@@ -4624,9 +4596,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                             },
                         )
-                        m.Add(_expr_3n_tail2).OnlyEnforceIf([X(n, T0, night), _co_lit])
+                        hard_add(m, "carryover_boundary", _expr_3n_tail2).OnlyEnforceIf([X(n, T0, night), _co_lit])
                     else:
-                        m.Add(_expr_3n_tail2).OnlyEnforceIf([X(n, T0, night)])
+                        hard_add(m, "carryover_boundary", _expr_3n_tail2).OnlyEnforceIf([X(n, T0, night)])
             if n_tail == 1 and n_offs_after_3n < 2 and (T0 + 3) <= T1:
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 2, T0 + 3)):
                     _expr_3n_tail1 = (countable_off(n, T0 + 2) + countable_off(n, T0 + 3) == 2)
@@ -4646,9 +4618,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                             },
                         )
-                        m.Add(_expr_3n_tail1).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night), _co_lit])
+                        hard_add(m, "carryover_boundary", _expr_3n_tail1).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night), _co_lit])
                     else:
-                        m.Add(_expr_3n_tail1).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
+                        hard_add(m, "carryover_boundary", _expr_3n_tail1).OnlyEnforceIf([X(n, T0, night), X(n, T0 + 1, night)])
             for d in range(T0 + 2, T1 - 1):
                 # (N_d-2 ∧ N_d-1 ∧ N_d) → (O_d+1 + O_d+2 == 2)
                 if any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (d + 1, d + 2)):
@@ -4674,12 +4646,12 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                             },
                         )
                     else:
-                        m.Add(_guard_3n_expr)
+                        hard_add(m, "carryover_boundary", _guard_3n_expr)
                     continue
                 _enforce_3n = [X(n, d, night), X(n, d - 1, night), X(n, d - 2, night)]
                 if _assume_3n2off is not None:
                     _enforce_3n.append(_assume_3n2off)
-                m.Add(
+                hard_add(m, "recovery_3n2off",
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
                 ).OnlyEnforceIf(_enforce_3n)
         if cfg.two_offs_after_two_nig and n not in n_forbid_n and not getattr(cfg, '_2n2off_pre_injected', False):
@@ -4707,7 +4679,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
             _2n_rem = max(0, 2 - n_offs_after) if n_tail >= 2 else 2
             if n_tail >= 2 and _2n_rem > 0 and (T0 + 1) <= T1 and T0 not in _blocked_2n and (T0 + 1) not in _blocked_2n:
                 end_prev_block = m.NewBoolVar(f"end_2n_prev_{n}")
-                m.Add(end_prev_block == X(n, T0, night).Not())
+                aux_add(m, "night_block_end", end_prev_block == X(n, T0, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0, T0 + 1)):
                     if _2n_rem >= 2:
                         _co_2n_expr = (countable_off(n, T0) + countable_off(n, T0 + 1) == 2)
@@ -4727,9 +4699,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                     "resolution_hint": "전월 경계 carryover 또는 월초 고정 배정을 조정하세요.",
                                 },
                             )
-                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
+                            hard_add(m, "carryover_boundary", _co_2n_expr).OnlyEnforceIf([end_prev_block, _co_lit])
                         else:
-                            m.Add(_co_2n_expr).OnlyEnforceIf([end_prev_block])
+                            hard_add(m, "carryover_boundary", _co_2n_expr).OnlyEnforceIf([end_prev_block])
                     else:
                         # _2n_rem == 1: 전월 OFF가 T0 직전에 인접 → 남은 OFF는 T0에 강제(연속 2OFF 보장)
                         _co_2n_expr = (countable_off(n, T0) >= 1)
@@ -4749,9 +4721,9 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                     "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                                 },
                             )
-                            m.Add(_co_2n_expr).OnlyEnforceIf([_co_lit])
+                            hard_add(m, "carryover_boundary", _co_2n_expr).OnlyEnforceIf([_co_lit])
                         else:
-                            m.Add(_co_2n_expr)
+                            hard_add(m, "carryover_boundary", _co_2n_expr)
                 print(f"[CP-SAT-Basic] [2N2OFF-cross] nurse_idx={n}, n_tail={n_tail}, "
                       f"offs_after={n_offs_after}, rem={_2n_rem}")
             elif n_tail >= 2 and _2n_rem == 0:
@@ -4759,7 +4731,7 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                       f"offs_after={n_offs_after} → 전월 내 2OFF 충족, 현월 강제 OFF 스킵")
             if n_tail >= 1 and n_offs_after < 2 and (T0 + 2) <= T1:
                 end_block_b0 = m.NewBoolVar(f'end_2n_main_b0_{n}')
-                m.Add(end_block_b0 == X(n, T0 + 1, night).Not())
+                aux_add(m, "night_block_end", end_block_b0 == X(n, T0 + 1, night).Not())
                 if not any((n, d2) in fixed_wanted_cells and fixed.get((n, d2)) != off_idx_full for d2 in (T0 + 1, T0 + 2)):
                     _enforce_2n_b0 = [X(n, T0, night), end_block_b0]
                     if _assume_2n2off is not None:
@@ -4781,25 +4753,25 @@ def _build_full_model(rs: RosterSystem, grouped, include_pair_objective: bool = 
                                 "resolution_hint": "월초 OFF 슬롯 또는 전월 carryover 입력을 조정하세요.",
                             },
                         )
-                        m.Add(_expr_2n_b0).OnlyEnforceIf(_enforce_2n_b0 + [_co_lit])
+                        hard_add(m, "carryover_boundary", _expr_2n_b0).OnlyEnforceIf(_enforce_2n_b0 + [_co_lit])
                     else:
-                        m.Add(_expr_2n_b0).OnlyEnforceIf(_enforce_2n_b0)
+                        hard_add(m, "carryover_boundary", _expr_2n_b0).OnlyEnforceIf(_enforce_2n_b0)
             for d in range(T0 + 1, T1 - 1):
                 # 블록이 2N 이상이고 d가 블록의 끝일 때만 2O 강제 (2N1O 금지, 3N 허용)
                 xn_prev = X(n, d - 1, night)
                 xn_curr = X(n, d, night)
                 xn_next = X(n, d + 1, night)
                 end_block = m.NewBoolVar(f'end_2n_main_{n}_{d}')
-                m.Add(end_block == xn_next.Not())
+                aux_add(m, "night_block_end", end_block == xn_next.Not())
                 if any(
                     (n, d2) in fixed_wanted_cells
                     and fixed.get((n, d2)) not in (off_idx_full, night, None)
                     for d2 in (d + 1, d + 2)
                 ):
                     # 회복 OFF 슬롯에 non-OFF/non-N fixed_wanted → 이 위치에서 2N 블록 종료 금지
-                    m.Add(xn_prev + xn_curr + end_block <= 2)
+                    hard_add(m, "recovery_2n2off", xn_prev + xn_curr + end_block <= 2)
                     continue
-                m.Add(
+                hard_add(m, "recovery_2n2off",
                     countable_off(n, d + 1) + countable_off(n, d + 2) == 2
                 ).OnlyEnforceIf(
                     [xn_prev, xn_curr, end_block]
@@ -4933,9 +4905,9 @@ def _solve_neighbourhood(
             assigned=np.where(rs.roster[n,d]==1)[0]
             if len(assigned):
                 s0=assigned[0]
-                model.Add(X(n,d,s0)==1)
+                hard_add(model, "lns_freeze", X(n,d,s0)==1)
                 for s in range(S):
-                    if s!=s0: model.Add(X(n,d,s)==0)
+                    if s!=s0: hard_add(model, "lns_freeze", X(n,d,s)==0)
 
     # 옵션: 프리셉터-포커스 이웃일 때만 해당 셀에 한정하여 보너스 항 주입
     try:
@@ -4977,8 +4949,8 @@ def _solve_neighbourhood(
                                     best,best_s=sc,s
                             if best is None: continue
                             z = model.NewBoolVar(f'pc_lns_{n1}_{n2}_{d}_{best_s}')
-                            model.Add(z <= X_sub(n1,d,best_s))
-                            model.Add(z <= X_sub(n2,d,best_s))
+                            aux_add(model, "preceptor_pair_bonus", z <= X_sub(n1,d,best_s))
+                            aux_add(model, "preceptor_pair_bonus", z <= X_sub(n2,d,best_s))
                             # 목적함수에 추가
                             # CP-SAT Python API에서는 Maximize가 호출 이전이면 terms 누적 가능
                             # 여기서는 model에 저장된 선형식이 없으므로 CpSolver쪽에서 자동 합산되도록 유지
@@ -5300,8 +5272,8 @@ def _add_preceptor_objective_terms(m, rs: RosterSystem, X, join, leave):
         K = min(K_default, len(scored))
         for _, d, s in sorted(scored, reverse=True)[:K]:
             z = m.NewBoolVar(f'pc_{n1}_{n2}_{d}_{s}')
-            m.Add(z <= X(n1,d,s))
-            m.Add(z <= X(n2,d,s))
+            aux_add(m, "preceptor_pair_bonus", z <= X(n1,d,s))
+            aux_add(m, "preceptor_pair_bonus", z <= X(n2,d,s))
             obj_terms.append(w * z)
             _added += 1
     _dt = _t.time()-_t0

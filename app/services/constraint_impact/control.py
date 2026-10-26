@@ -3,21 +3,29 @@
 이 모듈은 ontology 에 정의된 constraint family 를 module 단위로 보고,
 에이전트가 disable / force_soft / set_threshold / narrow_scope 4 종 액션으로
 조절할 수 있게 해 준다. 적용은 솔버 input config_dict 수정으로만 이루어진다.
+
+EI-11 11d — CLAUDE.md 하드락 표지(정책 판정은 `policy.card_filter`): 모듈 목록은 action 별 하드락 판정
+(`ModuleSummary.hard_lock`)을 싣고, 조정 기록은 하드락을 완화하는 조정에 '적용 불가'(`applicable: False`) 표지를 단다.
+control 은 표지만 단다(모드 없음 — 적용은 지금처럼 한다). 생성 거부는 생성 진입 관문이 한다.
 """
 
 from __future__ import annotations
 
 import copy
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from services.constraint_impact.atoms import build_assignment_atoms
 from services.constraint_impact.graph_builder import build_constraint_nodes
 from services.constraint_impact.snapshot import SemanticsSnapshot
+from services.engine_contract.defaults import registry_default
 from services.semantics.ontology import ConstraintOntology, get_default_ontology
 
+logger = logging.getLogger(__name__)
 
 SUPPORTED_ACTIONS = ("disable_module", "force_soft_mode", "set_threshold", "narrow_scope")
+_APPLIED_KEY = "_applied_constraint_adjustments"
 
 
 @dataclass(slots=True)
@@ -51,6 +59,8 @@ class ModuleSummary:
     current_mode_estimate: str
     instance_count_estimate: int
     supported_actions: list[str]
+    #: EI-11 11d — 지원 action 중 하드락 판정이 ok 가 아닌 것 `{action: {mode, rule_nos, cap?, key?}}`(blocked·capped·marked).
+    hard_lock: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -68,7 +78,8 @@ class InstanceView:
 
 _FAMILY_ACTION_MATRIX: dict[str, set[str]] = {
     "TeamMin": {"disable_module", "force_soft_mode", "set_threshold", "narrow_scope"},
-    "GradeMin": {"disable_module", "force_soft_mode"},
+    # EI-11 11f — GradeMin force_soft 는 뺐다. 엔진·생성이 읽지 않는 죽은 쓰기였다(등급 설정은 DB 에서 다시 읽는다).
+    "GradeMin": {"disable_module"},
     "GradeMax": {"disable_module", "force_soft_mode"},
     "CoverageMin": {"set_threshold"},
     "BoundaryTransitionBan": {"disable_module"},
@@ -146,8 +157,6 @@ def _module_mode_estimate(family: str, snapshot: SemanticsSnapshot) -> str:
             return "inactive"
         if family == "GradeMax" and bool(cfg.get("_force_grade_max_soft_fallback", False)):
             return "soft_fallback"
-        if family == "GradeMin" and bool(cfg.get("_force_grade_min_soft_fallback", False)):
-            return "soft_fallback"
         return "soft_fallback" if bool(gc.get("allow_soft_fallback", False)) else "enforced"
     if family == "BoundaryTransitionBan":
         any_active = (
@@ -157,14 +166,15 @@ def _module_mode_estimate(family: str, snapshot: SemanticsSnapshot) -> str:
         )
         return "enforced" if any_active else "inactive"
     if family == "NightRecovery":
-        any_on = bool(cfg.get("two_offs_after_two_nig", False)) or bool(
-            cfg.get("two_offs_after_three_nig", False)
+        # D49: 키가 없으면 '꺼짐'이 아니라 엔진 기본(레지스트리)
+        any_on = bool(cfg.get("two_offs_after_two_nig", registry_default("two_offs_after_two_nig"))) or bool(
+            cfg.get("two_offs_after_three_nig", registry_default("two_offs_after_three_nig"))
         )
         return "enforced" if any_on else "inactive"
     if family == "ConsecutiveWorkLimit":
-        return "enforced" if int(cfg.get("max_consecutive_work_days") or 0) > 0 else "inactive"
+        return "enforced" if int(cfg.get("max_conseq_work") or 0) > 0 else "inactive"
     if family == "ConsecutiveNightLimit":
-        return "enforced" if int(cfg.get("max_consecutive_nights") or 0) > 0 else "inactive"
+        return "enforced"  # 정본 three_seq_nig 는 bool — 켜면 3·꺼도 2 라 연속 나이트 상한이 늘 있다
     if family == "CoverageMin":
         return "enforced"
     return "enforced"
@@ -187,10 +197,41 @@ def _instance_count_estimate(family: str, snapshot: SemanticsSnapshot) -> int:
     return 0
 
 
+def _hard_lock_policy(ontology: ConstraintOntology) -> dict | None:
+    """(family, action) 하드락 판정(`card_filter.family_action_policy`) — 판정이 실패하면 None(호출부가 막는 쪽으로)."""
+    from services.policy import card_filter
+
+    try:
+        return card_filter.family_action_policy(ontology)
+    except Exception:
+        logger.warning("모듈 목록 하드락 판정 실패 — 하드락 family 의 지원 action 을 모두 막힘으로 표시합니다(fail-closed).",
+                       exc_info=True)
+        return None
+
+
+def _module_hard_lock(family: str, policy: dict | None) -> dict[str, dict]:
+    """그 family 의 지원 action 중 하드락 판정이 ok 가 아닌 것 `{action: {mode, rule_nos, cap?, key?}}`. 판정을 못 했으면
+    대체 집합(`HARD_LOCK_FAMILIES_FALLBACK`) family 의 지원 action 을 모두
+    `{"mode": "blocked", "rule_nos": [], "error": True}` 로 둔다."""
+    if policy is None:
+        from services.policy.card_filter import HARD_LOCK_FAMILIES_FALLBACK
+
+        if family not in HARD_LOCK_FAMILIES_FALLBACK:
+            return {}
+        return {action: {"mode": "blocked", "rule_nos": [], "error": True} for action in supported_actions_for(family)}
+    out: dict[str, dict] = {}
+    for action in supported_actions_for(family):
+        entry = policy.get((family, action)) or {}
+        if entry.get("mode", "ok") != "ok":
+            out[action] = {k: entry[k] for k in ("mode", "rule_nos", "cap", "key", "error") if k in entry}
+    return out
+
+
 def list_constraint_modules(
     snapshot: SemanticsSnapshot, *, ontology: ConstraintOntology | None = None
 ) -> list[ModuleSummary]:
     onto = ontology or get_default_ontology()
+    policy = _hard_lock_policy(onto)  # EI-11 11d — 호출당 한 번
     summaries: list[ModuleSummary] = []
     for family_id, entry in onto.constraints.items():
         summaries.append(
@@ -203,6 +244,7 @@ def list_constraint_modules(
                 current_mode_estimate=_module_mode_estimate(family_id, snapshot),
                 instance_count_estimate=_instance_count_estimate(family_id, snapshot),
                 supported_actions=supported_actions_for(family_id),
+                hard_lock=_module_hard_lock(family_id, policy),
             )
         )
     summaries.sort(key=lambda m: (m.parent, m.family))
@@ -297,14 +339,8 @@ def _apply_team_min(
 
 
 def _apply_grade(family: str, cfg: dict[str, Any], adj: ConstraintAdjustment) -> None:
-    if adj.action == "force_soft_mode":
-        if family == "GradeMax":
-            cfg["_force_grade_max_soft_fallback"] = True
-        else:
-            cfg["_force_grade_min_soft_fallback"] = True
-            gc = dict(cfg.get("grade_config") or {})
-            gc["allow_soft_fallback"] = True
-            cfg["grade_config"] = gc
+    if adj.action == "force_soft_mode" and family == "GradeMax":
+        cfg["_force_grade_max_soft_fallback"] = True
         return
     if adj.action == "disable_module":
         gc = copy.deepcopy(cfg.get("grade_config") or {})
@@ -333,6 +369,29 @@ def _apply_consec(cfg: dict[str, Any], key: str, adj: ConstraintAdjustment) -> N
     raise ValueError(f"unsupported {key} action: {adj.action}")
 
 
+class RuntimeKeyForbidden(ValueError):
+    """레지스트리가 런타임 조정을 금지한 설정(D13)을 바꾸려는 조정 — 설정은 쓰지 않고 '적용 불가'로만 기록한다."""
+
+    def __init__(self, violation) -> None:
+        super().__init__(violation.message_ko)
+        self.violation = violation
+
+
+def _apply_consec_nights(cfg: dict[str, Any], adj: ConstraintAdjustment) -> None:
+    """연속 나이트 상한 — 레지스트리가 런타임 조정을 금지(D13)하면 쓰지 않고 '적용 불가'로 기록한다. 금지 표지가 없으면 정본 bool
+    `three_seq_nig`(3 if x else 2)에 접어 쓴다 — 3 을 넘는 값도 True(=3)라 절대 상한(하드락 #3)을 못 넘는다."""
+    from services.policy.hard_lock import runtime_forbidden_violation
+
+    if adj.action != "set_threshold":
+        raise ValueError(f"unsupported ConsecutiveNightLimit action: {adj.action}")
+    if not isinstance(adj.target_value, int) or adj.target_value < 0:
+        raise ValueError("ConsecutiveNightLimit set_threshold target_value must be non-negative int")
+    violation = runtime_forbidden_violation("three_seq_nig")
+    if violation is not None:
+        raise RuntimeKeyForbidden(violation)
+    cfg["three_seq_nig"] = adj.target_value >= 3  # 표지가 없으면 정본 bool 로 접어 쓴다(레지스트리 `to_canonical` x>=3)
+
+
 def _apply_night_recovery(cfg: dict[str, Any], adj: ConstraintAdjustment) -> None:
     if adj.action == "disable_module":
         cfg["two_offs_after_two_nig"] = False
@@ -345,7 +404,7 @@ def _apply_monthly_night_cap(cfg: dict[str, Any], adj: ConstraintAdjustment) -> 
     if adj.action == "set_threshold":
         if not isinstance(adj.target_value, int) or adj.target_value < 0:
             raise ValueError("MonthlyNightCap set_threshold target_value must be non-negative int")
-        cfg["max_night_shifts_per_month"] = int(adj.target_value)
+        cfg["max_nig_per_month"] = int(adj.target_value)
         return
     raise ValueError(f"unsupported MonthlyNightCap action: {adj.action}")
 
@@ -400,13 +459,45 @@ def _apply_coverage_min(cfg: dict[str, Any], adj: ConstraintAdjustment) -> None:
         cfg["daily_shift_requirements"] = base
 
 
+def _changed_settings(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """조정 하나가 바꾼 최상위 키 → 새 값(조정 기록 칸 제외). 하드락 키는 스칼라라 얕은 사본 비교로 충분하다."""
+    keys = dict.fromkeys([*before, *after])
+    return {k: after.get(k) for k in keys if k != _APPLIED_KEY and before.get(k) != after.get(k)}
+
+
+def _hard_lock_record_marks(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """EI-11 11d — 조정 기록에 싣는 하드락 표지. 기본값(판정 위반 0)이면 빈 dict 라 기록 칸이 늘지 않는다.
+
+    BLOCK 이 있으면 `applicable: False` + `blocked_by_hard_lock: [{key, rule_nos, message_ko}]`, 인접·영향 변경이면
+    `hard_lock_relax_marks: [{key, message_ko}]`. 판정이 실패하면 `applicable: False`·`hard_lock_check_error: True`(§2.0.6 ⑦).
+    거부는 하지 않는다 — 적용은 지금처럼 하고, 생성 경로의 거부는 생성 진입 관문이 한다."""
+    from services.policy import card_filter
+    from services.policy.hard_lock import BLOCK
+
+    try:
+        violations = card_filter.delta_violations(_changed_settings(before, after))
+    except Exception:
+        logger.warning("조정 기록 하드락 판정 실패 — 이 조정을 '적용 불가'로 표시합니다(fail-closed).", exc_info=True)
+        return {"applicable": False, "hard_lock_check_error": True}
+    out: dict[str, Any] = {}
+    blocks = [v for v in violations if v.kind == BLOCK]
+    marks = [v for v in violations if v.kind != BLOCK]
+    if blocks:
+        out["applicable"] = False
+        out["blocked_by_hard_lock"] = [{"key": v.key, "rule_nos": sorted({int(n) for n in v.rule_nos if n}),
+                                        "message_ko": v.message_ko} for v in blocks]
+    if marks:
+        out["hard_lock_relax_marks"] = [{"key": v.key, "message_ko": v.message_ko} for v in marks]
+    return out
+
+
 _DISPATCH: dict[str, Any] = {
     "TeamMin": _apply_team_min,
     "GradeMin": lambda cfg, adj: _apply_grade("GradeMin", cfg, adj),
     "GradeMax": lambda cfg, adj: _apply_grade("GradeMax", cfg, adj),
     "BoundaryTransitionBan": _apply_boundary_transition,
-    "ConsecutiveWorkLimit": lambda cfg, adj: _apply_consec(cfg, "max_consecutive_work_days", adj),
-    "ConsecutiveNightLimit": lambda cfg, adj: _apply_consec(cfg, "max_consecutive_nights", adj),
+    "ConsecutiveWorkLimit": lambda cfg, adj: _apply_consec(cfg, "max_conseq_work", adj),
+    "ConsecutiveNightLimit": _apply_consec_nights,
     "NightRecovery": _apply_night_recovery,
     "MonthlyNightCap": _apply_monthly_night_cap,
     "WeekendOffOnly": _apply_weekend_off_only,
@@ -446,7 +537,14 @@ def apply_adjustments_to_config(
         handler = _DISPATCH.get(family)
         if handler is None:
             raise ValueError(f"no handler for family: {family}")
-        handler(new_cfg, adj)
+        before = dict(new_cfg)  # EI-11 11d — 하드락 표지용 얕은 사본(하드락 키는 스칼라)
+        try:
+            handler(new_cfg, adj)
+            marks = _hard_lock_record_marks(before, new_cfg)
+        except RuntimeKeyForbidden as exc:  # 설정은 그대로 — 기록만 '적용 불가'
+            v = exc.violation
+            marks = {"applicable": False, "blocked_by_hard_lock": [
+                {"key": v.key, "rule_nos": [v.rule_no], "message_ko": v.message_ko}]}
         applied.append(
             {
                 "family": family,
@@ -454,6 +552,7 @@ def apply_adjustments_to_config(
                 "scope_filter": dict(adj.scope_filter or {}),
                 "target_value": adj.target_value,
                 "reason": adj.reason,
+                **marks,
             }
         )
     new_cfg["_applied_constraint_adjustments"] = applied

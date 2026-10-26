@@ -29,7 +29,9 @@ from db.models import Nurse, NurseAssignment
 #   d['team_id']           = target_team_id
 #   d['grade']             = target_grade
 #   d['weekly_off_enabled']= target_weekly_off_enabled
-#   d['weekly_off_type']   = target_weekly_off_type      (런타임 주입 속성, 실컬럼 아님)
+#   d['weekly_off_type']   = target_weekly_off_type      (런타임 주입 속성, 실컬럼 아님 — 엔진 inbound
+#                            블록의 이 주입은 읽는 곳이 없어 EI-2a 에서 지웠다. 이 매핑 행은
+#                            assignment_service 가 쓰므로 남긴다)
 #   d['weekly_off_weekday']= target_weekly_off_weekday
 #   d['allowed_shifts']    = target_shift_types           (허용 시프트 코드 리스트, []=전부 허용)
 #   d['fixed_shift']       = target_fixed_shift

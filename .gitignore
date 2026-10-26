@@ -54,3 +54,7 @@ tools/harness/run_*.py
 tools/leave_analysis/*.json
 # lex A/B 실측 로그 — 원본 보존용(요약 표는 파생물)
 tools/harness/runs/
+
+# 엔진 입력 구조화(feature/engine-input) 골든 — 테스트 기대값 JSON 은 커밋하지 않는다(로컬 전용 · D29 2026-10-20).
+# 이 컴퓨터에서 회귀 비교용으로만 쓴다. 백업은 .omc/aide_docs/v2/engine_input/golden_store/ (README.md 는 커밋 가능).
+tests/engine_input/golden*/**/*.json

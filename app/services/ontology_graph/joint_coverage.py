@@ -17,6 +17,7 @@ from __future__ import annotations
 from itertools import product
 from typing import Any
 
+from services.ontology_graph.demand import demand_on_day, has_by_day
 from services.ontology_graph.lagrangian import _night_rules, _nurse_attr
 
 _MAX_POOL = 7          # N 가능 인원이 이보다 많으면 정확판정 포기(폭발) → 솔버 위임
@@ -24,10 +25,8 @@ _FRONTIER_CAP = 300_000
 
 
 def _demand_n(config: dict, day: int) -> int:
-    dsr = config.get("daily_shift_requirements") or {}
-    if isinstance(dsr, dict) and dsr:
-        return int(dsr.get("N", 0) or 0)
-    return int(config.get("nig_req", 0) or 0)
+    """day(0-based) 의 야간 수요 — 뷰가 준 일자별 수요(`IR_BY_DAY_KEY`)가 있으면 그 날 값, 없으면 평탄(= 지금과 같다)."""
+    return demand_on_day(config, day)["N"]
 
 
 def _n_pool(nurses: list, config: dict) -> list[dict]:
@@ -183,7 +182,8 @@ def detect_joint_night_infeasible(nurses: list, config: dict, num_days: int) -> 
     return {
         "classification": "coverage_shortage", "top_family": "night_coverage",
         "pool_ids": [p["nurse_id"] for p in pool],
-        "demand_n": _demand_n(config, 0),
+        "demand_n": max((_demand_n(config, d) for d in range(num_days)), default=0) if has_by_day(config)
+        else _demand_n(config, 0),
         "culprits": culprits or [{"nurse_id": p["nurse_id"], "name": p["name"],
                                   "n_only": p["n_only"]} for p in pool],
     }

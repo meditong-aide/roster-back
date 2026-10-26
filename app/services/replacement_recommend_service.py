@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from services.engine_contract.defaults import registry_default
 from services.group_access import assert_caller_can_access_group
 
 from db.models import (
@@ -69,6 +70,18 @@ WORK_SHIFT_GB_TO_MAIN = {
 
 logger = logging.getLogger(__name__)
 
+
+
+def _hl_int(config: Any, key: str) -> int:
+    """하드락 정수 키 — 설정 행 값이 있으면 그 값, 비었으면(없음·0·None) 레지스트리 기본(D24)."""
+    default = int(registry_default(key))  # type: ignore[call-overload]
+    return int(getattr(config, key, default) or default) if config else default
+
+
+def _hl_bool(config: Any, key: str) -> bool:
+    """하드락 bool 키 — 설정 행이 있으면 그 값(None 은 꺼짐, 엔진과 같음), 설정이 없으면 레지스트리 기본(D24)."""
+    default = bool(registry_default(key))
+    return bool(getattr(config, key, default)) if config else default
 
 def _is_candidate_allowed_by_scope(
     scope: str,
@@ -574,8 +587,8 @@ def _recovery_off_risk(
         night_streak += 1
         cursor -= 1
 
-    two_off_after_two = bool(getattr(config, "two_offs_after_two_nig", False)) if config else False
-    two_off_after_three = bool(getattr(config, "two_offs_after_three_nig", False)) if config else False
+    two_off_after_two = _hl_bool(config, "two_offs_after_two_nig")
+    two_off_after_three = _hl_bool(config, "two_offs_after_three_nig")
 
     risk = 0.0
     tags: List[str] = []
@@ -667,9 +680,9 @@ def _rule_safety_score(
             shift_meta_by_pk=shift_meta_by_pk,
         )[0]
 
-    max_conseq = int(getattr(config, "max_conseq_work", 6) or 6) if config else 6
-    monthly_night_limit = int(getattr(config, "max_nig_per_month", 8) or 8) if config else 8
-    banned_day_after_eve = bool(getattr(config, "banned_day_after_eve", False)) if config else False
+    max_conseq = _hl_int(config, "max_conseq_work")
+    monthly_night_limit = _hl_int(config, "max_nig_per_month")
+    banned_day_after_eve = _hl_bool(config, "banned_day_after_eve")
 
     prev_work, next_work = _compute_streak(
         schedule_ctx,
@@ -1082,7 +1095,7 @@ def _evaluate_segment_single_nurse(
     target_pk_row = schedule_shift_pk_map.get(req.target_nurse_id, [])
 
     eval_limit = min(max_scan, len(scored))
-    _max_conseq = int(getattr(config, "max_conseq_work", 5) or 5) if config else 5
+    _max_conseq = _hl_int(config, "max_conseq_work")
     for cid, ctx, base_score in scored[:eval_limit]:
         if cid == req.target_nurse_id or cid in used_nurse_ids:
             continue
@@ -2251,18 +2264,18 @@ def _count_path_violations(
                 affected_nurses[target_nurse_id] = set()
             affected_nurses[target_nurse_id].add(day_idx)
 
-    max_conseq = int(getattr(config, "max_conseq_work", 6) or 6) if config else 6
+    max_conseq = _hl_int(config, "max_conseq_work")
     monthly_night_limit = (
-        int(getattr(config, "max_nig_per_month", 8) or 8) if config else 8
+        _hl_int(config, "max_nig_per_month")
     )
     banned_day_after_eve = (
-        bool(getattr(config, "banned_day_after_eve", False)) if config else False
+        _hl_bool(config, "banned_day_after_eve")
     )
     two_off_after_two = (
-        bool(getattr(config, "two_offs_after_two_nig", False)) if config else False
+        _hl_bool(config, "two_offs_after_two_nig")
     )
     two_off_after_three = (
-        bool(getattr(config, "two_offs_after_three_nig", False)) if config else False
+        _hl_bool(config, "two_offs_after_three_nig")
     )
 
     violations: List[PathViolationDetail] = []
@@ -2739,7 +2752,7 @@ def _recommend_bulk_markov(
                             break
                         streak += 1
                         c += 1
-                    max_conseq = int(getattr(config, "max_conseq_work", 6) or 6) if config else 6
+                    max_conseq = _hl_int(config, "max_conseq_work")
                     streak_over = max(0, streak - max_conseq)
                     f_consecutive = max(0.3, 1.0 - 0.1 * streak_over)
 

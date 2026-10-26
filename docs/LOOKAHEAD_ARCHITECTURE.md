@@ -59,7 +59,7 @@
 |------|------|
 | `cp_sat/lookahead_helpers.py` | D_ext, leave_ext, physical_range, month_total_day_range (순수 함수) |
 | `cp_sat/lookahead_constraints.py` | 룩어헤드 일별 OFF 상한(고정 vs 선택 분리), 분산 패널티 항 |
-| `roster_create_service` | lookahead_weekly_off_cells 계산·config 전달, lookahead_days 기본값 |
+| `roster_create_service` | (EI-2b 로 제거됨 — 서버가 넣는 `lookahead_days` 는 늘 0 이었다. 생성 요청의 `config_override` 로 켤 수는 있었지만 보내는 곳(프론트·모바일·에이전트·해결책 카드)이 없어 `K_lookahead>0` 분기와 `_compute_lookahead_weekly_off_cells` 는 실제로 돈 적이 없다. 이제 `config_override` 로 보내도 무시된다. 엔진은 `config_data.get("lookahead_weekly_off_cells")` 가 없으면 빈 집합으로 처리한다. primary 를 다시 올릴 때 룩어헤드 주휴 셀이 필요하면 `49f14bd` 의 `roster_create_service.py:1758-1805`(함수)·`:6042-6070`(호출)에서 되살린다) |
 | `cp_sat_basic._build_full_model` | D_ext/leave_ext 적용, 월총량 D_phys 한정, 룩어헤드 제약/패널티 호출 |
 
 - 기존 로직은 **조건부(lookahead_days > 0)** 로만 확장되며, `lookahead_days == 0` 이면 기존과 동일하게 동작한다.
@@ -84,7 +84,7 @@
 
 ## 7. 설정·데이터 흐름
 
-- **config_dict / config_data**: `lookahead_days`(기본 0), `lookahead_weekly_off_cells`, `next_month_head_requirements`(선택)
+- **config_dict / config_data**: `lookahead_days` 는 EI-2b 로 제거됨(서버 값은 늘 0 · `config_override` 로 보내는 곳 없음 — 위 §4). `lookahead_weekly_off_cells`, `next_month_head_requirements`(선택)
 - **RosterSystem**: `num_days`(= D_phys) 유지. `lookahead_weekly_off_cells` 는 config 적용 시 `roster_system` 에 세팅.
 - **해 반영**: `d < D_phys` 인 경우만 `rs.roster` 에 기록. (`_build_full_model` 은 `join`, `leave`(물리)를 반환하므로 기존 해 기록 루프 변경 없음.)
 

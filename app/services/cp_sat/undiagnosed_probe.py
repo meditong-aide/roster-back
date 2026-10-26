@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from services.cp_sat.allowed_shift_types import HARD_MAX_NIGHTS_PER_MONTH
 from services.cp_sat.fix_location import attach_fix_to_options
+from services.engine_contract.settings import lookup as _lookup_setting
 
 
 def _raise_night_cap_delta(c: dict[str, Any]) -> dict[str, Any]:
@@ -34,26 +35,50 @@ def _raise_night_cap_delta(c: dict[str, Any]) -> dict[str, Any]:
     return {"max_nig_per_month": min(cur + 8, HARD_MAX_NIGHTS_PER_MONTH)}
 
 
+def _consec_work_cap() -> int:
+    """하드락 #1(연속근무) 상한 — 레지스트리에서 읽는다(숫자를 다시 적지 않는다, R3-06)."""
+    return int(_lookup_setting("max_conseq_work").hard_lock.cap)
+
+
+def _raise_consec_work_delta(c: dict[str, Any]) -> dict[str, Any]:
+    """연속근무 상한 완화 delta — 하드락 #1 상한 안에서만(EI-11). 올릴 여지가 없으면 빈 delta(=건너뜀).
+
+    ★ 0 의 뜻이 #6(`_raise_night_cap_delta`)과 다르다 — 엔진은 0·음수를 그대로 써서(레지스트리
+      `max_conseq_work` null_behavior) 오히려 엄격하다. 그래서 상한값을 내고, 탐색이 1..상한에서
+      최소값을 찾는다. 키 부재·None·숫자 아님은 빈 delta 다. 이미 상한 이상이어도 빈 delta 라
+      탐색(`probe_relaxations`)과 조합(`_find_combo`)에서 함께 빠진다.
+    """
+    raw = c.get("max_conseq_work")
+    if raw is None:
+        return {}
+    try:
+        cur = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    cap = _consec_work_cap()
+    if cur <= 0:
+        return {"max_conseq_work": cap}
+    if cur >= cap:
+        return {}
+    return {"max_conseq_work": min(cur + 3, cap)}
+
+
 # 결합제약 완화 카탈로그. apply(cfg)->delta(config_dict 키 기준, DB 컬럼명).
 # label_ko 는 사용자 노출용, family 는 그룹핑용. 침습도 낮은(=현실적인) 순서로.
+# ★ 하드락 8종(CLAUDE.md)을 완화하는 항목은 두지 않는다(EI-11) — 2N·3N 회복 해제(#5·#4)·연속 야간 +1(#3)·
+#   1N 금지 해제(#7)·전이 금지 해제 3종(#2)을 지웠고, 연속근무 상한(#1)·월 야간 상한(#6)은 상한 안으로 자른다.
+#   C5(tests/engine_contract/test_card_hard_lock_contract.py)가 모든 항목 × 표본에서 BLOCK 0 을 단언한다.
 RELAX_CATALOG: list[dict[str, Any]] = [
     # ★ 하드락 #6(월 나이트 최대 15)을 넘기지 않는다 — 예전엔 +8·탐색 상한 31 이라 월N 31 까지 제안했다
     #   (2026-10-02 · 메모리 "카드 하드락 필터 없음"). 이미 15 면 탐색 없이 건너뛴다(lo>hi).
     {"id": "raise_max_night_cap", "family": "night_cap", "label_ko": "월 야간 상한 완화",
      "apply": lambda c: _raise_night_cap_delta(c),
      "search": {"key": "max_nig_per_month", "dir": "up", "hi": HARD_MAX_NIGHTS_PER_MONTH}},
-    {"id": "disable_2n2off", "family": "night_recovery", "label_ko": "2N→2OFF 회복 규칙 해제",
-     "apply": lambda c: {"two_offs_after_two_nig": False}},
-    {"id": "disable_3n2off", "family": "night_recovery", "label_ko": "3N→2OFF 회복 규칙 해제",
-     "apply": lambda c: {"two_offs_after_three_nig": False}},
+    # ★ 하드락 #1(연속근무 상한 — 레지스트리 cap)을 넘기지 않는다 — 예전엔 +3·탐색 상한 14 라 그 위 값까지
+    #   제안했다(EI-11). 이미 상한이면 탐색 없이 건너뛴다(빈 delta).
     {"id": "raise_max_consec_work", "family": "consecutive", "label_ko": "연속근무 상한 완화",
-     "apply": lambda c: {"max_conseq_work": int(c.get("max_conseq_work") or 5) + 3},
-     "search": {"key": "max_conseq_work", "dir": "up", "hi": 14}},
-    {"id": "relax_consecutive_nights", "family": "night_consecutive", "label_ko": "연속 야간 상한 완화(+1)",
-     "apply": lambda c: {"max_consecutive_nights": int(c.get("max_consecutive_nights") or (3 if c.get("three_seq_nig") else 2)) + 1},
-     "search": {"key": "max_consecutive_nights", "dir": "up", "hi": 7}},
-    {"id": "disable_not_one_night", "family": "night_pattern", "label_ko": "단일 야간 금지 해제",
-     "apply": lambda c: {"not_one_night": False}},
+     "apply": lambda c: _raise_consec_work_delta(c),
+     "search": {"key": "max_conseq_work", "dir": "up", "hi": _consec_work_cap()}},
     {"id": "disable_ban_n_before_fixed_off", "family": "night_pattern", "label_ko": "고정OFF 직전 야간 금지 해제",
      "apply": lambda c: {"ban_night_before_fixed_off": False}},
     # ★ 위와 축이 다른 별개 설정이다(휴가·공가 type vs 확정 원티드 출처).
@@ -62,8 +87,6 @@ RELAX_CATALOG: list[dict[str, Any]] = [
     {"id": "disable_ban_n_before_fixed_wanted_off", "family": "night_pattern",
      "label_ko": "신청 휴무 직전 야간 금지 해제",
      "apply": lambda c: {"ban_night_before_fixed_wanted_off": False}},
-    {"id": "disable_banned_day_after_eve", "family": "transition", "label_ko": "E→D 전이 금지 해제",
-     "apply": lambda c: {"banned_day_after_eve": False}},
     {"id": "lower_off_days", "family": "off_budget", "label_ko": "월 OFF 요구일수 완화(-3)",
      "apply": lambda c: {"off_days": max(0, int(c.get("off_days") or 0) - 3)},
      "search": {"key": "off_days", "dir": "down", "lo": 0}},
@@ -75,31 +98,26 @@ RELAX_CATALOG: list[dict[str, Any]] = [
     # [주말휴무는 config 플래그로 끄지 않는다] weekend_off_only_enable 은 주말휴무자 '전원'의
     # 주말 강제OFF 를 켜고 끄는 global 정책 플래그다. 주말휴무는 개인 속성이므로 완화는
     # per-nurse(그 간호사만 해제, weekend_off_release)로만 제시한다 → 이 config 레버는 catalog 제외.
-    {"id": "disable_ban_n_to_d", "family": "transition", "label_ko": "야간→주간 전이 금지 해제",
-     "apply": lambda c: {"ban_n_to_d": False}},
-    {"id": "disable_ban_n_to_e", "family": "transition", "label_ko": "야간→저녁 전이 금지 해제",
-     "apply": lambda c: {"ban_n_to_e": False}},
     {"id": "soften_team_min", "family": "team", "label_ko": "팀 최소 인원 soft 완화",
      "apply": lambda c: {"team_min_soft_fallback": True}},
+    # EI-14c-4 — OFF 4연속 금지(enforce_4o_hard)는 완화 사다리에 없는 규칙이라 단독 해제가 실제로 풀 수 있다.
+    #   기본 꺼짐이라 켠 병동에서만 후보다(꺼져 있으면 빈 delta → 탐색이 건너뛴다). 하드락 8종과 무관(레지스트리
+    #   hard_lock=None). 앞 항목의 순서·재계산 수를 밀지 않도록 맨 끝에 둔다.
+    {"id": "disable_enforce_4o", "family": "off_streak", "label_ko": "OFF 4연속 금지 해제",
+     "apply": lambda c: ({"enforce_4o_hard": False} if bool(c.get("enforce_4o_hard", False)) else {})},
 ]
 
 
 # 사용자 노출용: 완화별 트레이드오프 / config 컬럼 한글 라벨
 TRADEOFF_KO: dict[str, str] = {
     "raise_max_night_cap": "야간 근무가 개인별로 더 몰릴 수 있습니다.",
-    "disable_2n2off": "야간 2회 후 2일 휴식 보장이 약해집니다.",
-    "disable_3n2off": "야간 3회 후 2일 휴식 보장이 약해집니다.",
     "raise_max_consec_work": "연속 근무일이 늘어날 수 있습니다.",
-    "relax_consecutive_nights": "야간을 더 길게 연속으로 서게 될 수 있습니다.",
-    "disable_not_one_night": "단일 야간(1N) 근무가 생길 수 있습니다.",
     "disable_ban_n_before_fixed_off": "고정 휴무 직전에 야간이 배치될 수 있습니다.",
     "disable_ban_n_before_fixed_wanted_off": "신청해 받은 휴무 직전에 야간이 배치되어, 그 휴무가 야간 회복분으로 소비될 수 있습니다.",
-    "disable_banned_day_after_eve": "이브닝 다음날 데이 전이가 생길 수 있습니다.",
     "lower_off_days": "월 휴무일이 줄어듭니다.",
     "disable_preceptee_sync": "프리셉티가 프리셉터와 동반(팔로우)하지 않게 됩니다(교육 동반 약화).",
-    "disable_ban_n_to_d": "야간 다음날 주간 전이가 생길 수 있습니다.",
-    "disable_ban_n_to_e": "야간 다음날 저녁 전이가 생길 수 있습니다.",
     "soften_team_min": "특정 시프트에서 팀 인원이 최소치보다 1~2명 부족할 수 있습니다(인계 시 주의).",
+    "disable_enforce_4o": "쉬는 날이 4일 이상 이어질 수 있고, 그만큼 다른 날 근무가 몰릴 수 있어요.",
 }
 COL_LABEL_KO: dict[str, str] = {
     "max_nig_per_month": "월 야간 상한", "two_offs_after_two_nig": "2N→2OFF 회복",
@@ -107,9 +125,10 @@ COL_LABEL_KO: dict[str, str] = {
     "not_one_night": "단일 야간 금지", "ban_night_before_fixed_off": "고정OFF 전 야간 금지",
     "ban_night_before_fixed_wanted_off": "신청 휴무 전 야간 금지",
     "banned_day_after_eve": "E→D 전이 금지", "off_days": "월 OFF 요구일수",
-    "max_consecutive_nights": "연속 야간 상한", "preceptee_on": "프리셉티 동반(팔로우)",
+    "preceptee_on": "프리셉티 동반(팔로우)",
     "weekend_off_only_enable": "주말휴무 전용", "ban_n_to_d": "N→D 전이 금지",
     "ban_n_to_e": "N→E 전이 금지", "team_min_soft_fallback": "팀 최소 soft 완화",
+    "enforce_4o_hard": "OFF 4연속 금지",
 }
 
 
@@ -174,19 +193,31 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
             #   같은 실패이거나(값 없음) 하드락을 넘는다. 수동(증원 필요)으로 내린다(OMC 재리뷰 2026-10-02).
             return t.get("action_type") == "data_correction_required" or (
                 bool(t.get("sizing_insufficient"))
-                and t.get("config_key") in ("max_nig_per_month", "max_night_shifts_per_month"))
+                and t.get("config_key") == "max_nig_per_month")
 
-        auto = [t for t in treatments if not _manual_only(t)]
+        def _demand_by_hand(t: dict[str, Any]) -> bool:
+            # ★ 일별 시프트 요구 인원은 config 의 daily_shift_requirements 가 dict 라 서비스가 ±1 목표값을
+            #   못 만든다(treatment_applicator._infer_target_value → None → 수동 분류) — 목표값(suggested_value)
+            #   이 없으면 누른 뒤 바뀌는 게 0 이다. 필요 인원을 자동으로 줄이는 건 환자안전상 안 한다(D30) →
+            #   버튼 없는 직접 수정 안내 카드로 내린다(treatment_ids 비움).
+            return (t.get("config_key") == "daily_shift_requirements"
+                    and t.get("suggested_value") is None and not _manual_only(t))
+
+        by_hand = [t for t in treatments if _demand_by_hand(t)]
+        auto = [t for t in treatments if not _manual_only(t) and not _demand_by_hand(t)]
         manual = [t for t in treatments if _manual_only(t)]
-        if not auto:
+        if not auto and not by_hand:
             continue  # 전부 수동(data_correction_required)이면 자동 적용 불가 → 옵션 제외
+        # 자동 적용 처방이 있으면 수요 하향(by_hand)은 제목·변경 목록·트레이드오프에 광고하지 않는다(눌러도 안 바뀐다).
+        shown = auto if auto else by_hand
         _bid = str(b.get("bundle_id") or "?")
         # magnitude sizing: enricher 가 단일축 precheck 숫자로 실효 목표값을 계산해
         # t["suggested_value"] 에 담았으면 changes 에 노출 + apply(직접적용 델타)로 승격.
         # 값이 없으면(조합/미지원) 기존처럼 방향만 제시 + treatment_ids 로 적용.
         _apply: dict[str, Any] = {}
         _changes = []
-        for t in auto:
+        _sized_ids: set = set()  # apply 가 목표값을 이미 정한 처방 — treatment_ids 로 또 적용하면 그 위에 +1 이 얹힌다(EI-12)
+        for t in shown:
             ck = t.get("config_key")
             sv = t.get("suggested_value")
             ch = {"config_key": ck, "label_ko": _lbl(t),
@@ -197,6 +228,7 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
                 ch["sizing_ko"] = t.get("sizing_ko")
                 if ck:
                     _apply[ck] = sv
+                    _sized_ids.add(t.get("treatment_id"))
             elif t.get("sizing_insufficient"):
                 ch["sizing_ko"] = t.get("sizing_ko")
                 ch["sizing_insufficient"] = True
@@ -209,11 +241,11 @@ def treatments_to_resolution_options(treatment_recommendations: list[dict[str, A
             "kind": "treatment_bundle", "source": "ontology",
             # sized 목표값이 있으면 apply 로 바로 적용 가능(수치 확정) → 반쯤 검증된 셈.
             "verified": False,
-            "title_ko": " + ".join(_lbl(t) for t in auto),
+            "title_ko": " + ".join(_lbl(t) for t in shown) + ("" if auto else " (직접 수정)"),
             "changes": _changes,
-            "trade_off_ko": " / ".join([t.get("trade_off_ko") for t in auto if t.get("trade_off_ko")]),
-            "treatment_ids": [t.get("treatment_id") for t in auto],
-            "manual_required": [t.get("treatment_id") for t in manual],
+            "trade_off_ko": " / ".join([t.get("trade_off_ko") for t in shown if t.get("trade_off_ko")]),
+            "treatment_ids": [t.get("treatment_id") for t in auto if t.get("treatment_id") not in _sized_ids],
+            "manual_required": [t.get("treatment_id") for t in manual + by_hand],
             "apply": _apply,
         })
     return attach_fix_to_options(opts)
@@ -228,6 +260,11 @@ _LEVER_BY_EVIDENCE_KEY: dict[str, tuple[str, str, str]] = {
         "연속근무 상한 완화",
         "한 사람이 최대 며칠까지 연달아 근무할 수 있는지가 늘어납니다.",
     ),
+    "off_floor_binding": (
+        "off_days",
+        "개인 월 휴무일 수 완화",
+        "한 사람의 월 최소 OFF 일수가 줄어 휴무가 그만큼 적게 보장됩니다.",
+    ),
 }
 
 
@@ -238,7 +275,7 @@ def config_lever_options_from_issues(issues: list[dict[str, Any]]) -> list[dict[
     capacity 부족을 '간호사 추가'(수동)로만 안내하던 오분류를 보완한다. precheck 가
     evidence(conseq_cap_binding)에 남긴 값으로 옵션을 만든다(verified=False, 클릭 시
     재생성으로 실검증). suggested_value 없으면(무제한으로도 미충족 = 진짜 인원부족) 생성
-    안 함. ※ 개인 월 휴무(off_days)는 엔진에서 소프트라 capacity 를 못 바꾼다 → 레버 아님.
+    안 함. ※ 개인 월 휴무(off_days)는 EI-14r3 부터 OFF 하한(min_off)으로 capacity 에 들어가므로 off_floor_binding 이 있을 때만 레버다.
     """
     opts: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -846,3 +883,24 @@ def probe_relaxations(
         "baseline_feasible": False,
         "timed_out": _over(),
     }
+
+
+#: payload 칸 이름 ← 탐색 결과 키(EI-11 11e). 형제 칸 `probe_resolutions`·`probe_combo` 처럼 `probe_` 를 붙인다(Q7).
+_PROBE_STATUS_KEYS: tuple[tuple[str, str], ...] = (
+    ("probe_found", "found"),
+    ("probe_baseline_feasible", "baseline_feasible"),
+    ("probe_timed_out", "timed_out"),
+)
+
+
+def probe_status_fields(res: dict[str, Any] | None) -> dict[str, bool | None]:
+    """탐색 결과 세 칸 — 생성 서비스가 payload `infeasibility` 에 그대로 싣는다(EI-11 11e).
+
+    탐색을 돌렸으면 bool 이다(결과에 그 키가 없으면 False). 돌리지 않았으면 — `res` 가 None 이거나 원인 진단이
+    탐색을 건너뛰게 한 결과(`skipped_by_cause`)면 — 세 칸 모두 None 이다. 서비스는 탐색 단계에 들어서면 먼저
+    None 으로 싣고 탐색을 돌리면 결과로 덮는다. 그래서 칸이 아예 없으면 그 경로에 탐색 단계가 없다는 뜻이다
+    (precheck 차단·A1 요청 안 함).
+    """
+    if not isinstance(res, dict) or res.get("skipped_by_cause"):
+        return {field: None for field, _key in _PROBE_STATUS_KEYS}
+    return {field: bool(res.get(key, False)) for field, key in _PROBE_STATUS_KEYS}

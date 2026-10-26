@@ -18,6 +18,7 @@ from collections import defaultdict
 from datetime import date
 from typing import Any
 
+from services.in_chunks import in_chunks
 from sqlalchemy import or_
 
 
@@ -35,16 +36,19 @@ def fetch_periods(db, Model, nurse_ids, month_start: date, month_end: date,
     """
     if not nurse_ids:
         return {}
-    q = db.query(Model).filter(
-        Model.nurse_id.in_(list(nurse_ids)),
-        Model.valid_from < month_end,
-        or_(Model.valid_to.is_(None), Model.valid_to > month_start),
-    )
-    if group_id is not None and hasattr(Model, "group_id"):
-        q = q.filter(Model.group_id == group_id)
     by_nurse: dict[str, list] = defaultdict(list)
-    for r in q.order_by(Model.valid_from.asc()).all():
-        by_nurse[str(r.nurse_id)].append(r)
+    # (EI-13c) IN 목록은 300개 단위로 끊는다 — 병동(≤300명)은 한 덩어리 = 지금과 같은 한 문장.
+    #   덩어리끼리 간호사가 겹치지 않아 간호사별 구간 순서(valid_from 오름차순)는 그대로다.
+    for chunk in in_chunks(nurse_ids):
+        q = db.query(Model).filter(
+            Model.nurse_id.in_(chunk),
+            Model.valid_from < month_end,
+            or_(Model.valid_to.is_(None), Model.valid_to > month_start),
+        )
+        if group_id is not None and hasattr(Model, "group_id"):
+            q = q.filter(Model.group_id == group_id)
+        for r in q.order_by(Model.valid_from.asc()).all():
+            by_nurse[str(r.nurse_id)].append(r)
     return by_nurse
 
 

@@ -28,14 +28,14 @@ from services.payload_graph import build_payload_graph
 
 
 # 설정성 오류로 분류되는 reason_code (즉시 차단 권장)
+# ※ FIXED_OFF_EXCEEDS_SPAN·FIXED_ASSIGN_EXCEEDS_NEED 는 EI-10d 부터 경고(severity="warning")라 이 집합에서 뺐다 —
+#   엔진은 둘을 불가능으로 안 본다(fallback_lex.py:1278-1280·1732-1738). 동작은 같다(has_blocking_issues 가 severity 도 본다).
 _BLOCKING_CODES = {
     "MID_REQUIRED_MISSING",
     "MID_DISABLED_BUT_USED",
     "ALLOWED_SHIFTS_ISOLATES_NURSE",
-    "FIXED_OFF_EXCEEDS_SPAN",
     "TEAM_SIZE_INSUFFICIENT",
     "GRADE_MIN_SUM_EXCEEDS_NEED",
-    "FIXED_ASSIGN_EXCEEDS_NEED",
     "FIXED_ASSIGN_VIOLATES_ALLOWED",
     "GLOBAL_DAY_CAPACITY_SHORTAGE",
     "GLOBAL_SHIFT_ALLOWED_SHORTAGE",
@@ -53,6 +53,20 @@ _BLOCKING_CODES = {
     "PRECEPTEE_SYNC_MISMATCH",
     "PER_NURSE_SEQUENCE_INFEASIBLE",
 }
+
+
+def _add_day_evidence(head_details: dict[str, Any], det: dict[str, Any]) -> None:
+    """일자별 총 수요 부족(day·required_total·available_nurses)은 날짜마다 숫자가 다를 수 있어 날짜별로 쌓는다(D28-3).
+
+    day 는 0 기준 원자료 그대로다(표시용 1 기준 변환은 문장을 만드는 쪽).
+    """
+    if det.get("day") is None or "required_total" not in det or "available_nurses" not in det:
+        return
+    rows = head_details.setdefault("day_evidence", [])
+    if any(r["day"] == det["day"] for r in rows):
+        return
+    rows.append({"day": det["day"], "required_total": det["required_total"],
+                 "available_nurses": det["available_nurses"]})
 
 
 def _dedup_causes_by_reason(causes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -75,6 +89,7 @@ def _dedup_causes_by_reason(causes: List[Dict[str, Any]]) -> List[Dict[str, Any]
             head_details["occurrence_count"] = 1
             head_details["affected_days"] = []
             head_details["affected_shifts"] = []
+            _add_day_evidence(head_details, raw_det)
             head["details"] = head_details
             bucket[rc] = head
             out.append(head)
@@ -84,6 +99,7 @@ def _dedup_causes_by_reason(causes: List[Dict[str, Any]]) -> List[Dict[str, Any]
             hd["occurrence_count"] = int(hd.get("occurrence_count") or 1) + 1
             d = raw_det.get("day")
             s = raw_det.get("shift")
+            _add_day_evidence(hd, raw_det)
             if d is not None and d not in hd["affected_days"]:
                 hd["affected_days"].append(d)
             if s is not None and s not in hd["affected_shifts"]:
@@ -111,12 +127,29 @@ def _extract_validator_evidence_summary(violated_constraints: List[Dict[str, Any
     return {}
 
 
+def _apply_policy_marks(
+    treatment_recommendations: list[dict[str, Any]],
+    resolution_narrative: dict[str, Any] | None,
+    causes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """EI-11 11c 후처리(H1) — 카드가 아닌 출구 칸(처방 목록·서술·problem_list)에 '정책상 금지' 표지와 상한 문구를 단다.
+
+    본문은 `policy.card_filter.mark_treatment_views` 다(판정과 같은 모듈 — 이 파일은 dev 에서 자주 고쳐 충돌 면을 줄인다).
+    그 함수는 예외를 내지 않는다(판정 실패면 하드락 가족 처방을 모두 표지 — fail-closed). 돌려주는 값은 원인을 덮는 금지
+    처방의 `policy_forbidden` 항목이다. 원인(`causes`)과 problem_list 의 `rendered_ko`(진단 문구)는 그대로다.
+    """
+    from services.policy.card_filter import mark_treatment_views
+
+    cause_ids = [c.get("reason_code") for c in causes if c.get("reason_code")]
+    return mark_treatment_views(treatment_recommendations, resolution_narrative, cause_ids)
+
+
 def _build_treatments_narrative_and_hard_case(
     causes: List[Dict[str, Any]],
     observed_symptoms: List[Dict[str, Any]],
     evidence: Dict[str, Any],
-) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-    """cause/evidence 로 treatment_recommendations + narrative + hard_case + graph 생성.
+) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any], Dict[str, Any], list[dict[str, Any]]]:
+    """cause/evidence 로 treatment_recommendations + narrative + hard_case + graph + 정책 금지 처방 항목 생성.
 
     blocking / unrecoverable payload 양쪽에서 동일하게 호출 (DRY).
     treatment build 실패 시 graceful degradation — payload 구조 보존.
@@ -255,6 +288,9 @@ def _build_treatments_narrative_and_hard_case(
     except Exception as _enr_exc_post:
         print(f"[TreatmentEnricher][post-hard-case] enrich 실패(무시): {_enr_exc_post}")
 
+    # EI-11 11c — '정책상 금지' 표지·상한 문구. 위 try 밖(실패해도 처방·서술을 비우지 않는다)이고, graph 가 후처리 뒤
+    #   값을 보게 hard_case_dict 바로 앞에 둔다.
+    policy_items = _apply_policy_marks(treatment_recommendations, resolution_narrative, causes)
     hard_case_dict = hard_case_verdict.to_dict()
     graph = build_payload_graph(
         causes=causes,
@@ -263,7 +299,7 @@ def _build_treatments_narrative_and_hard_case(
         evidence=evidence,
         hard_case=hard_case_dict,
     )
-    return treatment_recommendations, resolution_narrative, hard_case_dict, graph
+    return treatment_recommendations, resolution_narrative, hard_case_dict, graph, policy_items
 
 
 def has_blocking_issues(precheck_result: Dict[str, Any]) -> bool:
@@ -353,7 +389,7 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
         witness_schedule_id=None,
     )
 
-    treatment_recommendations, resolution_narrative, hard_case_dict, graph = (
+    treatment_recommendations, resolution_narrative, hard_case_dict, graph, policy_items = (
         _build_treatments_narrative_and_hard_case(causes, observed_symptoms, evidence)
     )
     # ontology treatment 추천 → 프론트용 통합 옵션 카드(precheck 차단/post-gen 모든 경로 공통).
@@ -365,9 +401,15 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
         _resolution_options = []
     # 사용자 설정(연속근무 상한 등)이 산술 차단의 원인이면 그 값을 올리는 auto 옵션을
     # 앞에 추가하고, 해당 원인의 '간호사 추가'(수동) 오안내는 제거(자동 해결 가능하므로).
+    # ★ EI-11 — 하드락을 넘는 레버(연속근무 상한 초과 제안)는 그 안내를 지우기 **전에** 거른다. 남은
+    #   레버가 있을 때만 안내를 지우므로, 다 걸리면 원인의 '간호사 추가' 안내가 남는다(걸린 카드는
+    #   policy_forbidden 으로 싣는다).
+    _lever_blocked: list = []
     try:
         from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
+        from services.policy.card_filter import filter_options
         _lever = config_lever_options_from_issues(issues)
+        _lever, _lever_blocked = filter_options(_lever)
         if _lever:
             for _c in causes:
                 if str(_c.get("reason_code") or "").upper() == "CAPACITY_TOTAL_SHORTAGE":
@@ -386,7 +428,7 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    return {
+    payload = {
         "infeasibility": {
             "severity": "blocking",
             "ui_text": _default_ui_text(),
@@ -412,8 +454,14 @@ def build_blocking_payload(precheck_result: Dict[str, Any]) -> Dict[str, Any]:
                 pool_snapshot={},
             ),
             "last_error_reason": None,
+            "policy_forbidden": policy_items + _lever_blocked,  # EI-11 11c — 원인을 덮는 금지 처방 기록이 앞
         }
     }
+    # EI-11 싱크 a — 하드락을 완화하는 카드를 거르고 policy_forbidden·blocked_by_hard_lock·policy_filter_error
+    #   를 싣는다. 예외를 내지 않으므로 try 로 감싸지 않는다(policy.card_filter 실패 계약).
+    from services.policy.card_filter import finalize_infeasibility
+    finalize_infeasibility(payload["infeasibility"])
+    return payload
 
 
 def build_success_payload(
@@ -555,7 +603,7 @@ def build_unrecoverable_payload(
     if nurse_index_map and isinstance(evidence, dict):
         evidence["nurse_index_map"] = nurse_index_map
 
-    treatment_recommendations, resolution_narrative, hard_case_dict, graph = (
+    treatment_recommendations, resolution_narrative, hard_case_dict, graph, policy_items = (
         _build_treatments_narrative_and_hard_case(causes, observed_symptoms, evidence)
     )
     # ontology treatment 추천 → 프론트용 통합 옵션 카드(precheck 차단/post-gen 모든 경로 공통).
@@ -567,9 +615,15 @@ def build_unrecoverable_payload(
         _resolution_options = []
     # 사용자 설정(연속근무 상한 등)이 산술 차단의 원인이면 그 값을 올리는 auto 옵션을
     # 앞에 추가하고, 해당 원인의 '간호사 추가'(수동) 오안내는 제거(자동 해결 가능하므로).
+    # ★ EI-11 — 하드락을 넘는 레버(연속근무 상한 초과 제안)는 그 안내를 지우기 **전에** 거른다. 남은
+    #   레버가 있을 때만 안내를 지우므로, 다 걸리면 원인의 '간호사 추가' 안내가 남는다(걸린 카드는
+    #   policy_forbidden 으로 싣는다).
+    _lever_blocked: list = []
     try:
         from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
+        from services.policy.card_filter import filter_options
         _lever = config_lever_options_from_issues(issues)
+        _lever, _lever_blocked = filter_options(_lever)
         if _lever:
             for _c in causes:
                 if str(_c.get("reason_code") or "").upper() == "CAPACITY_TOTAL_SHORTAGE":
@@ -588,7 +642,7 @@ def build_unrecoverable_payload(
     except Exception:
         pass
 
-    return {
+    payload = {
         "infeasibility": {
             "severity": "blocking",
             "ui_text": _default_ui_text(),
@@ -625,5 +679,11 @@ def build_unrecoverable_payload(
                 pool_snapshot=pool_snapshot or {},
             ),
             "last_error_reason": last_error_reason,
+            "policy_forbidden": policy_items + _lever_blocked,  # EI-11 11c — 원인을 덮는 금지 처방 기록이 앞
         }
     }
+    # EI-11 싱크 b — 싱크 a 와 같다. 라우터 폴백(routers/roster_create.py)·대시보드 사례 payload 도 이 빌더를
+    #   지난다. 생성 서비스의 사후 탐색 게이트는 거른 목록을 본다(하드락 카드만 있던 원인이면 탐색이 돈다).
+    from services.policy.card_filter import finalize_infeasibility
+    finalize_infeasibility(payload["infeasibility"])
+    return payload

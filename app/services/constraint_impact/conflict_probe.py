@@ -4,10 +4,14 @@
 
 US-2 (cost model 통합): 모든 cost 가중치는 services.cost_model + ontology.yaml meta.cost_model
 에서 derive. 본 모듈에는 magic constant 가 없다 (테스트로 enforced).
+
+EI-11 11d — probe plan 의 `disable_module` 단계마다 CLAUDE.md 하드락 판정(`policy.card_filter.family_action_policy`)을
+싣는다(`applicable` · `blocked_by_hard_lock` · `hard_lock_relax_marks`). 표지만 단다 — 계획 순서·후보는 그대로다.
 """
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -19,6 +23,8 @@ from services.semantics.ontology import (
     OntologyConflictScenario,
     get_default_ontology,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -192,12 +198,42 @@ def match_known_conflict_scenarios(
 # ---- probe plan ------------------------------------------------------------------
 
 
+def _disable_module_policy() -> dict | None:
+    """(family, action) 하드락 판정 — 실패하면 None(단계마다 '적용 불가'·판정 오류로 표시한다)."""
+    from services.policy import card_filter
+
+    try:
+        return card_filter.family_action_policy()
+    except Exception:
+        logger.warning("conflict_probe 하드락 판정 실패 — probe 단계를 모두 '적용 불가'로 표시합니다(fail-closed).", exc_info=True)
+        return None
+
+
+def _hard_lock_step_marks(family: str, policy: dict | None) -> dict[str, Any]:
+    """EI-11 11d — `disable_module` 단계 하나의 하드락 표지. `applicable` 은 늘 싣는다.
+
+    blocked(·capped) → `applicable: False` + `blocked_by_hard_lock`(rule_nos) · marked → `hard_lock_relax_marks` ·
+    control 이 지원하지 않는 끄기(매트릭스 밖 — 적용하면 control 이 거부한다) → `applicable: False` + `unsupported_action` ·
+    판정 실패 → `applicable: False` + `hard_lock_check_error`."""
+    if policy is None:
+        return {"applicable": False, "hard_lock_check_error": True}
+    entry = policy.get((family, "disable_module"))
+    if entry is None:
+        return {"applicable": False, "unsupported_action": True}
+    if entry.get("mode") in ("blocked", "capped"):
+        return {"applicable": False, "blocked_by_hard_lock": list(entry.get("rule_nos") or [])}
+    if entry.get("mode") == "marked":
+        return {"applicable": True, "hard_lock_relax_marks": [dict(m) for m in entry.get("marks") or []]}
+    return {"applicable": True}
+
+
 def build_probe_plan(
     *,
     ranked_candidates: list[RankedCandidate],
     max_steps: int = 5,
 ) -> list[ProbeStep]:
     plan: list[ProbeStep] = []
+    policy = _disable_module_policy() if ranked_candidates[:max_steps] else None  # EI-11 11d — 호출당 한 번
     for i, cand in enumerate(ranked_candidates[:max_steps]):
         rationale_parts = [f"score={cand.score}"]
         if cand.matched_scenario_ids:
@@ -211,6 +247,7 @@ def build_probe_plan(
                     "family": cand.family,
                     "action": "disable_module",
                     "reason": f"conflict_probe step {i + 1}",
+                    **_hard_lock_step_marks(cand.family, policy),
                 },
                 rationale="; ".join(rationale_parts),
             )

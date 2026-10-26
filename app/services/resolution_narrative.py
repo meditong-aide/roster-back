@@ -79,6 +79,35 @@ class NarrativeMessage:
     verified: bool = False
 
 
+def _daily_total_shortage_sentence(cause_id: str, evidence: Mapping[str, Any]) -> str:
+    """일자별 총 수요 부족 문장(D28-1·3) — precheck 증거 키(day 0 기준·required_total·available_nurses)로 만든다.
+
+    ontology.yaml 템플릿의 {total_demand}·{nurse_count} 와 키가 달라 '?명' 이 됐고 day 는 하루 어긋났다.
+    막힌 날 전부를 1 기준으로 쓰고 숫자는 날짜별로 둔다. 증거 키가 없으면 빈 문자열(= 템플릿 그대로).
+    """
+    if cause_id != "cause:capacity:daily_total_shortage":
+        return ""
+    rows = list(evidence.get("day_evidence") or [])
+    if not rows and evidence.get("day") is not None:
+        rows = [{"day": evidence["day"], "required_total": evidence.get("required_total"),
+                 "available_nurses": evidence.get("available_nurses")}]
+    try:
+        rows = sorted(
+            ({"day": int(r["day"]) + 1, "req": int(r["required_total"]), "avail": int(r["available_nurses"])}
+             for r in rows),
+            key=lambda r: r["day"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return ""
+    if not rows:
+        return ""
+    if len({(r["req"], r["avail"]) for r in rows}) == 1:
+        days = "·".join(f"{r['day']}일" for r in rows)
+        return f"{days} 총 근무 수요 {rows[0]['req']}명이 간호사 수 {rows[0]['avail']}명을 초과합니다."
+    parts = "·".join(f"{r['day']}일(수요 {r['req']}명/간호사 {r['avail']}명)" for r in rows)
+    return f"{parts} 총 근무 수요가 간호사 수를 초과합니다."
+
+
 def _fill_template(template: str, evidence: Mapping[str, Any]) -> str:
     """problem_template_ko 의 {key} 들을 evidence 값으로 채움.
 
@@ -148,7 +177,8 @@ def build_narrative(
         # cause_id / reason_code 도 evidence 로 평탄화 (template 변수 충분히 확보)
         merged_evidence = {**ev, **{k: v for k, v in p.items()
                                     if k not in ("cause_id", "reason_code", "details", "evidence")}}
-        rendered = _fill_template(c.problem_template_ko, merged_evidence)
+        rendered = _daily_total_shortage_sentence(c.cause_id, merged_evidence) or _fill_template(
+            c.problem_template_ko, merged_evidence)
         # U-4: 본 cause 에 대응 가능한 treatment 들을 ontology lookup
         mapped: list[dict[str, Any]] = []
         for t in onto.treatments_for_cause(c.cause_id):

@@ -14,6 +14,10 @@ from __future__ import annotations
 from services.precheck import run_runtime_precheck
 from services.precheck.team_grade_precheck import _working_capacity, PrecheckNurse
 
+# EI-10c: 생성 경로의 precheck 는 엔진이 쓰는 하드락 값(`hard_lock_view`)을 본다. 엔진 월 안 해석
+# (`create_config_from_db`)은 별칭 `max_consecutive_work` 를 읽지 않으므로(정본 `max_conseq_work` 만 — 키가
+# 없으면 5) 아래 e2e 설정은 정본 키로 쓴다. `_working_capacity` 직접 호출(dict 리터럴)은 별칭 fallback 그대로다.
+
 YEAR, MONTH = 2026, 8
 
 
@@ -52,13 +56,13 @@ def _cfg(N=8, D=1, E=1, max_nig=15, **extra):
 
 def test_max_conseq_1_triggers_capacity_shortage():
     # 10 nurses, max_conseq=1 → 각 16일 근무가능, demand D=E=N=6 → 월 need 558 > cap 160 → shortage
-    codes = _codes(_nurses(10), _cfg(D=6, E=6, N=6, max_consecutive_work=1))
+    codes = _codes(_nurses(10), _cfg(D=6, E=6, N=6, max_conseq_work=1))
     assert "CAPACITY_TOTAL_SHORTAGE" in codes
 
 
 def test_loose_conseq_no_false_positive():
     # 넉넉한 인원 + 느슨한 연속근무 → shortage 없어야
-    codes = _codes(_nurses(30), _cfg(D=2, E=2, N=2, max_consecutive_work=6))
+    codes = _codes(_nurses(30), _cfg(D=2, E=2, N=2, max_conseq_work=6))
     assert "CAPACITY_TOTAL_SHORTAGE" not in codes
 
 
@@ -76,7 +80,7 @@ def _cap_issue(issues):
 # 20명·mcw=1: capped cap=16/명(320) < need 403 ≤ uncapped 21/명(420) → 상한이 binding.
 # 10명·mcw=1·D=E=N=6: uncapped(210) 도 need(558) 미달 → 진짜 인원부족(레버 아님).
 def test_conseq_cap_binding_evidence_when_lever_is_cause():
-    issues = _issues(_nurses(20), _cfg(D=4, E=4, N=5, max_consecutive_work=1))
+    issues = _issues(_nurses(20), _cfg(D=4, E=4, N=5, max_conseq_work=1))
     cap = _cap_issue(issues)
     assert cap is not None
     b = (cap.get("evidence") or {}).get("conseq_cap_binding")
@@ -87,7 +91,7 @@ def test_conseq_cap_binding_evidence_when_lever_is_cause():
 
 
 def test_no_binding_when_genuinely_short_of_nurses():
-    issues = _issues(_nurses(10), _cfg(D=6, E=6, N=6, max_consecutive_work=1))
+    issues = _issues(_nurses(10), _cfg(D=6, E=6, N=6, max_conseq_work=1))
     cap = _cap_issue(issues)
     assert cap is not None
     assert (cap.get("evidence") or {}).get("conseq_cap_binding") is None
@@ -95,7 +99,7 @@ def test_no_binding_when_genuinely_short_of_nurses():
 
 def test_config_lever_option_built_with_auto_fix():
     from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
-    issues = _issues(_nurses(20), _cfg(D=4, E=4, N=5, max_consecutive_work=1))
+    issues = _issues(_nurses(20), _cfg(D=4, E=4, N=5, max_conseq_work=1))
     opts = config_lever_options_from_issues(issues)
     assert len(opts) == 1
     o = opts[0]
@@ -107,20 +111,22 @@ def test_config_lever_option_built_with_auto_fix():
 
 def test_no_lever_option_when_no_binding():
     from services.cp_sat.undiagnosed_probe import config_lever_options_from_issues
-    issues = _issues(_nurses(10), _cfg(D=6, E=6, N=6, max_consecutive_work=1))
+    issues = _issues(_nurses(10), _cfg(D=6, E=6, N=6, max_conseq_work=1))
     assert config_lever_options_from_issues(issues) == []
 
 
 # ── off_days(소프트)는 capacity 를 못 바꾼다 → CAPACITY_TOTAL 판정에 영향 없음(회귀 가드) ──
 def test_off_days_does_not_affect_capacity_shortage():
     # 넉넉한 인원·느슨한 연속근무면 off_days 를 크게 줘도 shortage 안 뜬다(예전엔 뜸=버그).
-    codes = _codes(_nurses(30), _cfg(D=2, E=2, N=2, max_consecutive_work=6, off_days=15))
+    codes = _codes(_nurses(30), _cfg(D=2, E=2, N=2, max_conseq_work=6, off_days=15))
     assert "CAPACITY_TOTAL_SHORTAGE" not in codes
 
 
 def test_raising_conseq_alone_resolves_off_coupled_case():
     # 예전 'coupled' 로 오판하던 케이스(off=10 & conseq=2)가 실제론 연속근무 단일 레버로 풀린다.
-    issues = _issues(_nurses(20), _cfg(D=5, E=4, N=5, max_consecutive_work=2, off_days=10))
+    # EI-14r3: 엔진 OFF 하드 하한(min_off)이 용량 바닥에 들어와 off_days=10 이면 20명 용량이 연속근무와 무관하게 420 < 434 (진짜 부족)이다.
+    #   off_days=8 로 두어 같은 구조(연속근무 단일 레버로 풀림)를 지킨다 — uncapped 23×20=460 ≥ 434 > capped 21×20=420.
+    issues = _issues(_nurses(20), _cfg(D=5, E=4, N=5, max_conseq_work=2, off_days=8))
     cap = _cap_issue(issues)
     assert cap is not None
     b = (cap.get("evidence") or {}).get("conseq_cap_binding")

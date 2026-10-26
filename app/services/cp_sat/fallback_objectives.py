@@ -17,10 +17,7 @@ from services.constraints.team_grade_handoff_constraints import (
     add_team_grade_handoff_constraints,
 )
 from services.day_windows import iter_nurse_days
-from services.cp_sat.objective_terms import (
-    add_even_mid_distribution_terms,
-    add_kld_distribution_terms,
-)
+from services.cp_sat.objective_terms import add_kld_distribution_terms
 
 
 def build_fallback_stage3_objective_terms(

@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
+from services.cp_sat.rule_tag import aux_add, hard_add
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,7 +69,7 @@ def add_lookahead_off_cap_constraints(
                 if join[n] <= d <= leave_ext[n] and (n, d) not in fixed_off_cells_lookahead
             ]
             if selectable_off:
-                m.Add(sum(selectable_off) <= selectable_cap)
+                hard_add(m, "lookahead_off_cap", sum(selectable_off) <= selectable_cap)
         logger.info(
             "%s 룩어헤드 일별 OFF 상한 적용: %s일, 고정 OFF 반영",
             logger_prefix,
@@ -116,7 +118,7 @@ def add_lookahead_distribution_penalty_terms(
                 if join[n] <= d <= leave_ext[n]
             ]
             if day_off:
-                m.Add(max_var >= sum(day_off))
+                aux_add(m, "lookahead_off_spread_max", max_var >= sum(day_off))
         obj_terms.append(-weight * max_var)
     except Exception as e:
         logger.warning("[Lookahead] 분산 패널티 항 생성 실패: %s", e)

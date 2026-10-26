@@ -14,7 +14,9 @@ import os
 from typing import Any
 
 # 진단·솔버 시퀀스가 읽는 config 키(값이 없으면 생략). 코퍼스를 얇게 유지.
-_CONFIG_KEYS = (
+# 레지스트리(engine_contract)에서 파생한다(EI-15): 아래 이름은 정본이든 별칭이든 (정본, *별칭) 으로 펼치고,
+# 하드락 cfg 경유 키 전체를 더한다. 레지스트리에 없는 이름(day_req 등)은 그대로 둔다.
+_LEGACY_CONFIG_KEYS = (
     "daily_shift_requirements", "day_req", "eve_req", "nig_req",
     "off_days", "global_monthly_off_days", "standard_personal_off_days",
     "max_nig_per_month", "max_night_shifts_per_month",
@@ -24,6 +26,30 @@ _CONFIG_KEYS = (
     "ban_night_before_fixed_wanted_off",
     "use_mid", "off_first", "preceptee_on",
 )
+
+
+def _derive_config_keys() -> tuple[str, ...]:
+    from services.engine_contract.effective import HARD_LOCK_CFG_KEYS, UnknownSettingKey, canonical_key
+    from services.engine_contract.settings import SETTINGS_BY_KEY
+
+    out: list[str] = []
+
+    def _add(name: str) -> None:
+        if name not in out:
+            out.append(name)
+
+    for name in (*_LEGACY_CONFIG_KEYS, *HARD_LOCK_CFG_KEYS):
+        try:
+            spec = SETTINGS_BY_KEY[canonical_key(name)]
+        except UnknownSettingKey:
+            _add(name)
+            continue
+        for n in (name, spec.key, *spec.aliases):
+            _add(n)
+    return tuple(out)
+
+
+_CONFIG_KEYS = _derive_config_keys()
 # per-nurse 속성(진단이 읽는 것).
 _NURSE_KEYS = (
     "nurse_id", "name", "grade", "team_id", "allowed_shifts", "is_night_only",

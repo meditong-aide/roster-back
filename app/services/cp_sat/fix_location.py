@@ -15,9 +15,9 @@ from __future__ import annotations
 from typing import Any, Optional
 
 # config_key → (where, where_label_ko, mode, toggle?)  ── 대부분 원클릭 자동적용
+# ★ max_consecutive_nights(연속 야간 상한 별칭)는 두지 않는다 — 카드가 이 키를 내지 않는다(D13 ② · EI-11).
 _FIX_BY_KEY: dict[str, tuple[str, str, str, bool]] = {
     "max_nig_per_month":        ("roster_config.night_month_limit", "설정 > 근무 규칙 > 한 달 밤 근무 최대 횟수", "auto_apply", False),
-    "max_consecutive_nights":   ("roster_config.max_consec_night",  "설정 > 근무 규칙 > 밤 근무 연달아 최대 일수", "auto_apply", False),
     "max_conseq_work":          ("roster_config.max_consec_work",   "설정 > 근무 규칙 > 연달아 일하는 최대 날수", "auto_apply", False),
     "off_days":                 ("roster_config.off_days",          "설정 > 근무 규칙 > 한 달 필수 휴무 날수",   "auto_apply", False),
     "two_offs_after_two_nig":   ("roster_config.recovery_2n",       "설정 > 근무 규칙 > 밤 2번 뒤 2일 쉬기",     "auto_apply", True),
@@ -94,11 +94,15 @@ def fix_for_option(opt: dict[str, Any]) -> Optional[dict[str, Any]]:
     if not ck or ck not in _FIX_BY_KEY:
         return None
     where, label, mode, toggle = _FIX_BY_KEY[ck]
+    how = _how_ko(ck, _change, toggle)
+    if mode == "manual_edit" and not (opt.get("treatment_ids") or opt.get("apply")):
+        # 자동 적용 버튼이 없는 직접 수정 카드 — '아래 버튼으로 바로 적용' 안내를 붙이지 않는다.
+        how = "자동 적용 버튼이 없습니다. 필요 인원을 줄이는 것은 환자안전을 직접 확인한 뒤에만, 설정에서 직접 조정해 주세요."
     return {
         "mode": mode,
         "where": where,
         "where_label_ko": label,
-        "how_ko": _how_ko(ck, _change, toggle),
+        "how_ko": how,
         "config_key": ck,
         "target": None,
     }

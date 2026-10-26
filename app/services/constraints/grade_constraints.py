@@ -12,6 +12,7 @@ from typing import Any
 
 from services.roster_system import RosterSystem
 from services.cp_sat.allowed_shift_types import is_n_only_profile
+from services.cp_sat.rule_tag import hard_add, aux_add
 
 
 def add_grade_constraints(
@@ -195,7 +196,7 @@ def add_grade_constraints(
                 if join[n] <= d <= leave[n]
             )
             slack = m.NewIntVar(0, int(m_t), f"grade_monthly_slack_{s_code}_g{g}")
-            m.Add(monthly_sum + slack >= int(m_t))
+            aux_add(m, "grade_monthly_short", monthly_sum + slack >= int(m_t))
             obj_terms.append(-monthly_weight * slack)
         print(
             f"[GradeConstraints] 월 합계 soft(near-hard) 추가: "
@@ -576,7 +577,7 @@ def _add_minimum_constraints(
             ceilings = [c for c in grade_domain if c >= g]
             if not ceilings:
                 # 요구 등급이 도메인에 없음 → 안전하게 그 등급 합으로 하드(기존 동작).
-                m.Add(sum(X(n, day_idx, shift_idx) for n in by_grade.get(g, [])) >= t)
+                hard_add(m, "grade_min", sum(X(n, day_idx, shift_idx) for n in by_grade.get(g, [])) >= t)
                 continue
             for off, c in enumerate(ceilings):
                 # ceiling c 까지(=grade ≤ c, 더 시니어 등급 포함) 누적 인원.
@@ -589,7 +590,7 @@ def _add_minimum_constraints(
                 short = m.NewIntVar(
                     0, t, f"gcasc_d{day_idx}_s{shift_idx}_g{g}_c{c}"
                 )
-                m.Add(short >= t - cum)  # short = max(0, t - 누적)
+                aux_add(m, "grade_cascade_short", short >= t - cum)  # short = max(0, t - 누적)
                 if off == 0:
                     w = penalty_weight
                     # [GradeOff0] "요구 등급 자체의 미달분"만 따로 모아 모델에 붙인다.
@@ -631,7 +632,7 @@ def _add_minimum_constraints(
         if allow_soft_fallback:
             # 부족분만큼 slack 허용 (0~t). 패널티는 상위 목적함수에서 추가 가능.
             slack = m.NewIntVar(0, int(t), f"grade_slack_d{day_idx}_s{shift_idx}_g{g}")
-            m.Add(vars_sum + slack >= int(t))
+            aux_add(m, "grade_min_soft_slack", vars_sum + slack >= int(t))
             obj_terms.append(-penalty_weight * slack)
         else:
             if _add_hard_fn is not None and _registry is not None:
@@ -655,7 +656,7 @@ def _add_minimum_constraints(
                 }
                 _add_hard_fn(m, _registry, name=_name, constraint_expr=(vars_sum >= int(t)), meta=_meta)
             else:
-                m.Add(vars_sum >= int(t))
+                hard_add(m, "grade_min", vars_sum >= int(t))
     return obj_terms
 
 
@@ -700,7 +701,7 @@ def _add_maximum_constraints(
             slack_over = m.NewIntVar(
                 0, max(0, upper - mt), f"grade_max_slack_d{day_idx}_s{shift_idx}_g{g}"
             )
-            m.Add(vars_sum - slack_over <= mt)
+            aux_add(m, "grade_max_soft_slack", vars_sum - slack_over <= mt)
             obj_terms.append(-penalty_weight * slack_over)
         else:
             if _add_hard_fn is not None and _registry is not None:
@@ -722,5 +723,5 @@ def _add_maximum_constraints(
                 }
                 _add_hard_fn(m, _registry, name=_name, constraint_expr=(vars_sum <= mt), meta=_meta)
             else:
-                m.Add(vars_sum <= mt)
+                hard_add(m, "grade_max", vars_sum <= mt)
     return obj_terms

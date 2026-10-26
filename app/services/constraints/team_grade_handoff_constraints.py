@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.cp_sat.rule_tag import aux_add, hard_add
 from services.roster_system import RosterSystem
 
 
@@ -93,10 +94,10 @@ def _or_aux_var(m, X, day: int, shift_idx: int, members: list[int], tag: str):
     """
     b = m.NewBoolVar(f"hoff_or_{tag}_d{day}_s{shift_idx}")
     if not members:
-        m.Add(b == 0)
+        aux_add(m, "handoff_or_link", b == 0)
         return b
     for n in members:
-        m.Add(b >= X(n, day, shift_idx))
+        aux_add(m, "handoff_or_link", b >= X(n, day, shift_idx))
     return b
 
 
@@ -193,7 +194,7 @@ def add_team_grade_handoff_constraints(
                                     0, max(0, len(active) - 1),
                                     f"hoff_same_t{team_id}_r{r_idx}_d{d}_s{s_idx}",
                                 )
-                                m.Add(vars_sum - slack <= 1)
+                                aux_add(m, "handoff_same_soft_slack", vars_sum - slack <= 1)
                                 if penalty_weight > 0:
                                     obj_terms.append(-penalty_weight * slack)
                             else:
@@ -224,7 +225,7 @@ def add_team_grade_handoff_constraints(
                                     _add_hard_fn(m, _registry, name=_name,
                                                  constraint_expr=(vars_sum <= 1), meta=_meta)
                                 else:
-                                    m.Add(vars_sum <= 1)
+                                    hard_add(m, "handoff_same", vars_sum <= 1)
 
                 # (B) 인접 인계 금지: b_L + b_R <= 1
                 if block_adj:
@@ -258,7 +259,7 @@ def add_team_grade_handoff_constraints(
                                     0, 1,
                                     f"hoff_adj_t{team_id}_r{r_idx}_d{d}_{tag}",
                                 )
-                                m.Add(bL + bR - slack <= 1)
+                                aux_add(m, "handoff_adj_soft_slack", bL + bR - slack <= 1)
                                 if penalty_weight > 0:
                                     obj_terms.append(-penalty_weight * slack)
                             else:
@@ -291,6 +292,6 @@ def add_team_grade_handoff_constraints(
                                     _add_hard_fn(m, _registry, name=_name,
                                                  constraint_expr=(bL + bR <= 1), meta=_meta)
                                 else:
-                                    m.Add(bL + bR <= 1)
+                                    hard_add(m, "handoff_adj", bL + bR <= 1)
 
     return obj_terms

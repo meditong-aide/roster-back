@@ -14,11 +14,13 @@ max-flow 가 못 보는 배열 결합도, 부분배정을 실제로 풀어(각 i
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ortools.sat.python import cp_model
 
+from services.ontology_graph.demand import demand_by_day, has_by_day
 from services.ontology_graph.schema import ConstraintNode, OntologyGraph, StateNode
 
 WORK = ("D", "E", "N")
@@ -250,6 +252,32 @@ def lambda_family_mass(
     return dict(fam_mass)
 
 
+#: coupled_sequence 원인 문구(D30 — 2026-10-20 사용자 결정 · EI-11 11c). 이 원인의 top 은 늘 야간 회복·전이·연속근무라
+#: CLAUDE.md 하드락(#1·#2·#4·#5)이다 — 그래서 완화를 권하지 않고 인원·고정 근무 조정을 안내한다(조건 없이 이 문구).
+_COUPLED_SEQUENCE_CERT = (
+    "근무 규칙(야간 회복·연속·전이)이 서로 겹쳐 배치가 안 돼요. 이 규칙들은 하드락이라 완화할 수 없어요 — "
+    "간호사 인원을 늘리거나 고정 근무(원티드·휴가)를 조정해 주세요. "
+    "필요 인원을 줄이는 것은 환자안전을 직접 확인한 뒤에만 해 주세요."
+)
+
+
+def _coupled_sequence_certificate(top: str | None, max_consec: int | None) -> str:
+    """coupled_sequence 원인 문구(D30). 연속근무가 top 이고 그 병동 실효 연속근무 상한(`max_consec`)이 하드락 #1 상한
+    미만이면 '연속근무 상한은 최대 {cap}일까지만 올릴 수 있어요.' 를 끝에 덧붙인다. cap 은 레지스트리에서 읽고, 못 읽으면
+    덧붙이지 않는다."""
+    if top != "consecutive" or max_consec is None:
+        return _COUPLED_SEQUENCE_CERT
+    try:
+        from services.engine_contract.settings import lookup
+
+        cap = int(lookup("max_conseq_work").hard_lock.cap)
+    except Exception:
+        return _COUPLED_SEQUENCE_CERT
+    if max_consec >= cap:
+        return _COUPLED_SEQUENCE_CERT
+    return f"{_COUPLED_SEQUENCE_CERT} 연속근무 상한은 최대 {cap}일까지만 올릴 수 있어요."
+
+
 @dataclass
 class InfeasibilityExplanation:
     classification: str                 # policy_overconstraint | coverage_shortage | coupled_sequence | unknown
@@ -267,6 +295,7 @@ def explain_infeasibility(
     weekend_off_nurses: set[int] | None = None, weekend_days: set[int] | None = None,
     night_cap_by_nurse: dict[int, int] | None = None,
     iters: int = 6, max_model_days: int = 12,
+    req_by_day: Sequence[Mapping[str, int]] | None = None,
 ) -> InfeasibilityExplanation:
     """해가 없어도 '왜 없는지' 설명. 결정론 arithmetic + λ 압력랭킹을 결합.
 
@@ -276,6 +305,12 @@ def explain_infeasibility(
     daily = sum(int(v or 0) for v in req.values())
     cells = num_nurses * num_days
     coverage = daily * num_days
+    if req_by_day:
+        # EI-14b2a3 — 일자별 수요: 인원 부족은 가장 바쁜 날(일 합의 최대), 셀 예산은 일 합의 총합으로 닫힌형 판정한다.
+        #   λ 모델(아래)은 평탄 `req` 그대로다(순위용 휴리스틱 — D-C1-6).
+        day_sums = [sum(int(v or 0) for v in row.values()) for row in req_by_day]
+        daily = max(day_sums)
+        coverage = sum(day_sums)
     off_budget = cells - coverage
     off_floor_sum = num_nurses * int(off_floor) if off_floor else 0
     excess = off_floor_sum - off_budget
@@ -313,7 +348,7 @@ def explain_infeasibility(
         cert = f"특정 간호사의 {_ko}가 근무와 겹쳐 안 돼요 — 그 간호사 {_ko}를 조정하세요."
         return InfeasibilityExplanation("personal_overconstraint", top, fam_mass, cert, arithmetic)
     if top:
-        cert = "근무 규칙(야간 회복·연속·전이)이 서로 겹쳐 배치가 안 돼요 — 규칙 하나를 완화하세요."
+        cert = _coupled_sequence_certificate(top, max_consec)
         return InfeasibilityExplanation("coupled_sequence", top, fam_mass, cert, arithmetic)
     return InfeasibilityExplanation(
         "unknown", None, {},
@@ -626,6 +661,7 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
     """
     import calendar as _cal
     req = _daily_req(config)
+    req_rows = demand_by_day(config, int(num_days)) if has_by_day(config) else None   # 뷰가 준 일자별 수요일 때만
     mc = config.get("max_conseq_work")
     max_nig = int(config.get("max_nig_per_month") or 0) or None
     off_floor = _effective_off_floor(nurses, config) or 0
@@ -726,6 +762,10 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
     #   적으면 그 주말은 못 채운다(필요조건, sound). 값싼 산술(전체 인원만 봄)의 사각지대를 메운다.
     #   presolve max-flow 가 계산하던 신호를 사용자 원인으로 승격. year/month 없으면 주말 미식별로 skip.
     _daily_req_sum = sum(int(v or 0) for v in req.values())
+    if req_rows and year and month:                  # 일자별 수요: 주말 날들 중 가장 바쁜 날의 합
+        _wk_sums = [sum(row.values()) for d, row in enumerate(req_rows) if _cal.weekday(int(year), int(month), d + 1) >= 5]
+        if _wk_sums:
+            _daily_req_sum = max(_wk_sums)
     if wk_nurses and wk_day_cnt > 0 and _daily_req_sum > 0:
         _avail_wk = len(nurses) - len(wk_nurses)
         if _avail_wk < _daily_req_sum:
@@ -783,7 +823,7 @@ def explain_infeasibility_from_config(nurses: list, config: dict, num_days: int,
         ban_n2d=bool(config.get("ban_n_to_d", True)),
         max_consec=int(mc) if mc else None,
         weekend_off_nurses=(wk_nurses or None), weekend_days=wk_days,
-        night_cap_by_nurse=(ncap_by or None), iters=iters)
+        night_cap_by_nurse=(ncap_by or None), iters=iters, req_by_day=req_rows)
 
     # personal_overconstraint(λ가 개인 family 지목) → 해당 간호사들을 target 으로 채움
     if exp.classification == "personal_overconstraint" and not exp.targets:

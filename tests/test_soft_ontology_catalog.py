@@ -40,10 +40,17 @@ def test_weight_constant_resolves_to_real_constant():
     assert checked >= 4  # 최소 4개 family 가 실제 weight 상수에 매핑
 
 
+#: 엔진이 읽는 칸의 생산자가 0 인 죽은 레버 — 처방(가중치 조정 액션)을 두지 않는다(EI-14d). 여기 있는 id 는 노브가 없어야 한다.
+_DEAD_LEVER_SOFT = {"isolated_work"}
+
+
 def test_every_soft_has_control_knob():
-    """각 soft family 는 런타임 control 노브(config_key)를 가진다 (set_threshold 대상)."""
+    """각 soft family 는 런타임 control 노브(config_key)를 가진다 (set_threshold 대상). 죽은 레버(EI-14d)만 예외로 노브가 없다."""
     ont = _ont()
     for sid, entry in ont.soft_constraints.items():
+        if sid in _DEAD_LEVER_SOFT:
+            assert entry.config_key is None, f"{sid}: 죽은 레버 처방이 되살아남"
+            continue
         assert entry.config_key, f"{sid}: config_key (control 노브) 누락"
 
 

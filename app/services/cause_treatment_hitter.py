@@ -18,6 +18,7 @@ bundle 출력 구조:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Mapping, Optional
@@ -31,6 +32,8 @@ from services.semantics.ontology import (
     friendly_direction_label,
     get_default_ontology,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -92,12 +95,15 @@ def propose_bundles(
             seen.add(resolved)
     if not causes_normalized:
         return []
+    forbidden_ids = _excluded_treatment_ids(onto)
 
-    # 2. cause → 후보 treatment (forbid 제외, cost-tagged)
+    # 2. cause → 후보 treatment (forbid·하드락 완화 처방 제외, cost-tagged)
     cause_to_treatments: dict[str, list[tuple[OntologyTreatment, float]]] = {}
     for cid in causes_normalized:
         candidates: list[tuple[OntologyTreatment, float]] = []
         for t in onto.treatments_for_cause(cid):
+            if t.treatment_id in forbidden_ids:
+                continue
             cost = compute_treatment_cost(
                 t.target_family,
                 onto,
@@ -159,12 +165,15 @@ def enumerate_minimal_hitting_sets_brute_force(
     causes_normalized = [c for c in (onto.resolve_cause_alias(x) for x in active_causes) if c]
     if not causes_normalized:
         return []
+    forbidden_ids = _excluded_treatment_ids(onto)
 
     cause_to_treatments: dict[str, list[tuple[OntologyTreatment, float]]] = {}
     all_tids: set[str] = set()
     for cid in causes_normalized:
         cands: list[tuple[OntologyTreatment, float]] = []
         for t in onto.treatments_for_cause(cid):
+            if t.treatment_id in forbidden_ids:
+                continue
             cost = compute_treatment_cost(t.target_family, onto, ward_profile=ward_profile)
             if cost is None:
                 continue
@@ -231,6 +240,22 @@ def enumerate_minimal_hitting_sets_brute_force(
 # ─────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────
+def _excluded_treatment_ids(onto: ConstraintOntology) -> frozenset[str]:
+    """set cover 후보에서 뺄 처방 — 하드락 8종을 완화하는 처방(`card_filter.forbidden_treatments` 키, EI-11 11a-2).
+
+    그 처방만 덮던 원인은 uncovered 로 남는다(원인 진단은 그대로). 판정이 실패하면 하드락 family 를 겨냥하는 처방을
+    모두 빼고 계속한다(막는 쪽 + WARNING) — 예외로 끊으면 payload 빌더의 except 가 처방·서술·번들을 통째로 비운다.
+    """
+    from services.policy import card_filter
+
+    try:
+        return frozenset(card_filter.forbidden_treatments(ontology=onto))
+    except Exception:
+        logger.warning("하드락 처방 판정 실패 — 하드락 family 처방을 set cover 후보에서 모두 뺍니다(fail-closed).",
+                       exc_info=True)
+        return card_filter.hard_lock_family_treatment_ids(onto)
+
+
 def _greedy_set_cover(
     causes: list[str],
     cause_to_treatments: dict[str, list[tuple[OntologyTreatment, float]]],

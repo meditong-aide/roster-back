@@ -103,15 +103,79 @@ def resolve_team_for_roster(
         .all()
     )
     if periods:
-        covering = [
-            p for p in periods
-            if p.valid_from <= m_start and (p.valid_to is None or p.valid_to > m_start)
-        ]
-        # ★ 월초를 덮는 구간이 여럿이면(겹침 — 원래 없어야 하지만 실측 운영 20쌍) **가장 늦게
-        #   시작한** 것을 쓴다. 화면(`get_team_period_on`·`group_members_in_month`)과 같은 선택이다.
-        #   예전엔 `covering[0]`(가장 먼저 시작)이라 생성기만 다른 팀으로 팀 제약을 걸었다(2026-10-02).
-        return _coerce_team_int((covering[-1] if covering else periods[0]).team_id)
+        return _team_of_periods(periods, m_start)
     return _ward_aware_fallback(db, nurse_id, group_id)
+
+
+def _team_of_periods(periods: list, m_start: date) -> int | None:
+    """이미 읽은 구간들(valid_from 오름차순)에서 로스터 팀 하나를 고른다 — 단건·일괄이 같은 규칙을 쓴다."""
+    covering = [
+        p for p in periods
+        if p.valid_from <= m_start and (p.valid_to is None or p.valid_to > m_start)
+    ]
+    # ★ 월초를 덮는 구간이 여럿이면(겹침 — 원래 없어야 하지만 실측 운영 20쌍) **가장 늦게
+    #   시작한** 것을 쓴다. 화면(`get_team_period_on`·`group_members_in_month`)과 같은 선택이다.
+    #   예전엔 `covering[0]`(가장 먼저 시작)이라 생성기만 다른 팀으로 팀 제약을 걸었다(2026-10-02).
+    return _coerce_team_int((covering[-1] if covering else periods[0]).team_id)
+
+
+def resolve_teams_for_roster(
+    db: Session, nurse_ids, group_id: str, year: int, month: int
+) -> dict:
+    """`resolve_team_for_roster` 의 일괄판(EI-13c) — 간호사마다 부르던 구간 조회·폴백 조회(N+1)를 묶는다.
+
+    같은 규칙(`_team_of_periods`·`_ward_aware_fallback` 의 판정)을 쓴다. 반환 {입력 nurse_id: team(int)|None}.
+    구간 조회는 수백 명 단위 덩어리마다 1문장, 구간이 없는 간호사의 폴백도 덩어리마다 1문장이다.
+    MSSQL CHAR 컬럼의 꼬리 공백이 키를 어긋나게 하지 않도록 행의 id 는 strip 해 맞춘다(단건은 SQL 비교라 공백을 무시한다).
+    """
+    from services.in_chunks import in_chunks
+
+    ids = list(dict.fromkeys(str(x) for x in (nurse_ids or []) if x is not None and str(x).strip()))
+    if not ids:
+        return {}
+    m_start = date(year, month, 1)
+    m_end = date(year, month, monthrange(year, month)[1])
+    periods_by: dict[str, list] = {}
+    for chunk in in_chunks(ids):
+        rows = (
+            db.query(NurseTeamPeriod)
+            .filter(
+                NurseTeamPeriod.nurse_id.in_(chunk),
+                NurseTeamPeriod.group_id == group_id,
+                NurseTeamPeriod.valid_from <= m_end,
+                or_(
+                    NurseTeamPeriod.valid_to.is_(None),
+                    NurseTeamPeriod.valid_to > m_start,
+                ),
+            )
+            .order_by(NurseTeamPeriod.valid_from.asc())
+            .all()
+        )
+        for p in rows:
+            periods_by.setdefault(str(p.nurse_id).strip(), []).append(p)
+    out: dict = {}
+    missing = []
+    for nid in ids:
+        periods = periods_by.get(nid.strip())
+        if periods:
+            out[nid] = _team_of_periods(periods, m_start)
+        else:
+            missing.append(nid)
+    if missing:
+        want = str(group_id or "").strip()
+        home: dict[str, tuple] = {}
+        for chunk in in_chunks(missing):
+            for nid, gid, tid in (
+                db.query(NurseModel.nurse_id, NurseModel.group_id, NurseModel.team_id)
+                .filter(NurseModel.nurse_id.in_(chunk))
+                .all()
+            ):
+                home.setdefault(str(nid).strip(), (gid, tid))
+        for nid in missing:
+            row = home.get(nid.strip())
+            # MSSQL CHAR 트레일링 공백/포맷 차이 방어: strip 후 비교(단건 `_ward_aware_fallback` 과 같다).
+            out[nid] = _coerce_team_int(row[1]) if row and str(row[0] or "").strip() == want else None
+    return out
 
 
 def resolve_teams_for_month(

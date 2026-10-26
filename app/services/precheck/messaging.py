@@ -178,6 +178,14 @@ _MESSAGES: Dict[str, Dict[str, Any]] = {
             "해당 짝에 배반근무(상호배제)가 걸려 있으면 설정 > 교육(프리셉티) 함께 근무에서 풀어 주세요.",
         ],
     },
+    # 개인 시퀀스 DP(check_per_nurse_sequence) — 고정 칸 × 개인 규칙 충돌. EI-10d 로 생성 경로에 닿는다.
+    "PER_NURSE_SEQUENCE_INFEASIBLE": {
+        "msg": "어떤 간호사의 미리 정한 근무·휴무(원티드·휴가 등)가 근무 순서 규칙(야간 다음 날 주간 금지, 야간 뒤 휴식, 연속 근무 상한 등)과 맞물려, 그 간호사의 이달 근무 순서를 만들 수 없습니다.",
+        "fix": [
+            "고정 근무 편집 > 해당 간호사에서 근무 순서 규칙과 부딪히는 확정 근무·휴무를 옮기거나 줄여 주세요(예: 야간 바로 다음 날의 확정 주간 근무).",
+            "간호사 관리 > 해당 간호사 > 설 수 있는 근무 종류가 확정 근무와 맞는지 확인해 주세요.",
+        ],
+    },
 }
 
 
@@ -202,6 +210,8 @@ def humanize(issue: Dict[str, Any]) -> Dict[str, Any]:
             pass
     if "need" in ev and "available" in ev:
         suffix_parts.append(f"필요={ev['need']} / 가능={ev['available']}")
+    elif "required_total" in ev and "available_nurses" in ev:
+        suffix_parts.append(f"필요={ev['required_total']} / 가능={ev['available_nurses']}")
     elif "min_sum" in ev and "need" in ev:
         suffix_parts.append(f"최소합계={ev['min_sum']} / 요구={ev['need']}")
     elif "monthly_demand" in ev and "monthly_capacity" in ev:
@@ -221,8 +231,37 @@ def humanize(issue: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _merge_capacity_days(out: list[dict[str, Any]]) -> None:
+    """같은 '일자별 인원 부족' 이슈가 여러 날이면 첫 이슈(= 요약·원인 문장의 머리)에 막힌 날 전부를 1 기준으로 적는다(D28-3).
+
+    숫자(필요/가능)는 날짜별이다 — 모두 같으면 한 번만 쓴다. 다른 이슈의 문장은 그대로(자기 날짜만).
+    """
+    rows: list[tuple] = []
+    for idx, it in enumerate(out):
+        ev = it.get("evidence") or {}
+        if str(it.get("reason_code") or "").upper() != "GLOBAL_DAY_CAPACITY_SHORTAGE":
+            continue
+        try:
+            rows.append((idx, int(ev["day"]) + 1, ev["required_total"], ev["available_nurses"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    rows.sort(key=lambda r: r[1])
+    rows = [r for i, r in enumerate(rows) if i == 0 or r[1] != rows[i - 1][1]]  # 같은 날 중복 제거
+    if len(rows) < 2:
+        return
+    base = _MESSAGES["GLOBAL_DAY_CAPACITY_SHORTAGE"]["msg"]
+    if len({(r[2], r[3]) for r in rows}) == 1:
+        tail = f"일자={'·'.join(f'{r[1]}일' for r in rows)}, 필요={rows[0][2]} / 가능={rows[0][3]}"
+    else:
+        tail = "일자=" + "·".join(f"{r[1]}일(필요={r[2]} / 가능={r[3]})" for r in rows)
+    first = min(r[0] for r in rows)
+    out[first]["human_message_ko"] = f"{base} ({tail})"
+
+
 def humanize_all(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [humanize(i) for i in issues or []]
+    out = [humanize(i) for i in issues or []]
+    _merge_capacity_days(out)
+    return out
 
 
 def summarize_violation_family(violated_constraints: List[Dict[str, Any]]) -> Dict[str, Any]:

@@ -22,17 +22,40 @@ feasible 이 난다. 따라서 "지원 제약 목록"을 두고, 목록 밖 hard
 
 from __future__ import annotations
 
+from services.engine_contract.defaults import registry_default
+from services.engine_contract.settings import SETTINGS_BY_KEY
 from services.ontology_graph.lagrangian import _nurse_attr
 
-# config 레벨 미지원 hard constraint 마커(활성=truthy/양수면 미지원)
-_UNSUPPORTED_CONFIG = (
-    "max_nig_per_month", "min_nig_per_month", "nig_max_month", "nig_min_month",
-    "off_days", "min_off_days", "weekend_off", "weekend_off_ids",
-    "grade_requirements", "grade_min", "team_requirements", "team_min",
-    "preceptor_pairs", "mutual_exclusion", "pairing",
+# config 레벨 미지원 hard constraint 마커(활성=truthy/양수면 미지원).
+# EI-14a — 이름은 개념별 정본 키(engine_contract 레지스트리)이고 별칭은 레지스트리에서 파생한다.
+# (옛 표는 어느 config 에도 없는 가짜 이름 13개를 들고 있어 그 개념이 활성이어도 안 잡혔다.)
+_UNSUPPORTED_CONCEPT_KEYS = (
+    "max_nig_per_month",              # 월 야간 한도
+    "off_days",                       # 월 OFF 한도
+    "team_min_by_team",               # 팀 최소 인원
+    "roster_grade_config.constraints_json",  # 등급 최소 인원 — config dict 에 안 실려 지금은 불활성(2단계 배선 지점)
+    "preceptee_period_by_nurse_id",   # 프리셉터 동기
+    "mutual_exclusion_by_nurse_id",   # 상호배제
+    "weekly_off_settings_activate",   # 주휴
     # 보건휴가: 활성 시 대상자 OFF 하한 +1(HARD, 솔브 전) — 그래프가 OFF 하한 미모델 → 미지원.
     "health_leave_enabled",
+    # MID: 그래프(IR·DP·factor graph)는 D/E/N/O 만 안다 — M 수요·공급이 빠져 FEASIBLE 은 믿을 수 없다.
+    "use_mid",
 )
+
+
+def _derive_unsupported_config() -> tuple[str, ...]:
+    out: list[str] = []
+    for key in _UNSUPPORTED_CONCEPT_KEYS:
+        spec = SETTINGS_BY_KEY.get(key)
+        names = [key] + (list(spec.aliases) if spec is not None else [])
+        for n in names:
+            if n not in out:
+                out.append(n)
+    return tuple(out)
+
+
+_UNSUPPORTED_CONFIG = _derive_unsupported_config()
 # per-nurse 미지원 마커
 _UNSUPPORTED_NURSE = ("n_exact", "n_min", "n_max", "is_weekend_off", "is_night_only",
                       "health_leave_extra_off")   # 보건휴가 대상자 OFF 하한 가산(HARD)
@@ -70,7 +93,7 @@ def unmodeled_active(nurses: list, config: dict) -> list[str]:
     # 프리셉티 커버리지 제외(preceptee_shift_count=False)는 **negative flag**: 솔버는 프리셉티를
     # 커버리지에서 빼는데 그래프는 전원 카운트 → 그래프 과다(낙관). INFEASIBLE 은 sound 유지되나
     # FEASIBLE 은 불확실 → 미지원 표시(FEASIBLE 주장만 차단). 기본 True(둘 다 카운트)면 일치=미표시.
-    if config.get("preceptee_on", False) and config.get("preceptee_shift_count", True) is False:
+    if config.get("preceptee_on", registry_default("preceptee_on")) and config.get("preceptee_shift_count", True) is False:
         out.append("config.preceptee_shift_count=False")
     return out
 

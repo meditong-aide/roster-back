@@ -18,6 +18,7 @@ use_mid=True 일 때는 'M' 키도 사용 가능.
 
 from __future__ import annotations
 
+from services.cp_sat.rule_tag import aux_add, hard_add
 from services.roster_system import RosterSystem
 
 
@@ -131,7 +132,7 @@ def add_team_min_constraints(
                 member_sum = sum(X(n, d, s_idx) for n in active)
                 present = m.NewBoolVar(f"tmin_present_t{tid}_d{d}_s{s_idx}")
                 # present=1 → 이 팀이 이 시프트에 min_t 명 이상 배치. present=0 → 제약 없음.
-                m.Add(member_sum >= min_t * present)
+                aux_add(m, "team_min_present", member_sum >= min_t * present)
                 present_vars.append(present)
             num_teams = len(present_vars)
             if num_teams == 0:
@@ -143,13 +144,13 @@ def add_team_min_constraints(
             covered = sum(present_vars)
             if allow_soft:
                 slack = m.NewIntVar(0, target, f"tmin_cover_slack_d{d}_s{s_idx}")
-                m.Add(covered + slack >= target)
+                aux_add(m, "team_min_soft_slack", covered + slack >= target)
                 cover_slacks.append(slack)
                 if penalty_weight > 0:
                     obj_terms.append(-penalty_weight * slack)
                 eff_mode = "soft_fallback"
             else:
-                m.Add(covered >= target)
+                hard_add(m, "team_min", covered >= target)
                 eff_mode = "enforced"
             added_cnt += 1
             _impact_modes.append({

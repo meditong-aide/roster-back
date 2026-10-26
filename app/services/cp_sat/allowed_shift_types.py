@@ -1,5 +1,8 @@
 import json
 
+from services.engine_contract.settings import HardLock
+from services.engine_contract.settings import lookup as _lookup_setting
+
 
 def normalize_allowed_shift_codes(raw, use_mid: bool = False) -> set[str]:
     if raw is None:
@@ -45,10 +48,20 @@ def is_code_blocked_by_profile(raw, code: str, use_mid: bool = False) -> bool:
     return str(code).strip().upper() not in allowed
 
 
+def _hard_max_nights_cap() -> int:
+    """하드락 #6 cap 재수출(EI-7 R3-06 — 정책 두 벌 금지). 레지스트리(`max_nig_per_month`
+    의 `HardLock.cap`)가 정본이다. 레지스트리에 없거나 cap 미설정이면 현행 값 15 로
+    방어한다(순환 import 없음 — `engine_contract.settings` 는 순수 데이터 모듈)."""
+    spec = _lookup_setting("max_nig_per_month")
+    if spec is not None and isinstance(spec.hard_lock, HardLock) and spec.hard_lock.cap is not None:
+        return int(spec.hard_lock.cap)
+    return 15
+
+
 #: 월 나이트 횟수 상한 — **하드락 #6**(CLAUDE.md · 간호사 1인당 월 최대 15회). 해결 카드가 병동 공통
 #: 상한(`max_nig_per_month`)이나 개인 한도(n_max)를 이보다 높게 **제안하면 안 된다**(하드락 완화 금지 —
 #: 못 풀면 infeasible 보고). N전담은 엔진에서 이 값으로 **고정**된다(OFF ≤ 근무가능일−상한 · N ≤ 상한).
-HARD_MAX_NIGHTS_PER_MONTH = 15
+HARD_MAX_NIGHTS_PER_MONTH = _hard_max_nights_cap()
 
 
 def effective_night_cap(nu, global_max_night: int) -> int:

@@ -22,6 +22,7 @@ from typing import Any
 
 from services.cp_sat.lookahead_helpers import month_total_day_range
 from services.roster_system import RosterSystem
+from services.cp_sat.rule_tag import aux_add, hard_add
 
 
 _SHIFT_PREFIX_TO_CODE = (
@@ -166,14 +167,14 @@ def add_monthly_limit_constraints(
                     _add_hard_fn(m, _registry, name=_assume_name, constraint_expr=(sumv <= mx), meta=_meta)
             else:
                 if mn is not None:
-                    m.Add(sumv >= mn)
+                    hard_add(m, f"monthly_limit_{code_upper.lower()}", sumv >= mn)
                 if mx is not None and upper_slack and ex_raw is None:
                     _cap_slack = m.NewIntVar(0, len(phys_range), f"capslack_{n_idx}_{code_upper}")
-                    m.Add(sumv <= mx + _cap_slack)
+                    aux_add(m, "monthly_cap_slack", sumv <= mx + _cap_slack)
                     if not hasattr(m, "_monthly_cap_slacks"):
                         m._monthly_cap_slacks = []
                     m._monthly_cap_slacks.append(_cap_slack)
                 elif mx is not None:
-                    m.Add(sumv <= mx)
+                    hard_add(m, f"monthly_limit_{code_upper.lower()}", sumv <= mx)
             added += 1
     return added

@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from services.ontology_graph.certificate import Certificate
-from services.ontology_graph.frontier_dp import _options, _prep, _req, _step
+from services.ontology_graph.demand import demand_by_day
+from services.ontology_graph.frontier_dp import _options, _prep, _step
 from services.ontology_graph.lagrangian import _night_rules
 
 
@@ -66,7 +67,7 @@ def build_factor_graph(nurses: list, config: dict, num_days: int) -> FactorGraph
     max_run, rec_trig, min_run = _night_rules(config)
     track_w = config.get("max_consecutive_work") is not None
     track_prev = bool(config.get("forbid_night_to_day"))
-    reqD, reqE, reqN = _req(config, "D"), _req(config, "E"), _req(config, "N")
+    dem = demand_by_day(config, num_days)            # 사설 키가 없으면 평탄 × num_days(= 지금과 같다)
 
     # 변수 도메인 (정적 per-cell 허용 shift; 시퀀스는 Nf 가 봄)
     variables: dict = {}
@@ -101,6 +102,8 @@ def build_factor_graph(nurses: list, config: dict, num_days: int) -> FactorGraph
 
     # per-day 커버리지 factor — 강제OFF(도메인={O}) 간호사는 항상 0 기여 → scope 제외(분리 유도)
     def _make_cov(d, members):
+        reqD, reqE, reqN = dem[d]["D"], dem[d]["E"], dem[d]["N"]
+
         def pred(assign):
             cD = sum(assign["x", i, d] == "D" for i in members)
             cE = sum(assign["x", i, d] == "E" for i in members)
@@ -109,6 +112,7 @@ def build_factor_graph(nurses: list, config: dict, num_days: int) -> FactorGraph
         return pred
 
     for d in range(num_days):
+        reqD, reqE, reqN = dem[d]["D"], dem[d]["E"], dem[d]["N"]
         if reqD or reqE or reqN:
             members = [i for i in range(k) if variables["x", i, d] != ("O",)]
             scope = tuple(("x", i, d) for i in members)

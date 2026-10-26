@@ -26,7 +26,6 @@ class Nurse:
     is_head_nurse: bool = False
     is_weekend_off: bool = False
     fixed_shift: Optional[str] = None
-    remaining_off_days: int = 0
     personal_off_adjustment: int = 0  # 이전 달에서 이월된 조정치(음수 또는 양수 가능)
     resignation_date: Optional[date] = None
     joining_date: Optional[date] = None
@@ -68,27 +67,7 @@ class Nurse:
     def __post_init__(self):
         if self.is_head_nurse and not self.head_nurse_off_pattern:
             self.head_nurse_off_pattern = 'weekend'  # 수간호사의 기본 패턴
-            
-    def calculate_available_off_days(self, config):
-        """설정 및 개인 조정치를 기반으로 사용 가능한 총 휴무일을 계산합니다."""
-        return config.calculate_total_off_days(self.personal_off_adjustment)
-    
-    def initialize_off_days(self, config):
-        """설정을 기반으로 남은 휴무일을 초기화합니다."""
-        self.remaining_off_days = self.calculate_available_off_days(config)
-        return self.remaining_off_days
-    
-    def can_take_off(self, requested_days: int) -> bool:
-        """간호사가 요청된 휴무일 수를 사용할 수 있는지 확인합니다."""
-        return self.remaining_off_days >= requested_days
-    
-    def update_off_days(self, used_days: int):
-        """사용 후 남은 휴무일을 업데이트합니다."""
-        self.remaining_off_days -= used_days
-        if self.remaining_off_days < 0:
-            self.personal_off_adjustment = self.remaining_off_days  # 음수 잔액을 다음 달로 이월
-            self.remaining_off_days = 0
-        
+
     def get_shift_preferences(self, day_idx: int, month_days: int, config, weekend_days) -> np.ndarray:
         """주어진 날짜에 대한 교대 근무 선호도를 계산합니다.
         
