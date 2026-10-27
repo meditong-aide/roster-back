@@ -620,6 +620,8 @@ app.include_router(nurses.router)
 app.include_router(roster.router)
 from routers import roster_change_notice  # noqa: E402
 app.include_router(roster_change_notice.router)
+from routers import tutorial_state  # noqa: E402
+app.include_router(tutorial_state.router)
 app.include_router(dates.router) 
 app.include_router(wanted.router) 
 app.include_router(preferences.router) 

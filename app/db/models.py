@@ -694,6 +694,22 @@ class RosterChangeAck(Base):
     ack_via = Column(VARCHAR(10), nullable=True)         # app | web
 
 
+class TutorialUserState(Base):
+    """튜토리얼(사용 안내) 계정별 상태 — 계정·키 1개 = 1행. `migrations/2026_10_26_add_tutorial_user_state.sql`.
+
+    ★ 키-값으로 둔다. 2차 자동 제안의 '그 달 제안 이력'은 키만 더한다(DDL 재작성 없음).
+    ★ 진행 위치·완료 여부는 저장하지 않는다(기획 2-5).
+    """
+
+    __tablename__ = "tutorial_user_state"
+
+    office_id = Column(VARCHAR(50), primary_key=True)    # JWT office_id
+    account_id = Column(VARCHAR(50), primary_key=True)   # JWT account_id(로그인 계정)
+    state_key = Column(VARCHAR(100), primary_key=True)   # welcome_shown | next_month_guide | (2차) …
+    state_value = Column(NVARCHAR(200), nullable=False)  # 짧은 문자열. 지우면 행을 삭제
+    updated_at = Column(DATETIME, nullable=False)
+
+
 class Shift(Base):
     __tablename__ = "shifts"
     shift_id = Column(VARCHAR(10), primary_key=True)
