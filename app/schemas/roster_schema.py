@@ -307,6 +307,28 @@ class WantedConfigCreate(WantedConfigBase):
     pass
 
 
+class WantedTeamLimitDefault(BaseModel):
+    """팀별 일자별 신청 한도 — 그 달 모든 날짜에 적용하는 팀 기본값."""
+
+    team_id: int
+    max_requests: int = Field(ge=0, description="팀이 하루에 낼 수 있는 휴가·휴무 계열 신청 수(0 = 신청 불가)")
+
+
+class WantedTeamLimitDate(BaseModel):
+    """팀별 일자별 신청 한도 — 특정 날짜 예외(팀 기본값보다 우선)."""
+
+    target_date: date
+    team_id: int
+    max_requests: int = Field(ge=0, description="그 날짜 그 팀 휴가·휴무 계열 신청 수 상한(0 = 신청 불가)")
+
+
+class WantedTeamLimitUpsert(BaseModel):
+    """팀별 일자별 신청 한도 저장 — 그 달 통째 교체. 목록에 없는 팀·날짜 = 제한 없음."""
+
+    defaults: List[WantedTeamLimitDefault] = Field(default_factory=list)
+    dates: List[WantedTeamLimitDate] = Field(default_factory=list)
+
+
 class WantedConfig(WantedConfigBase):
     """원티드 설정 조회 응답 스키마"""
 

@@ -1039,6 +1039,35 @@ class WantedConfig(Base):
     )
 
 
+class WantedTeamLimit(Base):
+    """팀별 일자별 원티드(휴가·휴무 계열) 신청 한도.
+
+    - target_date NULL = 그 달 팀 기본값, 값 있음 = 그 날짜 예외(기본값보다 우선). 행 없음 = 제한 없음.
+    - 병동 전체 일자별 제한(`wanted_config`)과 **함께** 적용한다(둘 다 통과해야 신청).
+    ★ `wanted_config` 를 넓히지 않은 이유 — 그 저장은 한 달 통째 교체라 팀 행이 섞이면 지워진다.
+    """
+
+    __tablename__ = "wanted_team_limit"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    group_id = Column(VARCHAR(50), ForeignKey("groups.group_id"), nullable=False)
+    year = Column(SMALLINT, nullable=False)
+    month = Column(TINYINT, nullable=False)
+    team_id = Column(INTEGER, nullable=False)
+    target_date = Column(DATE, nullable=True)
+    max_requests = Column(INTEGER, nullable=False)  # 0 = 그 팀 그날 신청 불가
+
+    created_at = Column(DATETIME, default=func.now())
+    updated_at = Column(DATETIME, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id", "year", "month", "team_id", "target_date",
+            name="ux_wanted_team_limit",
+        ),
+    )
+
+
 class IssuedRoster(Base):
     __tablename__ = "issued_roster"
     # 기존: seq_no 단일 PK → 변경: (office_id, group_id, version) 복합 PK

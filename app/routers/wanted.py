@@ -20,9 +20,10 @@ from schemas.roster_schema import (
     FixedWantedListResponse,
     FixedWantedEntryResponse,
     ToggleEntryResponse,
+    WantedTeamLimitUpsert,
 )
 from services.graph_service import graph_service
-from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse, assert_caller_can_access_group
+from services.group_access import resolve_effective_group, resolve_managed_group_ids, resolve_home_group_id, caller_is_head_nurse, caller_is_manager, assert_caller_can_access_group
 from routers.auth import get_current_user_from_cookie, require_current_user
 from db.client2 import get_db
 from db.models import (
@@ -63,6 +64,11 @@ from services.wanted_service import (
     update_wanted_deadline_service,
     run_wanted_auto_close,
     enqueue_wanted_close_push,
+)
+from services.wanted_daily_quota_service import (
+    TeamLimitUnavailableError,
+    get_team_limits,
+    replace_team_limits,
 )
 from services.roster_service import get_my_wanted_reflection_service
 
@@ -724,6 +730,59 @@ def validate_wanted_limits_endpoint(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"검증 실패: {str(e)}")
+
+
+# ── 팀별 일자별 원티드 신청 한도 ──────────────────────────────────────────
+def _team_limit_target_group(db: Session, current_user: UserSchema, group_id: Optional[str]) -> str:
+    """수간호사·그룹관리자·ADM 만. 대상 병동은 관리 범위 안에서만(resolve_effective_group)."""
+    if not caller_is_manager(db, current_user):
+        raise HTTPException(status_code=403, detail="수간호사 또는 관리자만 사용할 수 있습니다.")
+    return resolve_effective_group(db, current_user, group_id)
+
+
+@router.get("/team-limits")
+def get_wanted_team_limits_endpoint(
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """팀별 일자별 원티드 신청 한도 조회 — 팀 목록(1일 기준 인원)·팀 기본값·날짜 예외·날짜×팀 제출 수."""
+    target_group_id = _team_limit_target_group(db, current_user, group_id)
+    try:
+        return get_team_limits(db, target_group_id, year, month)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.put("/team-limits")
+def put_wanted_team_limits_endpoint(
+    body: WantedTeamLimitUpsert,
+    year: int,
+    month: int,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(require_current_user),
+    db: Session = Depends(get_db),
+):
+    """팀별 일자별 원티드 신청 한도 저장 — 그 달 통째 교체(빈 목록 = 팀 한도 끔).
+
+    응답은 조회와 같은 모양 + `warnings`(이미 제출된 신청이 새 한도를 넘는 날짜·팀 — 기존 신청은
+    유지되고 새 신청만 막힌다).
+    """
+    target_group_id = _team_limit_target_group(db, current_user, group_id)
+    try:
+        return replace_team_limits(
+            db, target_group_id, year, month,
+            defaults=[d.model_dump() for d in body.defaults],
+            dates=[d.model_dump() for d in body.dates],
+        )
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except TeamLimitUnavailableError as e:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 # 간호사 원티드 개수 제한 초과분인 경우에 대한 조회 및 무조건적인 삭제 기능 서비스 함수

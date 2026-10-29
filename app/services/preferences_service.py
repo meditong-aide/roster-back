@@ -5,6 +5,7 @@
 """
 import calendar
 import json
+import logging
 import pprint
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -20,6 +21,7 @@ from services.group_access import (
 )
 from datetime import datetime, timezone, timedelta, date
 
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────── 도메인 예외 ────────────────────────────
 # 라우터에서 HTTP 상태로 매핑한다(403/409/422). 그 외 예외는 기존대로 500.
@@ -29,6 +31,15 @@ class PreferenceForbiddenError(Exception):
 
 class PreferenceConflictError(Exception):
     """마감되었거나 이미 제출된 원티드 (409)."""
+
+
+class PreferenceQuotaError(PreferenceConflictError):
+    """일자별 신청 한도(병동 전체·팀) 초과 (409). detail.dates 에 넘친 날짜·범위(team|ward)."""
+
+    def __init__(self, message: str, detail=None):
+        super().__init__(message)
+        self.code = "daily_quota_exceeded"
+        self.detail = detail
 
 
 class PreferenceValidationError(Exception):
@@ -674,6 +685,10 @@ def save_wanted_entries_service(
     nurse_id = current_user.nurse_id
     group_id = _resolve_write_group_id(db, current_user, req.group_id)
 
+    if not is_draft:
+        # 일자별 신청 한도 검사를 위해 병동·월을 **칸을 쓰기 전에** 잠근다(교착 방지 — 함수 설명 참고).
+        from services.wanted_daily_quota_service import lock_wanted_month
+        lock_wanted_month(db, group_id, year, month)
     wanted = _load_wanted_window(db, group_id, year, month)
     _assert_wanted_writable(
         wanted, year, month, _latest_submitted_request(db, nurse_id, month_str)
@@ -765,6 +780,13 @@ def save_wanted_entries_service(
             db, nurse_id, group_id, year, month, draft.request_id, commit=False
         )
     if not is_draft:
+        # 일자별 신청 한도(병동 전체·팀) — 넘치면 409. 실패하면 라우터가 롤백한다.
+        from services.wanted_daily_quota_service import assert_daily_quota
+        db.flush()
+        assert_daily_quota(
+            db, nurse_id=nurse_id, group_id=group_id, year=year, month=month,
+            request_id=draft.request_id,
+        )
         draft.is_submitted = True
         draft.submitted_at = datetime.now()
 
@@ -821,6 +843,12 @@ def submit_preferences_service(
 
     # 본인 소속 그룹은 토큰 대신 DB(nurses.group_id)에서 — 토큰 stale 시에도 정합.
     home_gid = resolve_home_group_id(db, current_user)
+
+    if not is_draft:
+        # 일자별 신청 한도 검사를 위해 병동·월을 **어떤 행도 쓰기 전에** 잠근다(아래 draft 생성 포함 ·
+        # 교착 방지 — `lock_wanted_month` 설명 참고).
+        from services.wanted_daily_quota_service import lock_wanted_month
+        lock_wanted_month(db, home_gid, req.year, req.month)
 
     # data가 None이거나 없으면 빈 딕셔너리로 안전하게 처리
     preference_data = req.data if req.data is not None else {}
@@ -1093,6 +1121,13 @@ def submit_preferences_service(
 
     # 제출 처리
     if not is_draft:
+        # 일자별 신청 한도(병동 전체·팀) — 위에서 주석 처리된 DAILY_LIMIT 검증을 대신한다. 넘치면 409.
+        from services.wanted_daily_quota_service import assert_daily_quota
+        db.flush()
+        assert_daily_quota(
+            db, nurse_id=current_user.nurse_id, group_id=home_gid,
+            year=req.year, month=req.month, request_id=request_id,
+        )
         draft.is_submitted = True
         draft.submitted_at = datetime.now()
 
@@ -1235,6 +1270,24 @@ def _build_request_limit(db: Session, nurse_id: str, group_id: str | None, entri
     return {"used": used, "max": max_requests}
 
 
+def _build_daily_quota(db: Session, nurse_id: str, group_id: str, year: int, month: int) -> dict | None:
+    """일자별 신청 한도(병동 전체·우리 팀) 남은 자리 — 작성 화면 달력 칸 숫자용.
+
+    ★ 덧붙인 필드라 계산이 실패해도 원티드 조회 자체는 살린다(None + 로그). 이 호출은 조회의
+      마지막 단계라 실패한 문장이 같은 트랜잭션의 다음 쿼리를 막지 않는다.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from services.wanted_daily_quota_service import daily_quota_view
+
+    try:
+        return daily_quota_view(db, nurse_id=nurse_id, group_id=group_id, year=year, month=month)
+    except SQLAlchemyError:
+        logger.error("[wanted_quota] daily_quota 계산 실패 — 필드 생략: nurse=%s, %s-%02d",
+                     nurse_id, year, month, exc_info=True)
+        return None
+
+
 def get_latest_preference_service(
     year: int,
     month: int,
@@ -1293,6 +1346,7 @@ def get_latest_preference_service(
                 "deadline_at": wanted.exp_date.isoformat() if wanted and wanted.exp_date else None,
             },
             "request_limit": _build_request_limit(db, nurse_id, group_id, []),
+            "daily_quota": _build_daily_quota(db, nurse_id, group_id, year, month),
         }
     # 3️⃣ 해당 request_id로 shift / pair 데이터 가져오기
     shift_rows = (
@@ -1386,6 +1440,7 @@ def get_latest_preference_service(
             db, nurse_id, group_id,
             [{"shift_id": e["shift_id"]} for e in wanted_entries],
         ),
+        "daily_quota": _build_daily_quota(db, nurse_id, group_id, year, month),
     }
 
 def _resolve_all_preferences_scope(

@@ -16,6 +16,7 @@ from services.preferences_service import (
     # save_preference_draft_service,
     PreferenceConflictError,
     PreferenceForbiddenError,
+    PreferenceQuotaError,
     PreferenceValidationError,
     submit_preferences_service,
     submit_empty_preferences_service,
@@ -46,12 +47,18 @@ def _raise_domain_error(exc: Exception) -> None:
     """원티드 도메인 예외를 HTTP 상태로 매핑한다.
 
     - 403: 역할/그룹 불일치
-    - 409: 마감 또는 이미 제출됨
+    - 409: 마감 또는 이미 제출됨 · 일자별 신청 한도 초과(본문 `{code, message, detail.dates}`)
     - 422: 날짜 중복 · 유효하지 않은 shift_id · 미지원 intent · 한도 초과
     매핑 대상이 아니면 그대로 재전파해 호출부가 500 으로 처리하게 둔다.
     """
     if isinstance(exc, PreferenceForbiddenError):
         raise HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, PreferenceQuotaError):
+        # 화면이 넘친 날짜에 빨간 테두리를 그릴 수 있게 날짜·범위(team|ward)를 함께 내린다.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": str(exc), "detail": exc.detail},
+        )
     if isinstance(exc, PreferenceConflictError):
         raise HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, PreferenceValidationError):
