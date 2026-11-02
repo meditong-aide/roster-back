@@ -15,12 +15,15 @@ from typing import Any, Callable, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from schedule_edit_agent.answer import answer_for, describe_requests, status_text
-from schedule_edit_agent.grounding import SHIFTS, ground_changes, resolve_day, resolve_nurse
+from schedule_edit_agent.grounding import SHIFT_WORD, SHIFTS, ground_changes, resolve_day, resolve_nurse
 from services.schedule_edit.apply import ApplyError, apply_to_new_version
 from services.schedule_edit.journal import record_event
-from services.schedule_edit.requests import EditRequest, SetCell
+from services.schedule_edit.requests import (
+    TRANSFERS, CountTarget, EditRequest, SetCell, count_in, first_open_day, transfer_label, work_down, work_targets,
+)
 from services.schedule_edit.serialize import allow_to_json, requests_to_json, result_to_dict
-from services.schedule_edit.session import EditSession, allow_lever_id, keep, propose, reject
+from services.schedule_edit.session import EditSession, allow_lever_id, keep, propose, reject, stage
+from services.schedule_edit.solver import apply_candidate, propose_edits
 
 #: 채팅 한 번의 응답 시간 상한(초) — CloudFront 30초 안에 들어와야 한다. 경로에 들어온 순간부터 센다
 #: (슬롯 대기·판정 재료 로드·LLM·솔버 모두 이 안 · 검토 HIGH-2). 솔버 예산은 남은 시간이다.
@@ -45,6 +48,10 @@ class Turn:
 
     def remaining(self) -> float:
         return self.deadline - time.monotonic()
+
+    def open_from(self) -> int:
+        """바꿀 수 있는 첫날(0부터) — 오늘 이전은 닫는다."""
+        return first_open_day(self.session.ctx, self.today)
 
     def record(self, event: str, payload: Dict[str, Any], *, elapsed_ms: Optional[int] = None,
                new_schedule_id: Optional[str] = None) -> None:
@@ -93,27 +100,37 @@ def llm_tools() -> List[Dict[str, Any]]:
 _CHANGE = {
     "type": "object",
     "properties": {
-        "kind": {"type": "string", "enum": ["set", "avoid", "swap", "off_period"],
+        "kind": {"type": "string", "enum": ["set", "avoid", "swap", "off_period", "count"],
                  "description": "set=그 칸을 이 근무로 · avoid=그 칸에서 이 근무(들)를 빼기(무엇으로 바꿀지는 맡김) · "
-                                "swap=두 사람의 그날 근무 맞바꾸기 · off_period=day 부터 to_day 까지 OFF"},
+                                "swap=두 사람의 그날 근무 맞바꾸기 · off_period=day 부터 to_day 까지 OFF · "
+                                "count=날짜를 정하지 않고 그 사람의 그 근무 개수를 바꾸기(어느 날인지는 맡김)"},
         "nurse": {"type": "string", "description": "사용자가 말한 간호사 이름 그대로(호칭 '선생님' 등은 빼고)"},
         "other_nurse": {"type": "string", "description": "swap 의 상대 간호사 이름"},
-        "day": {"type": "integer", "minimum": 1, "maximum": 31, "description": "날짜(그 달의 일)"},
-        "to_day": {"type": "integer", "minimum": 1, "maximum": 31, "description": "off_period 의 마지막 날(포함)"},
+        "day": {"type": "integer", "minimum": 1, "maximum": 31,
+                "description": "날짜(그 달의 일). count 에서는 기간을 말했을 때만 그 첫날"},
+        "to_day": {"type": "integer", "minimum": 1, "maximum": 31,
+                   "description": "off_period·count 기간의 마지막 날(포함). count 에서 기간을 말하지 않았으면 비운다"},
+        "change": {"type": "integer", "description": "count: 늘리거나 줄일 개수(2개 빼 → -2, 하나 더 → 1)"},
+        "target": {"type": "integer", "minimum": 0, "description": "count: '6개로' 처럼 목표 개수를 말했을 때"},
+        "transfer": {"type": "string", "enum": list(TRANSFERS),
+                     "description": "count: 상대를 어떻게 정할지 사용자가 이미 말했을 때만(빠지는 근무를 누가 메울지 / "
+                                    "누구 것을 넘겨받을지). same_grade=같은 등급 · same_team=같은 팀 · fair=그 근무가 "
+                                    "적은(넘겨받을 땐 많은) 사람 · reduce_coverage=메우지 않고 그날 인원 줄이기 · "
+                                    "add_coverage=넘겨받지 않고 그날 인원 늘리기 · auto=가장 적게 바꾸기"},
         "shift": {"type": "string", "enum": list(SHIFTS),
                   "description": "set 의 근무. D=데이 E=이브닝 N=나이트 M=미드 OFF=휴무·오프"},
         "shifts": {"type": "array", "items": {"type": "string", "enum": list(SHIFTS)},
                    "description": "avoid 에서 뺄 근무들"},
     },
-    "required": ["kind", "nurse", "day"],
+    "required": ["kind", "nurse"],
 }
 _CELL = {
     "type": "object",
     "properties": {
         "nurse": {"type": "string", "description": "간호사 이름. 비우면 그날 모든 간호사"},
-        "day": {"type": "integer", "minimum": 1, "maximum": 31},
+        "day": {"type": "integer", "minimum": 1, "maximum": 31,
+                "description": "날짜. remove 에서 비우면 그 간호사의 요청 전부(개수 요청 포함)"},
     },
-    "required": ["day"],
 }
 
 
@@ -127,12 +144,14 @@ _CELL = {
         "후보를 최대 3개 낸다. 새 요청을 받을 때 쓴다(이전 요청은 버린다). "
         "예) '김민지 14일 오프로 해줘' → changes=[{kind:set, nurse:'김민지', day:14, shift:'OFF'}] · "
         "'15일 나이트 이영희랑 박서준 바꿔줘' → [{kind:swap, nurse:'이영희', other_nurse:'박서준', day:15}] · "
-        "'정다은 20일 나이트 빼줘' → [{kind:avoid, nurse:'정다은', day:20, shifts:['N']}]"),
+        "'정다은 20일 나이트 빼줘' → [{kind:avoid, nurse:'정다은', day:20, shifts:['N']}] · "
+        "'장원영 N 2개만 빼줘' → [{kind:count, nurse:'장원영', shift:'N', change:-2}] · "
+        "'장원영 나이트 너무 많아'(개수 없음) → [{kind:count, nurse:'장원영', shift:'N'}](시스템이 현황을 보여 주고 되묻는다)"),
     parameters={"type": "object", "properties": {"changes": {"type": "array", "items": _CHANGE}},
                 "required": ["changes"]},
     mode="preview", llm=True)
 def propose_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
-    grounded = ground_changes(turn.session.ctx, params.get("changes") or [])
+    grounded = ground_changes(turn.session.ctx, params.get("changes") or [], turn.open_from())
     if grounded.asks:
         return _clarify(turn, grounded.asks)
     return _propose(turn, grounded.requests)
@@ -143,11 +162,13 @@ def propose_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     description=(
         "바로 앞 요청을 고쳐 다시 찾는다. add=요청 더하기, remove=그 칸 요청 빼기, keep=이 칸(또는 그날 전체)은 "
         "지금 근무 그대로 두기. 예) '그리고 이영희 16일도 오프' → add · '15일은 건드리지 마' → keep=[{day:15}] · "
-        "'김민지 14일 건은 취소' → remove=[{nurse:'김민지', day:14}]"),
+        "'김민지 14일 건은 취소' → remove=[{nurse:'김민지', day:14}] · "
+        "개수 요청에서 빠지는 근무를 메우는 방식을 말하면 transfer('같은 등급으로' → same_grade)"),
     parameters={"type": "object", "properties": {
         "add": {"type": "array", "items": _CHANGE},
         "remove": {"type": "array", "items": _CELL},
         "keep": {"type": "array", "items": _CELL},
+        "transfer": {"type": "string", "enum": list(TRANSFERS)},
     }},
     mode="preview", llm=True)
 def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
@@ -155,14 +176,18 @@ def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     if not turn.session.requests:
         return _clarify(turn, ["고칠 앞 요청이 없습니다. 무엇을 바꿀지 처음부터 말씀해 주세요."])
     asks: List[str] = []
-    add = ground_changes(ctx, params["add"]) if params.get("add") else None
+    add = ground_changes(ctx, params["add"], turn.open_from()) if params.get("add") else None
     if add is not None:
         asks += add.asks
-    removed = _cells(ctx, params.get("remove") or [], asks)
+    removed = _removals(ctx, params.get("remove") or [], asks)
     kept = _cells(ctx, params.get("keep") or [], asks)
     if asks:
         return _clarify(turn, asks)
-    reqs = [r for r in turn.session.requests if (r.nurse_id, r.day) not in removed]
+    reqs = [r for r in turn.session.requests
+            if (r.nurse_id, r.day) not in removed and (r.nurse_id, None) not in removed]
+    if params.get("transfer") in TRANSFERS:
+        # 말로 바꾼 방식은 이미 고른 방식도 덮어쓴다('아니 같은 팀으로' · 검토 L4) — 버튼은 정하지 않은 것만
+        reqs = [_decided(r, params["transfer"], force=True) for r in reqs]
     for r in (add.requests if add else []):
         if r not in reqs:
             reqs.append(r)
@@ -173,6 +198,27 @@ def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     if not any(not _is_keep(ctx, r) for r in reqs):
         return _clarify(turn, ["남은 변경 요청이 없습니다. 무엇을 바꿀지 말씀해 주세요."])
     return _propose(turn, reqs)
+
+
+def _removals(ctx, items, asks: List[str]) -> set:
+    """빼기 — (간호사, 날) 또는 날 없이 (간호사, None)=그 간호사 요청 전부."""
+    out = set()
+    for item in items:
+        if item.get("day") is None and item.get("nurse"):
+            nurse, ask = resolve_nurse(ctx, item.get("nurse"))
+            if ask:
+                asks.append(ask)
+            else:
+                out.add((nurse, None))
+        else:
+            out |= _cells(ctx, [item], asks)
+    return out
+
+
+def _decided(r: EditRequest, transfer: str, force: bool = False) -> EditRequest:
+    if isinstance(r, CountTarget) and (r.transfer is None or force):
+        return CountTarget(r.nurse_id, r.codes, r.target, r.first_day, r.last_day, transfer)
+    return r
 
 
 def _cells(ctx, items, asks: List[str]) -> set:
@@ -291,6 +337,22 @@ def choose_lever(turn: Turn, params: Dict[str, Any]) -> Outcome:
     return _propose(turn, turn.session.requests)
 
 
+@register("choose_transfer", description="개수 요청에서 빠지는 근무를 메우는 방식을 고르고 그 방식으로 찾는다.",
+          parameters={"type": "object", "properties": {"choice_id": {"type": "string", "enum": list(TRANSFERS)}},
+                      "required": ["choice_id"]},
+          mode="preview", llm=False)
+def choose_transfer(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    choice = params.get("choice_id")
+    pending = next((r for r in turn.session.requests if isinstance(r, CountTarget) and r.transfer is None), None)
+    if pending is None:
+        raise SkillError("고를 개수 요청이 없습니다. 다시 요청해 주세요.")
+    shown = _SHOW_DOWN if work_down(turn.session.ctx, pending) else _SHOW_UP
+    if choice not in shown:                      # 보여 준 선택지만(방향과 맞지 않는 인원 완화 · 검토 P1)
+        raise SkillError("보여 드린 선택지 중에서 골라 주세요.")
+    turn.record("choose", {"choice_id": choice})
+    return _propose(turn, [_decided(r, choice) for r in turn.session.requests])
+
+
 # ── 공용 ────────────────────────────────────────────────────────────────────
 
 
@@ -310,6 +372,9 @@ def _candidate(turn: Turn, params: Dict[str, Any]):
 
 
 def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
+    undecided = next((r for r in requests if isinstance(r, CountTarget) and r.transfer is None), None)
+    if undecided is not None:
+        return _choose_transfer(turn, requests, undecided)
     ctx = turn.session.ctx
     if turn.remaining() < MIN_SOLVE:
         turn.record("error", {"stage": "budget", "requests": requests_to_json(requests),
@@ -326,6 +391,184 @@ def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
                 elapsed_ms=_ms(started))
     actions = [{"type": "preview_candidates"}] if result.candidates else []
     return Outcome(answer=answer, preview=preview, ui_actions=actions)
+
+
+#: 상대를 정하는 방식을 미리 풀 때 하나에 쓰는 시간 상한·하한(초)과, 미리 풀기 뒤 답을 만들 몫으로 남길 시간
+PROBE_SECONDS = 3.0
+PROBE_MIN = 0.8
+PROBE_RESERVE = 1.5
+#: 보여 주는 순서 — 기준안(가장 적게 바꾸기)은 맨 끝. 근무가 줄면 '그날 인원 줄이기', 늘면 '그날 인원 늘리기'
+_SHOW_DOWN = ("same_grade", "same_team", "fair", "reduce_coverage", "auto")
+_SHOW_UP = ("same_grade", "same_team", "fair", "add_coverage", "auto")
+
+
+def _choose_transfer(turn: Turn, requests: List[EditRequest], req: CountTarget) -> Outcome:
+    """개수 요청 — 상대를 어떻게 정할지 방식마다 미리 풀어 보여 주고 묻는다(사용자 결정 11-02).
+
+    · 요청자의 근무가 줄면(N 빼기·OFF 늘리기) 빠지는 근무를 누가 메울지, 늘면(N 더·OFF 빼기) 누구 것을 넘겨받을지.
+    · 가장 적게 바꾸는 안에서 상대가 없으면(다른 사람의 그 근무가 안 움직이면) 묻지 않는다.
+    · 어느 방식도 안 되면 묻지 않고 '가장 적게 바꾸기'로 불가 이유·레버를 낸다. 모두 시간 부족이면 그렇게 안내.
+    """
+    ctx, session = turn.session.ctx, turn.session
+    if turn.remaining() < MIN_SOLVE:
+        turn.record("error", {"stage": "budget", "requests": requests_to_json(requests)})
+        return Outcome(answer=OUT_OF_TIME)
+    started = time.monotonic()
+    down = work_down(ctx, req)
+    policies = [p for p in (_SHOW_DOWN if down else _SHOW_UP) if _applicable(ctx, req, p)]
+    # auto 먼저(묻지 않아도 되는지) — 그다음 남은 방식을 남은 시간으로 나눠, 방식마다 다시 잰다(검토 L2)
+    order = ["auto"] + [p for p in policies if p != "auto"]
+    choices: Dict[str, Dict[str, Any]] = {}
+    for i, p in enumerate(order):
+        per = min(PROBE_SECONDS, (turn.remaining() - PROBE_RESERVE) / (len(order) - i))
+        choices[p] = _probe(turn, requests, req, p, per) if per >= PROBE_MIN else _skipped(ctx, req, p)
+        if p == "auto" and choices[p]["feasible"] and not choices[p]["partners"]:
+            return _propose(turn, [_decided(r, "auto") for r in requests])
+    if not any(c["feasible"] for c in choices.values()):
+        if all(c.get("timed_out") for c in choices.values()):
+            turn.record("error", {"stage": "budget", "requests": requests_to_json(requests)})
+            return Outcome(answer=OUT_OF_TIME)          # '방법 없음' 과 다르다(검토 L3)
+        return _propose(turn, [_decided(r, "auto") for r in requests])
+    ordered = [choices[p] for p in policies if p in choices]
+    _mark_same_as_auto(ordered)
+    _recommend(ordered)
+    for c in ordered:
+        c.pop("_cells", None)
+    stage(session, requests)
+    word, moved = _word(req), abs(count_in(ctx, ctx.main, req) - req.target)
+    ask = (f"빠지는 {word} {moved}개를 어떻게 메울지" if down
+           else f"늘어나는 {word} {moved}개를 누구에게서 넘겨받을지")
+    lines = [f"{describe_requests(ctx, requests)} — {ask} 골라 주세요."]
+    lines += [f"{i}. {_choice_line(c)}" for i, c in enumerate(ordered, 1)]
+    answer = "\n".join(lines + [f"참고: {n}" for n in ctx.notes])
+    preview = {"status": "choose_transfer", "choices": ordered, "direction": "down" if down else "up",
+               "reasons": [], "notes": list(ctx.notes), "candidates": [], "levers": [], "blocking": []}
+    turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
+                            "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
+                            "avoid": [sorted(p) for p in session.avoid_people]}, elapsed_ms=_ms(started))
+    return Outcome(answer=answer, preview=preview, ui_actions=[{"type": "choose_transfer"}])
+
+
+def _word(req: CountTarget) -> str:
+    """사람에게 보일 근무 이름 — 근무 개수 요청이면 그 근무, OFF 요청이면 '근무'(빠지거나 느는 것은 근무다)."""
+    work = set(req.codes) & {"D", "E", "N", "M"}
+    return "·".join(SHIFT_WORD[c] for c in sorted(work)) if work else "근무"
+
+
+def _applicable(ctx, req: CountTarget, policy: str) -> bool:
+    if policy == "same_grade":
+        return ctx.grade_of.get(req.nurse_id) is not None
+    if policy == "same_team":
+        return ctx.team_of.get(req.nurse_id) is not None
+    return True
+
+
+def _probe(turn: Turn, requests: List[EditRequest], req: CountTarget, policy: str, seconds: float) -> Dict[str, Any]:
+    """그 방식으로 한 번 풀어 본다(후보 1개 · 불가 이유는 찾지 않음) — 세션은 바꾸지 않는다.
+
+    상대(partners)는 요청 기간 안에서 센다 — fair 의 기준과 같은 단위(검토 N3).
+    """
+    ctx, session = turn.session.ctx, turn.session
+    lower = req.target < count_in(ctx, ctx.main, req)
+    if policy == "fair" and not _has_partner(ctx, req, lower):
+        word = "OFF" if not (set(req.codes) & {"D", "E", "N", "M"}) else _word(req)
+        side = "적은" if lower else "많은"
+        return {**_skipped(ctx, req, policy), "timed_out": False,
+                "reason": f"그 기간 {word}이(가) {req.target}회보다 {side} 간호사가 없습니다"}
+    res = propose_edits(ctx, [_decided(r, policy) for r in requests], rules=session.rules, screen=session.screen,
+                        max_candidates=1, time_budget=seconds, today=turn.today, allow=session.allow,
+                        avoid_people=session.avoid_people, explain=False)
+    out: Dict[str, Any] = {"choice_id": policy, "label": transfer_label(ctx, req, policy), "feasible": res.status == "ok",
+                           "recommended": False, "partners": [], "coverage_changes": [], "quality": []}
+    if res.status != "ok":
+        out["reason"] = "방법 없음" if res.status == "infeasible" else "시간 안에 찾지 못함"
+        out["timed_out"] = res.status == "timeout"
+        return out
+    cand = res.candidates[0]
+    grid = apply_candidate(ctx, cand)
+    for m in cand.affected:
+        if m == req.nurse_id:
+            continue
+        before = sum(1 for d in req.days() if ctx.main[m][d] in req.codes)
+        after = sum(1 for d in req.days() if grid[m][d] in req.codes)
+        if (after > before) if lower else (after < before):
+            out["partners"].append({"nurse_id": m, "name": ctx.names.get(m, m), "before": before, "after": after})
+    for d in req.days():
+        for code in sorted(work_targets(req)):
+            before = sum(1 for n in ctx.nurse_ids if ctx.main[n][d] == code)
+            after = sum(1 for n in ctx.nurse_ids if grid[n][d] == code)
+            if after != before:
+                out["coverage_changes"].append({"day": d + 1, "code": code, "before": before, "after": after})
+    out.update(changed_count=cand.changed_count, span={"from": cand.span[0] + 1, "to": cand.span[1] + 1},
+               quality=list(cand.quality[:3]),
+               _cells=sorted((c.nurse_id, c.day, c.after_main) for c in cand.changes))   # 같은 안 판정용(내보내지 않음)
+    return out
+
+
+def _has_partner(ctx, req: CountTarget, lower: bool) -> bool:
+    """fair 상대가 있나 — 요청 기간 안 개수로(검토 N1). 줄이는 요청이면 목표보다 적고 그 근무를 할 수 있는 사람,
+    늘리는 요청이면 목표보다 많은 사람."""
+    days = list(req.days())
+    work = set(req.codes) & {"D", "E", "N", "M"}
+
+    def count(m: str) -> int:
+        return sum(1 for d in days if ctx.main[m][d] in req.codes)
+
+    def can_take(m: str) -> bool:
+        return any(ctx.is_free(m, d) and (not work or c not in ctx.forbidden.get((m, d), set()))
+                   for d in days for c in req.codes)
+
+    def can_give(m: str) -> bool:     # 그 기간에 바꿀 수 있는 그 근무 칸이 있어야 내줄 수 있다(검토 P2)
+        return any(ctx.is_free(m, d) and ctx.main[m][d] in req.codes for d in days)
+
+    others = [m for m in ctx.nurse_ids if m != req.nurse_id]
+    if lower:
+        return any(count(m) < req.target and can_take(m) for m in others)
+    return any(count(m) > req.target and can_give(m) for m in others)
+
+
+def _mark_same_as_auto(choices: List[Dict[str, Any]]) -> None:
+    """미리 푼 결과가 '가장 적게 바꾸기'와 같은 방식은 그렇게 적는다(같은 안을 다른 이름으로 고르게 하지 않게)."""
+    auto = next((c for c in choices if c["choice_id"] == "auto"), None)
+    if not auto or not auto["feasible"]:
+        return
+    for c in choices:
+        if c is not auto and c["feasible"] and c.get("_cells") == auto.get("_cells"):
+            c["same_as_auto"] = True
+
+
+def _skipped(ctx, req: CountTarget, policy: str) -> Dict[str, Any]:
+    return {"choice_id": policy, "label": transfer_label(ctx, req, policy), "feasible": False, "recommended": False,
+            "partners": [], "coverage_changes": [], "quality": [], "reason": "시간 안에 확인하지 못함",
+            "timed_out": True}
+
+
+def _recommend(choices: List[Dict[str, Any]]) -> None:
+    """추천 — 설정을 넘기지 않는 것(그날 인원을 바꾸지 않는 것)이 먼저, 그다음 품질 악화가 적고 칸이 적은 것.
+    '가장 적게 바꾸기'와 같은 안이면 그 이름(가장 적게 바꾸기)으로 추천한다."""
+    pool = [c for c in choices if c["feasible"]]
+    best = min(pool, key=lambda c: (c["choice_id"] in ("reduce_coverage", "add_coverage"), len(c["quality"]),
+                                    c["changed_count"], c["choice_id"] != "auto"))
+    if best.get("same_as_auto"):
+        best = next(c for c in pool if c["choice_id"] == "auto")
+    best["recommended"] = True
+
+
+def _choice_line(c: Dict[str, Any]) -> str:
+    if not c["feasible"]:
+        return f"{c['label']} — {c['reason']}"
+    parts = [f"{c['changed_count']}칸"]
+    if c["partners"]:
+        parts.append(", ".join(f"{r['name']} {r['before']}→{r['after']}" for r in c["partners"][:4]))
+    if c["choice_id"] in ("reduce_coverage", "add_coverage") and c["coverage_changes"]:
+        bound = "최소" if c["choice_id"] == "reduce_coverage" else "최대"
+        parts.append(", ".join(f"{x['day']}일 {SHIFT_WORD[x['code']]} {x['before']}→{x['after']}명"
+                               for x in c["coverage_changes"][:4]) + f"(일별 {bound} 인원을 이번만 넘김)")
+    if c["quality"]:
+        parts.append(c["quality"][0])
+    if c.get("same_as_auto"):
+        parts.append("가장 적게 바꾸기와 같은 안")
+    return f"{c['label']} — " + " · ".join(parts) + (" [추천]" if c["recommended"] else "")
 
 
 def _clarify(turn: Turn, asks: List[str]) -> Outcome:

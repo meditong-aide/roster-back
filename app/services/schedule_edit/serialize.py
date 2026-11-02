@@ -11,7 +11,7 @@ import json
 from typing import Any, Dict, List, Sequence, Tuple
 
 from services.schedule_edit.context import EditContext
-from services.schedule_edit.requests import AvoidCell, EditRequest, SetCell
+from services.schedule_edit.requests import AvoidCell, CountTarget, EditRequest, SetCell
 
 
 def allow_to_json(allow: Dict[Tuple, int]) -> List[List[Any]]:
@@ -26,7 +26,10 @@ def requests_to_json(requests: Sequence[EditRequest]) -> List[Dict[str, Any]]:
     """기록·재기동 복원용 — day 는 0부터(모델과 같게)."""
     out = []
     for r in requests:
-        if isinstance(r, SetCell):
+        if isinstance(r, CountTarget):
+            out.append({"kind": "count", "nurse_id": r.nurse_id, "codes": sorted(r.codes), "target": r.target,
+                        "first_day": r.first_day, "last_day": r.last_day, "transfer": r.transfer})
+        elif isinstance(r, SetCell):
             out.append({"kind": "set", "nurse_id": r.nurse_id, "day": r.day, "code": r.code})
         else:
             out.append({"kind": "avoid", "nurse_id": r.nurse_id, "day": r.day, "codes": sorted(r.codes)})
@@ -34,8 +37,16 @@ def requests_to_json(requests: Sequence[EditRequest]) -> List[Dict[str, Any]]:
 
 
 def requests_from_json(items: Sequence[Dict[str, Any]]) -> List[EditRequest]:
-    return [SetCell(i["nurse_id"], int(i["day"]), i["code"]) if i["kind"] == "set"
-            else AvoidCell(i["nurse_id"], int(i["day"]), frozenset(i["codes"])) for i in items or []]
+    out: List[EditRequest] = []
+    for i in items or []:
+        if i["kind"] == "count":
+            out.append(CountTarget(i["nurse_id"], frozenset(i["codes"]), int(i["target"]), int(i["first_day"]),
+                                   int(i["last_day"]), i.get("transfer")))
+        elif i["kind"] == "set":
+            out.append(SetCell(i["nurse_id"], int(i["day"]), i["code"]))
+        else:
+            out.append(AvoidCell(i["nurse_id"], int(i["day"]), frozenset(i["codes"])))
+    return out
 
 
 def lever_id(allow: Dict[Tuple, int]) -> str:

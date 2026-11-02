@@ -203,6 +203,9 @@ def test_partial_names_need_two_letters_at_the_end():
     from schedule_edit_agent.grounding import resolve_nurse
     ctx = _names(make_ctx({"n1": "DODO", "n2": "ODOD"}), {"n1": "김민지", "n2": "박지은수"})
     assert resolve_nurse(ctx, "민지") == ("n1", None)                 # 성을 뺀 이름
+    ctx3 = _names(make_ctx({"n1": "DODO", "n2": "ODOD"}), {"n1": "장원영", "n2": "이민지"})
+    assert resolve_nurse(ctx3, "원영이") == ("n1", None)              # 부를 때 붙는 '이'
+    assert resolve_nurse(ctx3, "철수이")[0] is None
     assert resolve_nurse(ctx, "김민지 ")[0] == "n1"
     for said in ("민", "김", "지은"):                                  # 한 글자·성만·가운데 글자는 묻는다
         nurse, ask = resolve_nurse(ctx, said)
@@ -329,3 +332,64 @@ def test_today_matters_for_past_days(world):
     agent, _ = _agent(call("propose_edit", changes=[A_OFF]))
     reply = agent.chat(None, USER, world.conv, "A 1일 오프", date(2026, 11, 2))
     assert reply.preview["status"] == "invalid" and "지난 날짜" in reply.answer
+
+
+# ── 개수 요청 ───────────────────────────────────────────────────────────────
+
+
+def _count_ward():
+    from tests.schedule_edit.test_count import _ward
+    return _ward()      # A N 4개 · B·C D 4개 · 날마다 N 1명 · 등급 A2 B2 C1 · 팀 A1 B2 C1
+
+
+N_LESS_2 = {"kind": "count", "nurse": "A", "shift": "N", "change": -2}
+
+
+def test_count_request_asks_how_to_cover_then_solves_the_choice(world):
+    world.ctxs["s1"] = _count_ward
+    agent, _ = _agent(call("propose_edit", changes=[N_LESS_2]))
+    asked = agent.chat(None, USER, world.conv, "A N 2개만 빼줘", BEFORE_MONTH)
+    assert asked.preview["status"] == "choose_transfer" and asked.ui_actions == [{"type": "choose_transfer"}]
+    choices = {c["choice_id"]: c for c in asked.preview["choices"]}
+    assert set(choices) == {"same_grade", "same_team", "fair", "reduce_coverage", "auto"}
+    assert [r["name"] for r in choices["same_grade"]["partners"]] == ["B"]
+    assert [r["name"] for r in choices["same_team"]["partners"]] == ["C"]
+    assert choices["reduce_coverage"]["coverage_changes"] and not choices["reduce_coverage"]["recommended"]
+    assert asked.preview["direction"] == "down"
+    assert all("_cells" not in c for c in asked.preview["choices"])            # 내부 판정용은 내보내지 않는다
+    assert "A N 4→2회 — 빠지는 N 2개를 어떻게 메울지" in asked.answer
+    assert world.conv.session.last is None                                     # 묻는 동안 지난 후보는 적용 못 함
+
+    done = agent.act(None, USER, world.conv, "choose_transfer", {"choice_id": "same_team"}, BEFORE_MONTH)
+    assert done.preview["status"] == "ok" and "같은 팀 간호사가 메우기" in done.answer
+    assert "C N 0→2" in done.answer
+    assert [e.event for e in world.events][-2:] == ["choose", "propose"]
+
+
+def test_saying_another_way_overrides_the_chosen_one(world):
+    world.ctxs["s1"] = _count_ward
+    agent, _ = _agent(call("propose_edit", changes=[{**N_LESS_2, "transfer": "same_grade"}]),
+                      call("revise_edit", transfer="same_team"))
+    first = agent.chat(None, USER, world.conv, "A N 2개 빼고 같은 등급이 메워", BEFORE_MONTH)
+    assert first.preview["status"] == "ok" and "B N 0→2" in first.answer         # 말한 방식이면 묻지 않는다
+    second = agent.chat(None, USER, world.conv, "아니 같은 팀으로", BEFORE_MONTH)
+    assert "C N 0→2" in second.answer                                            # 정한 방식도 말로 바꾼다
+
+
+def test_count_without_number_shows_status_and_asks(world):
+    world.ctxs["s1"] = _count_ward
+    agent, _ = _agent(call("propose_edit", changes=[{"kind": "count", "nurse": "A", "shift": "N"}]))
+    reply = agent.chat(None, USER, world.conv, "A 나이트 너무 많아", BEFORE_MONTH)
+    assert reply.answer.startswith("A 11월 N 4회입니다(병동 평균") and reply.answer.endswith("몇 회로 바꿀까요?")
+
+
+def test_asking_for_more_offers_whom_to_take_from(world):
+    world.ctxs["s1"] = _count_ward
+    agent, _ = _agent(call("propose_edit", changes=[{"kind": "count", "nurse": "B", "shift": "N", "change": 1}]))
+    asked = agent.chat(None, USER, world.conv, "B N 하나 더 줘", BEFORE_MONTH)
+    assert asked.preview["status"] == "choose_transfer" and asked.preview["direction"] == "up"
+    assert "늘어나는 N 1개를 누구에게서 넘겨받을지" in asked.answer
+    choices = {c["choice_id"]: c for c in asked.preview["choices"]}
+    assert set(choices) == {"same_grade", "same_team", "fair", "add_coverage", "auto"}
+    assert choices["same_grade"]["label"] == "같은 등급 간호사의 근무를 넘겨받기"
+    assert [r["name"] for r in choices["same_grade"]["partners"]] == ["A"]       # A 의 N 이 줄어든다

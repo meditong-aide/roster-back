@@ -24,8 +24,8 @@ from ortools.sat.python import cp_model
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.explain import Bend, add_rules_soft, bend_text
 from services.schedule_edit.model import (
-    EditModel, add_cell_vars, add_requests, add_span, edit_codes, forbid_same_people, free_cells, is_waived,
-    new_solver, read_solution, requested_cells,
+    EditModel, add_cell_vars, add_requests, add_span, edit_codes, forbid_same_people, free_cells, grid_relief,
+    is_waived, model_relief, new_solver, read_solution, requested_cells,
 )
 from services.schedule_edit.requests import EditRequest
 from services.schedule_edit.rules import Grid, RuleSet, build_rules, measure, new_violations
@@ -127,7 +127,8 @@ def _lever_model(ctx: EditContext, rules: RuleSet, requests: List[EditRequest], 
     em = EditModel(ctx=ctx, base=ctx.main, free=free_cells(ctx, range(start, ctx.days)), codes=edit_codes(ctx))
     add_cell_vars(em)
     slacks = add_rules_soft(em, rules, requested_cells(requests), allow,
-                             softenable=lambda family: family in LEVER_FAMILIES)
+                             softenable=lambda family: family in LEVER_FAMILIES,
+                             relief=model_relief(em, rules, requests))
     add_requests(em, requests)
     add_span(em)
     em.model.Add(em.total_changes() <= MAX_CHANGES)
@@ -152,10 +153,11 @@ def _to_lever(ctx: EditContext, rules: RuleSet, em: EditModel, grid: Grid, used,
     granted = dict(allow)
     for _f, key, amount in used:
         granted[key] = granted.get(key, 0) + amount
-    if not _within(ctx, rules, grid, granted, requested_cells(requests)):
+    if not _within(ctx, rules, grid, granted, requests):
         return None
     cells = [(n, d) for n, d in em.free if grid[n][d] != em.base[n][d]]
-    regress = screen_problems(screen, [cell_change(ctx, n, d, grid[n][d]) for n, d in cells], granted)
+    regress = screen_problems(screen, [cell_change(ctx, n, d, grid[n][d]) for n, d in cells],
+                              {**granted, **grid_relief(ctx, rules, requests, grid)})
     if regress:
         logger.info("[schedule_edit] 레버 해가 화면에서 나빠져 제외: %s", regress[:3])
         return None
@@ -169,10 +171,12 @@ def _to_lever(ctx: EditContext, rules: RuleSet, em: EditModel, grid: Grid, used,
     )
 
 
-def _within(ctx: EditContext, rules: RuleSet, grid: Grid, granted: Dict[Tuple, int], waived) -> bool:
+def _within(ctx: EditContext, rules: RuleSet, grid: Grid, granted: Dict[Tuple, int],
+            requests: List[EditRequest]) -> bool:
     """레버 해가 허용량 안에서만 넘겼는지 — 모델과 같은 부등식으로 다시 잰다(어긋나면 코드 결함)."""
+    waived, relief = requested_cells(requests), grid_relief(ctx, rules, requests, grid)
     worse = {k: v for k, v in new_violations(measure(ctx, ctx.main, rules), measure(ctx, grid, rules)).items()
-             if not is_waived(k, waived) and v[1] > v[0] + granted.get(k, 0)}
+             if not is_waived(k, waived) and v[1] > v[0] + granted.get(k, 0) + relief.get(k, 0)}
     if worse:
         logger.error("[schedule_edit] 레버 해가 허용량을 넘음: %s", sorted(worse.items())[:5])
     return not worse

@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 LLM_FAILED = "지금 말씀을 해석하지 못했습니다. 잠시 뒤 다시 말씀해 주세요."
 #: 버튼을 최근 대화에 남길 때의 말 — 다음 말('그 안에서 15일은 빼줘')이 무엇을 가리키는지 LLM 이 알게
 BUTTON_TEXT = {"apply_edit": "{rank}번 안 적용", "reject_candidate": "{rank}번 안 넘기기",
-               "keep_candidate": "{rank}번 안을 기준으로 다듬기", "choose_lever": "레버 고르기"}
+               "keep_candidate": "{rank}번 안을 기준으로 다듬기", "choose_lever": "레버 고르기",
+               "choose_transfer": "메우는 방식 고르기({choice_id})"}
 
 
 @dataclass
@@ -92,7 +93,7 @@ class EditAgent:
         if skill is None or skill.llm:
             raise SkillError("알 수 없는 동작입니다.")
         turn = self._turn(db, user, conv, today, deadline)
-        label = BUTTON_TEXT.get(action, action).format(rank=params.get("rank"))
+        label = BUTTON_TEXT.get(action, action).format(rank=params.get("rank"), choice_id=params.get("choice_id"))
         return self._finish(conv, turn, f"[버튼] {label}", self._run(turn, skill.run, params))
 
     # ── 내부 ────────────────────────────────────────────────────────────────

@@ -1,0 +1,612 @@
+{
+ "schedule_id": "f79fbe836e70",
+ "today": "2026-08-31",
+ "note": "dev 102560 데모 3병동-RN 9월 · 확인 전 초안",
+ "cases": [
+  {
+   "id": "I01",
+   "category": "set",
+   "context": null,
+   "text": "장원영 14일 오프로 해줘",
+   "expect": {
+    "set": [
+     "장원영",
+     14,
+     "OFF"
+    ]
+   },
+   "why": "가장 흔한 꼴"
+  },
+  {
+   "id": "I02",
+   "category": "set",
+   "context": null,
+   "text": "권은비 선생님 20일 나이트로 바꿔줘",
+   "expect": {
+    "set": [
+     "권은비",
+     20,
+     "N"
+    ]
+   },
+   "why": "호칭 빼기"
+  },
+  {
+   "id": "I03",
+   "category": "set",
+   "context": null,
+   "text": "김지원 9월 3일에 데이 넣어줘",
+   "expect": {
+    "set": [
+     "김지원",
+     3,
+     "D"
+    ]
+   },
+   "why": "월 포함 날짜"
+  },
+  {
+   "id": "I04",
+   "category": "set",
+   "context": null,
+   "text": "내일 노지선 쉬게 해줘",
+   "expect": {
+    "set": [
+     "노지선",
+     1,
+     "OFF"
+    ]
+   },
+   "why": "상대 날짜(오늘 8/31 → 9/1)"
+  },
+  {
+   "id": "I05",
+   "category": "set",
+   "context": null,
+   "text": "다음 주 월요일에 김태희 오프",
+   "expect": {
+    "set": [
+     "김태희",
+     7,
+     "OFF"
+    ]
+   },
+   "why": "상대 요일(9/7)"
+  },
+  {
+   "id": "I06",
+   "category": "set",
+   "context": null,
+   "text": "장원영 15일 이브닝으로",
+   "expect": {
+    "set": [
+     "장원영",
+     15,
+     "E"
+    ]
+   },
+   "why": "근무 이름 말"
+  },
+  {
+   "id": "I07",
+   "category": "set",
+   "context": null,
+   "text": "권은비 22일 휴무",
+   "expect": {
+    "set": [
+     "권은비",
+     22,
+     "OFF"
+    ]
+   },
+   "why": "'휴무' = OFF"
+  },
+  {
+   "id": "I08",
+   "category": "set",
+   "context": null,
+   "text": "김지원 18일 D로 해 주세요",
+   "expect": {
+    "set": [
+     "김지원",
+     18,
+     "D"
+    ]
+   },
+   "why": "코드로 말함"
+  },
+  {
+   "id": "I09",
+   "category": "avoid",
+   "context": null,
+   "text": "권은비 10일 나이트 빼줘",
+   "expect": {
+    "avoid": [
+     "권은비",
+     10,
+     [
+      "N"
+     ]
+    ]
+   },
+   "why": "무엇으로 바꿀지 맡김"
+  },
+  {
+   "id": "I10",
+   "category": "avoid",
+   "context": null,
+   "text": "김지원 20일은 데이만 아니면 돼",
+   "expect": {
+    "avoid": [
+     "김지원",
+     20,
+     [
+      "D"
+     ]
+    ]
+   },
+   "why": "부정 표현"
+  },
+  {
+   "id": "I11",
+   "category": "avoid",
+   "context": null,
+   "text": "노지선 25일에 나이트랑 이브닝은 안 되게 해줘",
+   "expect": {
+    "avoid": [
+     "노지선",
+     25,
+     [
+      "E",
+      "N"
+     ]
+    ]
+   },
+   "why": "여러 근무 빼기"
+  },
+  {
+   "id": "I12",
+   "category": "swap",
+   "context": null,
+   "text": "5일 장원영이랑 권은비 근무 바꿔줘",
+   "expect": {
+    "swap": [
+     "장원영",
+     "권은비",
+     5
+    ]
+   },
+   "why": "교환"
+  },
+  {
+   "id": "I13",
+   "category": "swap",
+   "context": null,
+   "text": "12일 김지원하고 김태희 맞바꿔",
+   "expect": {
+    "swap": [
+     "김지원",
+     "김태희",
+     12
+    ]
+   },
+   "why": "'맞바꿔'"
+  },
+  {
+   "id": "I14",
+   "category": "swap",
+   "context": null,
+   "text": "권은비랑 노지선 17일 근무 서로 바꿔 주세요",
+   "expect": {
+    "swap": [
+     "권은비",
+     "노지선",
+     17
+    ]
+   },
+   "why": "어순이 다름"
+  },
+  {
+   "id": "I15",
+   "category": "off_period",
+   "context": null,
+   "text": "장원영 14일부터 16일까지 쉬게 해줘",
+   "expect": {
+    "off_period": [
+     "장원영",
+     14,
+     16
+    ]
+   },
+   "why": "기간 OFF"
+  },
+  {
+   "id": "I16",
+   "category": "off_period",
+   "context": null,
+   "text": "권은비 20~22일 오프",
+   "expect": {
+    "off_period": [
+     "권은비",
+     20,
+     22
+    ]
+   },
+   "why": "물결 표기"
+  },
+  {
+   "id": "I17",
+   "category": "count",
+   "context": null,
+   "text": "장원영 N 개수가 너무 많은데 2개만 빼줘",
+   "expect": {
+    "count": {
+     "nurse": "장원영",
+     "shift": "N",
+     "change": -2
+    }
+   },
+   "why": "날짜 없는 개수"
+  },
+  {
+   "id": "I18",
+   "category": "count",
+   "context": null,
+   "text": "노지선 나이트 하나 줄여줘",
+   "expect": {
+    "count": {
+     "nurse": "노지선",
+     "shift": "N",
+     "change": -1
+    }
+   },
+   "why": "'하나'"
+  },
+  {
+   "id": "I19",
+   "category": "count",
+   "context": null,
+   "text": "김지원 나이트 6개로 맞춰줘",
+   "expect": {
+    "count": {
+     "nurse": "김지원",
+     "shift": "N",
+     "target": 6
+    }
+   },
+   "why": "목표 개수"
+  },
+  {
+   "id": "I20",
+   "category": "count",
+   "context": null,
+   "text": "권은비 오프 하나 더 줘",
+   "expect": {
+    "count": {
+     "nurse": "권은비",
+     "shift": "OFF",
+     "change": 1
+    }
+   },
+   "why": "OFF 늘리기"
+  },
+  {
+   "id": "I21",
+   "category": "count",
+   "context": null,
+   "text": "장원영 N 하나 더 넣어줘",
+   "expect": {
+    "count": {
+     "nurse": "장원영",
+     "shift": "N",
+     "change": 1
+    }
+   },
+   "why": "근무 늘리기"
+  },
+  {
+   "id": "I22",
+   "category": "count",
+   "context": null,
+   "text": "장원영 나이트 너무 많아",
+   "expect": {
+    "count": {
+     "nurse": "장원영",
+     "shift": "N"
+    }
+   },
+   "why": "개수 없음 → 시스템이 되묻기"
+  },
+  {
+   "id": "I23",
+   "category": "count",
+   "context": null,
+   "text": "장원영 N 2개 빼고 같은 등급 선생님이 메워줘",
+   "expect": {
+    "count": {
+     "nurse": "장원영",
+     "shift": "N",
+     "change": -2,
+     "transfer": "same_grade"
+    }
+   },
+   "why": "메우는 방식까지 말함"
+  },
+  {
+   "id": "I24",
+   "category": "count",
+   "context": null,
+   "text": "15일 이후로 김태희 이브닝 하나 줄여",
+   "expect": {
+    "count": {
+     "nurse": "김태희",
+     "shift": "E",
+     "change": -1,
+     "day": 15
+    }
+   },
+   "why": "기간이 있는 개수"
+  },
+  {
+   "id": "I25",
+   "category": "revise",
+   "context": {
+    "text": "장원영 14일 오프로 해줘",
+    "expect": {
+     "set": [
+      "장원영",
+      14,
+      "OFF"
+     ]
+    }
+   },
+   "text": "그리고 권은비 16일도 오프",
+   "expect": {
+    "revise": {
+     "add": [
+      {
+       "set": [
+        "권은비",
+        16,
+        "OFF"
+       ]
+      }
+     ]
+    }
+   },
+   "why": "더하기"
+  },
+  {
+   "id": "I26",
+   "category": "revise",
+   "context": {
+    "text": "장원영 14일 오프로 해줘",
+    "expect": {
+     "set": [
+      "장원영",
+      14,
+      "OFF"
+     ]
+    }
+   },
+   "text": "15일은 건드리지 마",
+   "expect": {
+    "revise": {
+     "keep": [
+      {
+       "day": 15
+      }
+     ]
+    }
+   },
+   "why": "그날 그대로 두기"
+  },
+  {
+   "id": "I27",
+   "category": "revise",
+   "context": {
+    "text": "장원영 14일 오프로 해줘",
+    "expect": {
+     "set": [
+      "장원영",
+      14,
+      "OFF"
+     ]
+    }
+   },
+   "text": "장원영 건은 취소",
+   "expect": {
+    "revise": {
+     "remove": [
+      {
+       "nurse": "장원영"
+      }
+     ]
+    }
+   },
+   "why": "빼기(날짜 없이)"
+  },
+  {
+   "id": "I28",
+   "category": "revise",
+   "context": {
+    "text": "장원영 N 2개만 빼줘",
+    "expect": {
+     "count": {
+      "nurse": "장원영",
+      "shift": "N",
+      "change": -2
+     }
+    }
+   },
+   "text": "아니 같은 팀으로",
+   "expect": {
+    "revise": {
+     "transfer": "same_team"
+    }
+   },
+   "why": "메우는 방식 말로 바꾸기"
+  },
+  {
+   "id": "I29",
+   "category": "revise",
+   "context": {
+    "text": "장원영 14일 오프로 해줘",
+    "expect": {
+     "set": [
+      "장원영",
+      14,
+      "OFF"
+     ]
+    }
+   },
+   "text": "김지원 18일은 데이로 둬",
+   "expect": {
+    "revise": {
+     "keep": [
+      {
+       "nurse": "김지원",
+       "day": 18
+      }
+     ]
+    }
+   },
+   "why": "한 칸 그대로 두기"
+  },
+  {
+   "id": "I30",
+   "category": "reply",
+   "context": null,
+   "text": "14일 오프로 해줘",
+   "expect": {
+    "reply": "who"
+   },
+   "why": "누구 빠짐"
+  },
+  {
+   "id": "I31",
+   "category": "count",
+   "context": null,
+   "text": "장원영 오프 하나 넣어줘 근데 언제가 좋을까",
+   "expect": {
+    "count": {
+     "nurse": "장원영",
+     "shift": "OFF",
+     "change": 1
+    }
+   },
+   "why": "날짜를 맡김 → 개수 요청"
+  },
+  {
+   "id": "I32",
+   "category": "reply",
+   "context": null,
+   "text": "장원영 14일 바꿔줘",
+   "expect": {
+    "reply": "what"
+   },
+   "why": "무엇으로 빠짐"
+  },
+  {
+   "id": "I33",
+   "category": "reply",
+   "context": null,
+   "text": "10월 3일 장원영 오프",
+   "expect": {
+    "reply": "outside_month"
+   },
+   "why": "근무표 달 밖"
+  },
+  {
+   "id": "I34",
+   "category": "reply",
+   "context": null,
+   "text": "나이트 최소 인원을 3명으로 바꿔줘",
+   "expect": {
+    "reply": "settings"
+   },
+   "why": "설정 변경"
+  },
+  {
+   "id": "I35",
+   "category": "reply",
+   "context": null,
+   "text": "10월 근무표 새로 만들어줘",
+   "expect": {
+    "reply": "settings"
+   },
+   "why": "새로 만들기"
+  },
+  {
+   "id": "I36",
+   "category": "reply",
+   "context": null,
+   "text": "오늘 점심 뭐 먹지",
+   "expect": {
+    "reply": "other"
+   },
+   "why": "상관없는 말"
+  },
+  {
+   "id": "I37",
+   "category": "reply",
+   "context": null,
+   "text": "바꿔 줬어?",
+   "expect": {
+    "reply": "status"
+   },
+   "why": "상태 질문 — '네' 를 지어내면 안 됨"
+  },
+  {
+   "id": "I38",
+   "category": "trap",
+   "context": null,
+   "text": "원영이 14일 오프",
+   "expect": {
+    "set": [
+     "원영",
+     14,
+     "OFF"
+    ],
+    "grounds_to": "장원영"
+   },
+   "why": "성 뺀 이름(스킬이 장원영으로 확정)"
+  },
+  {
+   "id": "I39",
+   "category": "trap",
+   "context": null,
+   "text": "김철수 14일 오프",
+   "expect": {
+    "set": [
+     "김철수",
+     14,
+     "OFF"
+    ],
+    "ask_contains": "없습니다"
+   },
+   "why": "없는 이름 — 다른 사람으로 바꾸면 안 됨"
+  },
+  {
+   "id": "I40",
+   "category": "trap",
+   "context": null,
+   "text": "장원영 14일 오프, 권은비 15일 나이트",
+   "expect": {
+    "set_many": [
+     [
+      "장원영",
+      14,
+      "OFF"
+     ],
+     [
+      "권은비",
+      15,
+      "N"
+     ]
+    ]
+   },
+   "why": "한 말에 두 요청"
+  }
+ ]
+}

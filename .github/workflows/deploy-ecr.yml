@@ -310,6 +310,7 @@ jobs:
             ANTHROPIC_API_KEY=${{ secrets.DEV_ENV_ANTHROPIC }}
             OPENAI_API_KEY=${{ secrets.DEV_ENV_OPENAI }}
             WANTED_AUTO_CLOSE_ENABLED=1
+            SCHEDULE_EDIT_AGENT_ENABLED=1
             EOF
             echo "/home/ubuntu/app/.env created for ${{ env.ENV }}"
 

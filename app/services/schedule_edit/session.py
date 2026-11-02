@@ -98,6 +98,14 @@ def propose(session: EditSession, requests: Sequence[EditRequest], *, today: Opt
     return session.last
 
 
+def stage(session: EditSession, requests: Sequence[EditRequest]) -> None:
+    """요청만 바꿔 두고 풀지는 않는다(개수 요청의 메우는 방식을 묻는 동안). 지난 후보는 버린다 — 적용 못 하게."""
+    if set(requests) != set(session.requests):
+        session.avoid_people = []
+    session.requests = list(requests)
+    session.last = None
+
+
 def allow_lever(session: EditSession, lever: Lever) -> None:
     """사용자가 고른 레버 — 허용량을 쌓는다(같은 위치를 두 번 고르면 더해진다). 레버 대상 규칙만."""
     for key, amount in lever_allow(lever.allow).items():

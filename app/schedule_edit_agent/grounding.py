@@ -9,8 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
-from services.schedule_edit.requests import AvoidCell, EditRequest, SetCell, swap
+from services.schedule_edit.requests import TRANSFERS, AvoidCell, CountTarget, EditRequest, SetCell, swap
 
 SHIFTS = ("D", "E", "N", "M", "OFF")
 #: 기간 OFF 한 번에 받는 최대 날 수 — 그보다 길면 휴가 처리 대상이라 되묻는다
@@ -24,10 +25,11 @@ class Grounded:
     asks: List[str] = field(default_factory=list)
 
 
-def ground_changes(ctx: EditContext, changes: Sequence[Dict[str, Any]]) -> Grounded:
+def ground_changes(ctx: EditContext, changes: Sequence[Dict[str, Any]], open_from: int = 0) -> Grounded:
+    """open_from: 바꿀 수 있는 첫날(0부터) — 개수 요청의 기간이 여기서 시작한다."""
     out = Grounded()
     for change in changes or []:
-        reqs, ask = _one(ctx, change)
+        reqs, ask = _one(ctx, change, open_from)
         if ask:
             out.asks.append(ask)
         else:
@@ -37,11 +39,13 @@ def ground_changes(ctx: EditContext, changes: Sequence[Dict[str, Any]]) -> Groun
     return out
 
 
-def _one(ctx: EditContext, change: Dict[str, Any]) -> Tuple[List[EditRequest], Optional[str]]:
+def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
     kind = change.get("kind")
     nurse, ask = resolve_nurse(ctx, change.get("nurse"))
     if ask:
         return [], ask
+    if kind == "count":
+        return _count(ctx, change, nurse, open_from)
     day, ask = resolve_day(ctx, change.get("day"))
     if ask:
         return [], ask
@@ -75,6 +79,60 @@ def _one(ctx: EditContext, change: Dict[str, Any]) -> Tuple[List[EditRequest], O
     return [], "어떤 변경인지 알기 어렵습니다. 예) '김민지 14일 OFF'"
 
 
+def _count(ctx: EditContext, change: Dict[str, Any], nurse: str,
+           open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
+    """개수 요청 — '장원영 N 2개만 빼줘'. 기간은 바꿀 수 있는 첫날(또는 말한 날)부터 말일(또는 말한 날)까지.
+    개수를 말하지 않았으면 현황을 보여 주고 되묻는다(사용자 결정 11-02 · 추측하지 않는다)."""
+    code, ask = resolve_shift(ctx, change.get("shift"))
+    if ask:
+        return [], ask
+    first, last = open_from, ctx.days - 1
+    if change.get("day") is not None:
+        day, ask = resolve_day(ctx, change.get("day"))
+        if ask:
+            return [], ask
+        first = max(first, day)
+    if change.get("to_day") is not None:
+        day, ask = resolve_day(ctx, change.get("to_day"))
+        if ask:
+            return [], ask
+        last = day
+    if first > last:
+        return [], "그 기간은 이미 지났거나 비어 있습니다. 기간을 다시 알려 주세요."
+    row = ctx.main[nurse]
+    now = sum(1 for d in range(first, last + 1) if row[d] == code)
+    word = SHIFT_WORD[code]
+    if change.get("target") is not None:
+        target = int(change["target"])
+    elif change.get("change") is not None:
+        target = now + int(change["change"])
+    else:
+        return [], count_status(ctx, nurse, code) + " 몇 회로 바꿀까요?"
+    name = ctx.names.get(nurse, nurse)
+    if target == now:
+        return [], f"{name} {word}은(는) 이미 {now}회입니다."
+    if target < 0:
+        return [], f"{name}의 {word}은(는) {now}회라 그만큼 줄일 수 없습니다."
+    transfer = change.get("transfer") if change.get("transfer") in TRANSFERS else None
+    return [CountTarget(nurse, frozenset({code}), target, first, last, transfer)], None
+
+
+#: 근무 종류를 사람에게 보일 때
+SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF"}
+
+
+def count_status(ctx: EditContext, nurse: str, code: str) -> str:
+    """'장원영 9월 N 5회(병동 평균 5.4회 · 가장 적은 사람 5회 · 가장 많은 사람 8회).' — 근무표에서만 센다."""
+    members = (dist.night_range_members(ctx) if code == "N" else dist.range_members(ctx)) or ctx.nurse_ids
+    counts = [sum(1 for m in ctx.main[n] if m == code) for n in members]
+    mine = sum(1 for m in ctx.main[nurse] if m == code)
+    head = f"{ctx.names.get(nurse, nurse)} {ctx.month}월 {SHIFT_WORD[code]} {mine}회"
+    if len(counts) < 2:
+        return head + "입니다."
+    return (f"{head}입니다(병동 평균 {sum(counts) / len(counts):.1f}회 · 가장 적은 사람 {min(counts)}회 · "
+            f"가장 많은 사람 {max(counts)}회).")
+
+
 def resolve_nurse(ctx: EditContext, said: Any) -> Tuple[Optional[str], Optional[str]]:
     """이름 → nurse_id. 정확히 같은 이름 1명 → 그 사람, 아니면 성을 뺀 이름('민지' → 김민지)이 맞는 1명.
 
@@ -96,6 +154,11 @@ def resolve_nurse(ctx: EditContext, said: Any) -> Tuple[Optional[str], Optional[
         return partial[0], None
     if len(partial) > 1:
         return None, f"'{key}'(이)라는 이름이 여럿입니다. {_who(ctx, partial)} 중 누구인가요?"
+    if key.endswith("이") and len(key) >= 3:
+        # '원영이' 처럼 이름 뒤에 붙여 부르는 '이' — 떼고 한 번 더 찾는다(못 찾으면 원래 말로 되묻는다)
+        nurse, ask = resolve_nurse(ctx, key[:-1])
+        if nurse is not None:
+            return nurse, None
     return None, f"이 근무표에 '{key}' 간호사가 없습니다. 이름을 다시 확인해 주세요."
 
 

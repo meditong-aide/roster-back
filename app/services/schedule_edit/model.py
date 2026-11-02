@@ -15,7 +15,9 @@ from ortools.sat.python import cp_model
 
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
-from services.schedule_edit.requests import AvoidCell, EditRequest, SetCell
+from services.schedule_edit.requests import (
+    AvoidCell, CountTarget, EditRequest, SetCell, count_in, work_targets,
+)
 from services.schedule_edit.rules import (
     WISH, Grid, Ineq, RuleSet, Term, TeamCover, cell, team_present, value_of,
 )
@@ -95,9 +97,10 @@ def build_model(ctx: EditContext, rules: RuleSet, requests: List[EditRequest],
     em = EditModel(ctx=ctx, base=ctx.main, free=free, codes=edit_codes(ctx))
     add_cell_vars(em)
     waived = requested_cells(requests)
+    relief = model_relief(em, rules, requests)
     for ineq in rules.ineqs:
         if not is_waived(ineq.key, waived):
-            _add_ineq(em, ineq, (allow or {}).get(ineq.key, 0))
+            _add_ineq(em, ineq, (allow or {}).get(ineq.key, 0) + relief.get(ineq.key, 0))
     for cover in rules.covers:
         add_team_cover(em, cover)
     add_requests(em, requests)
@@ -127,7 +130,8 @@ def add_span(em: EditModel) -> None:
 
 
 def requested_cells(requests: List[EditRequest]) -> Set[Cell]:
-    return {(r.nurse_id, r.day) for r in requests}
+    """수간호사가 직접 짚은 칸 — 개수 요청은 칸을 짚지 않는다(원티드 보호를 면제하지 않는다)."""
+    return {(r.nurse_id, r.day) for r in requests if not isinstance(r, CountTarget)}
 
 
 def is_waived(key: Tuple, waived: Set[Cell]) -> bool:
@@ -211,8 +215,12 @@ def _add_quality(em: EditModel, rules: RuleSet) -> None:
         days = [d for (m, d) in em.free if m == n]
         for c in em.codes:
             delta = sum(em.x[n, d, c] for d in days) - sum(1 for d in days if em.base[n][d] == c)
+            # ★ 상수가 붙은 식을 AddAbsEquality 에 바로 넘기면 OR-Tools 9.12 가 해가 있어도 불가를 낸다
+            #   (|y-4| 에서 y=2 가 불가 · 11-02 최소 재현). 엔진(objective_terms)처럼 정수 변수를 거친다.
+            diff = em.model.NewIntVar(-len(days), len(days), f"bal_d_{n}_{c}")
+            em.model.Add(diff == delta)
             gap = em.model.NewIntVar(0, len(days), f"bal_{n}_{c}")
-            em.model.AddAbsEquality(gap, delta)
+            em.model.AddAbsEquality(gap, diff)
             em.quality_terms.append(BALANCE_WEIGHT.get(c, 1) * gap)
 
 
@@ -256,12 +264,134 @@ def add_team_cover(em: EditModel, cover: TeamCover) -> None:
 
 def add_requests(em: EditModel, requests: List[EditRequest]) -> None:
     for req in requests:
-        if isinstance(req, SetCell):
+        if isinstance(req, CountTarget):
+            em.model.Add(count_expr(em, req.nurse_id, req.codes, req.days()) == req.target)
+            # 기간 밖으로 밀어내거나 끌어와 맞추지 않게 — 기간 밖 그 근무는 줄이는 요청이면 늘지 않고,
+            # 늘리는 요청이면 줄지 않는다(검토 L6)
+            lower = req.target < count_in(em.ctx, em.base, req)
+            outside = _free_days(em, req.nurse_id, exclude=req.days())
+            _hold(em, req.nurse_id, req.codes, outside, up=not lower)
+            add_transfer(em, req)
+        elif isinstance(req, SetCell):
             em.model.Add(em.x[req.nurse_id, req.day, req.code] == 1)
         elif isinstance(req, AvoidCell):
             for c in req.codes:
                 if (req.nurse_id, req.day, c) in em.x:
                     em.model.Add(em.x[req.nurse_id, req.day, c] == 0)
+
+
+def count_expr(em: EditModel, nurse_id: str, codes, days) -> Any:
+    """그 사람의 그 근무 개수(기간) — 바꿀 수 있는 칸은 변수, 나머지는 지금 값."""
+    expr = 0
+    for d in days:
+        if (nurse_id, d) in em.free:
+            expr += sum(em.x[nurse_id, d, c] for c in codes if (nurse_id, d, c) in em.x)
+        elif em.base[nurse_id][d] in codes:
+            expr += 1
+    return expr
+
+
+def _free_days(em: EditModel, nurse_id: str, exclude=()) -> List[int]:
+    skip = set(exclude)
+    return sorted(d for n, d in em.free if n == nurse_id and d not in skip)
+
+
+def _base_count(em: EditModel, nurse_id: str, codes, days) -> int:
+    return sum(1 for d in days if em.base[nurse_id][d] in codes)
+
+
+def _hold(em: EditModel, nurse_id: str, codes, days, *, up: bool) -> None:
+    """그 날들에서 그 근무 개수가 지금보다 늘지 않게(up=False) / 줄지 않게(up=True)."""
+    expr, now = count_expr(em, nurse_id, codes, days), _base_count(em, nurse_id, codes, days)
+    em.model.Add(expr >= now if up else expr <= now)
+
+
+def add_transfer(em: EditModel, req: CountTarget) -> None:
+    """상대를 어떻게 정할지(requests.TRANSFERS). 상대가 아닌 사람은 그 근무 개수가 움직이지 않는 쪽으로 묶는다
+    (바꿀 수 있는 날 전체에서 — 연쇄가 기간 밖으로 이어져도 몰리지 않게).
+
+    · 요청자가 그 근무를 줄이면 상대 = 받는 사람(다른 사람이 늘어남) — 상대가 아니면 늘지 않게.
+    · 요청자가 그 근무를 늘리면 상대 = 내주는 사람(다른 사람이 줄어듦) — 상대가 아니면 줄지 않게.
+    · fair 는 요청 기간 안에서 요청자의 목표(target)를 넘어 받지 / 밑으로 내주지 않는다. 같은 기간끼리 비교해야
+      '적은/많은 사람'의 뜻이 맞는다(검토 M1). 기간 밖은 움직이지 않게.
+    · 그날 인원 줄이기·늘리기는 상대가 없다(모두 묶고, 인원 규칙만 그날 1 풀어 준다 — coverage_relief).
+    """
+    policy = req.transfer or "auto"
+    if policy == "auto":
+        return
+    ctx = em.ctx
+    lower = req.target < count_in(ctx, em.base, req)      # 요청자의 그 근무가 주는가
+    grade, team = ctx.grade_of.get(req.nurse_id), ctx.team_of.get(req.nurse_id)
+    for m in ctx.nurse_ids:
+        if m == req.nurse_id:
+            continue
+        if policy == "same_grade" and grade is not None and ctx.grade_of.get(m) == grade:
+            continue
+        if policy == "same_team" and team is not None and ctx.team_of.get(m) == team:
+            continue
+        if policy == "fair":
+            inside, now = count_expr(em, m, req.codes, req.days()), _base_count(em, m, req.codes, req.days())
+            em.model.Add(inside <= max(now, req.target) if lower else inside >= min(now, req.target))
+            _hold(em, m, req.codes, _free_days(em, m, exclude=req.days()), up=not lower)
+            continue
+        _hold(em, m, req.codes, _free_days(em, m), up=not lower)
+
+
+def coverage_relief(ctx: EditContext, rules: RuleSet, requests: List[EditRequest], moved) -> Dict[Tuple, Any]:
+    """'그날 인원 줄이기/늘리기'를 고른 개수 요청 — **요청자의 칸이 실제로 바뀐 날만** 그날 인원 규칙을 1 풀어 준다
+    (검토 M2: 기간 전체를 풀면 다른 사람이 빠지거나 들어와도 통과).
+
+    · reduce_coverage: 요청자가 그날 하던 근무 b 를 놓으면 → b 의 인원최소·등급최소(요청자가 세어지는 등급) 1
+    · add_coverage: 요청자가 그날 근무 a 를 새로 하면 → a 의 인원최대 1
+    moved(n, d, c, gone) — gone=True 면 그 칸에서 c 가 빠졌는지, False 면 c 가 새로 들어왔는지.
+    모델에서는 식(1 - x / x), 검증에서는 0/1. 사용자가 그 선택지를 고른 것이 곧 동의다(하드락 아님).
+    """
+    out: Dict[Tuple, Any] = {}
+    grade_keys = [(i.key, *_grade_key(i.key)) for i in rules.ineqs if i.key[0] == "등급최소"]
+    for req in requests:
+        if not isinstance(req, CountTarget) or req.transfer not in ("reduce_coverage", "add_coverage"):
+            continue
+        n, grade, work = req.nurse_id, ctx.grade_of.get(req.nurse_id), work_targets(req)
+        for d in req.days():
+            b = ctx.main[n][d]
+            if req.transfer == "reduce_coverage":
+                if b not in work:
+                    continue
+                gone = moved(n, d, b, True)
+                keys = [("인원최소", None, d, b)]
+                if grade is not None:
+                    keys += [k for k, kd, code, g in grade_keys if kd == d and code == b and g is not None and g >= grade]
+                for k in keys:
+                    out[k] = out.get(k, 0) + gone
+            else:
+                for a in sorted(work - {b}):
+                    k = ("인원최대", None, d, a)
+                    out[k] = out.get(k, 0) + moved(n, d, a, False)
+    return out
+
+
+def _grade_key(key: Tuple) -> Tuple[Any, Optional[str], Optional[int]]:
+    """등급최소 키 ('등급최소', None, d, 'N≤2') → (d, 'N', 2). 형식이 다르면 등급 None(풀어 주지 않는다 · 검토 N4)."""
+    code, _sep, grade = str(key[3]).partition("≤")
+    try:
+        return key[2], code, int(grade)
+    except ValueError:
+        return key[2], code, None
+
+
+def model_relief(em: EditModel, rules: RuleSet, requests: List[EditRequest]) -> Dict[Tuple, Any]:
+    def moved(n, d, c, gone):
+        if (n, d, c) not in em.x:
+            return 0
+        return (1 - em.x[n, d, c]) if gone else em.x[n, d, c]
+    return coverage_relief(em.ctx, rules, requests, moved)
+
+
+def grid_relief(ctx: EditContext, rules: RuleSet, requests: List[EditRequest], grid: Grid) -> Dict[Tuple, int]:
+    """검증용 — 실제로 바뀐 날의 키만(값 0 인 키를 넣으면 '키가 있으면 허용' 으로 보는 화면 판정이 뚫린다 · 검토 N2)."""
+    relief = coverage_relief(ctx, rules, requests,
+                             lambda n, d, c, gone: int((grid[n][d] != c) if gone else (grid[n][d] == c)))
+    return {k: v for k, v in relief.items() if v > 0}
 
 
 def read_solution(em: EditModel, solver) -> Grid:

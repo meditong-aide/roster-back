@@ -6,9 +6,9 @@ from collections import Counter
 from typing import List, Sequence
 
 from services.schedule_edit.context import EditContext
-from services.schedule_edit.requests import EditRequest, SetCell
+from services.schedule_edit.requests import CountTarget, EditRequest, SetCell, count_in, transfer_label
 
-_SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF"}
+_SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
 
 
 def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
@@ -21,6 +21,9 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
     kept_by_day = Counter(r.day for r in requests if keeps and _same(ctx, r))
     for r in requests:
         who = ctx.names.get(r.nurse_id, r.nurse_id)
+        if isinstance(r, CountTarget):
+            parts.append(_describe_count(ctx, who, r))
+            continue
         if keeps and _same(ctx, r):
             if kept_by_day[r.day] < 3:
                 parts.append(f"{who} {r.day + 1}일 그대로")
@@ -32,6 +35,15 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
             codes = "·".join(_SHIFT_WORD.get(c, c) for c in sorted(r.codes))
             parts.append(f"{who} {r.day + 1}일 {codes} 빼기")
     return ", ".join(parts)
+
+
+def _describe_count(ctx: EditContext, who: str, r: CountTarget) -> str:
+    """예) '장원영 N 5→3회(3~30일 · 같은 등급 간호사가 메우기)'."""
+    word = "·".join(_SHIFT_WORD.get(c, c) for c in sorted(r.codes))
+    extra = [] if (r.first_day, r.last_day) == (0, ctx.days - 1) else [f"{r.first_day + 1}~{r.last_day + 1}일"]
+    if r.transfer and r.transfer != "auto":      # 기본값(가장 적게 바꾸기)은 적지 않는다 — 고른 것처럼 보이지 않게
+        extra.append(transfer_label(ctx, r, r.transfer))
+    return f"{who} {word} {count_in(ctx, ctx.main, r)}→{r.target}회" + (f"({' · '.join(extra)})" if extra else "")
 
 
 def _same(ctx: EditContext, r: EditRequest) -> bool:
@@ -47,6 +59,9 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result) -> str
         when = f"{lo + 1}일" if lo == hi else f"{lo + 1}~{hi + 1}일"
         lines = [f"{head} — 바꿀 방법 {len(result.candidates)}가지를 찾았습니다. "
                  f"가장 적게 바꾸는 안은 {first.changed_count}칸({when})입니다. 카드를 눌러 표에서 확인해 보세요."]
+        moved = _count_changes(ctx, requests, first)
+        if moved:
+            lines.append(f"근무 수 변화: {moved}")
         if first.quality:
             lines.append(f"이 안은 규칙은 모두 지키지만 {first.quality[0]} 등 근무 모양이 조금 나빠집니다.")
         return "\n".join(lines + notes)
@@ -56,6 +71,15 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result) -> str
     if result.levers:
         lines.append("아래 설정 중 하나를 이번만 넘기도록 고르시면 그 안에서 다시 찾습니다.")
     return "\n".join([f"{head}:"] + lines + notes) if head else "\n".join(lines + notes)
+
+
+def _count_changes(ctx: EditContext, requests: Sequence[EditRequest], cand) -> str:
+    """개수 요청이면 그 근무 수가 바뀐 사람을 — '장원영 N 5→3, 김지원 N 5→7'."""
+    asked = {c for r in requests if isinstance(r, CountTarget) for c in r.codes}
+    keys = {("OFF" if c == "O" else c) for c in asked}       # 후보 counts 는 OFF 를 'OFF' 로(휴가 뺀 순수 OFF)
+    parts = [f"{ctx.names.get(n, n)} {_SHIFT_WORD.get(c, c)} {b}→{a}"
+             for n, by in cand.counts.items() for c, (b, a) in by.items() if c in keys and a != b]
+    return ", ".join(parts)
 
 
 def status_text(session) -> str:

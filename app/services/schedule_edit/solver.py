@@ -37,11 +37,14 @@ from services.schedule_edit.context import EditContext, pure_off_count
 from services.schedule_edit.explain import direct_conflicts, explain_month
 from services.schedule_edit.levers import LEVER_SECONDS, find_levers, lever_allow
 from services.schedule_edit.model import (
-    CHANGE_COEF, SPAN_COEF, EditModel, build_model, forbid_same_people, free_cells, is_waived, new_solver,
+    CHANGE_COEF, SPAN_COEF, EditModel, build_model, forbid_same_people, free_cells, grid_relief, is_waived,
+    new_solver,
     read_solution,
     requested_cells, subcode_changes,
 )
-from services.schedule_edit.requests import EditRequest, first_open_day, is_satisfied, request_problem
+from services.schedule_edit.requests import (
+    CountTarget, EditRequest, first_open_day, is_satisfied, request_problem,
+)
 from services.schedule_edit.rules import Grid, RuleSet, build_rules, measure, measure_soft, new_violations
 from services.schedule_edit.screen_check import ScreenBaseline, screen_regressions
 
@@ -135,10 +138,11 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
                   screen: Optional[ScreenBaseline] = None, max_candidates: int = 3,
                   time_budget: float = TIME_BUDGET, today: Optional[date] = None,
                   allow: Optional[Dict[Tuple, int]] = None, avoid_people: Sequence[FrozenSet[str]] = (),
-                  hint: Optional[Grid] = None) -> EditResult:
+                  hint: Optional[Grid] = None, explain: bool = True) -> EditResult:
     """allow: 사용자가 고른 레버의 넘김 허용량(하드락이 아닌 규칙만 — `levers.LEVER_FAMILIES`).
     avoid_people: 같은 대화에서 넘긴 후보의 '바뀐 사람 묶음' — 다시 내밀지 않는다.
-    hint: 고른 후보 격자 — 이어지는 요청의 시작 해(CP-SAT 힌트, 해의 정당성과 무관)."""
+    hint: 고른 후보 격자 — 이어지는 요청의 시작 해(CP-SAT 힌트, 해의 정당성과 무관).
+    explain=False: 불가여도 이유·레버를 찾지 않는다(개수 요청의 메우는 방식 미리 풀기처럼 여러 번 돌릴 때)."""
     requests = list(requests)
     open_from = first_open_day(ctx, today or datetime.now(KST).date())
     problems = [p for p in (request_problem(ctx, r, open_from) for r in requests) if p]
@@ -150,9 +154,12 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
     run = _Run(ctx, rules, requests, measure(ctx, ctx.main, rules), measure_soft(ctx, ctx.main, rules),
                screen, max_candidates,
                time.monotonic() + time_budget, start=min(r.day for r in requests),
-               allow=lever_allow(allow), avoid=[set(p) for p in avoid_people], hint=hint)
+               allow=lever_allow(allow),
+               avoid=[set(p) for p in avoid_people], hint=hint)
     status = cp_model.UNKNOWN
-    for step in WINDOW_STEPS:
+    # 개수 요청은 어느 날을 바꿀지 정해지지 않았다 — 좁은 창부터 넓힐 근거가 없어 기간 전체로 바로 푼다
+    steps = (None,) if any(isinstance(r, CountTarget) for r in requests) else WINDOW_STEPS
+    for step in steps:
         days = _window_days(run, step)
         em = build_model(ctx, rules, requests, free_cells(ctx, days), MAX_CHANGES, run.allow)
         _carry_over(em, run)
@@ -162,13 +169,17 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return EditResult("infeasible", notes=list(ctx.notes), reasons=[
             "찾은 방법이 모두 근무표 화면에 새 위반을 만들어 후보로 내지 않았습니다."])
+    if not explain:
+        return EditResult("infeasible" if status == cp_model.INFEASIBLE else "timeout", notes=list(ctx.notes),
+                          reasons=[f"지금 규칙을 모두 지키면서 {MAX_CHANGES}칸 이내로는 방법이 없습니다."
+                                   if status == cp_model.INFEASIBLE else "시간 안에 방법을 찾지 못했습니다."])
     return _no_candidate(run, proven=status == cp_model.INFEASIBLE)
 
 
 def _window_days(run: _Run, step: Optional[int]) -> List[int]:
     """요청한 가장 이른 날부터 **뒤로만** 넓힌다 — 그 앞 날짜는 바꾸지 않는다(규칙 판정에는 상수로 들어간다)."""
     last = run.ctx.days - 1
-    hi = last if step is None else min(last, max(r.day for r in run.requests) + step)
+    hi = last if step is None else min(last, max(getattr(r, "last_day", r.day) for r in run.requests) + step)
     return list(range(run.start, hi + 1))
 
 
@@ -291,7 +302,7 @@ def _candidate(run: _Run, grid: Grid, rank: int, window: Tuple[int, int],
         logger.error("[schedule_edit] 모델 해가 검증에서 새 위반: %s", worse[:5])
         return None
     changes = [cell_change(ctx, n, d, grid[n][d]) for n, d in cells]
-    regress = screen_problems(run.screen, changes, run.allow)
+    regress = screen_problems(run.screen, changes, {**run.allow, **grid_relief(ctx, run.rules, run.requests, grid)})
     if regress:
         logger.info("[schedule_edit] 화면에서 나빠져 후보 제외: %s", regress[:3])
         return None
@@ -308,9 +319,10 @@ def rule_regressions(ctx: EditContext, rules: RuleSet, grid: Grid, requests: Seq
                      allow: Dict[Tuple, int], before: Optional[Dict] = None) -> List[Tuple]:
     """엔진 기준으로 지금보다 나빠진 곳(요청 칸의 원티드·허용 레버만큼은 뺀다)."""
     waived = requested_cells(list(requests))
+    relief = grid_relief(ctx, rules, list(requests), grid)    # '그날 인원 줄이기' 로 실제 빠진 날만
     base = before if before is not None else measure(ctx, ctx.main, rules)
     return sorted((k, v) for k, v in new_violations(base, measure(ctx, grid, rules)).items()
-                  if not is_waived(k, waived) and v[1] > v[0] + allow.get(k, 0))
+                  if not is_waived(k, waived) and v[1] > v[0] + allow.get(k, 0) + relief.get(k, 0))
 
 
 def screen_problems(screen: Optional[ScreenBaseline], changes: Sequence["CellChange"],
@@ -335,7 +347,8 @@ def verify_candidate(ctx: EditContext, rules: RuleSet, candidate: "Candidate", r
     found = [f"{c.day + 1}일은 이미 지난 날짜입니다" for c in candidate.changes if c.day < open_from][:1]
     found += [f"요청 미충족 {r}" for r in requests if not is_satisfied(ctx, r, grid)]
     found += [f"{k[0]} {k}" for k, _v in rule_regressions(ctx, rules, grid, requests, allow)]
-    return found + [f"화면 {k}" for k in screen_problems(screen, candidate.changes, allow)]
+    screen_allow = {**allow, **grid_relief(ctx, rules, list(requests), grid)}
+    return found + [f"화면 {k}" for k in screen_problems(screen, candidate.changes, screen_allow)]
 
 
 def _allowed_on_screen(v, allow: Dict[Tuple, int]) -> bool:

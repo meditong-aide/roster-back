@@ -58,9 +58,10 @@ class ChatBody(BaseModel):
 
 class ActionBody(BaseModel):
     conversation_id: str
-    action: Literal["apply_edit", "reject_candidate", "keep_candidate", "choose_lever"]
+    action: Literal["apply_edit", "reject_candidate", "keep_candidate", "choose_lever", "choose_transfer"]
     rank: Optional[int] = None
     lever_id: Optional[str] = None
+    choice_id: Optional[str] = None
     name: Optional[str] = Field(None, max_length=100)
     request_text: Optional[str] = Field(None, max_length=1000)
 

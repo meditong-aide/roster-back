@@ -24,10 +24,10 @@ from ortools.sat.python import cp_model
 
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.model import (
-    EditModel, add_cell_vars, add_requests, add_team_cover, edit_codes, free_cells, is_waived, new_solver,
-    read_solution, requested_cells,
+    EditModel, add_cell_vars, add_requests, add_team_cover, edit_codes, free_cells, is_waived, model_relief,
+    new_solver, read_solution, requested_cells,
 )
-from services.schedule_edit.requests import EditRequest, SetCell
+from services.schedule_edit.requests import CountTarget, EditRequest, SetCell
 from services.schedule_edit.rules import Grid, RuleSet, cell, value_of
 
 #: 넘김 1 의 무게 — 칸 하나 더 바꾸는 것보다 훨씬 무겁게(넘김을 먼저 줄인다)
@@ -106,7 +106,8 @@ def explain_month(ctx: EditContext, rules: RuleSet, requests: Sequence[EditReque
     """
     em = EditModel(ctx=ctx, base=ctx.main, free=free_cells(ctx, days), codes=edit_codes(ctx))
     add_cell_vars(em)
-    slacks = add_rules_soft(em, rules, requested_cells(list(requests)), allow or {})
+    slacks = add_rules_soft(em, rules, requested_cells(list(requests)), allow or {},
+                            relief=model_relief(em, rules, list(requests)))
     add_requests(em, requests)
     em.model.Add(em.total_changes() <= max_changes)
     em.model.Minimize(BEND_WEIGHT * sum(s for s, _f, _k in slacks) + em.total_changes())
@@ -133,7 +134,7 @@ def direct_conflicts(ctx: EditContext, rules: RuleSet, requests: Sequence[EditRe
     허용하면서(11-02) 불가의 대부분이 이 꼴이라, '하드락에 막힘' 대신 어느 칸 때문인지 알려 준다.
     """
     open_cells = {(n, d) for n in ctx.nurse_ids for d in days if ctx.is_free(n, d)}
-    options = {(r.nurse_id, r.day): _request_options(ctx, r) for r in requests}
+    options = {(r.nurse_id, r.day): _request_options(ctx, r) for r in requests if not isinstance(r, CountTarget)}
     out: List[Tuple[str, str]] = []
     for ineq in rules.ineqs:
         if ineq.key[0] not in HARD_LOCK_FAMILIES:
@@ -191,7 +192,8 @@ def _day_label(day: int) -> str:
 
 
 def add_rules_soft(em: EditModel, rules: RuleSet, waived, allow: Dict[Tuple, int],
-                    softenable: Optional[Callable[[str], bool]] = None) -> List[Tuple[object, str, Tuple]]:
+                    softenable: Optional[Callable[[str], bool]] = None,
+                    relief: Optional[Dict[Tuple, object]] = None) -> List[Tuple[object, str, Tuple]]:
     """softenable 인 규칙은 넘김 변수(slack)를 붙이고 나머지는 그대로 건다(기본: 하드락만 하드).
 
     팀 최소는 아직 넘김 대상이 아니다.
@@ -203,7 +205,7 @@ def add_rules_soft(em: EditModel, rules: RuleSet, waived, allow: Dict[Tuple, int
             continue
         base = value_of(em.ctx, em.base, ineq)
         expr = ineq.const + sum(t.coef * em.ind(t) for t in ineq.terms)
-        bound = max(ineq.cap, base) + allow.get(ineq.key, 0)
+        bound = max(ineq.cap, base) + allow.get(ineq.key, 0) + (relief or {}).get(ineq.key, 0)
         family = ineq.key[0]
         if not soft(family):
             em.model.Add(expr <= bound)
