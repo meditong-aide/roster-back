@@ -146,7 +146,8 @@ def test_buttons_keep_reject_lever_and_apply(world, monkeypatch):
     agent2.chat(None, USER, conv, "A 1일 오프", BEFORE_MONTH)
     monkeypatch.setattr(skills_mod, "apply_to_new_version", lambda *a, **kw: saved)
     applied = agent2.act(None, USER, conv, "apply_edit", {"rank": 1}, BEFORE_MONTH)
-    assert applied.ui_actions == [{"type": "switch_version", "schedule_id": "s2"}]
+    assert applied.ui_actions == [{"type": "switch_version", "schedule_id": "s2", "version": 7, "status": "draft",
+                                   "name": "11월 수정본"}]
     assert conv.schedule_id == "s2" and conv.session is None       # 다음 턴은 새 버전에서
     assert conv.history[-1]["user"] == "[버튼] 1번 안 적용"
 

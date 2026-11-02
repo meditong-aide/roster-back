@@ -308,7 +308,9 @@ def apply_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     name = saved.get("new_name") or ""
     return Outcome(
         answer=f"새 버전으로 저장했습니다: {name}(VER{saved.get('new_version')}). 화면을 새 버전으로 바꿉니다.",
-        ui_actions=[{"type": "switch_version", "schedule_id": turn.switched_to}])
+        ui_actions=[{"type": "switch_version", "schedule_id": turn.switched_to,
+                     "version": saved.get("new_version"), "status": saved.get("status", "draft"),
+                     "name": name}])
 
 
 @register("reject_candidate", description="이 후보는 싫다 — 같은 사람들을 바꾸는 안은 빼고 다시 찾는다.",
