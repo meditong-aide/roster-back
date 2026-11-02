@@ -168,3 +168,14 @@ def test_new_conversation_refused_for_no_slot_is_not_kept(api, monkeypatch):
         for ok in taken:
             if ok:
                 router_mod._slots.release()
+
+
+def test_availability_answers_instead_of_erroring(api, db, monkeypatch):
+    client, state = api
+    assert client.get("/api/schedule-edit/availability", params={"schedule_id": "s1"}).json() == \
+        {"enabled": True, "can_use": True, "reason": None}
+    state["user"] = _user(account="acc_nurse")
+    body = client.get("/api/schedule-edit/availability", params={"schedule_id": "s1"}).json()
+    assert body["can_use"] is False and "수간호사" in body["reason"]
+    monkeypatch.setenv("SCHEDULE_EDIT_AGENT_ENABLED", "0")
+    assert client.get("/api/schedule-edit/availability", params={"schedule_id": "s1"}).status_code == 404

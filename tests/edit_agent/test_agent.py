@@ -187,6 +187,8 @@ def test_reply_only_uses_fixed_sentences_including_status(world):
     assert status.answer.startswith("지금 요청: A 1일 OFF.") and "적용'을 누르기 전까지 바뀌지 않습니다" in status.answer
     assert "설정 화면에서" in agent.chat(None, USER, world.conv, "나이트 인원 3명으로", BEFORE_MONTH).answer
     assert agent.chat(None, USER, world.conv, "?", BEFORE_MONTH).answer.startswith("무엇을 바꿀지")
+    agent2, _ = _agent(call("reply_only", kind="unsupported"))
+    assert "아직 여기서 못 합니다" in agent2.chat(None, USER, world.conv, "15일 E 한 명 더", BEFORE_MONTH).answer
     assert [e.event for e in world.events][-2:] == ["message", "clarify"]
 
 

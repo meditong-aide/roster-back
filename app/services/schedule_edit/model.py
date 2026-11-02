@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
@@ -26,7 +27,9 @@ Cell = Tuple[str, int]
 
 #: CP-SAT 작업자 수 — 채팅 요청마다 운영 API 서버에서 돈다. 8 이면 요청 하나가 코어를 다 잡는다.
 #: (실측 dev 72건: 풀이 대부분 1초 미만이라 작업자를 줄여도 응답 시간보다 CPU 점유가 먼저 문제다)
-SOLVER_WORKERS = 4
+#: CP-SAT 작업자 수 — 서버 코어 수에 맞춘다(최대 4). 운영 API 는 t3.medium(vCPU 2)이라 4를 주면 스레드가 코어를
+#: 넘쳐 다른 API 요청까지 느려진다(11-02 확인). 실측(로컬): 작업자 2 는 4 보다 불가+레버 경로가 6.0→10.4초.
+SOLVER_WORKERS = int(os.getenv("SCHEDULE_EDIT_SOLVER_WORKERS") or min(4, os.cpu_count() or 2))
 SOLVER_SEED = 0
 
 

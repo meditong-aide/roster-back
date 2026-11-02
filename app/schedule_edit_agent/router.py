@@ -4,7 +4,8 @@
     일(P0)을 되풀이하지 않는다.
   · 수간호사·그룹관리자·ADM 만(`caller_is_manager` · DB 기준) + 그 근무표 병동에 접근 가능해야 한다.
   · 경로 함수는 `def` 다 — CP-SAT·DB 가 동기라 `async def` 면 이벤트 루프가 막혀 서버 전체가 멈춘다([PY] 규칙).
-  · 같은 대화는 한 번에 하나(409), 서버 전체 동시 풀이는 SCHEDULE_EDIT_MAX_CONCURRENCY 개(기본 2 · 넘으면 429).
+  · 같은 대화는 한 번에 하나(409), 서버 전체 동시 풀이는 SCHEDULE_EDIT_MAX_CONCURRENCY 개(넘으면 429) — 기본은 코어
+    2개 이하면 1, 아니면 2(운영 API 가 vCPU 2 라 둘을 같이 풀면 둘 다 느려진다).
   · 응답 시간은 경로에 들어온 순간부터 CHAT_BUDGET(25초) — 대기·판정 재료 로드·LLM·솔버 모두 이 안이다.
 """
 
@@ -39,7 +40,8 @@ router = APIRouter(prefix="/api/schedule-edit", tags=["schedule_edit_agent"])
 
 _store = ConversationStore()
 _agent = EditAgent(OpenAIEditLLM)
-_slots = threading.BoundedSemaphore(max(1, int(os.getenv("SCHEDULE_EDIT_MAX_CONCURRENCY") or 2)))
+_slots = threading.BoundedSemaphore(max(1, int(os.getenv("SCHEDULE_EDIT_MAX_CONCURRENCY")
+                                                or (1 if (os.cpu_count() or 2) <= 2 else 2))))
 
 
 def _enabled() -> None:
@@ -103,6 +105,18 @@ def action(body: ActionBody, current_user: User = Depends(require_current_user),
         except SkillError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     return EditChatResponse(**reply.__dict__)
+
+
+@router.get("/availability", dependencies=[Depends(_enabled)])
+def availability(schedule_id: str, current_user: User = Depends(require_current_user), db: Session = Depends(get_db)):
+    """패널을 보일지 — 기능이 꺼져 있으면 404, 켜져 있으면 이 근무표에서 쓸 수 있는지(오류 대신 값으로)."""
+    try:
+        _authorize(db, current_user, schedule_id)
+    except HTTPException as exc:
+        if exc.status_code in (403, 404):
+            return {"enabled": True, "can_use": False, "reason": exc.detail}
+        raise
+    return {"enabled": True, "can_use": True, "reason": None}
 
 
 @router.get("/conversations", dependencies=[Depends(_enabled)])

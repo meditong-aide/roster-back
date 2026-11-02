@@ -607,6 +607,66 @@
     ]
    },
    "why": "한 말에 두 요청"
+  },
+  {
+   "id": "I41",
+   "category": "unsupported",
+   "context": null,
+   "text": "15일 E 한 명 더 넣어줘",
+   "expect": {
+    "reply": "unsupported"
+   },
+   "why": "그날 인원 늘리기"
+  },
+  {
+   "id": "I42",
+   "category": "unsupported",
+   "context": null,
+   "text": "장원영 연속 근무 너무 길어, 좀 끊어줘",
+   "expect": {
+    "reply": "unsupported"
+   },
+   "why": "근무 모양"
+  },
+  {
+   "id": "I43",
+   "category": "unsupported",
+   "context": null,
+   "text": "김지원 20일부터 22일까지 연차 넣어줘",
+   "expect": {
+    "reply": "unsupported"
+   },
+   "why": "휴가 넣기(연차는 OFF 가 아니다)"
+  },
+  {
+   "id": "I44",
+   "category": "unsupported",
+   "context": null,
+   "text": "장원영 N 몇 개야?",
+   "expect": {
+    "reply": "unsupported"
+   },
+   "why": "조회 — 조회 스킬이 생기면 기대값이 바뀐다"
+  },
+  {
+   "id": "I45",
+   "category": "unsupported",
+   "context": null,
+   "text": "15일 나이트 누구야?",
+   "expect": {
+    "reply": "unsupported"
+   },
+   "why": "조회"
+  },
+  {
+   "id": "I46",
+   "category": "unsupported",
+   "context": null,
+   "text": "N 좀 고르게 맞춰줘",
+   "expect": {
+    "reply": "unsupported"
+   },
+   "why": "여러 사람 공평성"
   }
  ]
 }

@@ -244,7 +244,7 @@ def _is_keep(ctx, r: EditRequest) -> bool:
 
 
 #: 바꾸지 않는 답의 종류 → 정해진 문장(LLM 글을 사용자에게 보내지 않는다 · 검토 M3)
-REPLY_KINDS = ("who", "when", "what", "outside_month", "settings", "other", "status", "unclear")
+REPLY_KINDS = ("who", "when", "what", "outside_month", "settings", "unsupported", "other", "status", "unclear")
 
 
 def reply_text(kind: str, session: EditSession) -> str:
@@ -255,6 +255,9 @@ def reply_text(kind: str, session: EditSession) -> str:
         "what": "어떤 근무로 바꿀까요? (D·E·N·OFF)",
         "outside_month": f"이 근무표는 {ctx.year}년 {ctx.month}월입니다. {ctx.month}월 안의 날짜로 말씀해 주세요.",
         "settings": "인원·규칙·OFF 수 같은 설정은 여기서 바꿀 수 없습니다. 설정 화면에서 바꿔 주세요.",
+        "unsupported": ("그런 종류의 변경(그날 인원·근무 모양·휴가·원티드·여러 사람 고르게 맞추기, 근무 수 묻기)은 "
+                        "아직 여기서 못 합니다. 누구의 며칠 근무를 어떻게 바꿀지, 또는 누구의 어떤 근무를 몇 개로 할지로 "
+                        "말씀해 주시면 찾아 드립니다."),
         "other": "여기서는 이 근무표의 칸을 바꾸는 요청만 도와드릴 수 있습니다.",
         "status": status_text(session),
     }.get(kind, "무엇을 바꿀지 다시 말씀해 주세요. 예) '김민지 14일 OFF', '15일 나이트 이영희랑 바꿔 줘'")
@@ -265,7 +268,9 @@ def reply_text(kind: str, session: EditSession) -> str:
     description=(
         "근무표를 바꾸지 않고 답할 때 부른다. 답 문장은 시스템이 정해진 틀로 만든다. kind: who=누구인지 빠짐 · "
         "when=며칠인지 빠짐 · what=무엇으로 바꿀지 빠짐 · outside_month=근무표 달 밖의 날짜 · settings=인원·규칙·OFF 수 "
-        "같은 설정 변경이나 근무표 새로 만들기 · other=근무표와 상관없는 말 · status=지금 요청·결과가 어떤지 묻는 말"
+        "같은 설정 변경이나 근무표 새로 만들기 · unsupported=근무표를 바꾸는 말이지만 아직 못 하는 종류(그날 인원 "
+        "늘리기·줄이기, 연속 근무·주말 몰림 같은 근무 모양, 휴가·교육 넣기, 원티드 반영, 여러 사람 고르게 맞추기, "
+        "'몇 개야'·'누구야' 같은 조회) · other=근무표와 상관없는 말 · status=지금 요청·결과가 어떤지 묻는 말"
         "(예: '바꿔 줬어?', '지금 뭐 하고 있었지?') · unclear=그 밖에 알아듣기 어려움"),
     parameters={"type": "object", "properties": {"kind": {"type": "string", "enum": list(REPLY_KINDS)}},
                 "required": ["kind"]},
