@@ -2141,8 +2141,9 @@ def update_nurse_profile_service(
     if applied_source and email_changed and new_email is not None:
         try:
             msdb_manager.execute(
-                "UPDATE bizwiz20db.Member SET Email = %s WHERE EmpSeqNo = %s",
-                (new_email, nurse_id),
+                # 그룹웨어 Member 키는 (EmpSeqNo, OfficeCode) — 사번만 걸면 다른 병원 같은 사번 행까지 바뀐다.
+                "UPDATE bizwiz20db.Member SET Email = %s WHERE EmpSeqNo = %s AND OfficeCode = %s",
+                (new_email, nurse_id, nurse.office_id or current_user.office_id),
             )
         except Exception as e:
             logging.warning(f"[update_nurse_profile] MSSQL email 동기화 실패 nurse_id={nurse_id}: {e}")

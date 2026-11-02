@@ -1051,8 +1051,8 @@ def partial_update_personnel_basic_info(
     if update_data.email is not None:
         try:
             msdb_manager.execute(
-                "UPDATE bizwiz20db.Member SET Email = %s WHERE EmpSeqNo = %s",
-                (update_data.email, current_user.nurse_id),
+                "UPDATE bizwiz20db.Member SET Email = %s WHERE EmpSeqNo = %s AND OfficeCode = %s",
+                (update_data.email, current_user.nurse_id, current_user.office_id),
             )
         except Exception as e:
             import logging
@@ -1131,8 +1131,8 @@ def change_password(
     # 3. 기존 비밀번호가 맞는지 확인 (pwdcompare 사용)
     print("[DEBUG] 기존 비밀번호 검증 시작")
     result = msdb_manager.fetch_one(
-        "SELECT pwdcompare(%s, MemberPassEncrypt) AS IsCorrect FROM bizwiz20db.Member_Login WHERE EmpSeqNo = %s",
-        (payload.current_password, nurse_id),
+        "SELECT pwdcompare(%s, MemberPassEncrypt) AS IsCorrect FROM bizwiz20db.Member_Login WHERE EmpSeqNo = %s AND OfficeCode = %s",
+        (payload.current_password, nurse_id, current_user.office_id),
     )
     print(f"[DEBUG] pwdcompare 결과: {result}")
 
@@ -1228,8 +1228,8 @@ def verify_and_update_phone(
         db.commit()
 
     msdb_manager.execute(
-        "UPDATE bizwiz20db.Member SET PortableTel = %s WHERE EmpSeqNo = %s",
-        (cached["new_phone"], nurse_id),
+        "UPDATE bizwiz20db.Member SET PortableTel = %s WHERE EmpSeqNo = %s AND OfficeCode = %s",
+        (cached["new_phone"], nurse_id, current_user.office_id),
     )
 
     del verification_cache[nurse_id]
