@@ -8474,6 +8474,12 @@ def _generate_roster_service_impl(req: RosterRequest, current_user, db: Session,
     #   저장 뒤 따로 넣으면 그 사이 죽었을 때 근무표는 있는데 알림 근거가 없다(Codex 2026-10-02).
     _enqueue_assignment_created_push(db, req, current_user, _assignments, nurses_in_group)
     _persist_entries(db, schedule, generated, req)
+    # 근무표 수정 에이전트의 판정 기준 — 생성 당시 입력(일별 인원·등급·간호사 속성 등)을 근무표별로 남긴다.
+    #   별도 세션이라 실패해도 생성은 그대로 끝난다(`services/schedule_edit/basis.py`).
+    from services.schedule_edit.basis import record_edit_basis
+    record_edit_basis(db, schedule.schedule_id, generation_notes=(
+        ["이 근무표는 일부 설정을 그 생성에만 바꿔(해결책 적용) 만들었습니다 — 판정은 저장된 설정 기준입니다."]
+        if (config_override or treatment_ids) else None))
     # NOTE: ShiftTransferLog 기반 전달 복사는 source/target 독립 생성 전환으로 비활성화 (2026-04-13)
     # ── 전달된 인바운드 간호사를 nurses_in_group에 추가 (표시용) ──
     _group_nids = {str(n.nurse_id) for n in nurses_in_group}

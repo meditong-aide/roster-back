@@ -2787,6 +2787,9 @@ def _record_save_as(
         created_by=current_user.account_id,
         created_at=datetime.now(),
     ))
+    # 새 버전도 원본의 판정 기준(생성 당시 값)으로 수정 판정한다 — 사본이 없거나 표가 없으면 건너뛴다
+    from services.schedule_edit.basis import inherit_edit_basis
+    inherit_edit_basis(db, new_schedule.schedule_id, source.schedule_id)
     return diff
 
 
@@ -3642,6 +3645,9 @@ def copy_schedule_to_new_version(
             )
         )
 
+    # 복사본도 원본의 판정 기준(생성 당시 값)으로 수정 판정한다 — 사본이 없거나 표가 없으면 건너뛴다
+    from services.schedule_edit.basis import inherit_edit_basis
+    inherit_edit_basis(db, new_schedule_id, source.schedule_id)
     try:
         db.commit()
         db.refresh(new_schedule)

@@ -1,0 +1,70 @@
+"""결과를 스킬·화면이 쓰는 JSON 으로. 날짜는 사람이 보는 1일부터, 칸 위치는 nurse_id + 날짜(ISO).
+
+레버 허용량의 열쇠(규칙 위치 튜플)는 JSON 키가 될 수 없어 [열쇠 목록, 양] 쌍 목록으로 바꾼다.
+레버 id 는 허용량 내용의 해시 — 같은 레버면 같은 id(화면이 고른 레버를 그대로 돌려보낸다).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any, Dict, List, Tuple
+
+from services.schedule_edit.context import EditContext
+
+
+def allow_to_json(allow: Dict[Tuple, int]) -> List[List[Any]]:
+    return [[list(key), int(amount)] for key, amount in sorted(allow.items(), key=lambda kv: str(kv[0]))]
+
+
+def allow_from_json(items: List[List[Any]]) -> Dict[Tuple, int]:
+    return {tuple(key): int(amount) for key, amount in items or []}
+
+
+def lever_id(allow: Dict[Tuple, int]) -> str:
+    raw = json.dumps(allow_to_json(allow), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _day_iso(ctx: EditContext, day: int) -> str:
+    return ctx.day_date(day).isoformat()
+
+
+def candidate_to_dict(ctx: EditContext, cand) -> Dict[str, Any]:
+    return {
+        "rank": cand.rank,
+        "changed_count": cand.changed_count,
+        "loss": cand.loss,
+        "span": {"from": _day_iso(ctx, cand.span[0]), "to": _day_iso(ctx, cand.span[1]),
+                 "days": cand.span[1] - cand.span[0]},
+        "optimal": cand.optimal,
+        "affected": [{"nurse_id": n, "name": ctx.names.get(n, n)} for n in cand.affected],
+        "changes": [{
+            "nurse_id": c.nurse_id, "name": c.name, "date": _day_iso(ctx, c.day), "day": c.day + 1,
+            "before": c.before, "after": c.after, "before_main": c.before_main, "after_main": c.after_main,
+        } for c in cand.changes],
+        "counts": {n: {code: list(pair) for code, pair in by.items()} for n, by in cand.counts.items()},
+        "quality": list(cand.quality),
+    }
+
+
+def lever_to_dict(lever) -> Dict[str, Any]:
+    return {
+        "lever_id": lever_id(lever.allow),
+        "lose": list(lever.lose),
+        "changes": {"now": lever.changes[0], "after": lever.changes[1]},
+        "span_days": {"now": lever.span[0], "after": lever.span[1]},
+        "quality": list(lever.quality),
+        "allow": allow_to_json(lever.allow),
+    }
+
+
+def result_to_dict(ctx: EditContext, result) -> Dict[str, Any]:
+    return {
+        "status": result.status,
+        "reasons": list(result.reasons),
+        "notes": list(result.notes),
+        "blocking": list(result.blocking),
+        "candidates": [candidate_to_dict(ctx, c) for c in result.candidates],
+        "levers": [lever_to_dict(lv) for lv in result.levers],
+    }

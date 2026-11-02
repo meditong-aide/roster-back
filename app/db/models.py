@@ -675,6 +675,42 @@ class ScheduleLineage(Base):
     created_at = Column(DATETIME, nullable=False)
 
 
+class ScheduleEditBasis(Base):
+    """근무표 수정 판정 기준 사본 — 생성 당시 입력(일별 인원·등급·팀·개인 속성·원티드·전월 꼬리 등).
+
+    ★ `daily_shift`·`roster_grade_config`·`teams` 는 덮어쓰기라 이력이 없다. 수정 에이전트가 '그 근무표를
+      만들 때의 값'으로 판정하려면 생성 직후 따로 남겨야 한다(`services/schedule_edit/basis.py`).
+    ★ [새 버전으로 저장]으로 만든 버전은 원본 사본을 그대로 이어받는다(source_schedule_id).
+    ★ 따로 둔 이유는 schedule_lineage 와 같다 — DDL 이 빠져도 근무표 화면·생성은 영향이 없다.
+    """
+
+    __tablename__ = "schedule_edit_basis"
+
+    schedule_id = Column(VARCHAR(50), primary_key=True)
+    source_schedule_id = Column(VARCHAR(50), nullable=True)    # 이어받았으면 원본 버전
+    basis_version = Column(INTEGER, nullable=False)            # payload 형식 번호
+    payload = Column(JSON, nullable=False)
+    created_at = Column(DATETIME, nullable=False)
+
+
+class ScheduleEditLog(Base):
+    """근무표 수정 에이전트 기록 — 제안·레버 선택·넘김·적용 한 건 = 1행.
+
+    수간호사가 무엇을 보고 무엇을 골랐는지가 병동별 계수 학습의 재료다(기획 8장). 적용으로 만든
+    새 버전은 new_schedule_id 로 이어져 '에이전트가 만든 수정본' 출처가 된다(schedule_lineage 는 save_as 그대로).
+    """
+
+    __tablename__ = "schedule_edit_log"
+
+    log_id = Column(BIGINT, primary_key=True, autoincrement=True)
+    schedule_id = Column(VARCHAR(50), nullable=False)          # 수정 대상(원본) 버전
+    new_schedule_id = Column(VARCHAR(50), nullable=True)       # 적용으로 만든 새 버전
+    event = Column(VARCHAR(10), nullable=False)                # propose · lever · reject · apply
+    payload = Column(JSON, nullable=False)
+    created_by = Column(VARCHAR(50), nullable=True)            # account_id
+    created_at = Column(DATETIME, nullable=False)
+
+
 class RosterChangeAck(Base):
     """재마감 변경 확인 — 확인 대상자 1명 = 1행(성남 ②). `migrations/2026_10_02_add_roster_change_ack.sql`.
 
