@@ -85,7 +85,7 @@ def is_stale(db: Session, session: EditSession) -> bool:
 
 
 def propose(session: EditSession, requests: Sequence[EditRequest], *, today: Optional[date] = None,
-            keep_hint: bool = True) -> EditResult:
+            keep_hint: bool = True, time_budget: Optional[float] = None) -> EditResult:
     """요청을 풀어 후보를 낸다. 같은 대화의 허용 레버·고른 후보는 이어 쓰고, 넘긴 묶음은 같은 요청일 때만."""
     if set(requests) != set(session.requests):   # 순서만 바뀐 같은 요청은 같은 요청
         session.avoid_people = []
@@ -93,7 +93,8 @@ def propose(session: EditSession, requests: Sequence[EditRequest], *, today: Opt
     session.last = propose_edits(
         session.ctx, session.requests, rules=session.rules, screen=session.screen, today=today,
         allow=session.allow, avoid_people=session.avoid_people,
-        hint=session.hint if keep_hint else None)
+        hint=session.hint if keep_hint else None,
+        **({} if time_budget is None else {"time_budget": time_budget}))
     return session.last
 
 

@@ -202,6 +202,9 @@ def test_change_cap_is_reported_with_settings_to_bend(monkeypatch):
     assert res.status == "infeasible"
     assert "2칸 이내" in res.reasons[0]
     assert res.blocking and set(res.blocking) <= {"인원최소", "인원최대", "OFF수"}
+    bent = [r for r in res.reasons if "넘기면" in r]
+    assert len(bent) == 1 and bent[0].startswith("다음 설정을 함께 넘기면")   # 한 해가 함께 넘긴 묶음 — 한 문장
+    assert bent[0].count(" · ") >= 1
 
 
 def test_setting_bend_is_explained():
@@ -213,6 +216,7 @@ def test_setting_bend_is_explained():
     assert res.status == "infeasible"
     assert res.blocking == ["OFF수"]
     assert any("상한을 1 넘김" in r for r in res.reasons)
+    assert "다음 설정을 넘기면 20칸 이내로 가능합니다: A 개인 OFF 수 상한을 1 넘김" in res.reasons
 
 
 def test_missing_cells_are_never_filled():

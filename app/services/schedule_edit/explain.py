@@ -88,9 +88,12 @@ class Explanation:
             return [f"다른 설정을 다 넘겨도 {max_changes}칸 이내로는 하드락 규칙(연속 근무·전환 금지·"
                     "나이트 규칙 등)에 막힙니다. 하드락은 풀 수 없습니다."]
         if self.status == "bends":
+            # 한 해가 함께 넘긴 묶음이다 — 줄마다 '이걸 넘기면 가능' 이라 쓰면 하나만 넘겨도 되는 것처럼 읽힌다
             head = [] if self.proven else ["(시간 안에 더 나은 방법이 없는지 끝까지 확인하지는 못했습니다)"]
-            return head + [f"이 설정을 넘기면 {max_changes}칸 이내로 가능합니다: {bend_text(b, names)}"
-                           for b in self.bends[:5]]
+            more = f" 외 {len(self.bends) - 5}곳" if len(self.bends) > 5 else ""
+            together = "을 함께" if len(self.bends) > 1 else "을"
+            return head + [f"다음 설정{together} 넘기면 {max_changes}칸 이내로 가능합니다: "
+                           + " · ".join(bend_text(b, names) for b in self.bends[:5]) + more]
         return ["시간 안에 이유를 좁히지 못했습니다. 요청을 나눠서 다시 시도해 주세요."]
 
 

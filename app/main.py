@@ -654,6 +654,10 @@ app.include_router(agent_test_router)
 from agents_v2.chat_router import router as agent_chat_router
 app.include_router(agent_chat_router)
 
+# 근무표 수정 도우미(소형 CP-SAT) — SCHEDULE_EDIT_AGENT_ENABLED=1 일 때만 응답(기본 꺼짐 · 아니면 404)
+from schedule_edit_agent.router import router as schedule_edit_router
+app.include_router(schedule_edit_router)
+
 import uvicorn
 
 if __name__ == "__main__":

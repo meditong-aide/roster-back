@@ -694,19 +694,24 @@ class ScheduleEditBasis(Base):
 
 
 class ScheduleEditLog(Base):
-    """근무표 수정 에이전트 기록 — 제안·레버 선택·넘김·적용 한 건 = 1행.
+    """근무표 수정 에이전트 기록 — 대화 턴·사용자 행동 한 건 = 1행.
 
-    수간호사가 무엇을 보고 무엇을 골랐는지가 병동별 계수 학습의 재료다(기획 8장). 적용으로 만든
-    새 버전은 new_schedule_id 로 이어져 '에이전트가 만든 수정본' 출처가 된다(schedule_lineage 는 save_as 그대로).
+    대화 id 하나로 그 대화 전체(원문·해석·요청·결과·행동·시간)를 순서대로 본다. 수간호사가 무엇을 보고
+    무엇을 골랐는지가 병동별 계수 학습의 재료다(기획 8장). 서버가 재기동돼도 이 기록으로 대화 상태를 다시
+    세운다. 적용으로 만든 새 버전은 new_schedule_id 로 이어져 '에이전트가 만든 수정본' 출처가 된다
+    (schedule_lineage 는 save_as 그대로).
     """
 
     __tablename__ = "schedule_edit_log"
 
     log_id = Column(BIGINT, primary_key=True, autoincrement=True)
+    conversation_id = Column(VARCHAR(64), nullable=True)       # 대화 id(UUID)
+    turn_no = Column(INTEGER, nullable=True)                   # 대화 안 순서(1부터)
     schedule_id = Column(VARCHAR(50), nullable=False)          # 수정 대상(원본) 버전
     new_schedule_id = Column(VARCHAR(50), nullable=True)       # 적용으로 만든 새 버전
-    event = Column(VARCHAR(10), nullable=False)                # propose · lever · reject · apply
+    event = Column(VARCHAR(10), nullable=False)                # journal.EVENTS
     payload = Column(JSON, nullable=False)
+    elapsed_ms = Column(INTEGER, nullable=True)                # 이 턴 처리 시간
     created_by = Column(VARCHAR(50), nullable=True)            # account_id
     created_at = Column(DATETIME, nullable=False)
 

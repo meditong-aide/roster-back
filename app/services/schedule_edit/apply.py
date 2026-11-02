@@ -40,7 +40,8 @@ class ApplyError(Exception):
 
 def apply_to_new_version(db: Session, session: EditSession, candidate: Candidate, current_user, *,
                          request_text: str = "", name: Optional[str] = None,
-                         today: Optional[date] = None) -> Dict[str, Any]:
+                         today: Optional[date] = None, conversation_id: Optional[str] = None,
+                         turn_no: Optional[int] = None) -> Dict[str, Any]:
     if session.last is None or not any(c is candidate for c in session.last.candidates):
         raise ApplyError("unknown", "이 대화에서 마지막으로 찾은 후보가 아닙니다. 다시 후보를 찾아 주세요.")
     try:
@@ -63,7 +64,8 @@ def apply_to_new_version(db: Session, session: EditSession, candidate: Candidate
         "request_text": request_text,
         "candidate": candidate_to_dict(session.ctx, candidate),
         "allow": allow_to_json(session.allow),
-    }, created_by=getattr(current_user, "account_id", None), new_schedule_id=saved.get("new_schedule_id"))
+    }, created_by=getattr(current_user, "account_id", None), new_schedule_id=saved.get("new_schedule_id"),
+        conversation_id=conversation_id, turn_no=turn_no)
     return saved
 
 
