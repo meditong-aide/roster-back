@@ -5,6 +5,7 @@ from __future__ import annotations
 from schedule_edit_agent import skills as skills_mod
 from schedule_edit_agent.agent import Reply
 from schedule_edit_agent.view import CHOICE_NOTE, LEVER_NOTE, blocks_for, step_label
+from services.schedule_edit.precheck import Precheck
 from tests.edit_agent.test_agent import A_OFF, N_LESS_2, _agent, _count_ward, call, make_ctx, press, say
 
 
@@ -82,7 +83,10 @@ def test_transfer_question_becomes_a_choice(world):
     assert step.startswith("메우는 방식: ") and "같은 팀" in step
 
 
-def test_infeasible_shows_lever_cards_titled_by_the_setting(world):
+def test_infeasible_shows_lever_cards_titled_by_the_setting(world, monkeypatch):
+    # 같은 근무표에서 사전 점검은 먼저 묻는다(test_confirm) — 여기서는 끄고 레버 카드만 본다
+    monkeypatch.setattr(skills_mod, "precheck", lambda *a, **k: Precheck())
+
     def tight():
         ctx = make_ctx({"A": "DDOO"}, off_days=2, config={"not_one_night": False})
         ctx.frozen[("A", 2)] = ctx.frozen[("A", 3)] = "주휴·특수 휴무"

@@ -7,6 +7,8 @@
     같은 사람 묶음이 다른 변경일 수 있고, 남겨 두면 엉뚱한 불가가 난다 · 검토 11-02 M3).
   · 레버는 이 대화의 마지막 결과에 든 것만 id 로 고른다(`allow_lever_id`) — 밖에서 온 허용량은 쓰지 않는다.
   · 고른 후보는 이어지는 요청(예: '그 안에서 15일은 빼줘')의 시작 해로 쓴다(CP-SAT 힌트).
+  · 바꾸기 전 확인(`precheck`)에서 동의한 것은 이 대화에서 다시 묻지 않는다 — 묻는 동안의 앞 상태는 들고 있다가
+    [바꾸지 않기]면 되돌린다.
 대화 상태는 이 객체 하나다 — 에이전트 껍데기(P2)가 대화 id 로 들고 있는다.
 """
 
@@ -22,6 +24,7 @@ from sqlalchemy.orm import Session
 from db.models import Schedule, ScheduleEntry
 from services.schedule_edit.context import EditContext, load_edit_context
 from services.schedule_edit.levers import Lever, lever_allow
+from services.schedule_edit.precheck import Finding
 from services.schedule_edit.requests import EditRequest
 from services.schedule_edit.rules import Grid, RuleSet, build_rules
 from services.schedule_edit.screen_check import ScreenBaseline, load_screen_baseline
@@ -43,6 +46,12 @@ class EditSession:
     last: Optional[EditResult] = None
     #: 이미 보인 참고 문구('전월 근무표가 없어…') — 같은 문구를 매 답마다 붙이지 않는다(평가 11-03)
     shown_notes: Set[str] = field(default_factory=set)
+    #: 바꾸기 전·적용 전 확인에서 동의한 것(`Finding.id`) — 같은 위치·같은 양은 다시 묻지 않는다
+    confirmed: Set[str] = field(default_factory=set)
+    #: 지금 묻고 있는 풀기 전 확인 — [그래도 진행]이 이것을 받아들인다
+    asking: List[Finding] = field(default_factory=list)
+    #: 확인을 묻기 전 상태(요청·결과·넘긴 묶음) — [바꾸지 않기]면 되돌린다
+    held: Optional[Tuple[List[EditRequest], Optional[EditResult], List[FrozenSet[str]]]] = None
 
 
 def cells_stamp(db: Session, schedule_id: str) -> str:

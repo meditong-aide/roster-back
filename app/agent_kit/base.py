@@ -7,6 +7,7 @@
                  runtime 이 한다(handle 은 TurnResult 에 담기만).
   · restore    : 메모리에서 내려간 대화를 기록에서 다시 세운다. 없으면 ConversationError(not_found·closed).
   · transcript : 대화 한 건의 기록(권한 검사 포함).
+  · current    : (선택) 기록에서 다시 세운 대화를 이어 볼 때 마지막 결과 블록을 지금 상태로 다시 그린다.
 새 에이전트 = Agent 를 상속해 위를 채우고 `register()` — 경로·화면은 그대로다.
 """
 
@@ -114,6 +115,10 @@ class Agent(ABC):
 
     @abstractmethod
     def transcript(self, db: Session, user: Any, conversation_id: str) -> Dict[str, Any]: ...
+
+    def current(self, db: Session, user: Any, conv: Conversation) -> List[Block]:
+        """새로 고친 뒤 이어 볼 마지막 결과 — 메모리에 블록이 없을 때만 부른다. 기본은 없음(지난 턴 문장만 보인다)."""
+        return []
 
     def on_close(self, db: Session, user: Any, conv: Conversation) -> None:
         """닫을 때 기록을 남길 에이전트가 채운다."""

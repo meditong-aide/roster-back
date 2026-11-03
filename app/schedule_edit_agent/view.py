@@ -3,6 +3,8 @@
   · 후보(ok)          : 답 문장 + 후보 카드(고른 카드에 사람별 근무 수·나빠지는 모양·바뀌는 칸·버튼·표 미리보기)
   · 방식 고르기       : 묻는 문장 + 하나 고르기(미리 풀어 본 결과·추천·안 되는 이유)
   · 불가(infeasible)  : 이유 문장 + 막는 설정 + 레버 카드(잃는 것·얻는 것·버튼)
+  · 바꾸기 전 확인    : 묻는 문장 + 피할 수 없는 것 카드([그래도 진행]·[바꾸지 않기])
+  · 적용 전 확인      : 묻는 문장 + 그 안 카드(나빠지는 것·표 미리보기·[이대로 적용]·[다른 안 보기])
   · 적용              : 저장 안내(새 버전으로 바꾸기는 효과 switch_version)
   · 문장만 온 턴      : 문장 + 지금 들고 있는 결과(후보·레버)를 다시 — 패널은 언제나 지금 상태 전체다
 """
@@ -24,6 +26,9 @@ from services.schedule_edit.session import EditSession
 LEVER_NOTE = ("연속 근무·나이트 규칙·근무 순서 같은 하드락은 넘길 수 없습니다. "
               "이번 수정에만 적용되고 병동 설정은 바뀌지 않습니다.")
 CHOICE_NOTE = "선택지마다 미리 한 번 풀어 본 결과입니다. 고르면 그 방식으로 후보를 3개까지 다시 찾습니다."
+CONFIRM_NOTE = ("요청한 칸과 바꿀 수 없는 칸(지난 날·확정 칸·전월 근무)만으로 셈한 것이라 어떤 방법으로도 피할 수 "
+                "없습니다. 진행해도 이번 수정에만 해당하고 병동 설정은 바뀌지 않습니다.")
+APPLY_NOTE = "적용하면 새 버전으로 저장되고 이전 버전은 그대로 남습니다."
 #: 근무 수를 보일 순서(대표코드) — OFF 는 맨 끝
 _COUNT_ORDER = ("D", "E", "N", "M", "OFF")
 
@@ -49,6 +54,10 @@ def blocks_for(reply: Reply, session: Optional[EditSession]) -> List[B.Block]:
         return shown + [_candidate_cards(preview["candidates"], reply.focus, preview.get("source"))]
     if status == "choose_transfer":
         return shown + [_transfer_choice(preview)]
+    if status == "confirm":
+        return shown + [_confirm_card(preview)]
+    if status == "confirm_apply":
+        return shown + [_apply_confirm_card(preview)]
     if status == "infeasible" and preview.get("levers"):
         # 막는 설정은 카드 제목이 하나씩 말한다 — 내부 규칙 이름 줄을 따로 두지 않는다(ui-craft 11-03)
         return shown + [_lever_cards(preview["levers"])]
@@ -56,8 +65,9 @@ def blocks_for(reply: Reply, session: Optional[EditSession]) -> List[B.Block]:
 
 
 def _lead(answer: str, preview: Optional[Dict[str, Any]]) -> str:
-    """방식 고르기에서는 묻는 문장과 참고만 — 선택지는 아래 고르기 블록이 보인다."""
-    if preview and preview.get("status") == "choose_transfer" and preview.get("question"):
+    """방식 고르기·확인에서는 묻는 문장과 참고만 — 선택지·짚은 것은 아래 블록이 보인다."""
+    if preview and preview.get("status") in ("choose_transfer", "confirm", "confirm_apply") \
+            and preview.get("question"):
         return "\n".join([preview["question"]] + [f"참고: {n}" for n in preview.get("notes") or []])
     return answer
 
@@ -136,6 +146,45 @@ def _transfer_choice(preview: Dict[str, Any]) -> B.Block:
                     selected=recommended, footnote=CHOICE_NOTE)
 
 
+# ── 확인 ────────────────────────────────────────────────────────────────────
+
+
+def _confirm_card(preview: Dict[str, Any]) -> B.Block:
+    items = preview.get("findings") or []
+    card = B.card("confirm", f"그대로 바꾸면 생기는 것 {len(items)}가지",
+                  lines=[B.line(f["text"], tone="warning") for f in items],
+                  actions=[B.action("그래도 진행", "confirm_request", style="primary"),
+                           B.action("바꾸지 않기", "cancel_request")])
+    return B.cards([card], selectable=False, footnote=CONFIRM_NOTE)
+
+
+def _apply_confirm_card(preview: Dict[str, Any]) -> B.Block:
+    """고른 안 하나 — 표 미리보기(overlay)는 그대로 두고, 나빠지는 것과 [이대로 적용]·[다른 안 보기]만."""
+    rank = int(preview["rank"])
+    c = next(x for x in preview["candidates"] if x["rank"] == rank)
+    base = _candidate_card(c, preview.get("source"))
+    items = preview.get("findings") or []
+    lines = [B.line(f["text"], tone="warning") for f in items if f.get("kind") != "quality"]
+    shape = [f["text"] for f in items if f.get("kind") == "quality"]
+    if shape:
+        lines.append(B.line("근무 모양이 나빠짐: " + " · ".join(shape), tone="warning"))
+    card = B.card(str(rank), f"{base['title']} · 적용 전 확인", summary=base["summary"], chips=base["chips"],
+                  lines=lines, details=base["details"], overlay=base["overlay"],
+                  actions=[B.action("이대로 적용", "apply_edit",
+                                    {"rank": rank, "confirmed": True, "seen": [f["id"] for f in items]},
+                                    style="primary"),
+                           B.action("다른 안 보기", "back_to_candidates", {"rank": rank})])
+    return B.cards([card], key=f"confirm-{_key([c])}", selected=str(rank), footnote=APPLY_NOTE)
+
+
+def retry_card() -> B.Block:
+    """새로 고친 뒤 이어 볼 때 찾아 둔 후보가 없으면(서버가 다시 떴거나 메모리에서 내려갔다) — 같은 요청으로 다시 찾기."""
+    card = B.card("retry", "찾아 둔 후보를 다시 불러와야 합니다",
+                  lines=[B.line("잠시 비워 둔 사이 앞서 찾은 후보가 없어졌습니다. 같은 요청으로 다시 찾습니다.")],
+                  actions=[B.action("같은 요청으로 다시 찾기", "retry_request", style="primary")])
+    return B.cards([card], selectable=False)
+
+
 # ── 레버 ────────────────────────────────────────────────────────────────────
 
 
@@ -158,7 +207,16 @@ def step_label(action: str, params: Dict[str, Any], session: Optional[EditSessio
     last = session.last if session is not None else None
     if action == "apply_edit":
         source = getattr(last, "source", None)
-        return f"{SOURCE_WORD.get(source, source)} 적용" if source else f"{rank}안 적용"
+        which = f"{SOURCE_WORD.get(source, source)}" if source else f"{rank}안"
+        return f"{which} 확인하고 적용" if params.get("confirmed") else f"{which} 적용"
+    if action == "confirm_request":
+        return "그래도 진행"
+    if action == "cancel_request":
+        return "바꾸지 않기"
+    if action == "back_to_candidates":
+        return "다른 안 보기"
+    if action == "retry_request":
+        return "같은 요청으로 다시 찾기"
     if action == "keep_candidate":
         return f"{rank}안을 기준으로 다듬기"
     if action == "reject_candidate":

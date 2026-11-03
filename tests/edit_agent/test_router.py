@@ -299,3 +299,33 @@ def test_availability_gives_the_first_screen(api, monkeypatch):
     assert body["can_use"] is False and "수간호사" in body["reason"] and body["intro"] is None
     monkeypatch.setenv("SCHEDULE_EDIT_AGENT_ENABLED", "0")
     assert api.client.get(f"{URL}/availability", params={"schedule_id": "s1"}).status_code == 404
+
+
+def test_view_after_restart_redraws_the_candidates_from_the_log(api):
+    # 대화 흐름 그대로(사용자 결정 11-03) — 새로 고치면 지난 턴과 마지막 후보(버튼 포함)를 다시 그린다.
+    # 메모리에서 내려간 뒤(재기동)에도 기록으로 다시 세워 지금 상태로 그린다(`ScheduleEditAgent.current`)
+    client = api.client
+    first = say(client, "A 1일 오프").json()
+    cid = first["conversation_id"]
+    kept = press(client, cid, "keep_candidate", rank=1).json()
+    assert kept["history"] == [{"said": {"kind": "text", "text": "A 1일 오프"}, "answer": first_answer(first)}]
+    assert kept["said"] == {"kind": "action", "text": "1안을 기준으로 다듬기"}
+    seen = client.get(f"{URL}/conversations/{cid}/view", params={"schedule_id": "s1"}).json()
+    assert seen["blocks"] == kept["blocks"] and seen["turn_no"] == 2
+    api.agent.store.close(cid)          # 메모리에서 내린다(기록은 남아 있다 — close 이벤트는 없다)
+    redrawn = client.get(f"{URL}/conversations/{cid}/view", params={"schedule_id": "s1"})
+    assert redrawn.status_code == 200, redrawn.text
+    body = redrawn.json()
+    # 기록에는 요청만 남는다 — 마지막 답 + '같은 요청으로 다시 찾기'
+    assert [b["type"] for b in body["blocks"]] == ["trail", "text", "cards"]
+    retry = block(body, "cards")["items"][0]["actions"][0]["input"]
+    assert retry == {"kind": "action", "action": "retry_request", "params": {}}
+    # 기록에서 다시 세운 대화는 말 턴만 되살린다(버튼 턴의 답은 따로 남지 않는다)
+    assert body["history"] == [] and body["said"] == {"kind": "text", "text": "A 1일 오프"}
+    again = press(client, cid, "retry_request").json()
+    assert block(again, "cards")["items"][0]["actions"][0]["input"]["action"] == "apply_edit"
+    assert again["said"] == {"kind": "action", "text": "같은 요청으로 다시 찾기"}
+
+
+def first_answer(body):
+    return next(b["text"] for b in body["blocks"] if b["type"] == "text")

@@ -7,7 +7,8 @@
   3. 같은 판정(요청 충족·지난 날짜·엔진 기준·화면 기준, 고른 레버 허용량 포함)으로 다시 확인한다.
   4. [새 버전으로 저장]과 같은 함수로 저장한다 — 번호(그 달 최대+1)·이름('원본 이름 수정본')·출처
      (schedule_lineage kind=save_as)·변경 이력(source=save_as)·판정 기준 사본 승계가 그대로 따라온다.
-  5. 수정 기록(`schedule_edit_log`, event=apply)에 요청문·후보·허용 레버를 남긴다(에이전트 출처·학습 재료).
+  5. 수정 기록(`schedule_edit_log`, event=apply)에 요청문·후보·허용 레버와 적용 전 확인에서 받아들인 것(넘기는 설정·
+     원티드 칸·근무 모양)을 남긴다(에이전트 출처·학습 재료).
 
 ★ 저장 규칙을 두 벌로 만들지 않으려고 라우터의 `save_roster_as_new_version` 을 직접 부른다(그 본문이
   아직 서비스로 분리돼 있지 않다). 권한(수간호사·ADM)·원본 잠금·같은 달 확인도 그 안에서 한다.
@@ -41,7 +42,7 @@ class ApplyError(Exception):
 def apply_to_new_version(db: Session, session: EditSession, candidate: Candidate, current_user, *,
                          request_text: str = "", name: Optional[str] = None,
                          today: Optional[date] = None, conversation_id: Optional[str] = None,
-                         turn_no: Optional[int] = None) -> Dict[str, Any]:
+                         turn_no: Optional[int] = None, accepted: Optional[List[str]] = None) -> Dict[str, Any]:
     if session.last is None or not any(c is candidate for c in session.last.candidates):
         raise ApplyError("unknown", "이 대화에서 마지막으로 찾은 후보가 아닙니다. 다시 후보를 찾아 주세요.")
     try:
@@ -64,6 +65,7 @@ def apply_to_new_version(db: Session, session: EditSession, candidate: Candidate
         "request_text": request_text,
         "candidate": candidate_to_dict(session.ctx, candidate),
         "allow": allow_to_json(session.allow),
+        "accepted": list(accepted or []),
     }, created_by=getattr(current_user, "account_id", None), new_schedule_id=saved.get("new_schedule_id"),
         conversation_id=conversation_id, turn_no=turn_no)
     return saved

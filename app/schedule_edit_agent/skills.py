@@ -7,29 +7,39 @@ mode 는 read · preview · write. 쓰기는 적용 하나뿐이고 새 버전(d
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from schedule_edit_agent.answer import (
-    answer_for, describe_requests, fresh_notes, lookup_answer, postprocess_answer, status_text,
+    SOURCE_WORD, answer_for, describe_requests, fresh_notes, lookup_answer, postprocess_answer, status_text,
 )
 from schedule_edit_agent.grounding import SHIFT_WORD, SHIFTS, ground_changes, resolve_day, resolve_nurse, resolve_shift
 from services.schedule_edit.apply import ApplyError, apply_to_new_version
 from services.schedule_edit.journal import record_event
 from services.schedule_edit.postprocess import ANNUAL_LEAVE_SWAP, RUNNERS, as_result
 from services.schedule_edit.postprocess import KINDS as POSTPROCESS_KINDS
+from services.schedule_edit.precheck import (
+    BLOCKED_HEAD, Finding, Precheck, apply_findings, finding_to_json, precheck,
+)
 from services.schedule_edit.requests import (
-    TRANSFERS, CountTarget, CoverTarget, EditRequest, SetCell, count_cells, count_in, first_open_day, transfer_label,
-    work_down,
+    TRANSFERS, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, balance_counts, count_cells, count_in,
+    first_open_day, transfer_label, work_down,
     work_targets,
 )
 from services.schedule_edit.serialize import allow_to_json, requests_to_json, result_to_dict
+from services.schedule_edit.levers import lever_allow
 from services.schedule_edit.session import EditSession, allow_lever_id, keep, propose, reject, stage
-from services.schedule_edit.solver import EditResult, apply_candidate, propose_edits
+from services.schedule_edit.solver import (
+    BALANCE_MAX_CHANGES, EditResult, apply_candidate, min_balance_spread, propose_edits,
+)
+
+logger = logging.getLogger(__name__)
 
 #: 채팅 한 번의 응답 시간 상한(초) — CloudFront 30초 안에 들어와야 한다. 경로에 들어온 순간부터 센다
 #: (슬롯 대기·판정 재료 로드·LLM·솔버 모두 이 안 · 검토 HIGH-2). 솔버 예산은 남은 시간이다.
@@ -38,6 +48,8 @@ CHAT_BUDGET = 25.0
 MIN_SOLVE = 3.0
 OUT_OF_TIME = ("이번 말씀은 아직 반영되지 않았습니다 — 응답 시간 안에 찾기에 시간이 부족했습니다. "
                "같은 말을 한 번 더 보내 주세요.")
+#: 바꾸기 전 확인의 마지막 줄
+CONFIRM_ASK = "그래도 진행할까요? 진행해도 이번 수정에만 해당하고 병동 설정은 바뀌지 않습니다."
 
 
 @dataclass
@@ -111,14 +123,20 @@ def llm_tools() -> List[Dict[str, Any]]:
 _CHANGE = {
     "type": "object",
     "properties": {
-        "kind": {"type": "string", "enum": ["set", "avoid", "swap", "off_period", "count", "leave", "cover"],
+        "kind": {"type": "string",
+                 "enum": ["set", "avoid", "swap", "off_period", "count", "leave", "cover", "balance"],
                  "description": "set=그 칸을 이 근무로 · avoid=그 칸에서 이 근무(들)를 빼기(무엇으로 바꿀지는 맡김) · "
                                 "swap=두 사람의 그날 근무 맞바꾸기 · off_period=day 부터 to_day 까지 OFF · "
                                 "count=날짜를 정하지 않고 그 사람의 그 근무 개수를 바꾸기(어느 날인지는 맡김) · "
                                 "leave=그 날(또는 day~to_day)에 연차·휴가·공가 같은 휴가 코드 넣기(근무일에만) · "
                                 "cover=그날 그 근무 인원 늘리기·줄이기(nurse 없이 day·shift + change 또는 target · "
                                 "몇 명인지 말하지 않았으면 둘 다 비운다 · "
-                                "'1등급 넣어'처럼 등급을 말하면 grade)"},
+                                "'1등급 넣어'처럼 등급을 말하면 grade) · "
+                                "balance=여러 사람의 그 근무 수를 고르게(nurse 없이 shift · '모두 9개로'면 target · "
+                                "'차이 1 이하로'면 spread · 대상은 시스템이 그 근무를 할 수 있는 사람으로 정한다)"},
+        "spread": {"type": "integer", "minimum": 0,
+                   "description": "balance: 사람 사이 개수 차이를 몇 이하로 할지 말했을 때만(말하지 않으면 비운다 — "
+                                  "시스템이 줄일 수 있는 만큼 줄인다)"},
         "grade": {"type": "integer", "minimum": 1,
                   "description": "cover: 그 등급까지인 사람을 넣거나 뺄 때('20일 N에 1등급 넣어' → grade 1·change 1 · "
                                  "'1등급 빼' → grade 1·change -1). grade 를 쓰면 change 도 넣는다"},
@@ -133,7 +151,7 @@ _CHANGE = {
         "change": {"type": "integer",
                    "description": "count·cover: 늘리거나 줄일 개수·인원(2개 빼 → -2, 하나 더 → 1, 한 명 빼 → -1)"},
         "target": {"type": "integer", "minimum": 0,
-                   "description": "count·cover: '6개로'·'4명으로' 처럼 목표 개수·인원을 말했을 때"},
+                   "description": "count·cover·balance: '6개로'·'4명으로'·'모두 9개로' 처럼 목표 개수·인원을 말했을 때"},
         "transfer": {"type": "string", "enum": list(TRANSFERS),
                      "description": "count: 상대를 어떻게 정할지 사용자가 이미 말했을 때만(빠지는 근무를 누가 메울지 / "
                                     "누구 것을 넘겨받을지). same_grade=같은 등급 · same_team=같은 팀 · fair=그 근무가 "
@@ -168,7 +186,8 @@ _CELL = {
         "'15일 나이트 이영희랑 박서준 바꿔줘' → [{kind:swap, nurse:'이영희', other_nurse:'박서준', day:15}] · "
         "'정다은 20일 나이트 빼줘' → [{kind:avoid, nurse:'정다은', day:20, shifts:['N']}] · "
         "'장원영 N 2개만 빼줘' → [{kind:count, nurse:'장원영', shift:'N', change:-2}] · "
-        "'장원영 나이트 너무 많아'(개수 없음) → [{kind:count, nurse:'장원영', shift:'N'}](시스템이 현황을 보여 주고 되묻는다)"),
+        "'장원영 나이트 너무 많아'(개수 없음) → [{kind:count, nurse:'장원영', shift:'N'}](시스템이 현황을 보여 주고 되묻는다) · "
+        "'N 근무 수 고르게 맞춰줘' → [{kind:balance, shift:'N'}] · 'OFF 다 9개로 맞춰줘' → [{kind:balance, shift:'OFF', target:9}]"),
     parameters={"type": "object", "properties": {"changes": {"type": "array", "items": _CHANGE}},
                 "required": ["changes"]},
     mode="preview", llm=True)
@@ -221,7 +240,7 @@ def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     # '21일은 그대로 둬' — 요청한 칸이 그 날이면 그 요청을 뺀다(평가 11-03: 요청은 남기고 그날 다른 칸만 고정해 모순).
     # 그날 전체를 두라면 그날 인원 요청도 뺀다(남기면 그날을 다 묶은 채 인원을 바꾸라는 모순 · 검토 11-03)
     kept_days = _whole_days(ctx, kept)
-    reqs = [r for r in reqs if isinstance(r, CountTarget) or _is_keep(ctx, r)
+    reqs = [r for r in reqs if isinstance(r, (CountTarget, BalanceTarget)) or _is_keep(ctx, r)
             or (r.day not in kept_days if isinstance(r, CoverTarget) else (r.nurse_id, r.day) not in kept)]
     asked = {(r.nurse_id, r.day) for r in reqs}
     for n, d in sorted(kept - asked):
@@ -252,6 +271,8 @@ def _same_target(old: EditRequest, new: EditRequest) -> bool:
     if isinstance(old, CoverTarget) or isinstance(new, CoverTarget):
         return (isinstance(old, CoverTarget) and isinstance(new, CoverTarget)
                 and (old.day, old.code, old.grade) == (new.day, new.code, new.grade))
+    if isinstance(old, BalanceTarget) or isinstance(new, BalanceTarget):
+        return isinstance(old, BalanceTarget) and isinstance(new, BalanceTarget) and old.codes == new.codes
     if isinstance(old, CountTarget) or isinstance(new, CountTarget):
         return False
     return (old.nurse_id, old.day) == (new.nurse_id, new.day)
@@ -293,11 +314,9 @@ def _is_keep(ctx, r: EditRequest) -> bool:
 #: 바꾸지 않는 답의 종류 → 정해진 문장(LLM 글을 사용자에게 보내지 않는다 · 검토 M3)
 REPLY_KINDS = ("who", "when", "what", "outside_month", "settings", "unsupported", "other", "status", "unclear")
 #: 아직 못 하는 변경 — 답 문장과 처음 화면 안내가 같은 목록을 쓴다
-UNSUPPORTED = "근무 모양 고치기, 원티드 반영, 여러 사람 고르게 맞추기, 버전 되돌리기"
+UNSUPPORTED = "근무 모양 고치기, 원티드 반영, 버전 되돌리기"
 #: 아직 못 하는 종류별 안내(reply_only kind=unsupported 의 topic · 평가 11-03: 조회·되돌리기에도 같은 목록이 나갔다)
 UNSUPPORTED_TOPICS = {
-    "fairness": "여러 사람의 근무 수를 고르게 맞추기는 아직 못 합니다. '최유진 N 2개만 줄여줘'처럼 한 사람씩 말씀해 주시면 "
-                "찾아 드립니다.",
     "pattern": "연속 근무·주말 몰림 같은 근무 모양 고치기는 아직 못 합니다. 바꿀 사람과 날짜를 말씀해 주시면 찾아 드립니다.",
     "wanted": "원티드 반영은 아직 여기서 못 합니다. 반영할 사람과 날짜, 근무를 말씀해 주시면 그 칸을 바꿔 드립니다.",
     "undo": "만든 버전 되돌리기·버전 비교는 아직 여기서 못 합니다. 이전 버전은 그대로 남아 있으니 버전 목록에서 골라 주세요.",
@@ -328,10 +347,9 @@ def reply_text(kind: str, session: EditSession, topic: Optional[str] = None) -> 
     description=(
         "근무표를 바꾸지 않고 답할 때 부른다. 답 문장은 시스템이 정해진 틀로 만든다. kind: who=누구인지 빠짐 · "
         "when=며칠인지 빠짐 · what=무엇으로 바꿀지 빠짐 · outside_month=근무표 달 밖의 날짜 · settings=병동 설정값 자체"
-        "(하루 인원 기준·규칙·OFF 기준 수)를 바꾸는 말이나 근무표 새로 만들기 — '사람들 OFF·근무 수를 맞춰 줘'는 "
-        "settings 가 아니라 unsupported(topic=fairness) · unsupported=근무표를 바꾸는 말이지만 아직 못 하는 종류 — "
-        "topic 을 함께 고른다: fairness=여러 사람 근무 수 고르게 맞추기 · "
-        "pattern=연속 근무·주말 몰림 같은 근무 모양 · wanted=원티드 반영 · undo=버전 되돌리기·비교 · "
+        "(하루 인원 기준·규칙·OFF 기준 수)를 바꾸는 말이나 근무표 새로 만들기 — '사람들 OFF·근무 수를 고르게 맞춰 줘'는 "
+        "reply_only 가 아니라 propose_edit 의 kind=balance · unsupported=근무표를 바꾸는 말이지만 아직 못 하는 종류 — "
+        "topic 을 함께 고른다: pattern=연속 근무·주말 몰림 같은 근무 모양 · wanted=원티드 반영 · undo=버전 되돌리기·비교 · "
         "postprocess=자동 연차전환 밖의 생성 후처리(보건휴가·수면 OFF 등) · other=근무표와 상관없는 말 · "
         "status=지금 요청·결과가 어떤지 묻는 말"
         "(예: '바꿔 줬어?', '지금 뭐 하고 있었지?') · unclear=그 밖에 알아듣기 어려움"),
@@ -349,6 +367,24 @@ def reply_only(turn: Turn, params: Dict[str, Any]) -> Outcome:
 # ── 조회(근무표를 바꾸지 않는다 · 사용자 결정 11-03) ─────────────────────────────────────────
 
 LOOKUP_KINDS = ("day_shift", "person_count", "person_day")
+
+
+@register(
+    "answer_confirm",
+    description=(
+        "시스템이 '그래도 진행할까요?'라고 물은 뒤 사용자가 말로 답할 때만. 진행하자는 말('응', '그래도 해줘', "
+        "'괜찮아 바꿔')은 go=true, 그만두자는 말('아니', '그럼 하지 마', '취소')은 go=false. 다른 내용을 새로 "
+        "요청하거나 고쳐 말하면 이것 말고 propose_edit·revise_edit."),
+    parameters={"type": "object", "properties": {"go": {"type": "boolean"}}, "required": ["go"]},
+    mode="preview", llm=True)
+def answer_confirm(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    session = turn.session
+    if not session.asking:
+        if session.last is not None and session.last.candidates:
+            # 적용은 버튼으로만 — 말로 저장하지 않는다(쓰기는 적용 버튼 하나뿐)
+            return Outcome(answer="적용은 카드의 버튼으로 해 주세요. 누르기 전까지 근무표는 바뀌지 않습니다.")
+        return Outcome(answer=reply_text("unclear", session))
+    return _answer(turn, go=bool(params.get("go")))
 
 
 @register(
@@ -423,16 +459,28 @@ _RANK = {"type": "object", "properties": {"rank": {"type": "integer", "minimum":
 @register("apply_edit", description="고른 후보로 새 버전(draft)을 만든다.",
           parameters={"type": "object", "properties": {"rank": {"type": "integer", "minimum": 1},
                                                        "name": {"type": "string"},
-                                                       "request_text": {"type": "string"}},
+                                                       "request_text": {"type": "string"},
+                                                       "confirmed": {"type": "boolean"},
+                                                       "seen": {"type": "array", "items": {"type": "string"}}},
                       "required": ["rank"]},
           mode="write", llm=False)
 def apply_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    """적용 전에 이 안으로 나빠지는 것(넘기는 설정·원티드 칸·근무 모양)을 모아, 앞에서 동의하지 않은 것이 있으면
+    먼저 묻는다(사용자 지시 11-03). [이대로 적용](confirmed)이면 그대로 저장하고, 받아들인 것을 적용 기록에 남긴다."""
     cand = _candidate(turn, params)
+    session = turn.session
     started = time.monotonic()
+    found = apply_findings(session.ctx, session.rules, cand, session.requests)
+    pending = [f for f in found if f.id not in session.confirmed]
+    # [이대로 적용]은 그 카드에 보인 것만 받아들인다 — 낡은 카드 버튼으로 다른 안을 확인 없이 적용하지 않게(검토 L1)
+    seen = set(params.get("seen") or [])
+    if pending and not (params.get("confirmed") and {f.id for f in pending} <= seen):
+        return _ask_apply(turn, cand, pending, started)
     try:
         saved = apply_to_new_version(turn.db, turn.session, cand, turn.user,
                                      request_text=str(params.get("request_text") or ""), name=params.get("name"),
-                                     today=turn.today, conversation_id=turn.conversation_id, turn_no=turn.turn_no)
+                                     today=turn.today, conversation_id=turn.conversation_id, turn_no=turn.turn_no,
+                                     accepted=[f.text for f in found])
     except ApplyError as exc:
         turn.record("error", {"action": "apply", "code": exc.code, "message": exc.message},
                     elapsed_ms=_ms(started))
@@ -444,6 +492,52 @@ def apply_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
         effects=[{"type": "switch_version", "schedule_id": turn.switched_to,
                   "version": saved.get("new_version"), "status": saved.get("status", "draft"),
                   "name": name}])
+
+
+def _ask_apply(turn: Turn, cand, pending: List[Finding], started: float) -> Outcome:
+    session, ctx = turn.session, turn.session.ctx
+    source = getattr(session.last, "source", None)
+    which = f"{SOURCE_WORD.get(source, source)} 안" if source else f"{cand.rank}안"
+    question = f"{which}을 적용하면 지금보다 나빠지는 것이 있습니다. 그래도 적용할까요?"
+    answer = "\n".join([question] + [f"· {f.text}" for f in pending])
+    preview = result_to_dict(ctx, session.last)
+    preview.update({"status": "confirm_apply", "rank": cand.rank, "question": question,
+                    "findings": [finding_to_json(f) for f in pending]})
+    turn.record("check", {"rank": cand.rank, "findings": [finding_to_json(f) for f in pending]},
+                elapsed_ms=_ms(started))
+    return Outcome(answer=answer, preview=preview, focus=cand.rank)
+
+
+@register("back_to_candidates", description="적용 전 확인에서 '다른 안 보기' — 적용하지 않고 후보로 돌아간다.",
+          parameters={"type": "object", "properties": {"rank": {"type": "integer", "minimum": 1}}},
+          mode="read", llm=False)
+def back_to_candidates(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    last = turn.session.last
+    if last is None or not last.candidates:
+        raise SkillError("돌아갈 후보가 없습니다. 바꿀 내용을 다시 말씀해 주세요.")
+    rank = params.get("rank")
+    return Outcome(answer="적용하지 않았습니다. 다른 안을 고르거나 바꿀 내용을 말씀해 주세요.",
+                   focus=rank if isinstance(rank, int) and 1 <= rank <= len(last.candidates) else None)
+
+
+@register("retry_request", description="지금 요청으로 다시 찾는다 — 서버가 다시 떠 찾아 둔 후보가 없어졌을 때.",
+          parameters={"type": "object", "properties": {}}, mode="preview", llm=False)
+def retry_request(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    if not turn.session.requests:
+        raise SkillError("다시 찾을 요청이 없습니다. 바꿀 내용을 말씀해 주세요.")
+    return _propose(turn, turn.session.requests)
+
+
+@register("confirm_request", description="바꾸기 전 확인에서 '그래도 진행' — 짚은 것을 이번만 넘기고 후보를 찾는다.",
+          parameters={"type": "object", "properties": {}}, mode="preview", llm=False)
+def confirm_request(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    return _answer(turn, go=True)
+
+
+@register("cancel_request", description="바꾸기 전 확인에서 '바꾸지 않기' — 이 요청을 거두고 앞 상태로 돌아간다.",
+          parameters={"type": "object", "properties": {}}, mode="read", llm=False)
+def cancel_request(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    return _answer(turn, go=False)
 
 
 @register("reject_candidate", description="이 후보는 싫다 — 같은 사람들을 바꾸는 안은 빼고 다시 찾는다.",
@@ -520,16 +614,30 @@ def _candidate(turn: Turn, params: Dict[str, Any]):
 
 
 def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
+    session = turn.session
+    started = time.monotonic()
+    check = _precheck(turn, requests)
+    if check.blocked:
+        return _blocked(turn, requests, check, started)
+    asking = check.pending(session.confirmed)
+    if asking:
+        return _ask(turn, requests, asking, started)
+    session.asking, session.held = [], None
     undecided = next((r for r in requests if isinstance(r, CountTarget) and r.transfer is None), None)
     if undecided is not None:
         return _choose_transfer(turn, requests, undecided)
-    ctx = turn.session.ctx
     if turn.remaining() < MIN_SOLVE:
         turn.record("error", {"stage": "budget", "requests": requests_to_json(requests),
                               "remaining_ms": int(turn.remaining() * 1000)})
         return Outcome(answer=OUT_OF_TIME)
-    started = time.monotonic()
-    result = propose(turn.session, requests, today=turn.today, time_budget=turn.remaining())
+    requests, why = _resolve_balance(turn, requests)
+    result = propose(session, requests, today=turn.today, time_budget=turn.remaining())
+    result.notes = list(result.notes) + why
+    return _finish(turn, requests, result, started)
+
+
+def _finish(turn: Turn, requests: List[EditRequest], result: EditResult, started: float) -> Outcome:
+    ctx = turn.session.ctx
     preview = result_to_dict(ctx, result)
     preview["notes"] = fresh_notes(turn.session, result.notes)          # 답과 미리보기 모두 처음 한 번만(검토 L3)
     answer = answer_for(ctx, requests, result, notes=preview["notes"])
@@ -539,6 +647,102 @@ def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
                             "avoid": [sorted(p) for p in turn.session.avoid_people]},
                 elapsed_ms=_ms(started))
     return Outcome(answer=answer, preview=preview)
+
+
+def _precheck(turn: Turn, requests: List[EditRequest]) -> Precheck:
+    """바꾸기 전 산술 점검(`precheck`) — 점검이 깨져도 수정 흐름은 막지 않는다(풀이·적용 전 확인이 다시 본다)."""
+    session = turn.session
+    try:
+        return precheck(session.ctx, session.rules, requests, open_from=turn.open_from(), allow=session.allow)
+    except Exception as exc:   # noqa: BLE001 — 기록만 남기고 점검 없이 이어 간다
+        logger.exception("[schedule_edit] 사전 점검 실패")
+        turn.record("error", {"stage": "precheck", "error": f"{type(exc).__name__}: {exc}"[:500]})
+        return Precheck()
+
+
+def _blocked(turn: Turn, requests: List[EditRequest], check: Precheck, started: float) -> Outcome:
+    """넘길 수 없는 규칙에 반드시 걸린다 — 풀지 않고 이유만(전월 근무까지 넣어 셈한 것)."""
+    session = turn.session
+    stage(session, requests)
+    session.asking, session.held = [], None
+    session.last = EditResult("infeasible", reasons=[BLOCKED_HEAD] + check.blocked, notes=list(session.ctx.notes),
+                              blocking=check.families)
+    return _finish(turn, requests, session.last, started)
+
+
+def _ask(turn: Turn, requests: List[EditRequest], asking: List[Finding], started: float) -> Outcome:
+    """요청대로면 어떤 방법으로도 피할 수 없는 것을 먼저 알리고 동의를 묻는다(사용자 지시 11-03).
+    묻기 전 상태는 들고 있다가 [바꾸지 않기]면 되돌린다."""
+    session, ctx = turn.session, turn.session.ctx
+    if session.held is None:
+        session.held = (list(session.requests), session.last, list(session.avoid_people))
+    stage(session, requests)
+    session.asking = list(asking)
+    question = (f"{describe_requests(ctx, requests)} — 바꾸기 전에 셈해 보니(전월 근무 포함) 어떤 방법으로 바꿔도 "
+                "아래가 생깁니다.")
+    answer = "\n".join([question] + [f"· {f.text}" for f in asking] + [CONFIRM_ASK])
+    preview = {"status": "confirm", "question": question, "findings": [finding_to_json(f) for f in asking],
+               "reasons": [], "notes": [], "candidates": [], "levers": [], "blocking": []}
+    turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
+                            "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
+                            "avoid": [sorted(p) for p in session.avoid_people]}, elapsed_ms=_ms(started))
+    return Outcome(answer=answer, preview=preview)
+
+
+def _answer(turn: Turn, go: bool) -> Outcome:
+    """[그래도 진행] — 동의한 것을 기억하고(레버 대상 설정은 그만큼 이번만 넘긴다) 푼다.
+    [바꾸지 않기] — 묻기 전 상태로 돌아간다(근무표는 그대로)."""
+    session = turn.session
+    asking = session.asking
+    if not asking:
+        raise SkillError("지금 확인을 기다리는 요청이 없습니다. 바꿀 내용을 다시 말씀해 주세요.")
+    session.asking = []
+    if not go:
+        held, session.held = session.held, None
+        if held is not None:
+            session.requests, session.last, session.avoid_people = list(held[0]), held[1], list(held[2])
+        else:
+            session.requests, session.last = [], None
+        turn.record("cancel", {"ids": [f.id for f in asking], "requests": requests_to_json(session.requests),
+                               "allow": allow_to_json(session.allow),
+                               "avoid": [sorted(p) for p in session.avoid_people]})
+        kept = " 앞서 찾은 후보는 아래에 그대로 있습니다." if session.last is not None and session.last.candidates else ""
+        return Outcome(answer="바꾸지 않았습니다. 근무표는 그대로입니다." + kept)
+    for f in asking:
+        session.confirmed.add(f.id)
+        for key, amount in lever_allow(f.allow).items():
+            session.allow[key] = session.allow.get(key, 0) + amount
+    turn.record("confirm", {"ids": [f.id for f in asking], "accepted": [f.text for f in asking],
+                            "allow_total": allow_to_json(session.allow)})
+    # 되돌릴 지점(held)은 풀이에 들어갈 때 비운다 — 동의 뒤 다시 물으면 처음 상태로 돌아가야 한다(검토 M3)
+    return _propose(turn, session.requests)
+
+
+#: 고르게 맞추기에서 가장 작은 차이를 찾는 데 쓰는 시간 상한(초) — 나머지로 후보를 찾는다
+BALANCE_SECONDS = 6.0
+
+
+def _resolve_balance(turn: Turn, requests: List[EditRequest]) -> Tuple[List[EditRequest], List[str]]:
+    """차이를 정하지 않은 고르게 맞추기 — 줄일 수 있는 가장 작은 차이를 찾아 확정 조건으로 바꾼다.
+    못 줄이면(지금 차이가 가장 작거나 시간 안에 못 찾음) 지금보다 1 작은 차이로 풀어 불가 이유·넘길 설정을 보인다.
+    산술로 맞출 수 있는 차이(합을 사람 수로 나눈 나머지가 있으면 1, 없으면 0)보다 크면 왜인지 한 줄을 돌려준다."""
+    pending = next((r for r in requests if isinstance(r, BalanceTarget) and r.spread is None and r.target is None),
+                   None)
+    if pending is None:
+        return requests, []
+    ctx = turn.session.ctx
+    counts = list(balance_counts(ctx, ctx.main, pending).values())
+    now, floor = max(counts) - min(counts), (0 if sum(counts) % len(counts) == 0 else 1)
+    best, proven = min_balance_spread(ctx, requests, rules=turn.session.rules, today=turn.today,
+                                      seconds=min(BALANCE_SECONDS, max(0.5, turn.remaining() / 3)),
+                                      allow=turn.session.allow)
+    spread = best if best is not None else max(0, now - 1)
+    why = []
+    if best is not None and best > floor:
+        why.append(f"산술로는 차이 {floor}까지 맞출 수 있지만, 지금 규칙을 모두 지키며 바꾸는 칸 {BALANCE_MAX_CHANGES}개 안에서는 "
+                   + (f"차이 {best}보다 줄일 방법이 없습니다." if proven
+                      else f"시간 안에 차이 {best}보다 작은 방법을 찾지 못했습니다."))
+    return [dataclasses.replace(r, spread=spread) if r is pending else r for r in requests], why
 
 
 #: 상대를 정하는 방식을 미리 풀 때 하나에 쓰는 시간 상한·하한(초)과, 미리 풀기 뒤 답을 만들 몫으로 남길 시간

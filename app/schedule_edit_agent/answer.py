@@ -7,7 +7,8 @@ from typing import List, Optional, Sequence
 
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, count_in, cover_count, transfer_label,
+    BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, balance_counts, count_in, cover_count,
+    transfer_label,
 )
 
 _SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
@@ -36,6 +37,9 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
         if isinstance(r, CoverTarget):
             band = f"({r.grade}등급까지)" if r.grade is not None else ""
             parts.append(f"{r.day + 1}일 {r.code}{band} {cover_count(ctx, ctx.main, r)}→{r.target}명")
+            continue
+        if isinstance(r, BalanceTarget):
+            parts.append(_describe_balance(ctx, r))
             continue
         who = ctx.names.get(r.nurse_id, r.nurse_id)
         if isinstance(r, CountTarget):
@@ -67,6 +71,30 @@ def _describe_count(ctx: EditContext, who: str, r: CountTarget) -> str:
     return f"{who} {word} {count_in(ctx, ctx.main, r)}→{r.target}회" + (f"({' · '.join(extra)})" if extra else "")
 
 
+def _describe_balance(ctx: EditContext, r: BalanceTarget, grid=None) -> str:
+    """예) 'N 근무 수 고르게 3~9회(차이 6) → 차이 1 이하 · 15명' · 'OFF 수 모두 9회로 · 15명'."""
+    word = "·".join(_SHIFT_WORD.get(c, c) for c in sorted(r.codes))
+    counts = balance_counts(ctx, ctx.main if grid is None else grid, r).values()
+    low, high = (min(counts), max(counts)) if counts else (0, 0)
+    if r.target is not None:
+        return f"{word} 수 모두 {r.target}회로 · {len(r.members)}명"
+    goal = "" if r.spread is None else f" → 차이 {r.spread} 이하"
+    return f"{word} 근무 수 고르게 {low}~{high}회(차이 {high - low}){goal} · {len(r.members)}명"
+
+
+def balance_note(ctx: EditContext, r: BalanceTarget, cand) -> str:
+    """맞춘 뒤 범위와 대상에서 뺀 사람 — '맞춘 뒤 5~6회(차이 1). 대상에서 뺀 사람: 임윤아(N 전담·고정 근무·그 근무 불가)'."""
+    from services.schedule_edit.solver import apply_candidate   # 답 문장 모듈이 솔버를 늘 들고 있지 않게
+    counts = balance_counts(ctx, apply_candidate(ctx, cand), r).values()
+    low, high = min(counts), max(counts)
+    text = f"맞춘 뒤 {low}~{high}회(차이 {high - low})."
+    left = [ctx.names.get(n, n) for n in ctx.nurse_ids if n not in r.members]
+    if left:
+        shown = ", ".join(left[:4]) + (f" 외 {len(left) - 4}명" if len(left) > 4 else "")
+        text += f" 대상에서 뺀 사람: {shown}(N 전담·고정 근무·그 근무를 할 수 없는 사람)."
+    return text
+
+
 def _same(ctx: EditContext, r: EditRequest) -> bool:
     return isinstance(r, SetCell) and ctx.main[r.nurse_id][r.day] == r.code
 
@@ -94,6 +122,7 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
         if first.quality:
             lines.append(f"이 안은 규칙은 모두 지키지만 {first.quality[0]} 등 근무 모양이 조금 나빠집니다.")
         lines += [n for n in (cover_note(ctx, r) for r in requests if isinstance(r, CoverTarget)) if n]
+        lines += [balance_note(ctx, r, first) for r in requests if isinstance(r, BalanceTarget)]
         return "\n".join(lines + notes)
     if result.status == "already":
         return "\n".join([f"{head} — 이미 그렇게 되어 있습니다."] + notes)
@@ -121,11 +150,12 @@ def cover_note(ctx: EditContext, r) -> str:
 
 def _count_changes(ctx: EditContext, requests: Sequence[EditRequest], cand) -> str:
     """개수 요청이면 그 근무 수가 바뀐 사람을 — '장원영 N 5→3, 김지원 N 5→7'."""
-    asked = {c for r in requests if isinstance(r, CountTarget) for c in r.codes}
+    asked = {c for r in requests if isinstance(r, (CountTarget, BalanceTarget)) for c in r.codes}
     keys = {("OFF" if c == "O" else c) for c in asked}       # 후보 counts 는 OFF 를 'OFF' 로(휴가 뺀 순수 OFF)
     parts = [f"{ctx.names.get(n, n)} {_SHIFT_WORD.get(c, c)} {b}→{a}"
              for n, by in cand.counts.items() for c, (b, a) in by.items() if c in keys and a != b]
-    return ", ".join(parts)
+    # 고르게 맞추기는 여러 사람이 바뀐다 — 앞 6명만(나머지는 카드·표에서)
+    return ", ".join(parts[:6]) + (f" 외 {len(parts) - 6}명" if len(parts) > 6 else "")
 
 
 def current_request(session) -> str:

@@ -4,6 +4,7 @@
   POST /{agent_id}/turn                   한 턴 — 입력 봉투 {kind: text|action, …} → 블록·효과
   GET  /{agent_id}/conversations          메모리에 올라 있는 내 대화
   GET  /{agent_id}/conversations/{id}     대화 한 건의 기록(에이전트가 권한 검사)
+  GET  /{agent_id}/conversations/{id}/view?…대상…   새로 고친 뒤 이어 보기 — 턴 응답과 같은 모양(턴은 쓰지 않는다)
   POST /{agent_id}/conversations/{id}/close
 
   · 에이전트마다 스위치(enabled) — 꺼지면 모든 경로 404(AIDE 채팅이 조건 없이 열렸던 P0 을 되풀이하지 않는다).
@@ -22,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from agent_kit.base import Agent, TurnInput, get_agent
 from agent_kit.conversation import ConversationError
-from agent_kit.runtime import TurnError, run_turn, working
+from agent_kit.runtime import TurnError, run_turn, view_turn, viewing, working
 from db.client2 import get_db
 from routers.auth import require_current_user
 from schemas.auth_schema import User
@@ -54,6 +55,10 @@ class TurnResponse(BaseModel):
     blocks: List[Dict[str, Any]]
     effects: List[Dict[str, Any]] = []
     status: Dict[str, Any] = {}
+    #: 대화 흐름 — 지난 턴 [{said: {kind, text}, answer}], 이 턴의 사용자 쪽 말, 메모리에 없어 못 보이는 앞 턴 수
+    history: List[Dict[str, Any]] = []
+    said: Optional[Dict[str, Any]] = None
+    history_cut: int = 0
 
 
 def _agent(agent_id: str) -> Agent:
@@ -135,6 +140,20 @@ def conversation_detail(agent_id: str, conversation_id: str, current_user: User 
     detail = agent.transcript(db, current_user, conversation_id)
     live = [c.info() for c in agent.store.active() if c.id == conversation_id]
     return {"conversation": live[0] if live else {"conversation_id": conversation_id, "in_memory": False}, **detail}
+
+
+@router.get("/{agent_id}/conversations/{conversation_id}/view", response_model=TurnResponse)
+def view(agent_id: str, conversation_id: str, request: Request, current_user: User = Depends(require_current_user),
+         db: Session = Depends(get_db)):
+    """새로 고친 뒤 이어 보기 — 지난 턴들과 마지막 결과(버튼 포함). 끝난·남의 대화·다른 대상이면 턴과 같은 오류."""
+    agent = _agent(agent_id)
+    deadline = time.monotonic() + agent.budget_seconds
+    context = _authorize(agent, db, current_user, dict(request.query_params))
+    try:
+        with viewing(agent, db, current_user, conversation_id) as conv:
+            return view_turn(agent, db, current_user, conv, context, deadline)
+    except TurnError as exc:
+        raise _fail(exc) from exc
 
 
 @router.post("/{agent_id}/conversations/{conversation_id}/close", status_code=204)

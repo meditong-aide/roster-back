@@ -125,7 +125,8 @@ def test_buttons_add_steps_and_a_new_request_resets_them(echo):
     pressed = press(echo, cid).json()
     assert pressed["blocks"][0] == {"type": "trail", "request": "안녕", "steps": ["누르기"]}
     conv = echo.agent.store.active()[0]
-    assert conv.history[-1] == {"user": "[버튼] 누르기", "answer": "눌림"}     # 버튼은 에이전트가 정한 말로
+    assert conv.history[-1] == {"user": "[버튼] 누르기", "answer": "눌림",      # 버튼은 에이전트가 정한 말로
+                                "shown": {"kind": "action", "text": "누르기"}}  # 화면에는 흔적 한 줄로
     again = say(echo, "다시", cid=cid).json()
     assert again["blocks"][0] == {"type": "trail", "request": "다시", "steps": []}
 
@@ -262,3 +263,57 @@ def test_conversation_keeps_recent_history_and_drops_state_on_move():
     with pytest.raises(ConversationError) as err:
         store.checkout(None, "nope", "u1")
     assert err.value.code == "not_found"
+
+
+def test_each_turn_carries_the_conversation_so_far(echo):
+    first = say(echo, "안녕").json()
+    assert first["history"] == [] and first["said"] == {"kind": "text", "text": "안녕"} and first["history_cut"] == 0
+    pressed = press(echo, first["conversation_id"]).json()
+    assert pressed["history"] == [{"said": {"kind": "text", "text": "안녕"}, "answer": "안녕"}]
+    assert pressed["said"] == {"kind": "action", "text": "누르기"}
+
+
+def test_view_after_reload_redraws_the_last_turn_without_using_a_turn(echo):
+    cid = say(echo, "안녕").json()["conversation_id"]
+    pressed = press(echo, cid).json()
+    seen = echo.get(f"{URL}/conversations/{cid}/view", params={"doc": "d1"}).json()
+    assert seen["blocks"] == pressed["blocks"] and seen["history"] == pressed["history"]
+    assert seen["said"] == pressed["said"] and seen["turn_no"] == pressed["turn_no"] == 2
+    moved = echo.get(f"{URL}/conversations/{cid}/view", params={"doc": "d2"})
+    assert moved.status_code == 409 and code(moved) == "context_changed"
+    gone = echo.get(f"{URL}/conversations/없는-대화/view", params={"doc": "d1"})
+    assert gone.status_code == 404 and code(gone) == "not_found"
+    # 메모리에 블록이 없으면(재기동 등) 에이전트가 지금 상태로 다시 그린다 — 에코는 그릴 것이 없어 흔적만
+    echo.agent.store.active()[0].last_blocks = []
+    redrawn = echo.get(f"{URL}/conversations/{cid}/view", params={"doc": "d1"}).json()
+    assert types(redrawn) == ["trail"]
+
+
+def test_view_needs_no_slot_and_works_on_a_used_up_conversation(echo):
+    # 이어 보기는 메모리 블록이면 풀이 자리를 기다리지 않고, 턴을 다 쓴 대화도 마지막 결과는 다시 본다(검토 11-03)
+    cid = say(echo, "하나").json()["conversation_id"]
+    for said in ("둘", "셋"):
+        say(echo, said, cid=cid)
+    assert code(press(echo, cid)) == "too_long"                    # 턴은 다 썼다
+    taken = [echo.agent.slots.acquire(timeout=0) for _ in range(echo.agent.concurrency())]
+    try:
+        seen = echo.get(f"{URL}/conversations/{cid}/view", params={"doc": "d1"})
+        assert seen.status_code == 200 and seen.json()["said"] == {"kind": "text", "text": "셋"}
+        echo.agent.store.active()[0].last_blocks = []               # 다시 그려야 하면 그때만 자리를 기다린다
+        echo.agent.slot_wait_seconds = 0.1
+        busy = echo.get(f"{URL}/conversations/{cid}/view", params={"doc": "d1"})
+        assert busy.status_code == 429 and code(busy) == "server_busy"
+    finally:
+        for ok in taken:
+            if ok:
+                echo.agent.slots.release()
+
+
+def test_history_cut_counts_only_turns_pushed_out_of_the_window():
+    from agent_kit.conversation import Conversation
+    conv = Conversation(id="c", agent="a", owner="u", context={}, created_at=0, touched_at=0,
+                        limits=Limits(history_keep=2))
+    conv.turn_no = 9                                                 # 기록이 없는 턴이 섞여도
+    for i in range(3):
+        conv.remember(f"말{i}", f"답{i}")
+    assert conv.cut() == 1 and [h["said"]["text"] for h in conv.past()] == ["말1"]

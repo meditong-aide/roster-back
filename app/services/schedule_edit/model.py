@@ -17,7 +17,8 @@ from ortools.sat.python import cp_model
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    AvoidCell, CountTarget, CoverTarget, EditRequest, SetCell, count_cells, count_in, cover_members, is_satisfied,
+    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, count_cells, count_in, cover_members,
+    is_satisfied,
     work_targets,
 )
 from services.schedule_edit.rules import (
@@ -57,6 +58,8 @@ class EditModel:
     quality_terms: List[Any] = field(default_factory=list)
     #: 변경 발생 기간 = 마지막 바뀐 날 - 처음 바뀐 날(바뀐 날이 하루면 0)
     span: Any = 0
+    #: 고르게 맞추기의 최대−최소 차이(차이를 아직 정하지 않은 요청일 때만 · `solver.min_balance_spread` 가 줄인다)
+    spread: Any = None
 
     def ind(self, term: Term):
         """칸이 term.codes 중 하나인가 — 자유 칸이면 변수 합, 아니면 0/1 상수."""
@@ -140,7 +143,7 @@ def requested_cells(ctx: EditContext, requests: List[EditRequest]) -> Set[Cell]:
     바꿀 칸이 아니라 면제하지 않는다(검토 11-03: 면제하면 그 원티드 칸이 다른 근무로 바뀔 수 있었다).
     """
     return {(r.nurse_id, r.day) for r in requests
-            if not isinstance(r, (CountTarget, CoverTarget)) and not is_satisfied(ctx, r)}
+            if not isinstance(r, (CountTarget, CoverTarget, BalanceTarget)) and not is_satisfied(ctx, r)}
 
 
 def is_waived(key: Tuple, waived: Set[Cell]) -> bool:
@@ -284,6 +287,8 @@ def add_requests(em: EditModel, requests: List[EditRequest]) -> None:
         elif isinstance(req, CoverTarget):
             em.model.Add(sum(em.ind(Term(n, req.day, frozenset({req.code}))) for n in cover_members(em.ctx, req))
                          == req.target)
+        elif isinstance(req, BalanceTarget):
+            add_balance(em, req)
         elif isinstance(req, SetCell):
             if (req.nurse_id, req.day) in em.free:
                 em.model.Add(em.x[req.nurse_id, req.day, req.code] == 1)
@@ -294,6 +299,26 @@ def add_requests(em: EditModel, requests: List[EditRequest]) -> None:
             for c in req.codes:
                 if (req.nurse_id, req.day, c) in em.x:
                     em.model.Add(em.x[req.nurse_id, req.day, c] == 0)
+
+
+def add_balance(em: EditModel, req: BalanceTarget) -> None:
+    """대상마다 한 달 전체 그 근무 수를 [하한, 상한] 안에 — 상한−하한 ≤ spread. target 이면 모두 그 수.
+    spread 가 None 이면 차이를 변수로 두고(em.spread) 묶지 않는다 — 가장 작은 차이를 찾을 때."""
+    days = range(em.ctx.days)
+    counts = [count_expr(em, n, req.codes, days) for n in req.members]
+    if req.target is not None:
+        for expr in counts:
+            em.model.Add(expr == req.target)
+        return
+    low = em.model.NewIntVar(0, em.ctx.days, "balance_low")
+    high = em.model.NewIntVar(0, em.ctx.days, "balance_high")
+    for expr in counts:
+        em.model.Add(expr >= low)
+        em.model.Add(expr <= high)
+    if req.spread is None:
+        em.spread = high - low
+    else:
+        em.model.Add(high - low <= req.spread)
 
 
 def count_expr(em: EditModel, nurse_id: str, codes, days) -> Any:

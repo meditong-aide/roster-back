@@ -12,7 +12,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    TRANSFERS, AvoidCell, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, cover_count, eul, swap,
+    TRANSFERS, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, balance_members,
+    cover_count, eul, swap,
 )
 from services.schedule_edit.rules import coverage_bounds
 
@@ -46,6 +47,8 @@ def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List
     kind = change.get("kind")
     if kind == "cover":                      # 그날 인원 — 사람을 짚지 않는다
         return _cover(ctx, change)
+    if kind == "balance":                    # 여러 사람의 근무 수 고르게 — 사람을 짚지 않는다
+        return _balance(ctx, change, open_from)
     nurse, ask = resolve_nurse(ctx, change.get("nurse"))
     if ask:
         return [], ask
@@ -104,6 +107,22 @@ def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List
             return [], f"OFF 기간이 {MAX_PERIOD_DAYS}일보다 깁니다. 휴가 신청으로 처리해 주세요."
         return [SetCell(nurse, d, "O") for d in range(day, last + 1)], None
     return [], "어떤 변경인지 알기 어렵습니다. 예) '김민지 14일 OFF'"
+
+
+def _balance(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
+    """'N 근무 수 고르게 맞춰줘' · 'OFF 다 9개로' — 대상은 그 근무를 할 수 있는 전원(사용자 결정 11-03).
+    차이를 말하지 않았으면 비워 둔다 — 스킬이 줄일 수 있는 가장 작은 차이를 찾는다."""
+    code, ask = resolve_shift(ctx, change.get("shift"))
+    if ask:
+        return [], "어떤 근무의 수를 고르게 맞출까요? (D·E·N·OFF)"
+    nums, bad = _numbers(change, "target", "spread")
+    if bad:
+        return [], "개수·차이는 숫자로 말씀해 주세요. 예) 'OFF 다 9개로'"
+    if open_from >= ctx.days:
+        return [], "이 달에 바꿀 수 있는 날이 남아 있지 않습니다."
+    codes = frozenset({code})
+    return [BalanceTarget(codes, balance_members(ctx, codes, open_from), open_from, ctx.days - 1,
+                          nums["spread"], nums["target"])], None
 
 
 def _cover(ctx: EditContext, change: Dict[str, Any]) -> Tuple[List[EditRequest], Optional[str]]:

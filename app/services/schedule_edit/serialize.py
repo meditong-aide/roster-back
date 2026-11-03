@@ -11,7 +11,9 @@ import json
 from typing import Any, Dict, List, Sequence, Tuple
 
 from services.schedule_edit.context import EditContext
-from services.schedule_edit.requests import AvoidCell, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell
+from services.schedule_edit.requests import (
+    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell,
+)
 
 
 def allow_to_json(allow: Dict[Tuple, int]) -> List[List[Any]]:
@@ -35,6 +37,9 @@ def requests_to_json(requests: Sequence[EditRequest]) -> List[Dict[str, Any]]:
             out.append({"kind": "leave", "nurse_id": r.nurse_id, "day": r.day, "code": r.code})
         elif isinstance(r, CoverTarget):
             out.append({"kind": "cover", "day": r.day, "code": r.code, "target": r.target, "grade": r.grade})
+        elif isinstance(r, BalanceTarget):
+            out.append({"kind": "balance", "codes": sorted(r.codes), "members": list(r.members),
+                        "first_day": r.first_day, "last_day": r.last_day, "spread": r.spread, "target": r.target})
         else:
             out.append({"kind": "avoid", "nurse_id": r.nurse_id, "day": r.day, "codes": sorted(r.codes)})
     return out
@@ -52,6 +57,9 @@ def requests_from_json(items: Sequence[Dict[str, Any]]) -> List[EditRequest]:
             out.append(LeaveCell(i["nurse_id"], int(i["day"]), i["code"]))
         elif i["kind"] == "cover":
             out.append(CoverTarget(int(i["day"]), i["code"], int(i["target"]), i.get("grade")))
+        elif i["kind"] == "balance":
+            out.append(BalanceTarget(frozenset(i["codes"]), tuple(i["members"]), int(i["first_day"]),
+                                     int(i["last_day"]), i.get("spread"), i.get("target")))
         else:
             out.append(AvoidCell(i["nurse_id"], int(i["day"]), frozenset(i["codes"])))
     return out

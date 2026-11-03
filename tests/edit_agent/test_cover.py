@@ -8,7 +8,7 @@ from services.schedule_edit.requests import CoverTarget, SetCell, cover_count, r
 from services.schedule_edit.rules import coverage_bounds
 from services.schedule_edit.serialize import requests_from_json, requests_to_json
 from services.schedule_edit.solver import verify_candidate
-from tests.edit_agent.test_agent import BEFORE_MONTH, _agent, call, make_ctx, say
+from tests.edit_agent.test_agent import BEFORE_MONTH, _agent, call, make_ctx, press, say
 
 
 def _ward():
@@ -90,7 +90,11 @@ def test_revise_keep_or_remove_the_whole_day_drops_its_headcount(world):
 def test_one_more_on_a_day_moves_someone_in_and_names_the_setting_it_passes(world):
     world.ctxs["s1"] = _ward
     agent, _ = _agent(call("propose_edit", changes=[{"kind": "cover", "day": 1, "shift": "D", "change": 1}]))
-    reply = say(agent, world.conv, "1일 데이 한 명 더")
+    asked = say(agent, world.conv, "1일 데이 한 명 더")
+    # 최대 인원을 넘기는 것은 요청 자체가 정한다 — 풀기 전에 먼저 묻는다(사용자 지시 11-03)
+    assert asked.preview["status"] == "confirm"
+    assert "· 1일 D 1명 → 2명 — 일별 최대 인원 1명보다 1명 많음" in asked.answer
+    reply = press(agent, world.conv, "confirm_request", {})
     assert reply.preview["status"] == "ok", reply.answer
     assert reply.answer.startswith("1일 D 1→2명 — 바꿀 방법")
     assert "요청대로 1일 D를 최대 인원(1명)보다 1명 많이 둡니다(이번만 · 병동 설정은 그대로)." in reply.answer
@@ -98,7 +102,7 @@ def test_one_more_on_a_day_moves_someone_in_and_names_the_setting_it_passes(worl
     cand = session.last.candidates[0]
     assert any(c.day == 0 and c.after_main == "D" and c.nurse_id in ("B", "C") for c in cand.changes)
     assert verify_candidate(session.ctx, session.rules, cand, session.requests, today=BEFORE_MONTH) == []
-    assert reply.request_line == "1일 D 1→2명"                          # 흔적에도 해석한 요청
+    assert asked.request_line == "1일 D 1→2명"                          # 흔적에도 해석한 요청(말 턴)
 
 
 def test_one_less_on_a_day(world):

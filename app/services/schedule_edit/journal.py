@@ -4,6 +4,7 @@
   · clarify  되묻기(이름 모호 등)                       · lever / reject / keep  사용자 행동
   · apply    적용(새 버전)                              · error    처리 중 오류
   · choose   개수 요청에서 빠지는 근무를 메우는 방식을 고름
+  · confirm / cancel  바꾸기 전 확인에 [그래도 진행] / [바꾸지 않기]   · check  적용 전 확인을 물음
   · close    사용자가 대화를 닫음(다시 이어 가지 않는다)
 대화 id 로 한 대화를 순서대로 다시 보고(`read_conversation`), 재기동 뒤 대화 상태를 다시 세운다.
 
@@ -25,7 +26,8 @@ from db.models import ScheduleEditLog
 
 logger = logging.getLogger(__name__)
 
-EVENTS = ("message", "propose", "clarify", "lever", "reject", "keep", "choose", "apply", "error", "close")
+EVENTS = ("message", "propose", "clarify", "lever", "reject", "keep", "choose", "confirm", "cancel", "check", "apply",
+          "error", "close")
 #: 대화 하나를 다시 읽을 때 상한 — 대화가 이보다 길면 앞부분은 상태 복원에 안 쓴다
 READ_LIMIT = 500
 _ready = False

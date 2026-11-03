@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, FrozenSet, Iterable, List, Optional, Union
+from typing import Dict, FrozenSet, Iterable, List, Optional, Tuple, Union
 
 from services.schedule_edit.context import EDIT_MAINS, FIXED_WANTED, EditContext
 
@@ -118,7 +118,64 @@ class CountTarget:
         return range(self.first_day, self.last_day + 1)
 
 
-EditRequest = Union[SetCell, AvoidCell, CountTarget, LeaveCell, CoverTarget]
+@dataclass(frozen=True)
+class BalanceTarget:
+    """여러 사람의 이 근무 수를 고르게 — 예) 'N 근무 수 고르게 맞춰줘'(사용자 결정 11-03).
+
+    한 달 전체 개수로 맞춘다(지난 날·바꿀 수 없는 칸에 이미 있는 근무도 센다). 대상(members)은 그 근무를 할 수
+    있는 전원 — N 전담·고정 근무자·그 근무를 할 수 없는 사람은 뺀다(`balance_members`). 누구의 어느 날을 바꿀지는
+    솔버가 고른다(사람·칸을 짚지 않는다 — 원티드 보호를 면제하지 않는다).
+      · target: 모두 이 수로('OFF 다 9개로'). 주면 spread 는 보지 않는다.
+      · spread: 최대−최소 차이 상한. None 이면 아직 정하지 않은 것 — 스킬이 줄일 수 있는 가장 작은 차이를 찾아 채운다
+        (`solver.min_balance_spread`).
+    """
+
+    codes: FrozenSet[str]
+    members: Tuple[str, ...]
+    first_day: int
+    last_day: int
+    spread: Optional[int] = None
+    target: Optional[int] = None
+
+    @property
+    def nurse_id(self) -> None:
+        """사람을 짚지 않는다 — 칸 요청을 거르는 자리((간호사, 날) 비교)를 그대로 지나간다."""
+        return None
+
+    @property
+    def day(self) -> int:
+        """창·지난 날짜 판정의 기준 — 바꿀 수 있는 첫날."""
+        return self.first_day
+
+
+EditRequest = Union[SetCell, AvoidCell, CountTarget, LeaveCell, CoverTarget, BalanceTarget]
+
+
+def balance_members(ctx: EditContext, codes, open_from: int) -> Tuple[str, ...]:
+    """고르게 맞출 사람 — 바꿀 수 있는 날에 그 근무를 할 수 있는 사람. N 전담·고정 근무자는 뺀다(그 근무 수가
+    원래 다르다). OFF 를 맞출 때는 바꿀 수 있는 날이 있는 사람."""
+    work = set(codes) & WORK_CODES
+    out = []
+    for n in ctx.nurse_ids:
+        if n in ctx.n_only or n in ctx.single_shift:
+            continue
+        days = [d for d in range(open_from, ctx.days) if ctx.is_free(n, d)]
+        if not days:
+            continue
+        if work and not any(work - ctx.forbidden.get((n, d), set()) for d in days):
+            continue
+        out.append(n)
+    return tuple(out)
+
+
+def balance_counts(ctx: EditContext, grid: Dict[str, List], req: "BalanceTarget") -> Dict[str, int]:
+    """대상마다 한 달 전체 그 근무 수(순수 OFF 기준 · `count_cells`)."""
+    return {n: count_cells(ctx, grid, n, req.codes, range(ctx.days)) for n in req.members}
+
+
+def balance_spread(ctx: EditContext, grid: Dict[str, List], req: "BalanceTarget") -> int:
+    counts = balance_counts(ctx, grid, req).values()
+    return max(counts) - min(counts) if counts else 0
 
 
 def work_down(ctx: EditContext, req: CountTarget) -> bool:
@@ -195,6 +252,8 @@ def request_problem(ctx: EditContext, req: EditRequest, open_from: int = 0) -> O
     """요청 자체가 성립하지 않는 이유(사람이 읽는 문장). 성립하면 None."""
     if isinstance(req, CoverTarget):
         return _cover_problem(ctx, req, open_from)
+    if isinstance(req, BalanceTarget):
+        return _balance_problem(ctx, req, open_from)
     if req.nurse_id not in ctx.main:
         return f"{req.nurse_id} 는 이 근무표에 없습니다."
     if isinstance(req, CountTarget):
@@ -254,6 +313,28 @@ def _cover_problem(ctx: EditContext, req: CoverTarget, open_from: int) -> Option
     return None
 
 
+def _balance_problem(ctx: EditContext, req: BalanceTarget, open_from: int) -> Optional[str]:
+    usable = set(EDIT_MAINS) if ctx.use_mid else set(EDIT_MAINS) - {"M"}
+    if not set(req.codes) <= usable:
+        return f"고를 수 없는 근무입니다: {sorted(set(req.codes) - usable)}"
+    if req.first_day < open_from or req.first_day >= ctx.days:
+        return "이 달에 바꿀 수 있는 날이 남아 있지 않습니다."
+    if len(req.members) < 2:
+        return "고르게 맞출 사람이 두 명보다 적습니다(그 근무를 할 수 있는 사람 기준)."
+    if req.target is not None:
+        low = {n: sum(1 for d in range(ctx.days) if (d < open_from or not ctx.is_free(n, d))
+                      and count_cells(ctx, ctx.main, n, req.codes, (d,))) for n in req.members}
+        free = {n: sum(1 for d in range(open_from, ctx.days) if ctx.is_free(n, d)) for n in req.members}
+        over = [ctx.names.get(n, n) for n in req.members if low[n] > req.target]
+        under = [ctx.names.get(n, n) for n in req.members if low[n] + free[n] < req.target]
+        if over or under:
+            who = ", ".join((over + under)[:3]) + (" 등" if len(over + under) > 3 else "")
+            return f"{who}은(는) 바꿀 수 없는 칸 때문에 그 수({req.target}회)로 맞출 수 없습니다."
+    if req.spread is not None and req.spread < 0:
+        return "차이는 0 이상이어야 합니다."
+    return None
+
+
 def _count_problem(ctx: EditContext, req: CountTarget, open_from: int) -> Optional[str]:
     name = ctx.names.get(req.nurse_id, req.nurse_id)
     if not 0 <= req.first_day <= req.last_day < ctx.days:
@@ -285,6 +366,11 @@ def is_satisfied(ctx: EditContext, req: EditRequest, grid: Optional[Dict[str, Li
         return count_in(ctx, grid or ctx.main, req) == req.target
     if isinstance(req, CoverTarget):
         return cover_count(ctx, grid or ctx.main, req) == req.target
+    if isinstance(req, BalanceTarget):
+        counts = balance_counts(ctx, grid or ctx.main, req).values()
+        if req.target is not None:
+            return all(c == req.target for c in counts)
+        return max(counts) - min(counts) <= (1 if req.spread is None else req.spread)
     current = (grid or ctx.main)[req.nurse_id][req.day]
     if isinstance(req, LeaveCell):
         return current == "O"          # 대표코드는 O — 휴가 코드는 후보 칸(after)에 실린다

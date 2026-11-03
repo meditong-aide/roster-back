@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -21,13 +21,14 @@ from agent_kit.conversation import Conversation
 from agent_kit.runtime import TurnError
 from db.models import Schedule
 from schedule_edit_agent import view
-from schedule_edit_agent.agent import EditAgent, close_conversation
+from schedule_edit_agent.agent import EditAgent, Reply, close_conversation
 from schedule_edit_agent.examples import live_examples
 from schedule_edit_agent.llm import OpenAIEditLLM
 from schedule_edit_agent.skills import CHAT_BUDGET, MIN_SOLVE, UNSUPPORTED, SkillError
 from schedule_edit_agent.store import AGENT_ID, LIMITS, restore
 from services.group_access import assert_caller_can_access_group, caller_is_manager
 from services.schedule_edit.journal import read_conversation, read_conversation_head
+from services.schedule_edit.precheck import finding_to_json
 
 MANAGERS_ONLY = "근무표 수정 도우미는 수간호사·그룹관리자만 쓸 수 있습니다."
 
@@ -118,6 +119,19 @@ class ScheduleEditAgent(Agent):
                            "new_schedule_id": r.new_schedule_id, "elapsed_ms": r.elapsed_ms,
                            "created_at": r.created_at.isoformat() if r.created_at else None, "payload": r.payload}
                           for r in rows]}
+
+    def current(self, db: Session, user: Any, conv: Conversation) -> List[B.Block]:
+        """재기동·내려간 대화를 이어 볼 때 — 마지막 답과 지금 들고 있는 결과(후보·레버, 묻던 확인)를 다시 그린다."""
+        session = self.core.session_for(db, conv)
+        answer = conv.history[-1]["answer"] if conv.history else ""
+        preview = None
+        if session.asking:
+            preview = {"status": "confirm", "question": answer.splitlines()[0] if answer else "",
+                       "findings": [finding_to_json(f) for f in session.asking], "notes": []}
+        blocks = view.blocks_for(Reply(answer=answer, preview=preview), session)
+        if preview is None and session.last is None and session.requests:
+            blocks.append(view.retry_card())        # 기록에는 요청만 남는다 — 후보는 다시 찾아야 보인다
+        return blocks
 
     def on_close(self, db: Session, user: Any, conv: Conversation) -> None:
         close_conversation(db, user, conv)

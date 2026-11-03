@@ -19,6 +19,7 @@ from schedule_edit_agent import store as store_mod
 from schedule_edit_agent.agent import LLM_FAILED, EditAgent
 from schedule_edit_agent.prompt import HISTORY_TURNS
 from schedule_edit_agent.store import AGENT_ID, LIMITS, restore
+from services.schedule_edit.precheck import Precheck
 from services.schedule_edit.rules import build_rules
 from services.schedule_edit.serialize import lever_id
 from services.schedule_edit.session import EditSession
@@ -177,7 +178,11 @@ def test_buttons_keep_reject_lever_and_apply(world, monkeypatch):
     assert conv.history[-1]["user"] == "[버튼] 1번 안 적용"
 
 
-def test_lever_button_reproposes_with_allowance(world):
+def test_lever_button_reproposes_with_allowance(world, monkeypatch):
+    # 레버는 사전 점검이 못 짚는 넘김(연쇄로만 생기는 것)에 쓰인다 — 점검을 꺼서 레버 흐름만 본다
+    # (같은 근무표에서 점검이 먼저 묻는 흐름은 tests/edit_agent/test_confirm.py)
+    monkeypatch.setattr(skills_mod, "precheck", lambda *a, **k: Precheck())
+
     def tight():
         ctx = make_ctx({"A": "DDOO"}, off_days=2, config={"not_one_night": False})
         ctx.frozen[("A", 2)] = ctx.frozen[("A", 3)] = "주휴·특수 휴무"
@@ -272,7 +277,8 @@ def test_restore_rebuilds_requests_levers_rejects_and_history(monkeypatch):
     conv = restore(None, "c1")
     assert conv.turn_no == 3 and conv.context == {"schedule_id": "s1"} and conv.owner == "acc_hn"
     assert conv.agent == AGENT_ID and conv.limits == LIMITS
-    assert conv.restored == {"requests": req, "allow": allow, "avoid": [["A", "B"]]}
+    assert conv.restored == {"requests": req, "allow": allow, "avoid": [["A", "B"]], "confirmed": [], "asking": [],
+                             "held": None}
     assert [h["user"] for h in conv.history] == ["A 1일 오프", "고마워"]
     assert conv.request == "A 1일 오프"                                 # 흔적의 요청 줄은 새 요청만(인사는 덮지 않음)
 

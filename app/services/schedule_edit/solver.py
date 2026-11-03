@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -45,7 +46,8 @@ from services.schedule_edit.model import (
     requested_cells, subcode_changes,
 )
 from services.schedule_edit.requests import (
-    AvoidCell, CountTarget, EditRequest, LeaveCell, SetCell, first_open_day, is_satisfied, request_problem,
+    AvoidCell, BalanceTarget, CountTarget, EditRequest, LeaveCell, SetCell, balance_counts, first_open_day,
+    is_satisfied, request_problem,
 )
 from services.schedule_edit.rules import Grid, RuleSet, build_rules, measure, measure_soft, new_violations
 from services.schedule_edit.screen_check import ScreenBaseline, screen_regressions
@@ -60,6 +62,8 @@ MONTH_SECONDS = 6.0
 EXPLAIN_SECONDS = 6.0
 TIME_BUDGET = 20.0
 MAX_CHANGES = 20
+#: 고르게 맞추기는 여러 사람을 함께 옮긴다 — 칸 수 상한을 넓힌다(아래 무게 순위는 칸 40·사람 수에서도 지켜진다)
+BALANCE_MAX_CHANGES = 40
 #: 대안 후보는 최소 loss 보다 이만큼까지 더 써도 된다(칸 2개어치)
 EXTRA_LOSS = 4
 #: 사전식 순서를 무게로 흉내 낸다 — 주 loss(칸·기간) > 품질 > 사람 수 > 하위코드. 앞 순위 1 이 뒤 순위 전부보다 무겁게:
@@ -133,6 +137,8 @@ class _Run:
     start: int = 0
     #: 사용자가 레버로 허용한 넘김 {규칙 위치 key: 양}
     allow: Dict[Tuple, int] = field(default_factory=dict)
+    #: 바뀌는 칸 수 상한(고르게 맞추기면 넓다)
+    max_changes: int = MAX_CHANGES
     avoid: List[Set[str]] = field(default_factory=list)
     hint: Optional[Grid] = None
 
@@ -161,6 +167,88 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
     wished = _wished_night_before(ctx, leave, requests)
     if wished:
         return EditResult("invalid", reasons=wished, notes=list(ctx.notes))
+    ctx, rules, requests = _with_leave(ctx, rules, requests, leave)
+    run = _Run(ctx, rules, requests, measure(ctx, ctx.main, rules), measure_soft(ctx, ctx.main, rules),
+               screen, max_candidates,
+               time.monotonic() + time_budget, start=min(r.day for r in requests),
+               allow=lever_allow(allow),
+               avoid=[set(p) for p in avoid_people], hint=hint, max_changes=_max_changes(requests))
+    status = cp_model.UNKNOWN
+    # 개수 요청은 어느 날을 바꿀지 정해지지 않았다 — 좁은 창부터 넓힐 근거가 없어 기간 전체로 바로 푼다
+    steps = (None,) if any(isinstance(r, (CountTarget, BalanceTarget)) for r in requests) else WINDOW_STEPS
+    for step in steps:
+        days = _window_days(run, step)
+        em = build_model(ctx, rules, requests, free_cells(ctx, days), run.max_changes, run.allow)
+        _carry_over(em, run)
+        found, status = _search(run, em, (days[0], days[-1]), MONTH_SECONDS if step is None else SOLVE_SECONDS)
+        if found:
+            return EditResult("ok", candidates=[_as_leave(c, leave) for c in found] if leave else found,
+                              notes=list(ctx.notes))
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return EditResult("infeasible", notes=list(ctx.notes), reasons=[
+            "찾은 방법이 모두 근무표 화면에 새 위반을 만들어 후보로 내지 않았습니다."])
+    if not explain:
+        return EditResult("infeasible" if status == cp_model.INFEASIBLE else "timeout", notes=list(ctx.notes),
+                          reasons=[f"지금 규칙을 모두 지키면서는 방법을 찾지 못했습니다(바꾸는 칸 {run.max_changes}개까지 살펴봄)."
+                                   if status == cp_model.INFEASIBLE else "시간 안에 방법을 찾지 못했습니다."])
+    return _no_candidate(run, proven=status == cp_model.INFEASIBLE)
+
+
+def _max_changes(requests: Sequence[EditRequest]) -> int:
+    return BALANCE_MAX_CHANGES if any(isinstance(r, BalanceTarget) for r in requests) else MAX_CHANGES
+
+
+def min_balance_spread(ctx: EditContext, requests: Sequence[EditRequest], *, rules: Optional[RuleSet] = None,
+                       today: Optional[date] = None, seconds: float = MONTH_SECONDS,
+                       allow: Optional[Dict[Tuple, int]] = None) -> Tuple[Optional[int], bool]:
+    """차이를 정하지 않은 고르게 맞추기 — 규칙을 모두 지키며 칸 상한 안에서 줄일 수 있는 가장 작은 최대−최소 차이.
+
+    (차이, 더 줄일 수 없다고 증명했나). 지금 차이−1 부터 한 단계씩 '되는지만' 짧게 풀어 내려간다 — 차이를 목적식으로
+    한 번에 줄이면 실측(dev 3병동 N)에서 6초 안에 개선을 못 찾았다. 하나도 못 줄이면 (None, 증명 여부).
+    산술 하한(합을 사람 수로 나눈 나머지가 있으면 1, 없으면 0)보다 아래는 풀지 않는다.
+    """
+    requests = list(requests)
+    req = next((r for r in requests if isinstance(r, BalanceTarget) and r.spread is None and r.target is None), None)
+    if req is None:
+        return None, False
+    open_from = first_open_day(ctx, today or datetime.now(KST).date())
+    counts = list(balance_counts(ctx, ctx.main, req).values())
+    if not counts or any(request_problem(ctx, r, open_from) for r in requests):
+        return None, False
+    ctx, rules, requests = prepare(ctx, rules, requests)          # 함께 온 휴가 요청도 풀 때와 같은 재료로(검토 L2)
+    now = max(counts) - min(counts)
+    floor = 0 if sum(counts) % len(counts) == 0 else 1
+    deadline = time.monotonic() + seconds
+    start = min(r.day for r in requests)
+    found, proven = None, False
+    for spread in range(now - 1, floor - 1, -1):
+        left = deadline - time.monotonic()
+        if left < 0.3:
+            break
+        tried = [dataclasses.replace(r, spread=spread) if r is req else r for r in requests]
+        em = build_model(ctx, rules, tried, free_cells(ctx, range(start, ctx.days)), BALANCE_MAX_CHANGES,
+                         lever_allow(allow))
+        status = new_solver(min(SOLVE_SECONDS, left)).Solve(em.model)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            found = spread
+            proven = spread == floor
+            continue
+        proven = status == cp_model.INFEASIBLE
+        break
+    return found, proven
+
+
+def prepare(ctx: EditContext, rules: Optional[RuleSet],
+            requests: Sequence[EditRequest]) -> Tuple[EditContext, RuleSet, List[EditRequest]]:
+    """풀 때와 같은 재료·규칙·요청 — 직접 짚은 확정 원티드를 풀고, 휴가 요청 칸은 휴가로 넣어 OFF 지정으로 바꾼다.
+    바꾸기 전 산술 점검(`precheck`)이 솔버와 같은 식으로 센다."""
+    ctx, rules = _release(ctx, rules, requests)
+    leave = {(r.nurse_id, r.day): r.code for r in requests if isinstance(r, LeaveCell)}
+    return _with_leave(ctx, rules, list(requests), leave)
+
+
+def _with_leave(ctx: EditContext, rules: Optional[RuleSet], requests: List[EditRequest],
+                leave: Dict[Tuple[str, int], str]) -> Tuple[EditContext, RuleSet, List[EditRequest]]:
     if leave:
         # 연차·휴가 칸 — 그 칸을 휴가로 넣은 재료로 OFF 를 지정해 푼다(순수 OFF·패턴 판정이 휴가로 본다 · 빠진 근무는
         # 다른 사람이 메운다). 후보에서 그 칸만 휴가 코드로 바꾼다(`_as_leave`)
@@ -172,31 +260,7 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
             # 바꿀 수 없는 전날 N 은 요청 검사가 미리 거절한다
             requests += [AvoidCell(n, d - 1, frozenset({"N"})) for n, d in leave
                          if d >= 1 and (n, d - 1) not in leave and ctx.main[n][d - 1] == "N"]
-    rules = rules or build_rules(ctx)
-    run = _Run(ctx, rules, requests, measure(ctx, ctx.main, rules), measure_soft(ctx, ctx.main, rules),
-               screen, max_candidates,
-               time.monotonic() + time_budget, start=min(r.day for r in requests),
-               allow=lever_allow(allow),
-               avoid=[set(p) for p in avoid_people], hint=hint)
-    status = cp_model.UNKNOWN
-    # 개수 요청은 어느 날을 바꿀지 정해지지 않았다 — 좁은 창부터 넓힐 근거가 없어 기간 전체로 바로 푼다
-    steps = (None,) if any(isinstance(r, CountTarget) for r in requests) else WINDOW_STEPS
-    for step in steps:
-        days = _window_days(run, step)
-        em = build_model(ctx, rules, requests, free_cells(ctx, days), MAX_CHANGES, run.allow)
-        _carry_over(em, run)
-        found, status = _search(run, em, (days[0], days[-1]), MONTH_SECONDS if step is None else SOLVE_SECONDS)
-        if found:
-            return EditResult("ok", candidates=[_as_leave(c, leave) for c in found] if leave else found,
-                              notes=list(ctx.notes))
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return EditResult("infeasible", notes=list(ctx.notes), reasons=[
-            "찾은 방법이 모두 근무표 화면에 새 위반을 만들어 후보로 내지 않았습니다."])
-    if not explain:
-        return EditResult("infeasible" if status == cp_model.INFEASIBLE else "timeout", notes=list(ctx.notes),
-                          reasons=[f"지금 규칙을 모두 지키면서는 방법을 찾지 못했습니다(바꾸는 칸 {MAX_CHANGES}개까지 살펴봄)."
-                                   if status == cp_model.INFEASIBLE else "시간 안에 방법을 찾지 못했습니다."])
-    return _no_candidate(run, proven=status == cp_model.INFEASIBLE)
+    return ctx, rules or build_rules(ctx), requests
 
 
 def _release(ctx: EditContext, rules: Optional[RuleSet], requests: Sequence[EditRequest]):
@@ -278,13 +342,14 @@ def _no_candidate(run: _Run, proven: bool) -> EditResult:
         return EditResult("timeout", notes=notes, reasons=[
             "시간 안에 방법을 찾지 못했습니다. 요청을 나눠서 다시 시도해 주세요."])
     days = _window_days(run, None)
-    head = f"지금 규칙을 모두 지키면서는 이 요청을 들어줄 방법을 찾지 못했습니다(바꾸는 칸 {MAX_CHANGES}개까지 살펴봄)."
+    head = (f"지금 규칙을 모두 지키면서는 이 요청을 들어줄 방법을 찾지 못했습니다(바꾸는 칸 {run.max_changes}개까지 "
+            "살펴봄).")
     direct = direct_conflicts(run.ctx, run.rules, run.requests, days)
     if direct:
         # 바꿀 수 없는 칸과 바로 부딪친다 — 풀이로 이유를 찾을 필요가 없다(하드락이라 넘김 안내도 없다)
         return EditResult("infeasible", notes=notes, reasons=[head] + [text for _f, text in direct],
                           blocking=sorted({family for family, _t in direct}))
-    why = explain_month(run.ctx, run.rules, run.requests, MAX_CHANGES, run.seconds(EXPLAIN_SECONDS), days=days,
+    why = explain_month(run.ctx, run.rules, run.requests, run.max_changes, run.seconds(EXPLAIN_SECONDS), days=days,
                         allow=run.allow)
     if why.status == "found" and run.avoid:
         # 이유 찾기는 넘긴 묶음을 모른다 — 규칙을 다 지키는 해가 있는데 후보가 없었다면 넘긴 묶음 때문이다
@@ -296,7 +361,7 @@ def _no_candidate(run: _Run, proven: bool) -> EditResult:
                              max_levers=2, seconds=run.seconds(LEVER_SECONDS), screen=run.screen,
                              avoid_people=run.avoid)
     return EditResult("infeasible", notes=notes, blocking=why.families, levers=levers,
-                      reasons=[head] + why.sentences(run.ctx.names, MAX_CHANGES, list_bends=not levers))
+                      reasons=[head] + why.sentences(run.ctx.names, run.max_changes, list_bends=not levers))
 
 
 def _collect(run: _Run, em: EditModel, window: Tuple[int, int], loose, first_optimal: bool) -> List[Candidate]:
@@ -397,22 +462,13 @@ def verify_candidate(ctx: EditContext, rules: RuleSet, candidate: "Candidate", r
     후보를 찾은 뒤 자정을 넘기면 그사이 지난 날이 된 칸을 바꾸는 후보가 될 수 있어 날짜도 다시 본다.
     """
     allow = lever_allow(allow)
-    ctx, rules = _release(ctx, rules, requests)
-    rules = rules or build_rules(ctx)
-    grid = apply_candidate(ctx, candidate)
+    ctx, rules, grid, after_ctx, after_rules = _after(ctx, rules, candidate, requests)
     open_from = first_open_day(ctx, today or datetime.now(KST).date())
     found = [f"{c.day + 1}일은 이미 지난 날짜입니다" for c in candidate.changes if c.day < open_from][:1]
     # 묶인 칸(확정 원티드·파견 등)이 바뀌었으면 — 직접 짚은 확정 원티드 칸은 위에서 풀었다
     found += [f"{c.day + 1}일은 '{ctx.frozen[(c.nurse_id, c.day)]}' 칸입니다" for c in candidate.changes
               if not ctx.is_free(c.nurse_id, c.day)][:1]
     found += [f"요청 미충족 {r}" for r in requests if not is_satisfied(ctx, r, grid)]
-    # 휴가로 바뀐 칸은 대표코드가 O 그대로라 그대로 세면 순수 OFF 하한 위반을 놓친다(Codex 11-03) —
-    # 그 칸을 휴가로 넣은 재료로 규칙을 다시 세어, 지금(원래 재료) 값과 견준다
-    vacation = {(c.nurse_id, c.day) for c in candidate.changes if c.vacation}
-    after_ctx, after_rules = ctx, rules
-    if vacation:
-        after_ctx = with_vacation(ctx, vacation)
-        after_rules = build_rules(after_ctx)
     # 휴가 요청 칸에 정말 그 휴가 코드가 들어갔는가(검토 L6)
     found += [f"요청 미충족 {r}" for r in requests if isinstance(r, LeaveCell) and not any(
         (c.nurse_id, c.day, c.after) == (r.nurse_id, r.day, r.code) for c in candidate.changes)]
@@ -420,6 +476,28 @@ def verify_candidate(ctx: EditContext, rules: RuleSet, candidate: "Candidate", r
     found += [f"{k[0]} {k}" for k, _v in rule_regressions(after_ctx, after_rules, grid, requests, allow, before=base)]
     screen_allow = {**allow, **grid_relief(ctx, rules, list(requests), grid)}
     return found + [f"화면 {k}" for k in screen_problems(screen, candidate.changes, screen_allow)]
+
+
+def _after(ctx: EditContext, rules: Optional[RuleSet], candidate: "Candidate", requests: Sequence[EditRequest]):
+    """적용 판정 재료 — (풀 때 재료, 규칙, 적용한 격자, 적용 뒤를 셀 재료, 규칙).
+    휴가로 바뀐 칸은 대표코드가 O 그대로라 그대로 세면 순수 OFF 하한 위반을 놓친다(Codex 11-03) —
+    그 칸을 휴가로 넣은 재료로 규칙을 다시 세어, 지금(원래 재료) 값과 견준다."""
+    ctx, rules = _release(ctx, rules, requests)
+    rules = rules or build_rules(ctx)
+    grid = apply_candidate(ctx, candidate)
+    vacation = {(c.nurse_id, c.day) for c in candidate.changes if c.vacation}
+    if not vacation:
+        return ctx, rules, grid, ctx, rules
+    after_ctx = with_vacation(ctx, vacation)
+    return ctx, rules, grid, after_ctx, build_rules(after_ctx)
+
+
+def candidate_regressions(ctx: EditContext, rules: Optional[RuleSet], candidate: "Candidate",
+                          requests: Sequence[EditRequest]) -> Dict[Tuple, Tuple[int, int]]:
+    """이 후보로 지금보다 나빠지는 규칙 위치 전부 {위치: (전, 후)} — 고른 레버·그날 인원 요청·직접 짚은 원티드로
+    허용한 것도 빼지 않는다(적용 전 확인에서 '무엇을 감수하는지' 보여 줄 것 · 사용자 지시 11-03)."""
+    ctx, rules, grid, after_ctx, after_rules = _after(ctx, rules, candidate, requests)
+    return new_violations(measure(ctx, ctx.main, rules), measure(after_ctx, grid, after_rules))
 
 
 def _allowed_on_screen(v, allow: Dict[Tuple, int]) -> bool:

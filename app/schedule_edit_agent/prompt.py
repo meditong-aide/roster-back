@@ -25,8 +25,10 @@ SYSTEM = """너는 병원 간호 근무표 '수정' 도우미의 해석기다. �
 - 새로 칸을 바꾸는 요청은 propose_edit, 바로 앞 요청에 더하기·빼기·'그대로 두기'는 revise_edit.
 - 연차·병가·공가 같은 휴가를 그 날 칸에 넣는 말은 propose_edit 의 kind=leave(휴가 이름은 말한 그대로).
 - 그날 그 근무 인원을 늘리거나 줄이는 말('15일 E 한 명 더', '20일 N 한 명 빼', '20일 N에 1등급 넣어')은 propose_edit 의 kind=cover(사람 이름 없이 · 늘리면 change 1, 줄이면 change -1 · '5명으로'면 target · '15일 E 인원 좀 바꿔줘'처럼 몇 명인지 없으면 change·target 을 비운다 — 시스템이 지금 인원을 보여 주고 되묻는다. 날짜·근무를 이미 말했으면 되묻지 않는다). 병동 인원 기준 자체를 바꾸는 말은 설정 변경이다.
+- 여러 사람의 그 근무 수를 고르게 맞춰 달라는 말('N 근무 수 고르게 맞춰줘', '나이트 몰린 거 고르게', 'OFF 다 9개로')은 propose_edit 의 kind=balance(사람 이름 없이 · 모두 같은 수를 말하면 target · 대상은 시스템이 정한다). 한 사람의 개수만 말하면 kind=count.
 - 지금 근무표에서 누가·몇 개·무엇인지 묻는 말('15일 나이트 누구야', '장원영 N 몇 개야')은 lookup.
 - 근무표를 만들 때 하는 후처리를 지금 근무표에 해 달라는 말(예: '자동 연차전환 해줘', '남는 OFF 연차로 돌려줘')은 run_postprocess.
+- 시스템이 '그래도 진행할까요?'라고 물은 뒤의 '응·그래도 해줘'(go=true) / '아니·그만둘래'(go=false)는 answer_confirm.
 - 바꾸지 않고 답할 때(누가·며칠·무엇이 빠짐, 근무표 달 밖 날짜, 설정 변경·새로 만들기, 아직 못 하는 종류의 변경·조회, 상관없는 말, 지금 상태를 묻는 말)는 reply_only 의 kind 를 고른다. 답 문장은 시스템이 만든다.
 - 이름은 사용자가 말한 그대로 넣는다(호칭은 뺀다). 이름을 추측하거나 다른 사람으로 바꾸지 않는다.
 - 날짜는 근무표 달의 '일' 숫자다. '내일·모레·다음 주 월요일'은 아래 '오늘'로 계산한다.
@@ -56,6 +58,8 @@ def state_summary(session: EditSession, today: date) -> str:
             parts.append(f"마지막 결과: {last.status} — {_clip(last.reasons[0], 80)}")
     if session.hint is not None:
         parts.append("사용자가 고른 안을 기준으로 다듬는 중")
+    if session.asking:
+        parts.append(f"확인 기다림: 그대로 바꾸면 생기는 것 {len(session.asking)}가지 — 그래도 진행할지 묻는 중")
     if session.allow:
         parts.append(f"이번 대화에서 넘기도록 허용한 설정 {len(session.allow)}곳")
     return "지금 상태 — " + " · ".join(parts)

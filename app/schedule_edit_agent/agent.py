@@ -23,6 +23,7 @@ from schedule_edit_agent.skills import (
     CHAT_BUDGET, MIN_SOLVE, OUT_OF_TIME, SKILLS, Outcome, SkillError, Turn, llm_tools, reply_text,
 )
 from services.schedule_edit.journal import record_event
+from services.schedule_edit.precheck import finding_from_json
 from services.schedule_edit.serialize import allow_from_json, requests_from_json
 from services.schedule_edit.session import EditSession, is_stale, open_session
 
@@ -32,10 +33,12 @@ LLM_FAILED = "지금 말씀을 해석하지 못했습니다. 잠시 뒤 다시 �
 #: 버튼을 최근 대화에 남길 때의 말 — 다음 말('그 안에서 15일은 빼줘')이 무엇을 가리키는지 LLM 이 알게
 BUTTON_TEXT = {"apply_edit": "{rank}번 안 적용", "reject_candidate": "{rank}번 안 넘기기",
                "keep_candidate": "{rank}번 안을 기준으로 다듬기", "choose_lever": "레버 고르기",
-               "choose_transfer": "메우는 방식 고르기({choice_id})"}
+               "choose_transfer": "메우는 방식 고르기({choice_id})", "confirm_request": "그래도 진행",
+               "cancel_request": "바꾸지 않기", "back_to_candidates": "다른 안 보기",
+               "retry_request": "같은 요청으로 다시 찾기"}
 #: 말이 흔적을 바꾸는 방식 — 새 요청은 흔적을 새로, 고쳐 말하면 단계로. 그 밖(상태 질문·안내)은 그대로
 #: (실화면 확인 11-03: '반영 안 된 거지?' 가 요청 줄을 덮어썼다)
-TRAIL = {"propose_edit": "new", "revise_edit": "step", "run_postprocess": "new"}
+TRAIL = {"propose_edit": "new", "revise_edit": "step", "run_postprocess": "new", "answer_confirm": "step"}
 
 
 @dataclass
@@ -130,16 +133,27 @@ class EditAgent:
         schedule_id = schedule_of(conv)
         if session is not None and session.schedule_id == schedule_id and not is_stale(db, session):
             return session
+        same = session is not None and session.schedule_id == schedule_id
         carry = conv.restored or ({"requests": session.requests, "allow": session.allow,
-                                   "avoid": session.avoid_people} if session is not None
-                                  and session.schedule_id == schedule_id else None)
+                                   "avoid": session.avoid_people} if same else None)
         fresh = open_session(db, schedule_id)
-        if session is not None and session.schedule_id == schedule_id:
+        if same:
             fresh.shown_notes = set(session.shown_notes)          # 같은 근무표면 참고 문구를 다시 붙이지 않는다(검토 L2)
+            # 동의한 것·묻는 중인 확인도 이어 간다(칸이 바뀌어 다시 열어도 같은 대화다). 되돌릴 앞 후보는 버린다 —
+            # 옛 판정 재료로 찾은 후보라 지금 근무표와 '전' 값이 다를 수 있다(검토 M2)
+            fresh.confirmed, fresh.asking = set(session.confirmed), list(session.asking)
+            fresh.held = (list(session.held[0]), None, list(session.held[2])) if session.held else None
         if carry:
             fresh.requests = (requests_from_json(carry["requests"]) if conv.restored else list(carry["requests"]))
             fresh.allow = (allow_from_json(carry["allow"]) if conv.restored else dict(carry["allow"]))
             fresh.avoid_people = [frozenset(p) for p in carry["avoid"]]
+        if conv.restored:
+            fresh.confirmed = set(conv.restored.get("confirmed") or [])
+            fresh.asking = [finding_from_json(f) for f in conv.restored.get("asking") or []]
+            held = conv.restored.get("held")
+            if held:        # 후보는 다시 풀어야 해서 요청만 되살린다(검토 M2)
+                fresh.held = (requests_from_json(held.get("requests") or []), None,
+                              [frozenset(p) for p in held.get("avoid") or []])
         conv.state, conv.restored = fresh, None
         return fresh
 

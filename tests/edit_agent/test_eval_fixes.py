@@ -62,10 +62,9 @@ def test_reference_note_is_shown_once_per_conversation(world):
 
 def test_unsupported_answer_names_the_kind(world):
     agent, _ = _agent(call("reply_only", kind="unsupported", topic="undo"),
-                      call("reply_only", kind="unsupported", topic="fairness"),
                       call("reply_only", kind="unsupported"))
     assert say(agent, world.conv, "방금 버전 되돌려줘").answer.startswith("만든 버전 되돌리기")
-    assert say(agent, world.conv, "OFF 다 9개로 맞춰줘").answer.startswith("여러 사람의 근무 수를 고르게 맞추기")
+    # (여러 사람 고르게 맞추기는 11-03 부터 지원 — kind=balance · tests/edit_agent/test_balance.py)
     assert "근무 모양 고치기" in say(agent, world.conv, "?").answer              # 종류를 모르면 전체 목록
 
 

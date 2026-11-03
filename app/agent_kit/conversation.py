@@ -1,7 +1,9 @@
 """대화 보관 — 실행 중 상태는 서버 메모리, 다시 세우기는 에이전트의 기록에서(근무표 수정은 `schedule_edit_log`).
 
   · 대화는 '대상(context)'을 하나 든다 — 근무표 수정이면 {"schedule_id"}. 대상이 바뀌면 에이전트 상태를 버린다.
-  · 메모리에 두는 것: 에이전트 실행 상태(state — 근무표 수정은 판정 재료)·최근 대화·대화 흔적(trail).
+  · 메모리에 두는 것: 에이전트 실행 상태(state — 근무표 수정은 판정 재료)·최근 대화·대화 흔적(trail)·마지막 블록.
+  · 화면은 대화 흐름을 그대로 보인다(사용자 결정 11-03 '대화 흐름 그대로') — 응답마다 지난 턴들(말·답 문장)을 싣고,
+    새로 고친 뒤에는 마지막 블록(버튼 포함)까지 다시 그린다. 지난 턴은 최근 history_keep 개만.
   · 메모리에서 내렸거나 서버가 재기동된 뒤에는 에이전트가 기록으로 다시 세운다(`Agent.restore`).
 
 유지·관리(사용자 지시 11-02 · 에이전트마다 Limits 로):
@@ -47,6 +49,19 @@ class ConversationError(Exception):
 ENDED = ("not_found", "closed", "expired", "too_long")
 
 
+#: 버튼 턴을 최근 대화(LLM 문맥)에 남길 때의 머리 — 화면에는 떼고 보인다
+BUTTON_MARK = "[버튼] "
+
+
+def said_view(user_text: str) -> Dict[str, str]:
+    """최근 대화의 사용자 쪽 말 → 화면에 보일 말 {kind: text|action, text}. 기록에서 다시 세운 턴도 이걸로."""
+    if user_text.startswith(BUTTON_MARK):
+        return {"kind": "action", "text": user_text[len(BUTTON_MARK):]}
+    if user_text.startswith("[action] "):
+        return {"kind": "action", "text": user_text[len("[action] "):]}
+    return {"kind": "text", "text": user_text}
+
+
 @dataclass
 class Conversation:
     id: str
@@ -57,8 +72,13 @@ class Conversation:
     touched_at: float
     limits: Limits = field(default_factory=Limits)
     turn_no: int = 0
-    #: 최근 대화 [{"user": 원문, "answer": 답}] — 오래된 것부터
-    history: List[Dict[str, str]] = field(default_factory=list)
+    #: 최근 대화 [{"user": 원문, "answer": 답, "shown": 화면에 보일 사용자 쪽 말}] — 오래된 것부터
+    history: List[Dict[str, Any]] = field(default_factory=list)
+    #: 마지막 턴에 보인 블록(흔적 빼고) — 새로 고친 뒤 이어 볼 때 그대로 다시 그린다
+    last_blocks: List[Dict[str, Any]] = field(default_factory=list)
+    #: 최근 대화 창에서 밀려난 턴 수 — 화면의 '앞의 대화 n개'. 턴 번호와 빼서 세면 기록이 없는 턴(버튼 등)이
+    #: 복원 대화에서 함께 셈해진다(검토 11-03)
+    dropped: int = 0
     #: 화면에 보일 흔적 — 지금 요청 한 줄과 그 뒤 고른 것들
     request: Optional[str] = None
     steps: List[str] = field(default_factory=list)
@@ -72,9 +92,20 @@ class Conversation:
         self.turn_no += 1
         return self.turn_no
 
-    def remember(self, user_text: str, answer: str) -> None:
-        self.history.append({"user": user_text, "answer": answer})
-        del self.history[:-self.limits.history_keep]
+    def remember(self, user_text: str, answer: str, shown: Optional[Dict[str, str]] = None) -> None:
+        self.history.append({"user": user_text, "answer": answer, "shown": shown or said_view(user_text)})
+        over = len(self.history) - self.limits.history_keep
+        if over > 0:
+            self.dropped += over
+            del self.history[:over]
+
+    def past(self) -> List[Dict[str, Any]]:
+        """화면에 보일 지난 턴(마지막 턴 빼고) — [{"said": {kind, text}, "answer": 문장}]."""
+        return [{"said": h.get("shown") or said_view(h["user"]), "answer": h["answer"]} for h in self.history[:-1]]
+
+    def cut(self) -> int:
+        """최근 대화 창에서 밀려나 화면에 못 보이는 앞 턴 수."""
+        return self.dropped
 
     def move_to(self, context: Dict[str, Any]) -> None:
         """대상을 옮긴다(화면에서 다른 버전으로 갔거나 적용으로 새 버전이 생김) — 실행 상태는 새로 연다."""

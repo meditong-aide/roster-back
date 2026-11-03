@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from agent_kit import blocks as B
 from agent_kit.base import Agent, TurnCall, TurnInput
-from agent_kit.conversation import ENDED, Conversation, ConversationError
+from agent_kit.conversation import ENDED, Conversation, ConversationError, said_view
 
 RENEWED = "이전 대화가 끝나 새 대화로 이어 갑니다."
 #: 말(text)이면 새 대화로 이어 받는 code — 끝난 대화 + 남의 대화(같은 브라우저에서 다른 계정으로 다시 로그인하면
@@ -77,7 +77,11 @@ def run_turn(agent: Agent, db: Session, user: Any, conv: Conversation, inp: Turn
     agent.check_input(inp)
     conv.begin_turn()
     result = agent.handle(TurnCall(db=db, user=user, conv=conv, input=inp, today=agent.today(), deadline=deadline))
-    conv.remember(result.said or inp.text or f"[{inp.kind}] {inp.action}", result.answer)
+    # 화면에 보일 사용자 쪽 말 — 버튼은 흔적 한 줄('그래도 진행')이 누른 것을 가장 잘 말한다
+    said = result.said or inp.text or f"[{inp.kind}] {inp.action}"
+    shown = ({"kind": "text", "text": inp.text or ""} if inp.kind == "text"
+             else {"kind": "action", "text": result.step or said_view(said)["text"]})
+    conv.remember(said, result.answer, shown)
     if inp.kind == "text" and result.trail == "new":
         conv.request, conv.steps = result.request_line or inp.text, []
     elif inp.kind == "text" and result.trail == "step":
@@ -86,12 +90,55 @@ def run_turn(agent: Agent, db: Session, user: Any, conv: Conversation, inp: Turn
         conv.steps.append(result.step)
     if result.context is not None and result.context != conv.context:
         conv.move_to(result.context)
+    conv.last_blocks = list(result.blocks)
+    return _response(agent, conv, list(result.blocks), list(result.effects), renewed=renewed)
+
+
+@contextmanager
+def viewing(agent: Agent, db: Session, user: Any, conversation_id: str) -> Iterator[Conversation]:
+    """이어 보기용 대화 잠금 — 턴 한도·만료는 보지 않는다(다 쓴 대화도 마지막 결과는 다시 본다 · 버튼은 그 뒤 턴이
+    거절한다). 서버 슬롯은 잡지 않는다 — 메모리 블록을 다시 보이는 데 풀이 자리를 기다리게 하지 않는다(검토 11-03)."""
+    try:
+        conv = agent.store.checkout(db, conversation_id, user.account_id, check_limits=False)
+    except ConversationError as exc:
+        raise TurnError(exc.code, exc.message, exc.status) from exc
+    try:
+        yield conv
+    finally:
+        agent.store.checkin(conv)
+
+
+def view_turn(agent: Agent, db: Session, user: Any, conv: Conversation, context: Dict[str, Any],
+              deadline: float) -> Dict[str, Any]:
+    """새로 고친 뒤 이어 보기 — 턴을 쓰지 않고 지난 턴들과 마지막 블록(버튼 포함)을 다시 그린다.
+    메모리에 블록이 없으면(재기동·내려간 대화) 에이전트가 지금 상태로 다시 그린다(`Agent.current` · 판정 재료를 다시
+    읽을 수 있어 그때만 서버 슬롯을 잡는다)."""
+    if conv.context != context:
+        raise TurnError("context_changed", agent.moved_message, 409)
+    blocks = conv.last_blocks
+    if not blocks and conv.history:
+        wait = min(agent.slot_wait_seconds, deadline - time.monotonic() - agent.min_work_seconds)
+        if wait <= 0 or not agent.slots.acquire(timeout=wait):
+            raise TurnError("server_busy", "다른 요청을 처리하고 있습니다. 잠시 뒤 다시 열어 주세요.", 429)
+        try:
+            blocks = agent.current(db, user, conv)
+        finally:
+            agent.slots.release()
+    conv.last_blocks = list(blocks)
+    return _response(agent, conv, list(blocks), [])
+
+
+def _response(agent: Agent, conv: Conversation, blocks, effects, *, renewed: bool = False) -> Dict[str, Any]:
     shown = [B.notice(RENEWED)] if renewed else []
     if conv.request:
         shown.append(B.trail(conv.request, conv.steps))
     info = conv.info()
+    last = conv.history[-1] if conv.history else None
     return {
         "agent": agent.id, "conversation_id": conv.id, "turn_no": conv.turn_no, "context": dict(conv.context),
-        "blocks": shown + list(result.blocks), "effects": list(result.effects),
+        "blocks": shown + blocks, "effects": effects,
         "status": {k: info[k] for k in ("turns_left", "idle_expires_in_s", "expires_in_s")},
+        # 대화 흐름 — 지난 턴(말·답 문장)과 이 턴의 사용자 쪽 말. 버튼·카드는 이 턴 블록에만 있다
+        "history": conv.past(), "said": (last.get("shown") or said_view(last["user"])) if last else None,
+        "history_cut": conv.cut(),
     }

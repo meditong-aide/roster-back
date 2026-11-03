@@ -55,7 +55,7 @@ def restore(db: Session, conversation_id: str) -> Conversation:
     conv = Conversation(id=conversation_id, agent=AGENT_ID, owner=str(head.created_by or ""),
                         context={"schedule_id": rows[0].schedule_id}, created_at=head.created_at.timestamp(),
                         touched_at=time.time(), limits=LIMITS)
-    empty = {"requests": [], "allow": [], "avoid": []}
+    empty = {"requests": [], "allow": [], "avoid": [], "confirmed": [], "asking": [], "held": None}
     state: Dict[str, Any] = dict(empty)
     said: Optional[str] = None
     for row in rows:
@@ -72,13 +72,27 @@ def restore(db: Session, conversation_id: str) -> Conversation:
                 said = None
         elif row.event in ("propose", "clarify"):
             if row.event == "propose":
-                state = {k: payload.get(k) or [] for k in ("requests", "allow", "avoid")}
+                result = payload.get("result") or {}
+                asking = result.get("findings") or [] if result.get("status") == "confirm" else []
+                # 바꾸기 전 확인을 묻던 중이면 그 확인과, [바꾸지 않기]면 돌아갈 앞 요청(held)을 되살린다
+                held = (state.get("held") or {k: state.get(k) or [] for k in ("requests", "allow", "avoid")}) \
+                    if asking else None
+                state = {**{k: payload.get(k) or [] for k in ("requests", "allow", "avoid")},
+                         "confirmed": state.get("confirmed") or [], "asking": asking, "held": held}
                 # 흔적의 요청 줄은 해석한 요청으로(화면에 보였던 것과 같게 · 평가 11-03 U1)
                 line = SOURCE_WORD.get(payload["postprocess"]) if payload.get("postprocess") else payload.get("described")
                 conv.request = line or conv.request
             if said is not None:
                 conv.remember(said, payload.get("answer", ""))
                 said = None
+        elif row.event == "confirm":
+            # 동의로 넘긴 허용량도 함께 — 다음 제안 기록 전에 끊기면(시간 부족·재기동) 동의만 남고 양이 빠진다(검토 M1)
+            state = {**state, "confirmed": list(state.get("confirmed") or []) + list(payload.get("ids") or []),
+                     "allow": payload.get("allow_total") or state.get("allow") or [], "asking": []}
+        elif row.event == "cancel":
+            # [바꾸지 않기] — 묻기 전 요청으로 돌아갔다
+            state = {**{k: payload.get(k) or [] for k in ("requests", "allow", "avoid")},
+                     "confirmed": state.get("confirmed") or [], "asking": [], "held": None}
         elif row.event == "apply" and row.new_schedule_id:
             # 적용 뒤에는 새 버전에서 이어 간다
             conv.context, state = {"schedule_id": row.new_schedule_id}, dict(empty)
