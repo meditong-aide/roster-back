@@ -1,4 +1,6 @@
+import itertools
 import pprint
+import re
 import uuid
 from datetime import date
 from datetime import datetime
@@ -46,7 +48,7 @@ from fastapi.responses import (
     StreamingResponse,
     FileResponse,
 )
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Iterable
 from sqlalchemy.orm import Session
 from datetime import datetime
 from db.roster_config import NurseRosterConfig, DEFAULT_CONFIG
@@ -2716,36 +2718,52 @@ def save_roster(
 _SCHEDULE_NAME_MAX = 50
 
 
-def _save_as_name(requested: Optional[str], source: Schedule) -> str:
+#: 이름 끝의 '수정본'·'수정본 N' — 수정본을 다시 고칠 때 꼬리를 또 붙이지 않고 번호를 올린다
+_EDIT_TAIL = re.compile(r"\s*수정본(?:\s*\d+)?$")
+
+
+def _save_as_name(requested: Optional[str], source: Schedule, taken: Iterable[Optional[str]] = ()) -> str:
     """새 버전 이름 — 비우면 '원본이름 수정본'. 컬럼 길이를 넘기지 않게 자른다.
 
     ★ 기본 이름은 **원본 이름 쪽을** 잘라 ' 수정본' 꼬리를 지킨다 — 끝을 자르면 '…가 수' 처럼
       무엇인지 모를 이름이 된다(48자 원본 실측).
+    ★ 원본이 이미 수정본이면 꼬리를 떼고 번호를 올린다 — 'VER1 수정본' → 'VER1 수정본 2' → 'VER1 수정본 3'
+      ('VER1 수정본 수정본' 이 쌓였다 · 사용자 지적 11-03). taken(같은 병동·달의 이름)과 겹치면 다음 번호 —
+      한 원본에서 두 번 만들어도 이름이 같지 않게.
     """
     name = (requested or "").strip()
     if name:
         return name[:_SCHEDULE_NAME_MAX]
-    suffix = " 수정본"
-    base = (source.name or f"{source.month}월 근무표 VER{source.version}").strip()
-    return base[:_SCHEDULE_NAME_MAX - len(suffix)] + suffix
+    plain = f"{source.month}월 근무표 VER{source.version}"
+    base = _EDIT_TAIL.sub("", (source.name or plain).strip()).strip() or plain
+    used = {(t or "").strip() for t in taken}
+    for n in itertools.count(1):
+        suffix = " 수정본" if n == 1 else f" 수정본 {n}"
+        candidate = base[:_SCHEDULE_NAME_MAX - len(suffix)] + suffix
+        if candidate not in used:
+            return candidate
 
 
 def _new_version_row(db: Session, source: Schedule, req: SaveAsRequest, current_user: UserSchema) -> Schedule:
     """원본과 같은 병동·달·설정의 새 draft 버전 행(번호는 그룹·달 잠금 뒤 최대+1)."""
+    version = _get_next_version(db, source.group_id, source.year, source.month)
+    # 같은 병동·달의 이름(지운 버전 포함) — 번호 잠금 뒤에 읽어 동시에 만들어도 같은 이름이 나오지 않게
+    taken = [n for (n,) in db.query(Schedule.name).filter(
+        Schedule.group_id == source.group_id, Schedule.year == source.year, Schedule.month == source.month).all()]
     new_schedule = Schedule(
         schedule_id=str(uuid.uuid4().hex)[:12],
         office_id=source.office_id,
         group_id=source.group_id,
         year=source.year,
         month=source.month,
-        version=_get_next_version(db, source.group_id, source.year, source.month),
+        version=version,
         config_id=source.config_id,
         created_by=current_user.account_id,
         created_at=datetime.now(),
         updated_at=datetime.now(),
         status="draft",
         dropped=False,
-        name=_save_as_name(req.name, source),
+        name=_save_as_name(req.name, source, taken),
         memo=req.memo if req.memo is not None else source.memo,
     )
     db.add(new_schedule)
