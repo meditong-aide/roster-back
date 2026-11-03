@@ -48,7 +48,7 @@ from fastapi.responses import (
     StreamingResponse,
     FileResponse,
 )
-from typing import Optional, List, Dict, Any, Iterable
+from typing import Optional, List, Dict, Any, Iterable, Tuple
 from sqlalchemy.orm import Session
 from datetime import datetime
 from db.roster_config import NurseRosterConfig, DEFAULT_CONFIG
@@ -2719,7 +2719,18 @@ _SCHEDULE_NAME_MAX = 50
 
 
 #: 이름 끝의 '수정본'·'수정본 N' — 수정본을 다시 고칠 때 꼬리를 또 붙이지 않고 번호를 올린다
-_EDIT_TAIL = re.compile(r"\s*수정본(?:\s*\d+)?$")
+_EDIT_TAIL = re.compile(r"\s*수정본(?:\s*(\d+))?$")
+
+
+def _edit_stem(name: str) -> Tuple[str, int]:
+    """(꼬리를 뗀 이름, 수정본 번호) — 꼬리가 없으면 번호 0, '수정본'은 1. 예전에 쌓인 '수정본 수정본'도 끝까지 뗀다."""
+    stem, no = name.strip(), 0
+    while True:
+        m = _EDIT_TAIL.search(stem)
+        if not m:
+            return stem, no
+        no = no or int(m.group(1) or 1)
+        stem = stem[:m.start()].strip()
 
 
 def _save_as_name(requested: Optional[str], source: Schedule, taken: Iterable[Optional[str]] = ()) -> str:
@@ -2728,16 +2739,27 @@ def _save_as_name(requested: Optional[str], source: Schedule, taken: Iterable[Op
     ★ 기본 이름은 **원본 이름 쪽을** 잘라 ' 수정본' 꼬리를 지킨다 — 끝을 자르면 '…가 수' 처럼
       무엇인지 모를 이름이 된다(48자 원본 실측).
     ★ 원본이 이미 수정본이면 꼬리를 떼고 번호를 올린다 — 'VER1 수정본' → 'VER1 수정본 2' → 'VER1 수정본 3'
-      ('VER1 수정본 수정본' 이 쌓였다 · 사용자 지적 11-03). taken(같은 병동·달의 이름)과 겹치면 다음 번호 —
-      한 원본에서 두 번 만들어도 이름이 같지 않게.
+      ('VER1 수정본 수정본' 이 쌓였다 · 사용자 지적 11-03). 번호는 같은 계열 이름(taken = 같은 병동·달) 중 가장 큰
+      번호 + 1 이라 되돌아가지 않고, 한 원본에서 두 번 만들어도 겹치지 않는다. 길이 한도에서 잘린 이름은 앞부분이
+      서로 이어지면 같은 계열로 본다 — 꼬리 길이에 따라 잘리는 자리가 달라 정확히 같지 않다(Codex 11-03).
     """
     name = (requested or "").strip()
     if name:
         return name[:_SCHEDULE_NAME_MAX]
     plain = f"{source.month}월 근무표 VER{source.version}"
-    base = _EDIT_TAIL.sub("", (source.name or plain).strip()).strip() or plain
+    raw = (source.name or plain).strip()
+    base = _edit_stem(raw)[0] or plain
+    last = 0
+    for other in taken:
+        other = (other or "").strip()
+        stem, no = _edit_stem(other)
+        if not no:
+            continue
+        clipped = len(other) >= _SCHEDULE_NAME_MAX or len(raw) >= _SCHEDULE_NAME_MAX
+        if stem == base or (clipped and stem and (stem.startswith(base) or base.startswith(stem))):
+            last = max(last, no)
     used = {(t or "").strip() for t in taken}
-    for n in itertools.count(1):
+    for n in itertools.count(last + 1):
         suffix = " 수정본" if n == 1 else f" 수정본 {n}"
         candidate = base[:_SCHEDULE_NAME_MAX - len(suffix)] + suffix
         if candidate not in used:
