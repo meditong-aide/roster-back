@@ -2989,24 +2989,23 @@ def get_submission_statuses(
         db.query(Nurse.nurse_id).filter(Nurse.group_id == target_group_id).all()
     )
     nurse_ids_in_group = {n[0] for n in nurses_in_group}
-    # 각 간호사의 최신 제출 상태 확인
+    # 그 달에 제출한 요청이 하나라도 있는 간호사 — 간호사마다 묻던 것을 한 번에(로컬 실측 20명 20문장).
+    # IN 매개변수 상한(2,100)을 넘지 않게 1,000명씩.
     submitted_nurse_ids = set()
     month_str = f"{year:04d}-{month:02d}"
-    for nurse_id in nurse_ids_in_group:
-        # 해당 간호사의 최신 제출된 선호도가 있는지 확인
-        latest_submitted = (
-            db.query(WantedRequest)
+    _ids = list(nurse_ids_in_group)
+    for i in range(0, len(_ids), 1000):
+        submitted_nurse_ids.update(
+            row[0]
+            for row in db.query(WantedRequest.nurse_id)
             .filter(
-                WantedRequest.nurse_id == nurse_id,
-                # ShiftPreference.year == year,
+                WantedRequest.nurse_id.in_(_ids[i:i + 1000]),
                 WantedRequest.month == month_str,
                 WantedRequest.is_submitted == True,
             )
-            .order_by(WantedRequest.submitted_at.desc())
-            .first()
+            .distinct()
+            .all()
         )
-        if latest_submitted:
-            submitted_nurse_ids.add(nurse_id)
     return {
         "submitted_nurses": list(submitted_nurse_ids),
     }

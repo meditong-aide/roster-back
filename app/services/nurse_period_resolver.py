@@ -72,6 +72,24 @@ def is_weekend_off_asof(db, nurse_id, day: date | None = None) -> bool:
     return bool(resolve_asof(rows.get(str(nurse_id)), d, "weekend_off", default=None))
 
 
+def weekend_off_asof_map(db, nurse_ids, day: date | None = None) -> dict[str, bool]:
+    """여러 간호사의 주말휴무 여부(as-of day, 기본 today) — `is_weekend_off_asof` 를 사람마다 부르던 것을
+    한 번에(같은 창 [day, day+1) · 같은 해석). 반환 {nurse_id(str): bool}.
+
+    IN 매개변수 상한(2,100)을 넘지 않게 1,000명씩 나눠 읽는다.
+    """
+    from datetime import timedelta
+    from db.models import NurseWeekendOffPeriod
+    ids = list(dict.fromkeys(str(x) for x in (nurse_ids or []) if x))
+    if not ids:
+        return {}
+    d = day or date.today()
+    rows: dict[str, list] = {}
+    for i in range(0, len(ids), 1000):
+        rows.update(fetch_periods(db, NurseWeekendOffPeriod, ids[i:i + 1000], d, d + timedelta(days=1)))
+    return {nid: bool(resolve_asof(rows.get(nid), d, "weekend_off", default=None)) for nid in ids}
+
+
 def weekend_off_ids_asof(db, nurse_ids, year: int, month: int) -> set[str]:
     """as-of (year, month) 기준 주말휴무 대상 nurse_id 집합.
 

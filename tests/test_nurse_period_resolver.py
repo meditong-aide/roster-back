@@ -148,3 +148,17 @@ def test_open_span_covering(db):
     assert cur is not None and cur.allowed_shifts == ["D"]
     # 구간 시작 전엔 None
     assert open_span_covering(db, NurseAllowedShiftPeriod, "o1", date(2026, 6, 1)) is None
+
+
+# ── 여러 간호사 주말휴무 한 번에(weekend_off_asof_map) = 사람마다 부른 값 ──────────
+def test_weekend_off_asof_map_matches_single_lookup(db):
+    from services.nurse_period_resolver import is_weekend_off_asof, weekend_off_asof_map
+    upsert_period(db, NurseWeekendOffPeriod, "w1", date(2026, 7, 1), "weekend_off", 1, today=date(2026, 7, 1))
+    upsert_period(db, NurseWeekendOffPeriod, "w2", date(2026, 7, 1), "weekend_off", 1, today=date(2026, 7, 1))
+    upsert_period(db, NurseWeekendOffPeriod, "w2", date(2026, 7, 15), "weekend_off", 0, today=date(2026, 7, 1))
+    db.flush()
+    ids = ["w1", "w2", "w3", None, ""]          # w3 = 구간 없음(gap) · 빈 id 는 빠진다
+    for day in (date(2026, 6, 30), date(2026, 7, 1), date(2026, 7, 14), date(2026, 7, 15)):
+        got = weekend_off_asof_map(db, ids, day)
+        assert got == {n: is_weekend_off_asof(db, n, day) for n in ("w1", "w2", "w3")}
+    assert weekend_off_asof_map(db, []) == {}

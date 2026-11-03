@@ -471,6 +471,7 @@ def _compute_weekly_off_days(
     year: int,
     month: int,
     assignment_overlay: Optional[NurseAssignment] = None,
+    nurse_row: Optional[Nurse] = None,
 ) -> Set[int]:
     """주휴 사용 간호사의 주휴 일자(day set)를 계산합니다.
 
@@ -481,11 +482,13 @@ def _compute_weekly_off_days(
         year: 대상 연도
         month: 대상 월
         assignment_overlay: 지정 시 target_weekly_off_* 값으로 overlay (inbound 간호사 전용)
+        nurse_row: 이미 읽은 그 간호사 행 — 주면 다시 읽지 않는다(조정판이 간호사마다 다시 읽었다)
 
     반환:
         주휴 요일에 해당하는 day 집합(1~31). 휴직 기간은 제외.
     """
-    nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
+    if nurse_row is None:
+        nurse_row = db.query(Nurse).filter(Nurse.nurse_id == nurse_id).first()
     if not nurse_row:
         return set()
 
@@ -2706,6 +2709,42 @@ def get_wanted_adjustment_service(
         )
 
     nurses = list(source_nurses) + list(inbound_nurses)
+    # 간호사마다 따로 읽던 확정·금지 원티드·마지막 제출·제출 칸을 한 번씩 읽는다(로컬 실측 17명 91문장 1.7초).
+    # 행 순서는 간호사별로 따로 읽을 때와 같게 기본 키 순으로 맞춘다 — 응답 순서·임시 id 가 행 순서를 따른다.
+    _nurse_ids = [n.nurse_id for n in nurses]
+    _fixed_by_nurse: Dict[str, List[FixedWantedEntry]] = defaultdict(list)
+    _banned_by_nurse: Dict[str, List[BannedWantedEntry]] = defaultdict(list)
+    _latest_wr: Dict[str, WantedRequest] = {}
+    _shift_req_by_nurse: Dict[str, List[NurseShiftRequest]] = defaultdict(list)
+    if _nurse_ids:
+        for fe in sorted(db.query(FixedWantedEntry).filter(
+                FixedWantedEntry.nurse_id.in_(_nurse_ids),
+                FixedWantedEntry.year == year,
+                FixedWantedEntry.month == month,
+        ).all(), key=lambda r: r.id or 0):
+            _fixed_by_nurse[fe.nurse_id].append(fe)
+        for be in sorted(db.query(BannedWantedEntry).filter(
+                BannedWantedEntry.nurse_id.in_(_nurse_ids),
+                BannedWantedEntry.year == year,
+                BannedWantedEntry.month == month,
+        ).all(), key=lambda r: r.id or 0):
+            _banned_by_nurse[be.nurse_id].append(be)
+        for wr in db.query(WantedRequest).filter(
+                WantedRequest.nurse_id.in_(_nurse_ids),
+                WantedRequest.month == month_str,
+        ).all():
+            cur = _latest_wr.get(wr.nurse_id)
+            if cur is None or wr.request_id > cur.request_id:
+                _latest_wr[wr.nurse_id] = wr
+        _submitted = [(nid, wr.request_id) for nid, wr in _latest_wr.items() if wr.is_submitted]
+        if _submitted:
+            for sr in sorted(db.query(NurseShiftRequest).filter(
+                    or_(*[and_(NurseShiftRequest.nurse_id == nid, NurseShiftRequest.request_id == rid)
+                          for nid, rid in _submitted]),
+                    NurseShiftRequest.shift_date >= start_date,
+                    NurseShiftRequest.shift_date < end_date,
+            ).all(), key=lambda r: (r.request_id, r.detailed_request_id, r.shift_date)):
+                _shift_req_by_nurse[sr.nurse_id].append(sr)
     nurse_data_list: List[AdjustmentNurse] = []
     # caller 관할(stored group_id 불문) FixedWantedEntry 존재 여부 (UI 모드 플래그).
     # target caller 가 source 저장 엔트리를 상속받는 케이스 포함.
@@ -2760,11 +2799,7 @@ def get_wanted_adjustment_service(
         # FixedWantedEntry: stored group_id 불문, shift_date 기준 caller 관할 일자만 노출.
         # - blocked_set 으로 caller 관할 외 일자 제외.
         # - 동일 (nurse_id, shift_date) 중복은 최신 id 우선 (target-saved > 구 source-saved).
-        nurse_fixed_entries = db.query(FixedWantedEntry).filter(
-            FixedWantedEntry.nurse_id == nurse.nurse_id,
-            FixedWantedEntry.year == year,
-            FixedWantedEntry.month == month,
-        ).all()
+        nurse_fixed_entries = _fixed_by_nurse.get(nurse.nurse_id, [])
 
         _by_date: Dict[date, FixedWantedEntry] = {}
         for fe in nurse_fixed_entries:
@@ -2799,18 +2834,10 @@ def get_wanted_adjustment_service(
             # NurseShiftRequest fallback (최종 request_id 기준 제출 여부 확인).
             # caller 소유 일자만 반환(blocked_set 제외) — 파견 기간에 대한 제출은
             # source caller 조회에서, 원소속 기간은 target caller 조회에서 각각 제거.
-            latest_wr = db.query(WantedRequest).filter(
-                WantedRequest.nurse_id == nurse.nurse_id,
-                WantedRequest.month == month_str,
-            ).order_by(WantedRequest.request_id.desc()).first()
+            latest_wr = _latest_wr.get(nurse.nurse_id)
 
             if latest_wr and latest_wr.is_submitted:
-                shift_requests = db.query(NurseShiftRequest).filter(
-                    NurseShiftRequest.nurse_id == nurse.nurse_id,
-                    NurseShiftRequest.request_id == latest_wr.request_id,
-                    NurseShiftRequest.shift_date >= start_date,
-                    NurseShiftRequest.shift_date < end_date,
-                ).all()
+                shift_requests = _shift_req_by_nurse.get(nurse.nurse_id, [])
 
                 for idx, sr in enumerate(shift_requests):
                     if sr.shift_date in blocked_set:
@@ -2837,7 +2864,7 @@ def get_wanted_adjustment_service(
         # outbound 케이스: nurse.weekly_off 가 활성이어도 파견 기간(blocked_set)은
         # 타 병동 관할이라 source caller 에서 주휴를 드러내면 안 됨.
         _raw_wo_days = sorted(_weekly_off_days_for_caller(
-            db, nurse.nurse_id, group_id, year, month, _inbound_asgs,
+            db, nurse.nurse_id, group_id, year, month, _inbound_asgs, nurse_row=nurse,
         ))
         weekly_off_days: List[int] = [
             day for day in _raw_wo_days
@@ -2869,11 +2896,7 @@ def get_wanted_adjustment_service(
         #   그대로 되돌려 보내도 nurse 건은 서버가 걸러내 승격되지 않는다
         #   (`save_banned_wanted_service` 의 nurse 셀 제외 가드).
         banned_out: List[BannedWantedEntryResponse] = []
-        nurse_banned_entries = db.query(BannedWantedEntry).filter(
-            BannedWantedEntry.nurse_id == nurse.nurse_id,
-            BannedWantedEntry.year == year,
-            BannedWantedEntry.month == month,
-        ).all()
+        nurse_banned_entries = _banned_by_nurse.get(nurse.nurse_id, [])
         _banned_by_date: Dict[date, BannedWantedEntry] = {}
         for be in nurse_banned_entries:
             if be.shift_date in blocked_set:
@@ -2933,7 +2956,7 @@ def _inbound_assignments_for_caller(
 
 def _weekly_off_days_for_caller(
     db: Session, nurse_id: str, group_id: str, year: int, month: int,
-    inbound_asgs: List[NurseAssignment],
+    inbound_asgs: List[NurseAssignment], nurse_row: Optional[Nurse] = None,
 ) -> Set[int]:
     """그 병동이 보는 주휴 일자(day set).
 
@@ -2943,13 +2966,14 @@ def _weekly_off_days_for_caller(
     조정판 표시와 확정 원티드 저장(자동 주휴 '주' 건너뛰기)이 같이 쓴다.
     """
     if not inbound_asgs:
-        return _compute_weekly_off_days(db, nurse_id, group_id, year, month)
+        return _compute_weekly_off_days(db, nurse_id, group_id, year, month, nurse_row=nurse_row)
     days: Set[int] = set()
     for asg in inbound_asgs:
         in_dates, _ = _assignment_window_dates(asg, year, month)
         if not in_dates:
             continue
-        wo = _compute_weekly_off_days(db, nurse_id, group_id, year, month, assignment_overlay=asg)
+        wo = _compute_weekly_off_days(db, nurse_id, group_id, year, month, assignment_overlay=asg,
+                                      nurse_row=nurse_row)
         days |= {d.day for d in in_dates} & wo
     return days
 

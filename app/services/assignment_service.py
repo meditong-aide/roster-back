@@ -1306,9 +1306,18 @@ def group_members_in_month(
         v = _resolve_asof(_allowed_periods.get(nid), month_start, "fixed_shift", default=None)
         return v if v is not None else getattr(n_obj, "fixed_shift", None)
 
+    _period_set = set(_period_ids)
+
+    def _weekend_now(n_obj) -> int:
+        """월초 기준 주말휴무 — 미리 읽은 사람은 다시 묻지 않는다(`is_weekend_off_asof` 와 같은 창 [월초, +1일))."""
+        nid = str(n_obj.nurse_id)
+        if nid in _period_set:
+            return 1 if _resolve_asof(_weekend_periods.get(nid), month_start, "weekend_off", default=None) else 0
+        return 1 if is_weekend_off_asof(db, n_obj.nurse_id, month_start) else 0
+
     def _asof_weekend(nid: str, n_obj):
         v = _resolve_asof(_weekend_periods.get(nid), month_start, "weekend_off", default=None)
-        return v if v is not None else (1 if is_weekend_off_asof(db, n_obj.nurse_id, month_start) else 0)
+        return v if v is not None else _weekend_now(n_obj)
 
     def _row(n, status, marker, badge, team, grade, night_profile=...,
              weekend_off=..., fixed_shift=..., resign_date=None):
@@ -1317,7 +1326,7 @@ def group_members_in_month(
         #   아니라). 안 그러면 근무형태=DEN 인데 배지만 N전담으로 남는 불일치(/nurses·엔진은 오버레이 사용).
         #   night_profile 미지정(home) 은 base 사용. (생성기는 N전담을 팀 D/E 커버리지에서 제외.)
         _np = getattr(n, "allowed_shifts", None) if night_profile is ... else night_profile
-        _wo = (1 if is_weekend_off_asof(db, n.nurse_id, month_start) else 0) if weekend_off is ... else weekend_off
+        _wo = _weekend_now(n) if weekend_off is ... else weekend_off
         _fx = getattr(n, "fixed_shift", None) if fixed_shift is ... else fixed_shift
         night_dedicated = is_n_only_profile(_np)
         if night_dedicated and badge is None:

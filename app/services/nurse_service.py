@@ -456,7 +456,9 @@ def get_nurses_in_group_service(
 
     # 결과 변환: NurseProfile과 호환
     result = []
-    from services.nurse_period_resolver import is_weekend_off_asof
+    # 주말휴무(오늘 기준)는 사람마다 묻지 않고 한 번에 읽는다(같은 창·같은 해석 · 로컬 실측 20명 20문장)
+    from services.nurse_period_resolver import weekend_off_asof_map
+    weekend_off_map = weekend_off_asof_map(db, [n.nurse_id for n in nurses])
     for nurse in nurses:
         allowed_shifts = nurse.allowed_shifts or []
 
@@ -506,7 +508,7 @@ def get_nurses_in_group_service(
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
-            "is_weekend_off": is_weekend_off_asof(db, nurse.nurse_id),
+            "is_weekend_off": weekend_off_map.get(str(nurse.nurse_id), False),
             "work_shifts": nurse.work_shifts
             or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
             # 원티드 설정 (간호사별 개별 설정)
@@ -686,7 +688,9 @@ def get_nurses_filtered_service(
 
     # 결과 변환: NurseProfile과 호환
     result = []
-    from services.nurse_period_resolver import is_weekend_off_asof
+    # 주말휴무(오늘 기준)는 사람마다 묻지 않고 한 번에 읽는다(같은 창·같은 해석 · 로컬 실측 20명 20문장)
+    from services.nurse_period_resolver import weekend_off_asof_map
+    weekend_off_map = weekend_off_asof_map(db, [n.nurse_id for n in nurses])
     for nurse in nurses:
         allowed_shifts = nurse.allowed_shifts or []
 
@@ -735,7 +739,7 @@ def get_nurses_filtered_service(
             "weekly_off_weekday": nurse.weekly_off_weekday,
             "age": calculate_age(nurse.birth_date),
             "gender": nurse.gender,
-            "is_weekend_off": is_weekend_off_asof(db, nurse.nurse_id),
+            "is_weekend_off": weekend_off_map.get(str(nurse.nurse_id), False),
             "work_shifts": nurse.work_shifts
             or [],  # JSON 컬럼이므로 None일 수 있음 → []로 변환
             # 원티드 설정 (간호사별 개별 설정)
