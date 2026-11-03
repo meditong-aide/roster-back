@@ -113,7 +113,7 @@ def test_infeasible_request_offers_a_lever_and_applying_it_finds_a_candidate():
     assert res.status == "infeasible" and len(res.levers) == 1
     lever = res.levers[0]
     assert lever.allow == {("OFF수", "A", None, None, "상한"): 1}
-    assert lever.lose == ["A 개인 OFF 수 상한을 1 넘김"]
+    assert lever.lose == ["A 개인 OFF 수 상한을 1개 넘김"]
     assert lever.changes == (None, 1)
     again = propose(ctx, [SetCell("A", 0, "O")], allow=lever.allow)
     assert again.status == "ok" and again.candidates[0].changed_count == 1

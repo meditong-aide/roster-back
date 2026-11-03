@@ -498,7 +498,7 @@ def with_released(ctx: EditContext, cells) -> EditContext:
         out.frozen = {c: r for c, r in ctx.frozen.items() if c not in fixed}
         out.ban_n_before = set()
         _load_ban_n_before(out)
-    out.notes += [f"{ctx.names.get(n, n)} {d + 1}일은 {'확정 원티드' if (n, d) in fixed else '원티드로 받은'} 칸이지만 "
+    out.notes += [f"{ctx.names.get(n, n)} {d + 1}일은 {'확정 원티드' if (n, d) in fixed else '원티드가 반영된'} 칸이지만 "
                   "직접 요청하셔서 바꿉니다." for n, d in sorted(fixed | wished, key=lambda c: (c[1], c[0]))]
     return out
 

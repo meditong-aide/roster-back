@@ -82,7 +82,7 @@ def test_transfer_question_becomes_a_choice(world):
     assert step.startswith("메우는 방식: ") and "같은 팀" in step
 
 
-def test_infeasible_shows_blocking_settings_and_lever_cards(world):
+def test_infeasible_shows_lever_cards_titled_by_the_setting(world):
     def tight():
         ctx = make_ctx({"A": "DDOO"}, off_days=2, config={"not_one_night": False})
         ctx.frozen[("A", 2)] = ctx.frozen[("A", 3)] = "주휴·특수 휴무"
@@ -94,14 +94,14 @@ def test_infeasible_shows_blocking_settings_and_lever_cards(world):
     levers = blocks[-1]
     assert levers["type"] == "cards" and levers["selectable"] is False and levers["footnote"] == LEVER_NOTE
     assert reply.preview.get("blocking")
-    assert blocks[1] == {"type": "text", "tone": "muted",
-                         "text": "막는 설정 — " + ", ".join(reply.preview["blocking"])}
+    assert [b["type"] for b in blocks[1:]] == ["cards"]          # 내부 규칙 이름 줄('막는 설정 — OFF수')은 없다
     lever = reply.preview["levers"][0]
     card = levers["items"][0]
     assert card["id"] == lever["lever_id"]
     assert card["actions"][0]["input"] == {"kind": "action", "action": "choose_lever",
                                            "params": {"lever_id": lever["lever_id"]}}
-    assert [ln["text"] for ln in card["lines"]][:len(lever["lose"])] == ["잃는 것: " + t for t in lever["lose"]]
+    assert card["title"] == " · ".join(lever["lose"]) == "A 개인 OFF 수 상한을 1개 넘김"   # 카드마다 무엇을 넘기는지
+    assert card["lines"][0]["text"].startswith("넘기면 ")
 
     step = step_label("choose_lever", {"lever_id": lever["lever_id"]}, world.conv.state)
     assert step == "이번만 넘김: " + ", ".join(lever["lose"])

@@ -194,7 +194,7 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
             "찾은 방법이 모두 근무표 화면에 새 위반을 만들어 후보로 내지 않았습니다."])
     if not explain:
         return EditResult("infeasible" if status == cp_model.INFEASIBLE else "timeout", notes=list(ctx.notes),
-                          reasons=[f"지금 규칙을 모두 지키면서 {MAX_CHANGES}칸 이내로는 방법이 없습니다."
+                          reasons=[f"지금 규칙을 모두 지키면서는 방법을 찾지 못했습니다(바꾸는 칸 {MAX_CHANGES}개까지 살펴봄)."
                                    if status == cp_model.INFEASIBLE else "시간 안에 방법을 찾지 못했습니다."])
     return _no_candidate(run, proven=status == cp_model.INFEASIBLE)
 
@@ -216,7 +216,7 @@ def _wished_night_before(ctx: EditContext, leave: Dict[Tuple[str, int], str],
     if not ctx.config.get("ban_night_before_fixed_off"):
         return []
     named = requested_cells(ctx, list(requests))
-    return [f"{ctx.names.get(n, n)} {d}일 나이트는 원티드로 받은 칸이라 {d + 1}일에 휴가를 넣으려면 그 나이트도 바꿔야 합니다"
+    return [f"{ctx.names.get(n, n)} {d}일 나이트는 원티드가 반영된 칸이라 {d + 1}일에 휴가를 넣으려면 그 나이트도 바꿔야 합니다"
             f"(휴가 전날 나이트 금지 설정). 바꿔도 되면 '{d}일 나이트도 빼줘'라고 함께 말씀해 주세요."
             for n, d in sorted(leave) if d >= 1 and (n, d - 1) not in leave and (n, d - 1) not in named
             and ctx.main[n][d - 1] == "N" and "N" in ctx.wishes.get((n, d - 1), ())]
@@ -278,7 +278,7 @@ def _no_candidate(run: _Run, proven: bool) -> EditResult:
         return EditResult("timeout", notes=notes, reasons=[
             "시간 안에 방법을 찾지 못했습니다. 요청을 나눠서 다시 시도해 주세요."])
     days = _window_days(run, None)
-    head = f"지금 규칙을 모두 지키면서 {MAX_CHANGES}칸 이내로 바꿔서는 이 요청을 들어줄 방법이 없습니다."
+    head = f"지금 규칙을 모두 지키면서는 이 요청을 들어줄 방법을 찾지 못했습니다(바꾸는 칸 {MAX_CHANGES}개까지 살펴봄)."
     direct = direct_conflicts(run.ctx, run.rules, run.requests, days)
     if direct:
         # 바꿀 수 없는 칸과 바로 부딪친다 — 풀이로 이유를 찾을 필요가 없다(하드락이라 넘김 안내도 없다)
@@ -296,7 +296,7 @@ def _no_candidate(run: _Run, proven: bool) -> EditResult:
                              max_levers=2, seconds=run.seconds(LEVER_SECONDS), screen=run.screen,
                              avoid_people=run.avoid)
     return EditResult("infeasible", notes=notes, blocking=why.families, levers=levers,
-                      reasons=[head] + why.sentences(run.ctx.names, MAX_CHANGES))
+                      reasons=[head] + why.sentences(run.ctx.names, MAX_CHANGES, list_bends=not levers))
 
 
 def _collect(run: _Run, em: EditModel, window: Tuple[int, int], loose, first_optimal: bool) -> List[Candidate]:

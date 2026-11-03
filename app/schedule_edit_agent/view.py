@@ -50,8 +50,7 @@ def blocks_for(reply: Reply, session: Optional[EditSession]) -> List[B.Block]:
     if status == "choose_transfer":
         return shown + [_transfer_choice(preview)]
     if status == "infeasible" and preview.get("levers"):
-        if preview.get("blocking"):
-            shown.append(B.text("막는 설정 — " + ", ".join(preview["blocking"]), tone="muted"))
+        # 막는 설정은 카드 제목이 하나씩 말한다 — 내부 규칙 이름 줄을 따로 두지 않는다(ui-craft 11-03)
         return shown + [_lever_cards(preview["levers"])]
     return shown
 
@@ -143,10 +142,11 @@ def _transfer_choice(preview: Dict[str, Any]) -> B.Block:
 def _lever_cards(levers: List[Dict[str, Any]]) -> B.Block:
     items = []
     for lv in levers:
-        lines = [B.line("잃는 것: " + t) for t in lv["lose"]]
-        lines.append(B.line(f"얻는 것: {lv['changes']['after']}칸 바꿔서 가능 · {lv['span_days']['after'] + 1}일 동안"))
+        # 제목 = 넘기는 설정 — 카드끼리 무엇이 다른지가 제목에서 보인다(같은 제목이 반복됐다 · ui-craft 11-03)
+        lines = [B.line(f"넘기면 {lv['changes']['after']}칸을 바꿔 들어줄 수 있습니다"
+                        f"({lv['span_days']['after'] + 1}일 동안)")]
         lines += [B.line(q, tone="warning") for q in lv["quality"]]
-        items.append(B.card(lv["lever_id"], "이 설정을 이번만 넘기면 됩니다", lines=lines,
+        items.append(B.card(lv["lever_id"], " · ".join(lv["lose"]), lines=lines,
                             actions=[B.action("이 설정만 넘기고 다시 찾기", "choose_lever",
                                               {"lever_id": lv["lever_id"]}, style="primary")]))
     return B.cards(items, selectable=False, footnote=LEVER_NOTE)

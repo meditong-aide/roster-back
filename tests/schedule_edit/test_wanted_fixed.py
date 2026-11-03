@@ -53,11 +53,11 @@ def test_submitted_wanted_is_kept_and_never_offered_as_a_lever():
     assert res.status != "ok"
     assert WISH not in LEVER_FAMILIES
     assert all(key[0] != WISH for lever in res.levers for key in lever.allow)
-    assert any(r.startswith("원티드 칸(A ") and "직접 짚어" in r for r in res.reasons), res.reasons   # 2일·4일 대칭
+    assert any(r.startswith("원티드가 반영된 칸(A ") and "직접 말씀해 주세요" in r for r in res.reasons), res.reasons  # 2·4일 대칭
     # 그 원티드 칸을 직접 짚으면 요청이 이긴다
     named = propose(ctx, [SetCell("A", 0, "O"), SetCell("A", 1, "D")])
     assert named.status == "ok" and ("A", 1) in _changed(named)
-    assert "A 2일은 원티드로 받은 칸이지만 직접 요청하셔서 바꿉니다." in named.notes
+    assert "A 2일은 원티드가 반영된 칸이지만 직접 요청하셔서 바꿉니다." in named.notes
 
 
 def test_already_done_cells_in_a_named_range_do_not_release_the_wanted():
@@ -81,4 +81,4 @@ def test_leave_that_needs_a_wanted_night_changed_asks_to_name_it():
     ctx.leave_codes = {"연": "연차휴가"}
     ctx.wishes = {("A", 2): {"N"}}                                      # A 3일 N 은 원티드
     res = propose(ctx, [LeaveCell("A", 3, "연")])
-    assert res.status == "invalid" and "A 3일 나이트는 원티드로 받은 칸" in res.reasons[0], res.reasons
+    assert res.status == "invalid" and "A 3일 나이트는 원티드가 반영된 칸" in res.reasons[0], res.reasons

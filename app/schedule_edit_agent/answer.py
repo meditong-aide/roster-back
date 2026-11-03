@@ -34,7 +34,7 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
     kept_by_day = Counter(r.day for r in requests if keeps and _same(ctx, r))
     for r in requests:
         if isinstance(r, CoverTarget):
-            band = f"(등급≤{r.grade})" if r.grade is not None else ""
+            band = f"({r.grade}등급까지)" if r.grade is not None else ""
             parts.append(f"{r.day + 1}일 {r.code}{band} {cover_count(ctx, ctx.main, r)}→{r.target}명")
             continue
         who = ctx.names.get(r.nurse_id, r.nurse_id)
@@ -105,7 +105,7 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
 
 def cover_note(ctx: EditContext, r) -> str:
     """그날 인원 요청으로 넘기는 인원 설정 — 요청한 것이 곧 동의지만 무엇을 넘기는지는 말한다.
-    예) '요청대로 15일 E 를 필요 인원(3명)보다 1명 많이 둡니다(이번만 · 병동 설정은 그대로).'"""
+    예) '요청대로 15일 E를 필요 인원(3명)보다 1명 많이 둡니다(이번만 · 병동 설정은 그대로).'"""
     from services.schedule_edit.model import cover_relief     # 모델을 답 문장 모듈이 늘 들고 있지 않게
     from services.schedule_edit.rules import coverage_bounds
     need, upper, over = coverage_bounds(ctx, r.day, r.code)
@@ -169,7 +169,7 @@ def postprocess_answer(ctx: EditContext, result) -> str:
     if report.get("kept_off_for_week_floor"):
         notes.append(f"기준을 넘는 OFF {report['kept_off_for_week_floor']}칸은 주 2회 휴일 하한을 지키려면 그대로 둬야 합니다")
     if report.get("protected"):
-        notes.append(f"{report['protected']}칸은 나이트 뒤 회복 OFF·원티드·주휴라 바꾸지 않습니다")
+        notes.append(f"{report['protected']}칸은 나이트 뒤 회복 OFF·원티드 반영 칸·주휴라 바꾸지 않습니다")
     if report.get("skipped_n_only"):
         notes.append(f"N 전담 {report['skipped_n_only']}명은 바꾸지 않습니다")
     if result.held:

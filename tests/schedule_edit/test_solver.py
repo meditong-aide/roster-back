@@ -203,10 +203,10 @@ def test_change_cap_is_reported_with_settings_to_bend(monkeypatch):
     ctx = _two_nurse_ctx()
     res = propose(ctx, [SetCell("A", 0, "O")])
     assert res.status == "infeasible"
-    assert "2칸 이내" in res.reasons[0]
+    assert "바꾸는 칸 2개까지 살펴봄" in res.reasons[0]
     assert res.blocking and set(res.blocking) <= {"인원최소", "인원최대", "OFF수"}
     bent = [r for r in res.reasons if "넘기면" in r]
-    assert len(bent) == 1 and bent[0].startswith("다음 설정을 함께 넘기면")   # 한 해가 함께 넘긴 묶음 — 한 문장
+    assert len(bent) == 1 and bent[0].startswith("다음 설정을 함께 이번만 넘기면")   # 한 해가 함께 넘긴 묶음 — 한 문장
     assert bent[0].count(" · ") >= 1
 
 
@@ -218,8 +218,9 @@ def test_setting_bend_is_explained():
     res = propose(ctx, [SetCell("A", 0, "O")])
     assert res.status == "infeasible"
     assert res.blocking == ["OFF수"]
-    assert any("상한을 1 넘김" in r for r in res.reasons)
-    assert "다음 설정을 넘기면 20칸 이내로 가능합니다: A 개인 OFF 수 상한을 1 넘김" in res.reasons
+    # 넘길 설정은 레버 카드가 하나씩 보여 준다 — 같은 묶음을 이유 문장으로 또 늘어놓지 않는다(ui-craft 11-03)
+    assert [lv.lose for lv in res.levers] == [["A 개인 OFF 수 상한을 1개 넘김"]]
+    assert not any("넘기면" in r for r in res.reasons)
 
 
 def test_missing_cells_are_never_filled():

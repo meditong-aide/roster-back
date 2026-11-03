@@ -83,20 +83,22 @@ class Explanation:
     def families(self) -> List[str]:
         return sorted({b.family for b in self.bends})
 
-    def sentences(self, names: Dict[str, str], max_changes: int) -> List[str]:
+    def sentences(self, names: Dict[str, str], max_changes: int, list_bends: bool = True) -> List[str]:
+        """list_bends=False: 넘길 설정을 레버 카드가 하나씩 보여 줄 때 — 같은 묶음을 문장으로 또 늘어놓지 않는다(ui-craft 11-03)."""
         if self.status == "hard_lock":
-            return [f"다른 설정을 다 넘겨도 {max_changes}칸 이내로는 하드락 규칙(연속 근무·전환 금지·"
-                    "나이트 규칙 등)에 막힙니다. 하드락은 풀 수 없습니다."]
+            return [f"다른 설정을 다 넘겨도 하드락 규칙(연속 근무·전환 금지·나이트 규칙 등)에 막힙니다(바꾸는 칸 "
+                    f"{max_changes}개까지 살펴봄). 하드락은 풀 수 없습니다."]
         if self.status == "bends":
             # 한 해가 함께 넘긴 묶음이다 — 줄마다 '이걸 넘기면 가능' 이라 쓰면 하나만 넘겨도 되는 것처럼 읽힌다
             head = [] if self.proven else ["(시간 안에 더 나은 방법이 없는지 끝까지 확인하지는 못했습니다)"]
             more = f" 외 {len(self.bends) - 5}곳" if len(self.bends) > 5 else ""
             together = "을 함께" if len(self.bends) > 1 else "을"
             wish = [b for b in self.bends if b.family == WISH]
-            tail = [f"원티드 칸({', '.join(_wish_cell(b, names) for b in wish[:3])})은 직접 짚어 바꿔 달라고 하실 때만 "
-                    "바꿉니다."] if wish else []
-            return head + [f"다음 설정{together} 넘기면 {max_changes}칸 이내로 가능합니다: "
-                           + " · ".join(bend_text(b, names) for b in self.bends[:5]) + more] + tail
+            tail = [f"원티드가 반영된 칸({', '.join(_wish_cell(b, names) for b in wish[:3])})은 바꾸지 않았습니다. "
+                    "바꿔도 되면 그 칸을 직접 말씀해 주세요."] if wish else []
+            listed = [f"다음 설정{together} 이번만 넘기면 가능합니다: "
+                      + " · ".join(bend_text(b, names) for b in self.bends[:5]) + more] if list_bends else []
+            return head + listed + tail
         return ["시간 안에 이유를 좁히지 못했습니다. 요청을 나눠서 다시 시도해 주세요."]
 
 
@@ -227,15 +229,24 @@ def add_rules_soft(em: EditModel, rules: RuleSet, waived, allow: Dict[Tuple, int
     return slacks
 
 
+#: 넘김 양의 단위 — 숫자만 쓰면 명·회·일 중 무엇인지 모른다(ui-craft 11-03). 없으면 '회'
+BEND_UNIT = {"OFF수": "개", "인원최소": "명", "인원최대": "명", "인원초과": "명", "등급최소": "명",
+             "같은근무연속": "일", "금지근무": "칸", WISH: "칸"}
+
+
 def bend_text(bend: Bend, names: Dict[str, str]) -> str:
-    """예) '김예나 개인 OFF 수 상한을 1 넘김' · '14일 일별 최소 인원(D) 1 넘김'."""
+    """예) '김예나 개인 OFF 수 상한을 1개 넘김' · '14일 일별 최소 인원(D) 1명 넘김' · '20일 등급별 최소 인원(D 1등급까지) 1명 넘김'."""
     _fam, nurse, day, extra, side = (list(bend.key) + [None] * 5)[:5]
     who = names.get(nurse, nurse) if nurse else ""
     when = f"{day + 1}일" if isinstance(day, int) and day >= 0 else ""
     what = family_label(bend.key)
-    if extra not in (None, "") and bend.family not in ("OFF수", "개인한도", "전환금지"):
+    if bend.family == "등급최소" and "≤" in str(extra):
+        code, _sep, grade = str(extra).partition("≤")
+        what += f"({code} {grade}등급까지)"
+    elif extra not in (None, "") and bend.family not in ("OFF수", "개인한도", "전환금지"):
         what += f"({extra})"
     if bend.family == "개인한도":
         what += f"({str(extra).upper()})"
-    tail = f"{side}을 {bend.amount} 넘김" if side else f"{bend.amount} 넘김"
+    amount = f"{bend.amount}{BEND_UNIT.get(bend.family, '회')}"
+    tail = f"{side}을 {amount} 넘김" if side else f"{amount} 넘김"
     return " ".join(p for p in (who, when, what, tail) if p)
