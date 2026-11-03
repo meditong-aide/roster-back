@@ -64,7 +64,8 @@ def restore(db: Session, conversation_id: str) -> Conversation:
         payload = row.payload or {}
         if row.event == "message":
             said = payload.get("text")
-            conv.request = said or conv.request
+            if payload.get("tool") in ("propose_edit", "run_postprocess"):   # 흔적의 요청 줄은 새 요청만
+                conv.request = said or conv.request
             if payload.get("reply") is not None:          # 도구 없이 끝난 턴(정해진 문장)
                 conv.remember(said or "", payload["reply"])
                 said = None

@@ -9,6 +9,17 @@ from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import CountTarget, EditRequest, SetCell, count_in, transfer_label
 
 _SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
+#: 생성 후처리의 이름(`services.schedule_edit.postprocess.KINDS`)
+SOURCE_WORD = {"annual_leave_swap": "자동 연차전환"}
+#: 자동 연차전환을 건너뛴 이유(off_swap report.skip) → 문장
+_SWAP_SKIP = {
+    "disabled": "이 근무표 설정은 자동 연차전환이 꺼져 있습니다. 근무표 설정에서 켜야 합니다.",
+    "no_target": "연차로 바꿀 근무 코드가 정해져 있지 않습니다. 근무코드 설정에서 '연차 전환 대상'을 정해 주세요.",
+    "target_is_work": "연차 전환 대상 코드가 '근무' 종류라 바꾸지 않습니다. 근무코드 설정을 확인해 주세요.",
+    "no_baseline": "기준 OFF 수가 설정돼 있지 않아 바꾸지 않습니다.",
+    "no_off_code": "이 병동에 OFF 코드가 없어 바꾸지 않습니다.",
+    "no_config": "이 근무표가 쓴 설정을 찾지 못해 돌릴 수 없습니다.",
+}
 
 
 def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
@@ -82,10 +93,17 @@ def _count_changes(ctx: EditContext, requests: Sequence[EditRequest], cand) -> s
     return ", ".join(parts)
 
 
+def current_request(session) -> str:
+    """지금 요청 한 줄 — 생성 후처리로 낸 결과면 그 이름, 아니면 솔버 요청."""
+    last = session.last
+    if last is not None and getattr(last, "source", None):
+        return SOURCE_WORD.get(last.source, last.source)
+    return describe_requests(session.ctx, session.requests)
+
+
 def status_text(session) -> str:
     """'지금 어떻게 돼 있어?' 같은 말에 — 대화 상태에서만 만든다(바뀌지 않은 걸 바뀌었다고 말하지 않게)."""
-    ctx = session.ctx
-    lines = [f"지금 요청: {describe_requests(ctx, session.requests) or '없음'}."]
+    lines = [f"지금 요청: {current_request(session) or '없음'}."]
     last = session.last
     if last is None:
         lines.append("아직 찾은 결과가 없습니다.")
@@ -95,3 +113,31 @@ def status_text(session) -> str:
     else:
         lines.append("마지막으로 찾았을 때 방법이 없었습니다. 근무표는 바뀌지 않았습니다.")
     return " ".join(lines)
+
+
+def postprocess_answer(ctx: EditContext, result) -> str:
+    """생성 후처리(지금은 자동 연차전환)를 미리 돌린 결과 — 바뀌는 칸 수와, 안 바뀐 몫의 이유를 서비스 숫자 그대로."""
+    report = result.report or {}
+    if report.get("skip"):
+        return _SWAP_SKIP.get(report["skip"], "자동 연차전환을 돌릴 수 없습니다.")
+    head = f"자동 연차전환(OFF 기준 {report.get('baseline')}개 · 바꿀 코드 '{report.get('target_shift')}')"
+    notes: List[str] = []
+    if report.get("kept_off_for_week_floor"):
+        notes.append(f"기준을 넘는 OFF {report['kept_off_for_week_floor']}칸은 주 2회 휴일 하한을 지키려면 그대로 둬야 합니다")
+    if report.get("protected"):
+        notes.append(f"{report['protected']}칸은 나이트 뒤 회복 OFF·확정 원티드·주휴라 바꾸지 않습니다")
+    if report.get("skipped_n_only"):
+        notes.append(f"N 전담 {report['skipped_n_only']}명은 바꾸지 않습니다")
+    if result.held:
+        notes.append(f"지난 날·바꿀 수 없는 칸 {result.held}칸은 바꾸지 않습니다")
+    if not result.changes:
+        if not report.get("excess_total"):
+            return f"{head}을 돌려 봤지만 기준을 넘는 OFF 가 없어 바꿀 칸이 없습니다."
+        return f"{head}을 돌려 봤지만 바꿀 칸이 없습니다. " + " · ".join(notes) + "."
+    people = len({c.nurse_id for c in result.changes})
+    lines = [f"{head}을 지금 근무표에 돌리면 OFF {len(result.changes)}칸을 연차로 바꿉니다({people}명). "
+             "카드를 눌러 표에서 확인해 보세요."]
+    if notes:
+        lines.append("참고: " + " · ".join(notes) + ".")
+    lines.append("연차 잔여는 보지 않습니다(근무표를 만들 때의 자동 전환과 같습니다).")
+    return "\n".join(lines)

@@ -56,7 +56,10 @@ class Echo(Agent):
     def handle(self, call):
         inp = call.input
         if inp.kind == "text":
-            return TurnResult(blocks=[B.text(f"{call.conv.context['doc']}: {inp.text}")], answer=inp.text)
+            # '?' 로 시작하면 묻기(흔적 그대로) · '+' 면 고쳐 말하기(단계로) · 그 밖은 새 요청
+            trail = "keep" if inp.text.startswith("?") else "step" if inp.text.startswith("+") else "new"
+            return TurnResult(blocks=[B.text(f"{call.conv.context['doc']}: {inp.text}")], answer=inp.text,
+                              trail=trail)
         if inp.action == "move":
             return TurnResult(blocks=[B.notice("옮겼습니다", tone="success")], answer="옮김", step="d2 로 옮기기",
                               context={"doc": "d2"}, effects=[{"type": "switch_doc", "doc": "d2"}])
@@ -125,6 +128,14 @@ def test_buttons_add_steps_and_a_new_request_resets_them(echo):
     assert conv.history[-1] == {"user": "[버튼] 누르기", "answer": "눌림"}     # 버튼은 에이전트가 정한 말로
     again = say(echo, "다시", cid=cid).json()
     assert again["blocks"][0] == {"type": "trail", "request": "다시", "steps": []}
+
+
+def test_the_agent_decides_how_text_changes_the_trail(echo):
+    cid = say(echo, "안녕").json()["conversation_id"]
+    asked = say(echo, "?지금 뭐 하고 있어", cid=cid).json()
+    assert asked["blocks"][0] == {"type": "trail", "request": "안녕", "steps": []}
+    revised = say(echo, "+조금 더", cid=cid).json()
+    assert revised["blocks"][0] == {"type": "trail", "request": "안녕", "steps": ["+조금 더"]}
 
 
 def test_target_moves_with_effect_and_old_buttons_are_refused(echo):

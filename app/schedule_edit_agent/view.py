@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from agent_kit import blocks as B
 from schedule_edit_agent.agent import Reply
+from schedule_edit_agent.answer import SOURCE_WORD
 from schedule_edit_agent.skills import choice_parts
 from services.schedule_edit.requests import CountTarget, transfer_label, work_down
 from services.schedule_edit.serialize import lever_id, result_to_dict
@@ -45,7 +46,7 @@ def blocks_for(reply: Reply, session: Optional[EditSession]) -> List[B.Block]:
         return shown
     status = preview.get("status")
     if status == "ok":
-        return shown + [_candidate_cards(preview["candidates"], reply.focus)]
+        return shown + [_candidate_cards(preview["candidates"], reply.focus, preview.get("source"))]
     if status == "choose_transfer":
         return shown + [_transfer_choice(preview)]
     if status == "infeasible" and preview.get("levers"):
@@ -65,26 +66,30 @@ def _lead(answer: str, preview: Optional[Dict[str, Any]]) -> str:
 # ── 후보 카드 ───────────────────────────────────────────────────────────────
 
 
-def _candidate_cards(candidates: List[Dict[str, Any]], focus: Optional[int]) -> B.Block:
-    items = [_candidate_card(c) for c in candidates]
+def _candidate_cards(candidates: List[Dict[str, Any]], focus: Optional[int], source: Optional[str] = None) -> B.Block:
+    items = [_candidate_card(c, source) for c in candidates]
     return B.cards(items, key=_key(candidates), selected=str(focus) if focus else None)
 
 
-def _candidate_card(c: Dict[str, Any]) -> Dict[str, Any]:
+def _candidate_card(c: Dict[str, Any], source: Optional[str] = None) -> Dict[str, Any]:
+    """후보 카드. 생성 후처리(source)로 낸 안은 하나뿐이고 서비스 규칙 그대로라 '적용'만 둔다."""
     rank = c["rank"]
     people = [p["name"] for p in c["affected"]]
     lines = []
     if c["quality"]:
         lines.append(B.line("규칙은 모두 지키지만 근무 모양이 나빠집니다: " + " · ".join(c["quality"]), tone="warning"))
     changes = c["changes"]
+    actions = [B.action("이 안 적용", "apply_edit", {"rank": rank}, style="primary")]
+    if source is None:
+        actions += [B.action("이 안에서 다듬기", "keep_candidate", {"rank": rank}),
+                    B.action("이 사람들 말고", "reject_candidate", {"rank": rank})]
+    title = f"{SOURCE_WORD.get(source, source)} · " if source else f"{rank}안 · "
     return B.card(
-        str(rank), f"{rank}안 · {c['changed_count']}칸 · {_span(c)}",
+        str(rank), f"{title}{c['changed_count']}칸 · {_span(c)}",
         summary=" · ".join(people), chips=_person_chips(c), lines=lines,
         details={"label": f"바뀌는 칸 {len(changes)}개",
                  "items": [f"{x['name']} {x['day']}일 {x['before'] or '빈 칸'} → {x['after']}" for x in changes]},
-        actions=[B.action("이 안 적용", "apply_edit", {"rank": rank}, style="primary"),
-                 B.action("이 안에서 다듬기", "keep_candidate", {"rank": rank}),
-                 B.action("이 사람들 말고", "reject_candidate", {"rank": rank})],
+        actions=actions,
         overlay={"kind": "schedule_cells",
                  "cells": [{"nurse_id": x["nurse_id"], "day": x["day"], "before": x["before"], "after": x["after"]}
                            for x in changes]})
@@ -152,7 +157,8 @@ def step_label(action: str, params: Dict[str, Any], session: Optional[EditSessio
     rank = params.get("rank")
     last = session.last if session is not None else None
     if action == "apply_edit":
-        return f"{rank}안 적용"
+        source = getattr(last, "source", None)
+        return f"{SOURCE_WORD.get(source, source)} 적용" if source else f"{rank}안 적용"
     if action == "keep_candidate":
         return f"{rank}안을 기준으로 다듬기"
     if action == "reject_candidate":

@@ -76,10 +76,12 @@ def run_turn(agent: Agent, db: Session, user: Any, conv: Conversation, inp: Turn
         conv.move_to(context)           # 말은 새 대상에서 이어 간다
     agent.check_input(inp)
     conv.begin_turn()
-    if inp.kind == "text":
-        conv.request, conv.steps = inp.text, []
     result = agent.handle(TurnCall(db=db, user=user, conv=conv, input=inp, today=agent.today(), deadline=deadline))
     conv.remember(result.said or inp.text or f"[{inp.kind}] {inp.action}", result.answer)
+    if inp.kind == "text" and result.trail == "new":
+        conv.request, conv.steps = inp.text, []
+    elif inp.kind == "text" and result.trail == "step":
+        conv.steps.append(inp.text or "")
     if result.step:
         conv.steps.append(result.step)
     if result.context is not None and result.context != conv.context:

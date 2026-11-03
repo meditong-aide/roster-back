@@ -95,4 +95,5 @@ def result_to_dict(ctx: EditContext, result) -> Dict[str, Any]:
         "blocking": list(result.blocking),
         "candidates": [candidate_to_dict(ctx, c) for c in result.candidates],
         "levers": [lever_to_dict(lv) for lv in result.levers],
+        "source": getattr(result, "source", None),
     }

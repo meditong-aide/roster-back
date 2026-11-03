@@ -14,10 +14,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from schedule_edit_agent.answer import answer_for, describe_requests, status_text
+from schedule_edit_agent.answer import answer_for, describe_requests, postprocess_answer, status_text
 from schedule_edit_agent.grounding import SHIFT_WORD, SHIFTS, ground_changes, resolve_day, resolve_nurse
 from services.schedule_edit.apply import ApplyError, apply_to_new_version
 from services.schedule_edit.journal import record_event
+from services.schedule_edit.postprocess import ANNUAL_LEAVE_SWAP, RUNNERS, as_result
+from services.schedule_edit.postprocess import KINDS as POSTPROCESS_KINDS
 from services.schedule_edit.requests import (
     TRANSFERS, CountTarget, EditRequest, SetCell, count_in, first_open_day, transfer_label, work_down, work_targets,
 )
@@ -289,6 +291,34 @@ def reply_only(turn: Turn, params: Dict[str, Any]) -> Outcome:
     return Outcome(answer=answer)
 
 
+# ── 생성 후처리(사용자 결정 11-03 — 만들 때 하는 후처리도 쓸 수 있는 범위) ─────────────────────
+
+
+@register(
+    "run_postprocess",
+    description=(
+        "근무표를 만들 때 서비스가 저장 직전에 하는 후처리를 지금 근무표에 다시 돌려 본다(저장 전 미리보기 · 적용하면 "
+        "새 버전). kind: annual_leave_swap=자동 연차전환(병동 OFF 기준을 넘는 OFF 를 연차 코드로 — '자동 연차전환 "
+        "해줘', '남는 OFF 연차로 돌려줘', '연차 전환 써줘')."),
+    parameters={"type": "object", "properties": {"kind": {"type": "string", "enum": list(POSTPROCESS_KINDS)}},
+                "required": ["kind"]},
+    mode="preview", llm=True)
+def run_postprocess(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    kind = params.get("kind") if params.get("kind") in POSTPROCESS_KINDS else ANNUAL_LEAVE_SWAP
+    started = time.monotonic()
+    session = turn.session
+    result = RUNNERS[kind](turn.db, session, turn.today)
+    answer = postprocess_answer(session.ctx, result)
+    # 솔버 요청과는 다른 일이다 — 지금 요청·넘긴 묶음·기준 안을 비우고 이 결과만 든다(적용은 다른 후보와 같은 길)
+    session.requests, session.avoid_people, session.hint = [], [], None
+    session.last = as_result(session, result) if result.changes else None
+    preview = result_to_dict(session.ctx, session.last) if session.last is not None else None
+    turn.record("propose", {"requests": [], "postprocess": kind, "report": result.report, "held": result.held,
+                            "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
+                            "avoid": []}, elapsed_ms=_ms(started))
+    return Outcome(answer=answer, preview=preview)
+
+
 # ── 카드 버튼(LLM 없음) ──────────────────────────────────────────────────────
 
 _RANK = {"type": "object", "properties": {"rank": {"type": "integer", "minimum": 1}}, "required": ["rank"]}
@@ -323,7 +353,7 @@ def apply_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
 @register("reject_candidate", description="이 후보는 싫다 — 같은 사람들을 바꾸는 안은 빼고 다시 찾는다.",
           parameters=_RANK, mode="preview", llm=False)
 def reject_candidate(turn: Turn, params: Dict[str, Any]) -> Outcome:
-    cand = _candidate(turn, params)
+    cand = _apply_only_guard(turn, _candidate(turn, params))
     reject(turn.session, cand)
     turn.record("reject", {"rank": cand.rank, "people": sorted(cand.affected)})
     return _propose(turn, turn.session.requests)
@@ -332,7 +362,7 @@ def reject_candidate(turn: Turn, params: Dict[str, Any]) -> Outcome:
 @register("keep_candidate", description="이 후보를 기준으로 이어서 다듬는다(다음 탐색의 시작 해).",
           parameters=_RANK, mode="read", llm=False)
 def keep_candidate(turn: Turn, params: Dict[str, Any]) -> Outcome:
-    cand = _candidate(turn, params)
+    cand = _apply_only_guard(turn, _candidate(turn, params))
     keep(turn.session, cand)
     turn.record("keep", {"rank": cand.rank, "people": sorted(cand.affected)})
     return Outcome(answer=f"{cand.rank}번 안을 기준으로 이어서 다듬습니다. 더 바꾸거나 그대로 둘 곳을 말씀해 주세요.",
@@ -373,6 +403,13 @@ def choose_transfer(turn: Turn, params: Dict[str, Any]) -> Outcome:
 
 class SkillError(Exception):
     """버튼 인자가 지금 상태와 안 맞는다(없는 후보 번호 등) — 사용자에게 그대로 보여 준다."""
+
+
+def _apply_only_guard(turn: Turn, cand):
+    """생성 후처리로 낸 안은 서비스 규칙 그대로라 적용만 — 다듬기·넘기기는 빈 요청으로 솔버를 돌려 엉뚱한 답을 낸다(검토 M1)."""
+    if getattr(turn.session.last, "source", None):
+        raise SkillError("이 안은 '적용'만 할 수 있습니다. 다른 방법이 필요하면 바꿀 내용을 말씀해 주세요.")
+    return cand
 
 
 def _candidate(turn: Turn, params: Dict[str, Any]):

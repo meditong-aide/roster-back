@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import date, datetime, timedelta, timezone
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
@@ -77,6 +78,8 @@ class CellChange:
     after: str
     before_main: Optional[str]
     after_main: str
+    #: 휴가 코드로 바뀐 칸(생성 후처리의 연차전환) — 대표코드는 O 그대로지만 순수 OFF 수에서는 빠진다
+    vacation: bool = False
 
 
 @dataclass
@@ -109,6 +112,8 @@ class EditResult:
     blocking: List[str] = field(default_factory=list)
     #: 레버 — 무엇을 손해 보면 무엇을 얻는지(`levers.find_levers` 가 채운다)
     levers: List[Any] = field(default_factory=list)
+    #: 후보를 낸 곳 — None 이면 솔버, 그 밖은 생성 후처리(`postprocess.KINDS` · 예: annual_leave_swap)
+    source: Optional[str] = None
 
 
 @dataclass
@@ -346,7 +351,15 @@ def verify_candidate(ctx: EditContext, rules: RuleSet, candidate: "Candidate", r
     open_from = first_open_day(ctx, today or datetime.now(KST).date())
     found = [f"{c.day + 1}일은 이미 지난 날짜입니다" for c in candidate.changes if c.day < open_from][:1]
     found += [f"요청 미충족 {r}" for r in requests if not is_satisfied(ctx, r, grid)]
-    found += [f"{k[0]} {k}" for k, _v in rule_regressions(ctx, rules, grid, requests, allow)]
+    # 휴가로 바뀐 칸은 대표코드가 O 그대로라 그대로 세면 순수 OFF 하한 위반을 놓친다(Codex 11-03) —
+    # 그 칸을 휴가로 넣은 재료로 규칙을 다시 세어, 지금(원래 재료) 값과 견준다
+    vacation = {(c.nurse_id, c.day) for c in candidate.changes if c.vacation}
+    after_ctx, after_rules = ctx, rules
+    if vacation:
+        after_ctx = dataclasses.replace(ctx, vacation=set(ctx.vacation) | vacation)
+        after_rules = build_rules(after_ctx)
+    base = measure(ctx, ctx.main, rules)
+    found += [f"{k[0]} {k}" for k, _v in rule_regressions(after_ctx, after_rules, grid, requests, allow, before=base)]
     screen_allow = {**allow, **grid_relief(ctx, rules, list(requests), grid)}
     return found + [f"화면 {k}" for k in screen_problems(screen, candidate.changes, screen_allow)]
 

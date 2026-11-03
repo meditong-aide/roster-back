@@ -259,6 +259,18 @@ def test_a_button_checks_the_schedule_once(api, monkeypatch):
     assert checks == ["s1"]                                  # 흔적 줄과 버튼이 같은 판정 재료를 쓴다(검토 L3)
 
 
+def test_status_question_keeps_the_trail_and_revision_adds_a_step(api):
+    # 실화면 확인(11-03): '반영 안 된 거지?' 가 흔적의 요청 줄을 덮어썼다
+    api.agent.core._llm = FakeLLM(call("propose_edit", changes=[A_OFF]), call("reply_only", kind="status"),
+                                  call("revise_edit", keep=[{"day": 3}]))
+    cid = say(api.client, "A 1일 오프").json()["conversation_id"]
+    status = say(api.client, "반영 안 된 거지?", cid=cid).json()
+    assert block(status, "trail") == {"type": "trail", "request": "A 1일 오프", "steps": []}
+    assert block(status, "cards")["items"]                              # 보던 후보도 그대로
+    revised = say(api.client, "3일은 건드리지 마", cid=cid).json()
+    assert block(revised, "trail")["steps"] == ["3일은 건드리지 마"]
+
+
 def test_bad_inputs_are_refused_before_the_turn(api):
     cid = say(api.client, "A 1일 오프").json()["conversation_id"]
     unknown = press(api.client, cid, "drop_table")

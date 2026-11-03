@@ -59,6 +59,9 @@ class TurnResult:
     said: Optional[str] = None
     #: 버튼이면 흔적에 붙일 한 줄('메우는 방식: 같은 팀')
     step: Optional[str] = None
+    #: 말(text) 턴이 흔적을 어떻게 바꾸나 — new: 새 요청(흔적을 이 말로 새로) · step: 고쳐 말함(단계로 붙임) ·
+    #: keep: 요청을 바꾸지 않는 말(상태 질문·안내·해석 실패) — 흔적 그대로
+    trail: str = "new"
     #: 대화 대상이 바뀌면(적용 → 새 버전) 새 대상
     context: Optional[Dict[str, Any]] = None
 

@@ -31,6 +31,7 @@ def postprocess_off_swap(
     generated: dict,
     latest_config,
     req,
+    report: dict | None = None,
 ) -> dict:
     """초과 OFF 를 연차 코드로 변환.
 
@@ -40,16 +41,25 @@ def postprocess_off_swap(
         generated: {nurse_id: [shift_code_per_day, ...]} — 1일=index 0
         latest_config: RosterConfig 인스턴스 (off_swap_enabled / off_days / use_mid)
         req: RosterRequest (year, month)
+        report: 주면 결과를 숫자로 채운다(로그와 같은 값) — 근무표 수정 도우미가 '왜 안 바뀌었는지'를
+            문장으로 답할 때 쓴다(11-03). skip = 건너뛴 이유(disabled·no_target·target_is_work·no_baseline·
+            no_off_code) 또는 None, 그 밖에 target_shift·baseline·two_offs_per_week·converted·skipped_n_only·
+            kept_off_for_week_floor·excess_total(기준을 넘은 OFF 합)·protected(넘었지만 회복 OFF·확정 원티드라
+            후보가 모자란 수). 생성 경로는 넘기지 않는다 — 동작은 그대로다.
 
     Returns:
         변환된 generated dict (in-place mutation 후 반환).
     """
+    report = report if report is not None else {}
+    report.update(skip=None, converted=0, skipped_n_only=0, kept_off_for_week_floor=0, excess_total=0,
+                  protected=0)
     print(
         f"[OffSwap][ENTER] schedule={schedule.schedule_id} "
         f"off_swap_enabled={getattr(latest_config, 'off_swap_enabled', None)!r}"
     )
     if not bool(getattr(latest_config, "off_swap_enabled", False)):
         print("[OffSwap][SKIP] off_swap_enabled=False — early return")
+        report["skip"] = "disabled"
         return generated
 
     target = _resolve_target_shift(db, schedule.group_id)
@@ -59,7 +69,9 @@ def postprocess_off_swap(
     )
     if target is None:
         print("[OffSwap][SKIP] target shift 없음 (off_swap_target=True 인 shifts row 미존재)")
+        report["skip"] = "no_target"
         return generated
+    report["target_shift"] = target.shift_id
     # 안전망: target shift 의 type 이 '근무' 면 OFF→근무 변환이 일별 coverage oversupply 를
     # 유발하므로 변환 자체를 SKIP. 정상적으로는 _assert_off_swap_target_valid 로 저장
     # 단계에서 차단되지만, 기존 dirty 데이터 보호용.
@@ -71,12 +83,15 @@ def postprocess_off_swap(
         print(
             f"[OffSwap][SKIP] target shift={target.shift_id} type='근무' — oversupply 위험"
         )
+        report["skip"] = "target_is_work"
         return generated
 
     baseline = int(getattr(latest_config, "off_days", 0) or 0)
     print(f"[OffSwap] baseline off_days={baseline}")
+    report["baseline"] = baseline
     if baseline <= 0:
         print(f"[OffSwap][SKIP] baseline={baseline} <= 0")
+        report["skip"] = "no_baseline"
         return generated
 
     n_codes, o_only_codes, weekly_off_codes = _resolve_shift_code_sets(
@@ -88,6 +103,7 @@ def postprocess_off_swap(
     )
     if not o_only_codes:
         print("[OffSwap][SKIP] OFF 코드 없음 (default_shift='O' 인 shift 미존재)")
+        report["skip"] = "no_off_code"
         return generated
     # 솔버의 baseline 비교는 'O'+'주' 합산 기준 (cap_semantics=nonvac_total_off).
     # '주' 셀은 변환 안 하지만 excess 계산엔 반드시 포함시켜야 한다.
@@ -110,6 +126,7 @@ def postprocess_off_swap(
     #   DB 컬럼명은 `two_offs_per_week` 다(엔진 dataclass 의 `enforce_two_offs_per_week`
     #   와 이름이 다르다). NULL(미설정)은 False 로 떨어진다.
     two_offs_on = bool(getattr(latest_config, "two_offs_per_week", False))
+    report["two_offs_per_week"] = two_offs_on
 
     converted_total = 0
     skipped_n_only = 0
@@ -140,6 +157,7 @@ def postprocess_off_swap(
         excess = total_off_count - baseline
         if excess <= 0:
             continue
+        report["excess_total"] += excess
 
         # 변환 후보 — 'O' 만 (주 보호) + fixed_wanted/회복 OFF 제외
         eligible: list[int] = []
@@ -155,6 +173,7 @@ def postprocess_off_swap(
             eligible.append(d_idx)
 
         to_convert_count = min(excess, len(eligible))
+        report["protected"] += excess - max(0, to_convert_count)
         if to_convert_count <= 0:
             continue
 
@@ -176,6 +195,8 @@ def postprocess_off_swap(
             shifts_seq[d_idx] = target.shift_id
             converted_total += 1
 
+    report.update(converted=converted_total, skipped_n_only=skipped_n_only,
+                  kept_off_for_week_floor=kept_for_floor)
     print(
         f"[OffSwap][DONE] schedule={schedule.schedule_id} converted={converted_total} "
         f"baseline={baseline} target_shift={target.shift_id} "

@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Dict, List
 
-from schedule_edit_agent.answer import describe_requests
+from schedule_edit_agent.answer import current_request
 from agent_kit.conversation import Conversation
 from services.schedule_edit.session import EditSession
 
@@ -23,6 +23,7 @@ _WEEKDAY = "월화수목금토일"
 
 SYSTEM = """너는 병원 간호 근무표 '수정' 도우미의 해석기다. 수간호사의 말을 읽고 언제나 도구 하나를 골라 인자를 채운다. 글로 답하지 않는다.
 - 새로 칸을 바꾸는 요청은 propose_edit, 바로 앞 요청에 더하기·빼기·'그대로 두기'는 revise_edit.
+- 근무표를 만들 때 하는 후처리를 지금 근무표에 해 달라는 말(예: '자동 연차전환 해줘', '남는 OFF 연차로 돌려줘')은 run_postprocess.
 - 바꾸지 않고 답할 때(누가·며칠·무엇이 빠짐, 근무표 달 밖 날짜, 설정 변경·새로 만들기, 아직 못 하는 종류의 변경·조회, 상관없는 말, 지금 상태를 묻는 말)는 reply_only 의 kind 를 고른다. 답 문장은 시스템이 만든다.
 - 이름은 사용자가 말한 그대로 넣는다(호칭은 뺀다). 이름을 추측하거나 다른 사람으로 바꾸지 않는다.
 - 날짜는 근무표 달의 '일' 숫자다. '내일·모레·다음 주 월요일'은 아래 '오늘'로 계산한다.
@@ -43,7 +44,7 @@ def state_summary(session: EditSession, today: date) -> str:
     ctx = session.ctx
     parts = [f"오늘: {today.isoformat()}({_WEEKDAY[today.weekday()]})",
              f"근무표: {ctx.year}년 {ctx.month}월({ctx.days}일까지)",
-             f"지금 요청: {describe_requests(ctx, session.requests) or '없음'}"]
+             f"지금 요청: {current_request(session) or '없음'}"]
     last = session.last
     if last is not None:
         if last.status == "ok" and last.candidates:

@@ -263,7 +263,7 @@ def _logs(monkeypatch, rows):
 def test_restore_rebuilds_requests_levers_rejects_and_history(monkeypatch):
     req = [{"kind": "set", "nurse_id": "A", "day": 0, "code": "O"}]
     allow = [[["OFF수", "A", None, None, "상한"], 1]]
-    rows = [_row("message", 1, {"text": "A 1일 오프"}),
+    rows = [_row("message", 1, {"text": "A 1일 오프", "tool": "propose_edit"}),
             _row("propose", 1, {"requests": req, "allow": [], "avoid": [], "answer": "후보 3개"}),
             _row("lever", 2, {"lever_id": "x"}),
             _row("propose", 2, {"requests": req, "allow": allow, "avoid": [["A", "B"]], "answer": "다시 찾음"}),
@@ -274,7 +274,7 @@ def test_restore_rebuilds_requests_levers_rejects_and_history(monkeypatch):
     assert conv.agent == AGENT_ID and conv.limits == LIMITS
     assert conv.restored == {"requests": req, "allow": allow, "avoid": [["A", "B"]]}
     assert [h["user"] for h in conv.history] == ["A 1일 오프", "고마워"]
-    assert conv.request == "고마워"                                     # 흔적은 마지막 말 한 줄
+    assert conv.request == "A 1일 오프"                                 # 흔적의 요청 줄은 새 요청만(인사는 덮지 않음)
 
 
 def test_restore_after_apply_moves_to_new_version_and_refuses_closed(monkeypatch):

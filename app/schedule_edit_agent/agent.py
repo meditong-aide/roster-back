@@ -32,6 +32,9 @@ LLM_FAILED = "지금 말씀을 해석하지 못했습니다. 잠시 뒤 다시 �
 BUTTON_TEXT = {"apply_edit": "{rank}번 안 적용", "reject_candidate": "{rank}번 안 넘기기",
                "keep_candidate": "{rank}번 안을 기준으로 다듬기", "choose_lever": "레버 고르기",
                "choose_transfer": "메우는 방식 고르기({choice_id})"}
+#: 말이 흔적을 바꾸는 방식 — 새 요청은 흔적을 새로, 고쳐 말하면 단계로. 그 밖(상태 질문·안내)은 그대로
+#: (실화면 확인 11-03: '반영 안 된 거지?' 가 요청 줄을 덮어썼다)
+TRAIL = {"propose_edit": "new", "revise_edit": "step", "run_postprocess": "new"}
 
 
 @dataclass
@@ -45,6 +48,8 @@ class Reply:
     context: Optional[Dict[str, Any]] = None
     focus: Optional[int] = None
     failed: bool = False
+    #: 말 턴이 흔적을 어떻게 바꾸나(agent_kit TurnResult.trail) — 스킬로 정한다(TRAIL)
+    trail: str = "keep"
 
 
 def schedule_of(conv: Conversation) -> str:
@@ -99,7 +104,9 @@ class EditAgent:
         skill = SKILLS.get(call.name)
         if skill is None or not skill.llm:
             return self._reply(turn, Outcome(answer="무엇을 바꿀지 다시 말씀해 주세요."))
-        return self._reply(turn, self._run(turn, skill.run, call.args or {}))
+        reply = self._reply(turn, self._run(turn, skill.run, call.args or {}))
+        reply.trail = TRAIL.get(call.name, "keep")
+        return reply
 
     def act(self, db: Session, user, conv: Conversation, action: str, params: Dict[str, Any],
             today: date, *, deadline: Optional[float] = None, session: Optional[EditSession] = None) -> Reply:
