@@ -77,7 +77,10 @@ def test_nothing_to_convert_says_why_from_the_service_numbers(world, swap):
                           skipped_n_only=1, kept_off_for_week_floor=8, excess_total=8, protected=0)
     agent, _ = _agent(SWAP, SWAP, SWAP)
     reply = say(agent, world.conv, "자동 연차전환 해줘", TODAY)
-    assert reply.preview is None and world.conv.state.last is None
+    last = world.conv.state.last
+    assert reply.preview is None and last.status == "already" and not last.candidates
+    # 상태 질문이 그 이유를 다시 말한다(평가 11-03: '왜 안 바뀌어?' 에 '요청 없음' 이라 답했다)
+    assert status_text(world.conv.state) == "지금 요청: 자동 연차전환. " + reply.answer
     assert reply.answer == ("자동 연차전환(OFF 기준 8개 · 바꿀 코드 '연')을 돌려 봤지만 바꿀 칸이 없습니다. "
                             "기준을 넘는 OFF 8칸은 주 2회 휴일 하한을 지키려면 그대로 둬야 합니다 · N 전담 1명은 바꾸지 않습니다.")
     swap["report"] = {"skip": "disabled"}

@@ -123,7 +123,8 @@ def test_text_then_buttons_and_conversation_log(api):
     assert body["agent"] == "schedule-edit" and body["turn_no"] == 1 and body["status"]["turns_left"] > 0
     assert body["context"] == {"schedule_id": "s1"} and body["effects"] == []
     assert [b["type"] for b in body["blocks"]] == ["trail", "text", "cards"]
-    assert block(body, "trail") == {"type": "trail", "request": "A 1일 오프", "steps": []}
+    # 흔적의 요청 줄은 해석한 요청(평가 11-03 U1) — 원문은 기록에 남는다
+    assert block(body, "trail") == {"type": "trail", "request": "A 1일 OFF", "steps": []}
     cards = block(body, "cards")
     top = cards["items"][0]
     assert cards["selected"] == "1" and top["title"].startswith("1안 · ")
@@ -241,7 +242,7 @@ def test_apply_switches_version_with_the_request_line(api, monkeypatch):
     monkeypatch.setattr(skills_mod, "apply_to_new_version", fake_apply)
     cid = say(api.client, "A 1일 오프").json()["conversation_id"]
     body = press(api.client, cid, "apply_edit", rank=1).json()
-    assert seen["request_text"] == "A 1일 오프"                         # 화면이 보내지 않아도 대화의 요청 줄
+    assert seen["request_text"] == "A 1일 OFF"                         # 화면이 보내지 않아도 대화의 요청 줄
     assert body["effects"] == [{"type": "switch_version", "schedule_id": "s2", "version": 3, "status": "draft",
                                 "name": "11월 수정본"}]
     assert body["context"] == {"schedule_id": "s2"}
@@ -265,7 +266,7 @@ def test_status_question_keeps_the_trail_and_revision_adds_a_step(api):
                                   call("revise_edit", keep=[{"day": 3}]))
     cid = say(api.client, "A 1일 오프").json()["conversation_id"]
     status = say(api.client, "반영 안 된 거지?", cid=cid).json()
-    assert block(status, "trail") == {"type": "trail", "request": "A 1일 오프", "steps": []}
+    assert block(status, "trail") == {"type": "trail", "request": "A 1일 OFF", "steps": []}
     assert block(status, "cards")["items"]                              # 보던 후보도 그대로
     revised = say(api.client, "3일은 건드리지 마", cid=cid).json()
     assert block(revised, "trail")["steps"] == ["3일은 건드리지 마"]

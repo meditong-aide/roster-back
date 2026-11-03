@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -41,6 +41,8 @@ class EditSession:
     hint: Optional[Grid] = None
     requests: List[EditRequest] = field(default_factory=list)
     last: Optional[EditResult] = None
+    #: 이미 보인 참고 문구('전월 근무표가 없어…') — 같은 문구를 매 답마다 붙이지 않는다(평가 11-03)
+    shown_notes: Set[str] = field(default_factory=set)
 
 
 def cells_stamp(db: Session, schedule_id: str) -> str:

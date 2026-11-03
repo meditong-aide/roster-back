@@ -16,6 +16,7 @@ from __future__ import annotations
 import calendar
 import json
 from collections import defaultdict
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
@@ -62,6 +63,8 @@ class EditContext:
     main: Dict[str, List[Optional[str]]] = field(default_factory=dict)
     #: 휴가·공가 칸 — O 로 세지만 '순수 OFF' 가 아니다(OFF 수에서 뺀다)
     vacation: Set[Cell] = field(default_factory=set)
+    #: 이 병동의 휴가·공가 근무 코드 → 이름(연차·병가 등) — 칸에 넣을 수 있는 휴가(`requests.LeaveCell`)
+    leave_codes: Dict[str, str] = field(default_factory=dict)
     #: 바꿀 수 없는 칸과 그 이유
     frozen: Dict[Cell, str] = field(default_factory=dict)
     tail: Dict[str, List[str]] = field(default_factory=dict)
@@ -212,6 +215,10 @@ def _load_shift_defs(db: Session, ctx: EditContext) -> List[dict]:
     } for r in rows]
     _id_to_main, main_to_id = build_shift_normalizer(shifts)
     ctx.rep_code = {m: main_to_id.get(m, m) for m in EDIT_MAINS}
+    ctx.leave_codes = {}
+    for r in rows:       # 같은 코드가 여럿이면 순서상 앞 행(화면 규약)
+        if str(r.type or "") in VACATION_TYPES:
+            ctx.leave_codes.setdefault(str(r.shift_id), str(r.name or r.shift_id))
     return shifts
 
 
@@ -540,6 +547,18 @@ def _freeze_preceptee(ctx: EditContext, nurse_id: str, info: Dict[str, Any]) -> 
             ctx.cov_exclude.add((nurse_id, int(day)))
         if preceptor in ctx.raw:
             ctx.frozen.setdefault((preceptor, int(day)), "프리셉티 동행(프리셉터)")
+
+
+def with_vacation(ctx: EditContext, cells) -> EditContext:
+    """그 칸들을 휴가로 넣은 재료(사본) — 순수 OFF·고립 OFF 판정과 '휴가 전날 N 금지'(설정 켜짐)가 그 칸까지 본다.
+
+    근무표를 열 때 한 번 계산하는 `ban_n_before` 도 같이 넓힌다(검토 M1: vacation 만 넓히면 새 휴가 칸 전날 N 을 놓친다).
+    """
+    cells = set(cells)
+    out = dataclasses.replace(ctx, vacation=set(ctx.vacation) | cells, ban_n_before=set(ctx.ban_n_before))
+    if ctx.config.get("ban_night_before_fixed_off"):
+        out.ban_n_before |= {(n, d - 1) for n, d in cells if d >= 1}
+    return out
 
 
 def _load_ban_n_before(ctx: EditContext) -> None:

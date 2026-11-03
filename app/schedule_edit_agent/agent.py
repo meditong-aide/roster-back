@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from agent_kit.conversation import Conversation
+from schedule_edit_agent.answer import current_request
 from schedule_edit_agent.llm import CALL_TIMEOUT, EditLLM
 from schedule_edit_agent.prompt import build_messages
 from schedule_edit_agent.skills import (
@@ -50,6 +51,8 @@ class Reply:
     failed: bool = False
     #: 말 턴이 흔적을 어떻게 바꾸나(agent_kit TurnResult.trail) — 스킬로 정한다(TRAIL)
     trail: str = "keep"
+    #: 새 요청이면 흔적의 요청 줄(해석한 요청)
+    request_line: Optional[str] = None
 
 
 def schedule_of(conv: Conversation) -> str:
@@ -106,6 +109,8 @@ class EditAgent:
             return self._reply(turn, Outcome(answer="무엇을 바꿀지 다시 말씀해 주세요."))
         reply = self._reply(turn, self._run(turn, skill.run, call.args or {}))
         reply.trail = TRAIL.get(call.name, "keep")
+        if reply.trail == "new":
+            reply.request_line = current_request(turn.session) or None
         return reply
 
     def act(self, db: Session, user, conv: Conversation, action: str, params: Dict[str, Any],
@@ -129,6 +134,8 @@ class EditAgent:
                                    "avoid": session.avoid_people} if session is not None
                                   and session.schedule_id == schedule_id else None)
         fresh = open_session(db, schedule_id)
+        if session is not None and session.schedule_id == schedule_id:
+            fresh.shown_notes = set(session.shown_notes)          # 같은 근무표면 참고 문구를 다시 붙이지 않는다(검토 L2)
         if carry:
             fresh.requests = (requests_from_json(carry["requests"]) if conv.restored else list(carry["requests"]))
             fresh.allow = (allow_from_json(carry["allow"]) if conv.restored else dict(carry["allow"]))

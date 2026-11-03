@@ -17,7 +17,7 @@ from ortools.sat.python import cp_model
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    AvoidCell, CountTarget, EditRequest, SetCell, count_in, work_targets,
+    AvoidCell, CountTarget, EditRequest, SetCell, count_cells, count_in, work_targets,
 )
 from services.schedule_edit.rules import (
     WISH, Grid, Ineq, RuleSet, Term, TeamCover, cell, team_present, value_of,
@@ -284,12 +284,14 @@ def add_requests(em: EditModel, requests: List[EditRequest]) -> None:
 
 
 def count_expr(em: EditModel, nurse_id: str, codes, days) -> Any:
-    """그 사람의 그 근무 개수(기간) — 바꿀 수 있는 칸은 변수, 나머지는 지금 값."""
+    """그 사람의 그 근무 개수(기간) — 바꿀 수 있는 칸은 변수, 나머지는 지금 값. OFF 는 휴가·공가 칸을 세지 않는다
+    (`requests.count_cells` 와 같은 기준 · 휴가 칸은 바꿀 수 없어 변수가 아니다)."""
+    skip = "O" in codes
     expr = 0
     for d in days:
         if (nurse_id, d) in em.free:
             expr += sum(em.x[nurse_id, d, c] for c in codes if (nurse_id, d, c) in em.x)
-        elif em.base[nurse_id][d] in codes:
+        elif em.base[nurse_id][d] in codes and not (skip and (nurse_id, d) in em.ctx.vacation):
             expr += 1
     return expr
 
@@ -300,7 +302,7 @@ def _free_days(em: EditModel, nurse_id: str, exclude=()) -> List[int]:
 
 
 def _base_count(em: EditModel, nurse_id: str, codes, days) -> int:
-    return sum(1 for d in days if em.base[nurse_id][d] in codes)
+    return count_cells(em.ctx, em.base, nurse_id, codes, days)
 
 
 def _hold(em: EditModel, nurse_id: str, codes, days, *, up: bool) -> None:

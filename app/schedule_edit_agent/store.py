@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy.orm import Session
 
 from agent_kit.conversation import Conversation, ConversationError, Limits
+from schedule_edit_agent.answer import SOURCE_WORD
 from services.schedule_edit.journal import read_conversation, read_conversation_head
 
 AGENT_ID = "schedule-edit"
@@ -72,6 +73,9 @@ def restore(db: Session, conversation_id: str) -> Conversation:
         elif row.event in ("propose", "clarify"):
             if row.event == "propose":
                 state = {k: payload.get(k) or [] for k in ("requests", "allow", "avoid")}
+                # 흔적의 요청 줄은 해석한 요청으로(화면에 보였던 것과 같게 · 평가 11-03 U1)
+                line = SOURCE_WORD.get(payload["postprocess"]) if payload.get("postprocess") else payload.get("described")
+                conv.request = line or conv.request
             if said is not None:
                 conv.remember(said, payload.get("answer", ""))
                 said = None

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from services.schedule_edit.context import EditContext
-from services.schedule_edit.requests import CountTarget, EditRequest, SetCell, count_in, transfer_label
+from services.schedule_edit.requests import CountTarget, EditRequest, LeaveCell, SetCell, count_in, transfer_label
 
 _SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
 #: 생성 후처리의 이름(`services.schedule_edit.postprocess.KINDS`)
@@ -36,12 +36,16 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
             parts.append(_describe_count(ctx, who, r))
             continue
         if keeps and _same(ctx, r):
-            if kept_by_day[r.day] < 3:
+            if r.code == "O" and kept_by_day[r.day] < 3:
+                parts.append(f"{who} {r.day + 1}일 OFF 유지")       # 기간 OFF 중 이미 OFF 인 날(평가 11-03)
+            elif kept_by_day[r.day] < 3:
                 parts.append(f"{who} {r.day + 1}일 그대로")
             elif f"{r.day + 1}일 {kept_by_day[r.day]}명 그대로" not in parts:
                 parts.append(f"{r.day + 1}일 {kept_by_day[r.day]}명 그대로")
         elif isinstance(r, SetCell):
             parts.append(f"{who} {r.day + 1}일 {_SHIFT_WORD.get(r.code, r.code)}")
+        elif isinstance(r, LeaveCell):
+            parts.append(f"{who} {r.day + 1}일 {ctx.leave_codes.get(r.code, r.code)}")
         else:
             codes = "·".join(_SHIFT_WORD.get(c, c) for c in sorted(r.codes))
             parts.append(f"{who} {r.day + 1}일 {codes} 빼기")
@@ -61,9 +65,17 @@ def _same(ctx: EditContext, r: EditRequest) -> bool:
     return isinstance(r, SetCell) and ctx.main[r.nurse_id][r.day] == r.code
 
 
-def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result) -> str:
+def fresh_notes(session, notes: Sequence[str]) -> List[str]:
+    """아직 보이지 않은 참고 문구만 — 보인 것으로 표시한다(같은 대화에서 매 답마다 붙지 않게)."""
+    new = [n for n in notes if n not in session.shown_notes]
+    session.shown_notes.update(new)
+    return new
+
+
+def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes: Optional[Sequence[str]] = None) -> str:
+    """notes: 붙일 참고 문구(없으면 결과의 것 전부) — 대화에서는 `fresh_notes` 로 처음 한 번만."""
     head = describe_requests(ctx, requests)
-    notes = [f"참고: {n}" for n in result.notes]
+    notes = [f"참고: {n}" for n in (result.notes if notes is None else notes)]
     if result.status == "ok":
         first = result.candidates[0]
         lo, hi = first.span
@@ -110,6 +122,15 @@ def status_text(session) -> str:
     elif last.status == "ok" and last.candidates:
         lines.append(f"바꿀 방법 {len(last.candidates)}가지를 찾아 두었습니다(가장 적게 바꾸는 안 "
                      f"{last.candidates[0].changed_count}칸). 근무표는 카드에서 '적용'을 누르기 전까지 바뀌지 않습니다.")
+    elif last.reasons and (last.status == "already" or getattr(last, "source", None)):
+        lines.append(last.reasons[0])           # 생성 후처리를 돌렸지만 바뀔 칸이 없었던 이유 등(평가 11-03)
+    elif last.status == "already":
+        lines.append("이미 그렇게 되어 있어 바꿀 칸이 없습니다. 근무표는 바뀌지 않았습니다.")
+    elif last.status == "invalid":
+        lines.append("요청을 받을 수 없었습니다" + (f": {last.reasons[0]}" if last.reasons else ".")
+                     + " 근무표는 바뀌지 않았습니다.")
+    elif last.status == "timeout":
+        lines.append("시간 안에 방법을 찾지 못했습니다. 근무표는 바뀌지 않았습니다.")
     else:
         lines.append("마지막으로 찾았을 때 방법이 없었습니다. 근무표는 바뀌지 않았습니다.")
     return " ".join(lines)
@@ -141,3 +162,27 @@ def postprocess_answer(ctx: EditContext, result) -> str:
         lines.append("참고: " + " · ".join(notes) + ".")
     lines.append("연차 잔여는 보지 않습니다(근무표를 만들 때의 자동 전환과 같습니다).")
     return "\n".join(lines)
+
+
+def lookup_answer(ctx: EditContext, kind: str, nurse, day, code) -> str:
+    """조회 답 — 지금 저장된 근무표에서만 센다(찾아 둔 후보는 아직 근무표가 아니다)."""
+    from schedule_edit_agent.grounding import count_status
+    word = _SHIFT_WORD.get(code, code)
+    if kind == "person_count":
+        return count_status(ctx, nurse, code) + " (지금 저장된 근무표 기준)"
+    if kind == "person_day":
+        raw, main = ctx.raw[nurse][day], ctx.main[nurse][day]
+        shown = ctx.leave_codes.get(raw, raw) if raw else "빈 칸"
+        detail = f"({_SHIFT_WORD.get(main, main)})" if main and raw and _SHIFT_WORD.get(main, main) != raw else ""
+        return f"{ctx.names.get(nurse, nurse)} {day + 1}일은 {shown}{detail}입니다(지금 저장된 근무표 기준)."
+    names = [ctx.names.get(n, n) for n in ctx.nurse_ids
+             if ctx.main[n][day] == code and not (code == "O" and (n, day) in ctx.vacation)]
+    if code == "O":
+        away = [f"{ctx.names.get(n, n)}({ctx.leave_codes.get(ctx.raw[n][day], ctx.raw[n][day])})"
+                for n in ctx.nurse_ids if (n, day) in ctx.vacation]
+        tail = f" 휴가 {len(away)}명: {', '.join(away)}." if away else ""
+    else:
+        tail = ""
+    if not names:
+        return f"{day + 1}일 {word}인 사람이 없습니다.{tail} (지금 저장된 근무표 기준)"
+    return f"{day + 1}일 {word} {len(names)}명: {', '.join(names)}.{tail} (지금 저장된 근무표 기준)"

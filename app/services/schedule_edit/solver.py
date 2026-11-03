@@ -27,14 +27,13 @@ from __future__ import annotations
 import logging
 import time
 from datetime import date, datetime, timedelta, timezone
-import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 from ortools.sat.python import cp_model
 
 from services.schedule_edit import distribution as dist
-from services.schedule_edit.context import EditContext, pure_off_count
+from services.schedule_edit.context import EditContext, pure_off_count, with_vacation
 from services.schedule_edit.explain import direct_conflicts, explain_month
 from services.schedule_edit.levers import LEVER_SECONDS, find_levers, lever_allow
 from services.schedule_edit.model import (
@@ -44,7 +43,7 @@ from services.schedule_edit.model import (
     requested_cells, subcode_changes,
 )
 from services.schedule_edit.requests import (
-    CountTarget, EditRequest, first_open_day, is_satisfied, request_problem,
+    AvoidCell, CountTarget, EditRequest, LeaveCell, SetCell, first_open_day, is_satisfied, request_problem,
 )
 from services.schedule_edit.rules import Grid, RuleSet, build_rules, measure, measure_soft, new_violations
 from services.schedule_edit.screen_check import ScreenBaseline, screen_regressions
@@ -155,6 +154,18 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
         return EditResult("invalid", reasons=problems, notes=list(ctx.notes))
     if all(is_satisfied(ctx, r) for r in requests):
         return EditResult("already", notes=list(ctx.notes))
+    leave = {(r.nurse_id, r.day): r.code for r in requests if isinstance(r, LeaveCell)}
+    if leave:
+        # 연차·휴가 칸 — 그 칸을 휴가로 넣은 재료로 OFF 를 지정해 푼다(순수 OFF·패턴 판정이 휴가로 본다 · 빠진 근무는
+        # 다른 사람이 메운다). 후보에서 그 칸만 휴가 코드로 바꾼다(`_as_leave`)
+        ctx = with_vacation(ctx, leave)
+        rules = None
+        requests = [SetCell(r.nurse_id, r.day, "O") if isinstance(r, LeaveCell) else r for r in requests]
+        if ctx.config.get("ban_night_before_fixed_off"):
+            # 휴가 전날 N 금지(설정) — 지금 전날이 N 이면 그 N 을 빼야 한다(기준선 위반으로 묻히지 않게 · 검토 M1).
+            # 바꿀 수 없는 전날 N 은 요청 검사가 미리 거절한다
+            requests += [AvoidCell(n, d - 1, frozenset({"N"})) for n, d in leave
+                         if d >= 1 and (n, d - 1) not in leave and ctx.main[n][d - 1] == "N"]
     rules = rules or build_rules(ctx)
     run = _Run(ctx, rules, requests, measure(ctx, ctx.main, rules), measure_soft(ctx, ctx.main, rules),
                screen, max_candidates,
@@ -170,7 +181,8 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
         _carry_over(em, run)
         found, status = _search(run, em, (days[0], days[-1]), MONTH_SECONDS if step is None else SOLVE_SECONDS)
         if found:
-            return EditResult("ok", candidates=found, notes=list(ctx.notes))
+            return EditResult("ok", candidates=[_as_leave(c, leave) for c in found] if leave else found,
+                              notes=list(ctx.notes))
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return EditResult("infeasible", notes=list(ctx.notes), reasons=[
             "찾은 방법이 모두 근무표 화면에 새 위반을 만들어 후보로 내지 않았습니다."])
@@ -179,6 +191,15 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
                           reasons=[f"지금 규칙을 모두 지키면서 {MAX_CHANGES}칸 이내로는 방법이 없습니다."
                                    if status == cp_model.INFEASIBLE else "시간 안에 방법을 찾지 못했습니다."])
     return _no_candidate(run, proven=status == cp_model.INFEASIBLE)
+
+
+def _as_leave(cand: Candidate, leave: Dict[Tuple[str, int], str]) -> Candidate:
+    """휴가 요청 칸은 OFF 로 풀었다 — 저장할 코드는 휴가 코드, 재확인은 그 칸을 휴가로 센다(CellChange.vacation)."""
+    for ch in cand.changes:
+        code = leave.get((ch.nurse_id, ch.day))
+        if code is not None:
+            ch.after, ch.vacation = code, True
+    return cand
 
 
 def _window_days(run: _Run, step: Optional[int]) -> List[int]:
@@ -356,8 +377,11 @@ def verify_candidate(ctx: EditContext, rules: RuleSet, candidate: "Candidate", r
     vacation = {(c.nurse_id, c.day) for c in candidate.changes if c.vacation}
     after_ctx, after_rules = ctx, rules
     if vacation:
-        after_ctx = dataclasses.replace(ctx, vacation=set(ctx.vacation) | vacation)
+        after_ctx = with_vacation(ctx, vacation)
         after_rules = build_rules(after_ctx)
+    # 휴가 요청 칸에 정말 그 휴가 코드가 들어갔는가(검토 L6)
+    found += [f"요청 미충족 {r}" for r in requests if isinstance(r, LeaveCell) and not any(
+        (c.nurse_id, c.day, c.after) == (r.nurse_id, r.day, r.code) for c in candidate.changes)]
     base = measure(ctx, ctx.main, rules)
     found += [f"{k[0]} {k}" for k, _v in rule_regressions(after_ctx, after_rules, grid, requests, allow, before=base)]
     screen_allow = {**allow, **grid_relief(ctx, rules, list(requests), grid)}

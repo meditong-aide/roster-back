@@ -31,6 +31,28 @@ class AvoidCell:
     codes: FrozenSet[str]
 
 
+def eul(word: str) -> str:
+    """목적격 조사 — 받침이 있으면 '을', 없으면 '를'('연차를' · '공가를' · '생휴를')."""
+    last = word[-1:] if word else ""
+    if "가" <= last <= "힣":
+        return word + ("을" if (ord(last) - 0xAC00) % 28 else "를")
+    return word + "을(를)"
+
+
+@dataclass(frozen=True)
+class LeaveCell:
+    """이 칸을 휴가·공가 코드로 — 예) 김민주 25일 연차. 쉬는 날이지만 순수 OFF 로 세지 않는다.
+
+    근무일에만 넣는다 — 이미 쉬는 날(O)에 넣으면 순수 OFF 가 줄어 OFF 수 판정이 솔버·재확인에서 어긋난다
+    (남는 OFF 를 연차로 바꾸는 것은 '자동 연차전환'). 솔버는 그 칸을 휴가로 넣은 재료로 OFF 를 지정해 풀고,
+    후보의 그 칸만 휴가 코드로 바꾼다(`solver.propose_edits`).
+    """
+
+    nurse_id: str
+    day: int
+    code: str
+
+
 #: 개수 요청의 '상대' 를 어떻게 정할지(사용자 결정 11-02: 선택지를 미리 풀어 보여 주고 고르게 한다).
 #:   요청자의 근무가 줄면(N 빼기·OFF 늘리기) 빠지는 근무를 누가 메울지, 늘면(N 더·OFF 빼기) 누구 것을 넘겨받을지.
 #:   reduce_coverage = 메우지 않고 그날 인원 줄이기 · add_coverage = 넘겨받지 않고 그날 인원 늘리기(둘 다 그날 인원 설정을
@@ -63,7 +85,7 @@ class CountTarget:
         return range(self.first_day, self.last_day + 1)
 
 
-EditRequest = Union[SetCell, AvoidCell, CountTarget]
+EditRequest = Union[SetCell, AvoidCell, CountTarget, LeaveCell]
 
 
 def work_down(ctx: EditContext, req: CountTarget) -> bool:
@@ -96,14 +118,28 @@ def transfer_label(ctx: EditContext, req: CountTarget, policy: str) -> str:
     return "가장 적게 바꾸기"
 
 
+def count_cells(ctx: EditContext, grid: Dict[str, List], nurse_id: str, codes, days) -> int:
+    """그 사람의 그 근무 개수(그 날들) — OFF 는 휴가·공가 칸을 세지 않는다(순수 OFF · 화면·병동 규칙과 같게 ·
+    평가 11-03: '장원영 OFF 11→12' 로 연차까지 셌다). 요청자·상대·미리 풀기 모두 이 함수로 센다(검토 M2).
+    휴가 칸은 바꿀 수 없는 칸이라 목표 계산은 그대로 맞는다."""
+    skip = "O" in codes
+    return sum(1 for d in days if grid[nurse_id][d] in codes and not (skip and (nurse_id, d) in ctx.vacation))
+
+
+def counts_as(ctx: EditContext, req: CountTarget, day: int) -> bool:
+    """그 칸이 이 개수 요청에서 셀 수 있는 칸인가(`count_cells` 와 같은 기준)."""
+    return not ("O" in req.codes and (req.nurse_id, day) in ctx.vacation)
+
+
 def count_in(ctx: EditContext, grid: Dict[str, List], req: CountTarget) -> int:
-    return sum(1 for d in req.days() if grid[req.nurse_id][d] in req.codes)
+    return count_cells(ctx, grid, req.nurse_id, req.codes, req.days())
 
 
 def fixed_count(ctx: EditContext, req: CountTarget, open_from: int = 0) -> int:
     """기간 안에서 못 바꾸는 칸(지난 날·고정 칸)에 이미 있는 그 근무 수 — 목표의 하한."""
     row = ctx.main[req.nurse_id]
-    return sum(1 for d in req.days() if row[d] in req.codes and (d < open_from or not ctx.is_free(req.nurse_id, d)))
+    return sum(1 for d in req.days() if row[d] in req.codes and counts_as(ctx, req, d)
+               and (d < open_from or not ctx.is_free(req.nurse_id, d)))
 
 
 def swap(ctx: EditContext, nurse_a: str, nurse_b: str, day: int) -> List[SetCell]:
@@ -136,6 +172,18 @@ def request_problem(ctx: EditContext, req: EditRequest, open_from: int = 0) -> O
     reason = ctx.frozen.get((req.nurse_id, req.day))
     if reason:
         return f"{name} {req.day + 1}일은 '{reason}' 칸이라 바꿀 수 없습니다."
+    if isinstance(req, LeaveCell):
+        if req.code not in ctx.leave_codes:
+            return f"'{req.code}' 는 이 병동의 휴가 코드가 아닙니다."
+        if ctx.main[req.nurse_id][req.day] in (None, "O"):
+            return (f"{name} {req.day + 1}일은 이미 쉬는 날이라 {eul(ctx.leave_codes[req.code])} 넣지 않습니다. "
+                    "근무일을 골라 주세요(남는 OFF 를 연차로 바꾸려면 '자동 연차전환'이라고 말씀해 주세요).")
+        before = req.day - 1
+        if (ctx.config.get("ban_night_before_fixed_off") and before >= 0 and ctx.main[req.nurse_id][before] == "N"
+                and (before < open_from or not ctx.is_free(req.nurse_id, before))):
+            return (f"{name} {before + 1}일 나이트를 바꿀 수 없어 {req.day + 1}일에 휴가를 넣을 수 없습니다"
+                    "(휴가 전날 나이트 금지 설정).")
+        return None
     codes = {req.code} if isinstance(req, SetCell) else set(req.codes)
     usable = set(EDIT_MAINS) if ctx.use_mid else set(EDIT_MAINS) - {"M"}
     if not codes <= usable:
@@ -177,6 +225,8 @@ def is_satisfied(ctx: EditContext, req: EditRequest, grid: Optional[Dict[str, Li
     if isinstance(req, CountTarget):
         return count_in(ctx, grid or ctx.main, req) == req.target
     current = (grid or ctx.main)[req.nurse_id][req.day]
+    if isinstance(req, LeaveCell):
+        return current == "O"          # 대표코드는 O — 휴가 코드는 후보 칸(after)에 실린다
     if isinstance(req, SetCell):
         return current == req.code
     return current not in req.codes

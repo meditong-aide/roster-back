@@ -11,7 +11,7 @@ import json
 from typing import Any, Dict, List, Sequence, Tuple
 
 from services.schedule_edit.context import EditContext
-from services.schedule_edit.requests import AvoidCell, CountTarget, EditRequest, SetCell
+from services.schedule_edit.requests import AvoidCell, CountTarget, EditRequest, LeaveCell, SetCell
 
 
 def allow_to_json(allow: Dict[Tuple, int]) -> List[List[Any]]:
@@ -31,6 +31,8 @@ def requests_to_json(requests: Sequence[EditRequest]) -> List[Dict[str, Any]]:
                         "first_day": r.first_day, "last_day": r.last_day, "transfer": r.transfer})
         elif isinstance(r, SetCell):
             out.append({"kind": "set", "nurse_id": r.nurse_id, "day": r.day, "code": r.code})
+        elif isinstance(r, LeaveCell):
+            out.append({"kind": "leave", "nurse_id": r.nurse_id, "day": r.day, "code": r.code})
         else:
             out.append({"kind": "avoid", "nurse_id": r.nurse_id, "day": r.day, "codes": sorted(r.codes)})
     return out
@@ -44,6 +46,8 @@ def requests_from_json(items: Sequence[Dict[str, Any]]) -> List[EditRequest]:
                                    int(i["last_day"]), i.get("transfer")))
         elif i["kind"] == "set":
             out.append(SetCell(i["nurse_id"], int(i["day"]), i["code"]))
+        elif i["kind"] == "leave":
+            out.append(LeaveCell(i["nurse_id"], int(i["day"]), i["code"]))
         else:
             out.append(AvoidCell(i["nurse_id"], int(i["day"]), frozenset(i["codes"])))
     return out

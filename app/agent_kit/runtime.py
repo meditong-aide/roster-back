@@ -79,7 +79,7 @@ def run_turn(agent: Agent, db: Session, user: Any, conv: Conversation, inp: Turn
     result = agent.handle(TurnCall(db=db, user=user, conv=conv, input=inp, today=agent.today(), deadline=deadline))
     conv.remember(result.said or inp.text or f"[{inp.kind}] {inp.action}", result.answer)
     if inp.kind == "text" and result.trail == "new":
-        conv.request, conv.steps = inp.text, []
+        conv.request, conv.steps = result.request_line or inp.text, []
     elif inp.kind == "text" and result.trail == "step":
         conv.steps.append(inp.text or "")
     if result.step:

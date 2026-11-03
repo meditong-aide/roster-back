@@ -62,6 +62,9 @@ class TurnResult:
     #: 말(text) 턴이 흔적을 어떻게 바꾸나 — new: 새 요청(흔적을 이 말로 새로) · step: 고쳐 말함(단계로 붙임) ·
     #: keep: 요청을 바꾸지 않는 말(상태 질문·안내·해석 실패) — 흔적 그대로
     trail: str = "new"
+    #: trail=new 일 때 흔적의 요청 줄 — 에이전트가 해석한 요청('박민지 18일 OFF'). 없으면 말 원문
+    #: (되물음에 이름만 답하면 원문 '박민지' 가 요청 줄이 됐다 · 평가 11-03 U1)
+    request_line: Optional[str] = None
     #: 대화 대상이 바뀌면(적용 → 새 버전) 새 대상
     context: Optional[Dict[str, Any]] = None
 

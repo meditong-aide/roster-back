@@ -14,18 +14,21 @@ from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from schedule_edit_agent.answer import answer_for, describe_requests, postprocess_answer, status_text
-from schedule_edit_agent.grounding import SHIFT_WORD, SHIFTS, ground_changes, resolve_day, resolve_nurse
+from schedule_edit_agent.answer import (
+    answer_for, describe_requests, fresh_notes, lookup_answer, postprocess_answer, status_text,
+)
+from schedule_edit_agent.grounding import SHIFT_WORD, SHIFTS, ground_changes, resolve_day, resolve_nurse, resolve_shift
 from services.schedule_edit.apply import ApplyError, apply_to_new_version
 from services.schedule_edit.journal import record_event
 from services.schedule_edit.postprocess import ANNUAL_LEAVE_SWAP, RUNNERS, as_result
 from services.schedule_edit.postprocess import KINDS as POSTPROCESS_KINDS
 from services.schedule_edit.requests import (
-    TRANSFERS, CountTarget, EditRequest, SetCell, count_in, first_open_day, transfer_label, work_down, work_targets,
+    TRANSFERS, CountTarget, EditRequest, SetCell, count_cells, count_in, first_open_day, transfer_label, work_down,
+    work_targets,
 )
 from services.schedule_edit.serialize import allow_to_json, requests_to_json, result_to_dict
 from services.schedule_edit.session import EditSession, allow_lever_id, keep, propose, reject, stage
-from services.schedule_edit.solver import apply_candidate, propose_edits
+from services.schedule_edit.solver import EditResult, apply_candidate, propose_edits
 
 #: 채팅 한 번의 응답 시간 상한(초) — CloudFront 30초 안에 들어와야 한다. 경로에 들어온 순간부터 센다
 #: (슬롯 대기·판정 재료 로드·LLM·솔버 모두 이 안 · 검토 HIGH-2). 솔버 예산은 남은 시간이다.
@@ -107,10 +110,13 @@ def llm_tools() -> List[Dict[str, Any]]:
 _CHANGE = {
     "type": "object",
     "properties": {
-        "kind": {"type": "string", "enum": ["set", "avoid", "swap", "off_period", "count"],
+        "kind": {"type": "string", "enum": ["set", "avoid", "swap", "off_period", "count", "leave"],
                  "description": "set=그 칸을 이 근무로 · avoid=그 칸에서 이 근무(들)를 빼기(무엇으로 바꿀지는 맡김) · "
                                 "swap=두 사람의 그날 근무 맞바꾸기 · off_period=day 부터 to_day 까지 OFF · "
-                                "count=날짜를 정하지 않고 그 사람의 그 근무 개수를 바꾸기(어느 날인지는 맡김)"},
+                                "count=날짜를 정하지 않고 그 사람의 그 근무 개수를 바꾸기(어느 날인지는 맡김) · "
+                                "leave=그 날(또는 day~to_day)에 연차·휴가·공가 같은 휴가 코드 넣기(근무일에만)"},
+        "leave": {"type": "string",
+                  "description": "leave 의 휴가 이름 — 사용자가 말한 그대로(연차·병가·공가·생휴 등). 말하지 않았으면 비운다"},
         "nurse": {"type": "string", "description": "사용자가 말한 간호사 이름 그대로(호칭 '선생님' 등은 빼고)"},
         "other_nurse": {"type": "string", "description": "swap 의 상대 간호사 이름"},
         "day": {"type": "integer", "minimum": 1, "maximum": 31,
@@ -196,8 +202,12 @@ def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
         # 말로 바꾼 방식은 이미 고른 방식도 덮어쓴다('아니 같은 팀으로' · 검토 L4) — 버튼은 정하지 않은 것만
         reqs = [_decided(r, params["transfer"], force=True) for r in reqs]
     for r in (add.requests if add else []):
+        if not isinstance(r, CountTarget):     # 같은 칸 요청은 새 것이 덮어쓴다('A 15일 E' 뒤 'A 15일 연차' · 검토 L1)
+            reqs = [x for x in reqs if isinstance(x, CountTarget) or (x.nurse_id, x.day) != (r.nurse_id, r.day)]
         if r not in reqs:
             reqs.append(r)
+    # '21일은 그대로 둬' — 요청한 칸이 그 날이면 그 요청을 뺀다(평가 11-03: 요청은 남기고 그날 다른 칸만 고정해 모순)
+    reqs = [r for r in reqs if isinstance(r, CountTarget) or _is_keep(ctx, r) or (r.nurse_id, r.day) not in kept]
     asked = {(r.nurse_id, r.day) for r in reqs}
     for n, d in sorted(kept - asked):
         if ctx.is_free(n, d):     # 고정 칸은 원래 안 바뀐다
@@ -253,11 +263,24 @@ def _is_keep(ctx, r: EditRequest) -> bool:
 #: 바꾸지 않는 답의 종류 → 정해진 문장(LLM 글을 사용자에게 보내지 않는다 · 검토 M3)
 REPLY_KINDS = ("who", "when", "what", "outside_month", "settings", "unsupported", "other", "status", "unclear")
 #: 아직 못 하는 변경 — 답 문장과 처음 화면 안내가 같은 목록을 쓴다
-UNSUPPORTED = "그날 인원·근무 모양·휴가·원티드·여러 사람 고르게 맞추기, 근무 수 묻기"
+UNSUPPORTED = "그날 인원 늘리기·줄이기, 근무 모양 고치기, 원티드 반영, 여러 사람 고르게 맞추기, 버전 되돌리기"
+#: 아직 못 하는 종류별 안내(reply_only kind=unsupported 의 topic · 평가 11-03: 조회·되돌리기에도 같은 목록이 나갔다)
+UNSUPPORTED_TOPICS = {
+    "coverage": "그날 인원 늘리기·줄이기는 아직 여기서 못 합니다. '15일 김채원 E로'처럼 누구의 며칠 근무를 바꿀지 "
+                "말씀해 주시면 찾아 드립니다.",
+    "fairness": "여러 사람의 근무 수를 고르게 맞추기는 아직 못 합니다. '최유진 N 2개만 줄여줘'처럼 한 사람씩 말씀해 주시면 "
+                "찾아 드립니다.",
+    "pattern": "연속 근무·주말 몰림 같은 근무 모양 고치기는 아직 못 합니다. 바꿀 사람과 날짜를 말씀해 주시면 찾아 드립니다.",
+    "wanted": "원티드 반영은 아직 여기서 못 합니다. 반영할 사람과 날짜, 근무를 말씀해 주시면 그 칸을 바꿔 드립니다.",
+    "undo": "만든 버전 되돌리기·버전 비교는 아직 여기서 못 합니다. 이전 버전은 그대로 남아 있으니 버전 목록에서 골라 주세요.",
+    "postprocess": "그 후처리는 아직 여기서 못 합니다. 지금은 자동 연차전환만 할 수 있습니다.",
+}
 
 
-def reply_text(kind: str, session: EditSession) -> str:
+def reply_text(kind: str, session: EditSession, topic: Optional[str] = None) -> str:
     ctx = session.ctx
+    if kind == "unsupported" and topic in UNSUPPORTED_TOPICS:
+        return UNSUPPORTED_TOPICS[topic]
     return {
         "who": "누구의 근무를 바꿀까요? 이름을 알려 주세요.",
         "when": "며칠의 근무인가요?",
@@ -276,18 +299,62 @@ def reply_text(kind: str, session: EditSession) -> str:
     "reply_only",
     description=(
         "근무표를 바꾸지 않고 답할 때 부른다. 답 문장은 시스템이 정해진 틀로 만든다. kind: who=누구인지 빠짐 · "
-        "when=며칠인지 빠짐 · what=무엇으로 바꿀지 빠짐 · outside_month=근무표 달 밖의 날짜 · settings=인원·규칙·OFF 수 "
-        "같은 설정 변경이나 근무표 새로 만들기 · unsupported=근무표를 바꾸는 말이지만 아직 못 하는 종류(그날 인원 "
-        "늘리기·줄이기, 연속 근무·주말 몰림 같은 근무 모양, 휴가·교육 넣기, 원티드 반영, 여러 사람 고르게 맞추기, "
-        "'몇 개야'·'누구야' 같은 조회) · other=근무표와 상관없는 말 · status=지금 요청·결과가 어떤지 묻는 말"
+        "when=며칠인지 빠짐 · what=무엇으로 바꿀지 빠짐 · outside_month=근무표 달 밖의 날짜 · settings=병동 설정값 자체"
+        "(하루 인원 기준·규칙·OFF 기준 수)를 바꾸는 말이나 근무표 새로 만들기 — '사람들 OFF·근무 수를 맞춰 줘'는 "
+        "settings 가 아니라 unsupported(topic=fairness) · unsupported=근무표를 바꾸는 말이지만 아직 못 하는 종류 — "
+        "topic 을 함께 고른다: coverage=그날 인원 늘리기·줄이기 · fairness=여러 사람 근무 수 고르게 맞추기 · "
+        "pattern=연속 근무·주말 몰림 같은 근무 모양 · wanted=원티드 반영 · undo=버전 되돌리기·비교 · "
+        "postprocess=자동 연차전환 밖의 생성 후처리(보건휴가·수면 OFF 등) · other=근무표와 상관없는 말 · "
+        "status=지금 요청·결과가 어떤지 묻는 말"
         "(예: '바꿔 줬어?', '지금 뭐 하고 있었지?') · unclear=그 밖에 알아듣기 어려움"),
-    parameters={"type": "object", "properties": {"kind": {"type": "string", "enum": list(REPLY_KINDS)}},
+    parameters={"type": "object", "properties": {"kind": {"type": "string", "enum": list(REPLY_KINDS)},
+                                                 "topic": {"type": "string", "enum": list(UNSUPPORTED_TOPICS)}},
                 "required": ["kind"]},
     mode="read", llm=True)
 def reply_only(turn: Turn, params: Dict[str, Any]) -> Outcome:
     kind = params.get("kind") if params.get("kind") in REPLY_KINDS else "unclear"
-    answer = reply_text(kind, turn.session)
+    answer = reply_text(kind, turn.session, params.get("topic"))
     turn.record("clarify", {"kind": kind, "asks": [answer], "answer": answer})
+    return Outcome(answer=answer)
+
+
+# ── 조회(근무표를 바꾸지 않는다 · 사용자 결정 11-03) ─────────────────────────────────────────
+
+LOOKUP_KINDS = ("day_shift", "person_count", "person_day")
+
+
+@register(
+    "lookup",
+    description=(
+        "근무표를 바꾸지 않고 지금 저장된 근무표에서 찾아 답한다(조회). kind: day_shift=그날 그 근무가 누구인지"
+        "('15일 나이트 누구야') · person_count=그 사람의 그 달 근무 개수('장원영 N 몇 개야', '권은비 OFF 몇 개') · "
+        "person_day=그 사람의 그날 근무('장원영 15일 뭐야')."),
+    parameters={"type": "object", "properties": {
+        "kind": {"type": "string", "enum": list(LOOKUP_KINDS)},
+        "nurse": {"type": "string", "description": "사용자가 말한 간호사 이름 그대로"},
+        "day": {"type": "integer", "minimum": 1, "maximum": 31},
+        "shift": {"type": "string", "enum": list(SHIFTS)}}, "required": ["kind"]},
+    mode="read", llm=True)
+def lookup(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    ctx = turn.session.ctx
+    kind = params.get("kind")
+    asks: List[str] = []
+    nurse = day = code = None
+    if kind in ("person_count", "person_day"):
+        nurse, ask = resolve_nurse(ctx, params.get("nurse"))
+        asks += [ask] if ask else []
+    if kind in ("day_shift", "person_day"):
+        day, ask = resolve_day(ctx, params.get("day"))
+        asks += [ask] if ask else []
+    if kind in ("day_shift", "person_count"):
+        code, ask = resolve_shift(ctx, params.get("shift"))
+        asks += [ask] if ask else []
+    if kind not in LOOKUP_KINDS:
+        asks.append("무엇을 찾을지 다시 말씀해 주세요. 예) '15일 나이트 누구야', '장원영 N 몇 개야'")
+    if asks:
+        return _clarify(turn, asks)
+    answer = lookup_answer(ctx, kind, nurse, day, code)
+    turn.record("clarify", {"lookup": kind, "answer": answer})
     return Outcome(answer=answer)
 
 
@@ -311,8 +378,9 @@ def run_postprocess(turn: Turn, params: Dict[str, Any]) -> Outcome:
     answer = postprocess_answer(session.ctx, result)
     # 솔버 요청과는 다른 일이다 — 지금 요청·넘긴 묶음·기준 안을 비우고 이 결과만 든다(적용은 다른 후보와 같은 길)
     session.requests, session.avoid_people, session.hint = [], [], None
-    session.last = as_result(session, result) if result.changes else None
-    preview = result_to_dict(session.ctx, session.last) if session.last is not None else None
+    session.last = (as_result(session, result) if result.changes
+                    else EditResult("already", reasons=[answer], source=kind))
+    preview = result_to_dict(session.ctx, session.last) if result.changes else None
     turn.record("propose", {"requests": [], "postprocess": kind, "report": result.report, "held": result.held,
                             "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
                             "avoid": []}, elapsed_ms=_ms(started))
@@ -435,7 +503,8 @@ def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
     started = time.monotonic()
     result = propose(turn.session, requests, today=turn.today, time_budget=turn.remaining())
     preview = result_to_dict(ctx, result)
-    answer = answer_for(ctx, requests, result)
+    preview["notes"] = fresh_notes(turn.session, result.notes)          # 답과 미리보기 모두 처음 한 번만(검토 L3)
+    answer = answer_for(ctx, requests, result, notes=preview["notes"])
     turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
                             "result": preview, "answer": answer,
                             "allow": allow_to_json(turn.session.allow),
@@ -491,9 +560,10 @@ def _choose_transfer(turn: Turn, requests: List[EditRequest], req: CountTarget) 
            else f"늘어나는 {word} {moved}개를 누구에게서 넘겨받을지")
     question = f"{describe_requests(ctx, requests)} — {ask} 골라 주세요."
     lines = [question] + [f"{i}. {_choice_line(c)}" for i, c in enumerate(ordered, 1)]
-    answer = "\n".join(lines + [f"참고: {n}" for n in ctx.notes])
+    notes = fresh_notes(session, ctx.notes)
+    answer = "\n".join(lines + [f"참고: {n}" for n in notes])
     preview = {"status": "choose_transfer", "choices": ordered, "direction": "down" if down else "up",
-               "question": question, "reasons": [], "notes": list(ctx.notes), "candidates": [], "levers": [],
+               "question": question, "reasons": [], "notes": notes, "candidates": [], "levers": [],
                "blocking": []}
     turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
                             "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
@@ -541,8 +611,8 @@ def _probe(turn: Turn, requests: List[EditRequest], req: CountTarget, policy: st
     for m in cand.affected:
         if m == req.nurse_id:
             continue
-        before = sum(1 for d in req.days() if ctx.main[m][d] in req.codes)
-        after = sum(1 for d in req.days() if grid[m][d] in req.codes)
+        before = count_cells(ctx, ctx.main, m, req.codes, req.days())
+        after = count_cells(ctx, grid, m, req.codes, req.days())
         if (after > before) if lower else (after < before):
             out["partners"].append({"nurse_id": m, "name": ctx.names.get(m, m), "before": before, "after": after})
     for d in req.days():
@@ -564,7 +634,7 @@ def _has_partner(ctx, req: CountTarget, lower: bool) -> bool:
     work = set(req.codes) & {"D", "E", "N", "M"}
 
     def count(m: str) -> int:
-        return sum(1 for d in days if ctx.main[m][d] in req.codes)
+        return count_cells(ctx, ctx.main, m, req.codes, days)
 
     def can_take(m: str) -> bool:
         return any(ctx.is_free(m, d) and (not work or c not in ctx.forbidden.get((m, d), set()))

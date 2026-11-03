@@ -151,7 +151,7 @@ def test_revise_keeps_a_day_as_is(world):
     agent, _ = _agent(call("propose_edit", changes=[A_OFF]), call("revise_edit", keep=[{"day": 3}]))
     say(agent, world.conv, "A 1일 오프")
     reply = say(agent, world.conv, "3일은 건드리지 마")
-    assert "A 3일 그대로" in reply.answer and "B 3일 그대로" in reply.answer
+    assert "A 3일 그대로" in reply.answer and "B 3일 OFF 유지" in reply.answer      # 이미 OFF 인 칸은 'OFF 유지'(평가 11-03)
     for cand in reply.preview["candidates"]:
         assert all(c["day"] != 3 for c in cand["changes"])
 
