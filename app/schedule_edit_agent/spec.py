@@ -22,6 +22,7 @@ from agent_kit.runtime import TurnError
 from db.models import Schedule
 from schedule_edit_agent import view
 from schedule_edit_agent.agent import EditAgent, close_conversation
+from schedule_edit_agent.examples import live_examples
 from schedule_edit_agent.llm import OpenAIEditLLM
 from schedule_edit_agent.skills import CHAT_BUDGET, MIN_SOLVE, UNSUPPORTED, SkillError
 from schedule_edit_agent.store import AGENT_ID, LIMITS, restore
@@ -29,8 +30,6 @@ from services.group_access import assert_caller_can_access_group, caller_is_mana
 from services.schedule_edit.journal import read_conversation, read_conversation_head
 
 MANAGERS_ONLY = "근무표 수정 도우미는 수간호사·그룹관리자만 쓸 수 있습니다."
-EXAMPLES = ["○○○ 14일 오프로", "15일 ○○○, ○○○ 근무 바꿔줘", "○○○ N 2개만 줄여줘", "15일 이브닝 한 명 더",
-            "○○○ 25일 연차 넣어줘", "15일 나이트 누구야", "남는 OFF 연차로 전환해줘"]
 
 
 class ScheduleEditAgent(Agent):
@@ -57,15 +56,17 @@ class ScheduleEditAgent(Agent):
 
     def intro(self, db: Session, user: Any, context: Dict[str, Any]) -> Dict[str, Any]:
         schedule = db.query(Schedule).filter(Schedule.schedule_id == context["schedule_id"]).first()
+        # 화면의 버전 고르기에 보이는 근무표 이름으로('11월 근무표 VER1 수정본' · 사용자 지적 11-03) — 이름이 없으면 VER 번호
         version = getattr(schedule, "version", None)
+        label = str(getattr(schedule, "name", "") or "").strip() or (f"VER{version}" if version is not None else "")
         return {
             "title": self.title,
-            "subtitle": (f"VER{version} 기준 · " if version is not None else "") + "규칙을 지키며 가장 적게 바꾸는 안을 찾습니다",
+            "subtitle": (f"{label} 기준 · " if label else "") + "규칙을 지키며 가장 적게 바꾸는 안을 찾습니다",
             "blocks": [
                 B.notice("하드락과 병동 설정을 모두 지키면서 가장 적게 바꾸는 안을 3개까지 찾아 표에 미리 보여 드립니다. "
                          "고른 안은 새 버전으로 저장되고, 이 버전은 그대로 남습니다.",
                          tone="normal", title="바꿀 내용을 말로 적어 주세요"),
-                B.examples("이렇게 말할 수 있어요", EXAMPLES),
+                B.examples("이렇게 말할 수 있어요", live_examples(db, schedule, self.today())),
                 B.notice(UNSUPPORTED, tone="muted", title="아직 못 하는 것"),
             ],
             "composer": {"label": "바꿀 내용", "placeholder": "예: 15일 나이트를 데이로 바꿔줘",

@@ -291,7 +291,7 @@ def test_availability_gives_the_first_screen(api, monkeypatch):
     body = api.client.get(f"{URL}/availability", params={"schedule_id": "s1"}).json()
     assert body["enabled"] and body["can_use"] and body["reason"] is None
     intro = body["intro"]
-    assert intro["title"] == "근무표 수정 도우미" and intro["subtitle"].startswith("VER1 기준")
+    assert intro["title"] == "근무표 수정 도우미" and intro["subtitle"].startswith("11월 기준")   # 근무표 이름(버전 고르기와 같은 말)
     assert [b["type"] for b in intro["blocks"]] == ["notice", "examples", "notice"]
     assert intro["composer"]["max_length"] == 1000
     api.state["user"] = _user(account="acc_nurse")
