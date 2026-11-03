@@ -93,7 +93,7 @@ def test_one_more_on_a_day_moves_someone_in_and_names_the_setting_it_passes(worl
     asked = say(agent, world.conv, "1일 데이 한 명 더")
     # 최대 인원을 넘기는 것은 요청 자체가 정한다 — 풀기 전에 먼저 묻는다(사용자 지시 11-03)
     assert asked.preview["status"] == "confirm"
-    assert "· 1일 D 1명 → 2명 — 일별 최대 인원 1명보다 1명 많음" in asked.answer
+    assert "· 1일 D 1명 → 2명 — 최대 근무 인원(1명)보다 1명 많음" in asked.answer
     reply = press(agent, world.conv, "confirm_request", {})
     assert reply.preview["status"] == "ok", reply.answer
     assert reply.answer.startswith("1일 D 1→2명 — 바꿀 방법")

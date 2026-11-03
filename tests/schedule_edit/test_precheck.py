@@ -33,7 +33,7 @@ def test_a_request_with_room_has_nothing_to_ask():
 def test_unavoidable_setting_is_asked_with_the_amount_to_pass():
     out = _check(_tight(), SetCell("A", 0, "O"))
     assert out.blocked == []
-    assert [(f.kind, f.text) for f in out.findings] == [("setting", "A 개인 OFF 수 상한을 1개 넘김")]
+    assert [(f.kind, f.text) for f in out.findings] == [("setting", "A OFF 수 상한보다 1개 많게")]
     assert out.findings[0].allow == {("OFF수", "A", None, None, "상한"): 1}
     # 이미 그만큼 허용했으면(고른 레버 등) 다시 묻지 않는다
     assert _check(_tight(), SetCell("A", 0, "O"), allow=out.findings[0].allow).findings == []
@@ -52,8 +52,8 @@ def test_consecutive_work_across_the_month_boundary_names_the_fixed_days():
     ctx = make_ctx({"A": "OOOOO", "B": "DDDOO"}, config=LOOSE)
     ctx.tail = {"A": ["D", "D", "D"], "B": ["O", "O", "O"]}
     out = _check(ctx, SetCell("A", 0, "D"), SetCell("A", 1, "D"), SetCell("A", 2, "D"))
-    assert out.blocked == ["A 1·2·3일 요청대로 바꾸면 연속 근무일 상한에 걸립니다(전월 말일 2일 전 D, 전월 말일 1일 전 D, "
-                           "전월 말일 D — 이미 정해져 바꿀 수 없는 칸)."]
+    assert out.blocked == ["A 1·2·3일 요청대로 바꾸면 최대 연속 근무일 수에 걸립니다(바꿀 수 없는 칸: 전월 말일 2일 전 D, 전월 말일 1일 전 D, "
+                           "전월 말일 D)."]
 
 
 def test_count_target_against_personal_limit_and_monthly_night_cap():
@@ -61,16 +61,16 @@ def test_count_target_against_personal_limit_and_monthly_night_cap():
                    config={**LOOSE, "max_nig_per_month": 5, "two_offs_after_two_nig": False})
     ctx.monthly_limits["A"] = {"n_max": 4}
     out = _check(ctx, CountTarget("A", frozenset({"N"}), 5, 0, 7))
-    assert [(f.kind, f.text) for f in out.findings] == [("setting", "A 개인 월 근무 한도(N) 상한을 1회 넘김")]
+    assert [(f.kind, f.text) for f in out.findings] == [("setting", "A 월 N 상한보다 1회 많게")]
     assert out.findings[0].allow == {("개인한도", "A", None, "n", "상한"): 1}
     blocked = _check(ctx, CountTarget("A", frozenset({"N"}), 6, 0, 7)).blocked
-    assert blocked == ["A — 요청대로면 이 달 N이 적어도 6회라 월 나이트 상한 5회를 넘습니다."]
+    assert blocked == ["A — 요청대로면 이 달 N이 6회 이상이라 월 최대 야간 근무 수(5회)를 넘습니다."]
 
 
 def test_cover_request_below_minimum_is_asked_with_counts():
     ctx = make_ctx({"A": "DD", "B": "DD", "C": "OO"}, cov_min={"D": 2}, config=LOOSE)
     out = _check(ctx, CoverTarget(0, "D", 1))
-    assert [(f.kind, f.text) for f in out.findings] == [("cover", "1일 D 2명 → 1명 — 일별 최소 인원 2명보다 1명 적음")]
+    assert [(f.kind, f.text) for f in out.findings] == [("cover", "1일 D 2명 → 1명 — 최소 근무 인원(2명)보다 1명 적음")]
     assert out.findings[0].allow == {}                        # 그날 인원 요청은 풀이가 이미 봐준다 — 동의만 받는다
 
 

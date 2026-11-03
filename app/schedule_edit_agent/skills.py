@@ -17,7 +17,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from schedule_edit_agent.answer import (
-    SOURCE_WORD, answer_for, describe_requests, fresh_notes, lookup_answer, postprocess_answer, status_text,
+    SHAPE, SOURCE_WORD, answer_for, check_answer, describe_requests, fresh_notes, lookup_answer, postprocess_answer,
+    status_text,
 )
 from schedule_edit_agent.grounding import SHIFT_WORD, SHIFTS, ground_changes, resolve_day, resolve_nurse, resolve_shift
 from services.schedule_edit.apply import ApplyError, apply_to_new_version
@@ -27,6 +28,8 @@ from services.schedule_edit.postprocess import KINDS as POSTPROCESS_KINDS
 from services.schedule_edit.precheck import (
     BLOCKED_HEAD, Finding, Precheck, apply_findings, finding_to_json, precheck,
 )
+from services.schedule_edit.rule_check import ALL as CHECK_ALL
+from services.schedule_edit.rule_check import TOPICS as CHECK_RULE_TOPICS
 from services.schedule_edit.requests import (
     TRANSFERS, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, WishTarget, balance_counts, count_cells,
     count_in, first_open_day, transfer_label, wish_count, wish_targets, work_down, work_targets,
@@ -423,6 +426,38 @@ def lookup(turn: Turn, params: Dict[str, Any]) -> Outcome:
     answer = lookup_answer(ctx, kind, nurse, day, code)
     turn.record("clarify", {"lookup": kind, "answer": answer})
     return Outcome(answer=answer)
+
+
+CHECK_TOPICS = (*CHECK_RULE_TOPICS, SHAPE, CHECK_ALL)
+
+
+@register(
+    "check_rules",
+    description=(
+        "근무표를 바꾸지 않고, 찾아 둔 후보(없으면 지금 저장된 근무표)가 규칙을 지키는지 묻는 말에 답한다"
+        "('그레이드는 다 지켜져?', '2안 나이트 규칙 괜찮아?', '인원 다 맞아?', '문제없는 거지?'). topic: "
+        "grade=등급(그레이드)별 최소 인원 · coverage=그날 근무 인원(최소·최대) · team=팀별 최소 인원 · "
+        "consecutive=연속 근무·같은 근무 연속·하루만 근무 · night=나이트 규칙(연속 N·N 뒤 OFF·1N·N 간격·월 N 상한·"
+        "휴가 전날 N) · transition=근무 전환 금지(N→D 등) · off=OFF 수·월 근무 한도 · shift_rule=허용 근무형·기피 근무·"
+        "주말휴무 · mutex=상호배제 · wanted=반영돼 있던 원티드를 지키는지 · shape=근무 모양(N-O-D 같은 순서·하루짜리 OFF·"
+        "몰림) · all=어느 규칙인지 말하지 않음('다 지켜져?'). rank=사용자가 '1안'·'두 번째 안'처럼 후보를 짚었을 때만."),
+    parameters={"type": "object", "properties": {
+        "topic": {"type": "string", "enum": list(CHECK_TOPICS)},
+        "rank": {"type": "integer", "minimum": 1}}, "required": ["topic"]},
+    mode="read", llm=True)
+def check_rules(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    session = turn.session
+    topic = params.get("topic") if params.get("topic") in CHECK_TOPICS else CHECK_ALL
+    last = session.last
+    candidates = list(last.candidates) if last is not None and last.status == "ok" else []
+    rank, focus = params.get("rank"), None
+    if isinstance(rank, int) and candidates:
+        if not 1 <= rank <= len(candidates):
+            return Outcome(answer=f"후보는 {len(candidates)}개입니다. 1~{len(candidates)}안 중에서 말씀해 주세요.")
+        candidates, focus = [candidates[rank - 1]], rank
+    answer = check_answer(session, topic, candidates)
+    turn.record("clarify", {"check": topic, "rank": focus, "answer": answer})
+    return Outcome(answer=answer, focus=focus)
 
 
 # ── 생성 후처리(사용자 결정 11-03 — 만들 때 하는 후처리도 쓸 수 있는 범위) ─────────────────────

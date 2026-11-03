@@ -78,5 +78,5 @@ def metrics(ctx: EditContext, grid: Dict[str, List]) -> Dict[str, int]:
     }
 
 
-METRIC_LABEL = {"off_range": "사람 간 OFF 수 격차", "n_range": "사람 간 나이트 수 격차",
-                "de": "D/E 불균형(허용폭 초과 합)"}
+METRIC_LABEL = {"off_range": "사람마다 OFF 수 차이", "n_range": "사람마다 나이트 수 차이",
+                "de": "D·E 쏠림 점수"}

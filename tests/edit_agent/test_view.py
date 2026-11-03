@@ -104,8 +104,8 @@ def test_infeasible_shows_lever_cards_titled_by_the_setting(world, monkeypatch):
     assert card["id"] == lever["lever_id"]
     assert card["actions"][0]["input"] == {"kind": "action", "action": "choose_lever",
                                            "params": {"lever_id": lever["lever_id"]}}
-    assert card["title"] == " · ".join(lever["lose"]) == "A 개인 OFF 수 상한을 1개 넘김"   # 카드마다 무엇을 넘기는지
-    assert card["lines"][0]["text"].startswith("넘기면 ")
+    assert card["title"] == " · ".join(lever["lose"]) == "A OFF 수 상한보다 1개 많게"   # 카드마다 무엇을 넘기는지
+    assert card["lines"][0]["text"]== "이 설정을 이번만 넘기시면 1칸을 바꿔 요청을 들어줄 수 있습니다"
 
     step = step_label("choose_lever", {"lever_id": lever["lever_id"]}, world.conv.state)
     assert step == "이번만 넘김: " + ", ".join(lever["lose"])

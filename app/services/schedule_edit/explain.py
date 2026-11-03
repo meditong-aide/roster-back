@@ -38,14 +38,14 @@ HARD_LOCK_FAMILIES = {"연속근무", "전환금지", "연속나이트", "3N후O
                       "월나이트", "1N"}
 
 FAMILY_LABEL = {
-    "연속근무": "연속 근무일 상한", "전환금지": "N→D·E→D·N→E 같은 전환 금지", "연속나이트": "나이트 연속 상한",
+    "연속근무": "최대 연속 근무일 수", "전환금지": "N→D·E→D·N→E 같은 전환 금지", "연속나이트": "나이트 연속 상한",
     "3N후OFF": "나이트 3일 뒤 OFF 2일", "2N후OFF": "나이트 2일 뒤 OFF 2일",
-    "2N후OFF(화면)": "나이트 2일 뒤 OFF 2일(화면 기준)", "월나이트": "월 나이트 상한",
-    "1N": "나이트 단독(1N) 금지", "N간격": "나이트 블록 간 최소 간격", "같은근무연속": "같은 근무 연속 상한",
-    "고립근무": "OFF 사이 하루 근무 금지", "금지근무": "허용 근무형·기피 근무", "휴무전날N": "휴가 전날 나이트 금지",
-    "주말휴무": "주말휴무 대상자 규칙", "개인한도": "개인 월 근무 한도", "OFF수": "개인 OFF 수",
-    "인원최소": "일별 최소 인원", "인원최대": "일별 최대 인원", "등급최소": "등급별 최소 인원",
-    "상호배제": "같은 근무 피하기 짝", "원티드": "간호사 원티드(희망) 반영 칸",
+    "2N후OFF(화면)": "나이트 2일 뒤 OFF 2일(화면 기준)", "월나이트": "월 최대 야간 근무 수",
+    "1N": "나이트 단독(1N) 금지", "N간격": "나이트 사이 최소 간격", "같은근무연속": "같은 근무 연속 상한",
+    "고립근무": "앞뒤 OFF 사이 하루 근무 금지", "금지근무": "허용 근무형·기피 근무", "휴무전날N": "휴가 전날 나이트 금지",
+    "주말휴무": "주말휴무 대상자 규칙", "개인한도": "월 근무 한도", "OFF수": "OFF 수",
+    "인원최소": "최소 근무 인원", "인원최대": "최대 근무 인원", "등급최소": "등급별 최소 인원",
+    "상호배제": "상호배제(같은 근무 피하기)", "원티드": "간호사 원티드(희망) 반영 칸", "팀최소": "팀별 최소 인원",
 }
 
 #: 전환금지는 쌍마다 문구가 다르다(rules `_transition_pairs`) — MID 두 쌍은 use_mid 병동에서만 생긴다
@@ -179,8 +179,7 @@ def _conflict_sentence(ctx: EditContext, ineq, target, codes: List[str], others)
     parts = ", ".join(f"{_day_label(t.day)} {_shown(ctx, t.nurse_id, t.day)}"
                       for t in sorted(others, key=lambda t: t.day))
     want = _AS_CODE[codes[0]] if len(codes) == 1 else "/".join(codes) + " 어느 것으로"
-    return (f"{ctx.names.get(n, n)} {d + 1}일을 {want} 하면 {family_label(ineq.key)}에 "
-            f"걸립니다({parts} — 이 칸들은 이미 정해져 바꿀 수 없습니다).")
+    return f"{ctx.names.get(n, n)} {d + 1}일을 {want} 하면 {family_label(ineq.key)}에 걸립니다(바꿀 수 없는 칸: {parts})."
 
 
 def _shown(ctx: EditContext, nurse_id: str, day: int) -> str:
@@ -231,22 +230,46 @@ def add_rules_soft(em: EditModel, rules: RuleSet, waived, allow: Dict[Tuple, int
 
 #: 넘김 양의 단위 — 숫자만 쓰면 명·회·일 중 무엇인지 모른다(ui-craft 11-03). 없으면 '회'
 BEND_UNIT = {"OFF수": "개", "인원최소": "명", "인원최대": "명", "인원초과": "명", "등급최소": "명",
-             "같은근무연속": "일", "금지근무": "칸", WISH: "칸"}
+             "같은근무연속": "일", "금지근무": "칸", WISH: "칸", "팀최소": "팀"}
 
 
-def bend_text(bend: Bend, names: Dict[str, str]) -> str:
-    """예) '김예나 개인 OFF 수 상한을 1개 넘김' · '14일 일별 최소 인원(D) 1명 넘김' · '20일 등급별 최소 인원(D 1등급까지) 1명 넘김'."""
-    _fam, nurse, day, extra, side = (list(bend.key) + [None] * 5)[:5]
+def bend_text(bend: Bend, names: Dict[str, str], *, state: bool = False) -> str:
+    """넘기는 것 한 줄 — '무엇이 어느 쪽으로 얼마나'(사용자 지시 11-03 표현 다듬기: '최소 인원 1명 넘김'은 무엇이 어떻게 되는지
+    안 읽혔다). 예) '14일 D 최소 근무 인원보다 1명 적게' · '김예나 OFF 수 상한보다 1개 많게' · '김예나 월 N 상한보다 1회 많게'.
+    state=True 면 지금 어긋나 있는 모양으로('…보다 1명 적음') — 규칙 질문의 '원래 어긋나 있던 곳'(`rule_check`)."""
+    fam, nurse, day, extra, side = (list(bend.key) + [None] * 5)[:5]
+    less, more, longer, over = ("적음", "많음", "김", "넘음") if state else ("적게", "많게", "길게", "넘김")
     who = names.get(nurse, nurse) if nurse else ""
     when = f"{day + 1}일" if isinstance(day, int) and day >= 0 else ""
-    what = family_label(bend.key)
-    if bend.family == "등급최소" and "≤" in str(extra):
+    amount = f"{bend.amount}{BEND_UNIT.get(fam, '회')}"
+    lower = side == "하한"
+    edge = f"{'하한' if lower else '상한'}보다 {amount} {less if lower else more}"
+
+    def say(*parts) -> str:
+        return " ".join(p for p in parts if p)
+    if fam == "인원최소":
+        return say(when, extra, f"최소 근무 인원보다 {amount} {less}")
+    if fam == "인원최대":
+        return say(when, extra, f"최대 근무 인원보다 {amount} {more}")
+    if fam == "인원초과":
+        return say(when, extra, f"필요 인원보다 {amount} {more}")
+    if fam == "등급최소":
         code, _sep, grade = str(extra).partition("≤")
-        what += f"({code} {grade}등급까지)"
-    elif extra not in (None, "") and bend.family not in ("OFF수", "개인한도", "전환금지"):
-        what += f"({extra})"
-    if bend.family == "개인한도":
-        what += f"({str(extra).upper()})"
-    amount = f"{bend.amount}{BEND_UNIT.get(bend.family, '회')}"
-    tail = f"{side}을 {amount} 넘김" if side else f"{amount} 넘김"
-    return " ".join(p for p in (who, when, what, tail) if p)
+        return say(when, code, f"{grade}등급까지 최소 인원보다 {amount} {less}")
+    if fam == "팀최소":
+        return say(when, extra, f"팀별 최소 인원보다 {amount} {less}")
+    if fam == "OFF수":
+        return say(who, "OFF 수", edge)
+    if fam == "개인한도":
+        return say(who, f"월 {'OFF' if extra == 'o' else str(extra).upper()}", edge)
+    if fam == "N간격":
+        return say(who, when, f"나이트 사이 최소 간격 미달 {amount}")
+    if fam == "같은근무연속":
+        return say(who, when, f"{extra} 연속 상한보다 {amount} {longer}")
+    if fam == "고립근무":
+        return say(who, when, f"앞뒤 OFF 사이 하루 근무 {amount}")
+    if fam == "상호배제":
+        return say(who, when, extra, f"상호배제 {amount}")
+    if fam == WISH:
+        return say(who, when, "원티드 칸 바꿈")
+    return say(who, when, family_label(bend.key), f"{amount} {over}")

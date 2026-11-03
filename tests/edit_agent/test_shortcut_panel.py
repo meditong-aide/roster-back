@@ -16,6 +16,6 @@ def test_panel_shows_the_candidates_then_how_a_setting_would_cut_them(world):
     blocks = blocks_for(reply, world.conv.state)
     candidates, levers = blocks[-2], blocks[-1]
     assert candidates["selectable"] and not levers["selectable"]
-    first = next(c for c in levers["items"] if c["title"] == "2일 일별 최소 인원(E) 1명 넘김")
-    assert first["lines"][0]["text"].startswith("이 설정을 이번만 넘기시면 5칸 → 2칸으로 줄어듭니다")
+    first = next(c for c in levers["items"] if c["title"] == "2일 E 최소 근무 인원보다 1명 적게")
+    assert first["lines"][0]["text"] == "이 설정을 이번만 넘기시면 바꾸는 칸이 5칸 → 2칸으로 줄어듭니다"
     assert first["actions"][0]["input"]["action"] == "choose_lever"

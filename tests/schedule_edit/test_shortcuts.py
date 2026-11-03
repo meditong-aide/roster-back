@@ -46,7 +46,7 @@ def test_levers_are_offered_only_when_they_cut_the_changes():
     assert result.status == "ok" and min(c.changed_count for c in result.candidates) == 5
     # 레버마다 칸이 실제로 줄어든다(같은 비용의 두 번째 레버는 풀 때마다 A·B 중 하나로 갈려 이름은 보지 않는다)
     assert result.levers and all(lv.changes[0] == 5 and lv.changes[1] < 5 for lv in result.levers)
-    assert min((lv.changes[1], lv.lose[0]) for lv in result.levers) == (2, "2일 일별 최소 인원(E) 1명 넘김")
+    assert min((lv.changes[1], lv.lose[0]) for lv in result.levers) == (2, "2일 E 최소 근무 인원보다 1명 적게")
     # 고르면 그 칸 수로 다시 찾아진다
     best = min(result.levers, key=lambda lv: lv.changes[1])
     again = S.propose_edits(ctx, [SetCell("A", 1, "O")], today=BEFORE_MONTH, allow=best.allow)

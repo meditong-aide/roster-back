@@ -167,7 +167,7 @@ def test_last_day_single_night_cannot_borrow_earlier_day():
     res = propose(ctx, [SetCell("B", 6, "N")])
     assert res.status == "infeasible"
     assert res.blocking == ["1N"]
-    assert "B 7일을 N으로 하면 나이트 단독(1N) 금지에 걸립니다(6일 D" in res.reasons[1]
+    assert "B 7일을 N으로 하면 나이트 단독(1N) 금지에 걸립니다(바꿀 수 없는 칸: 6일 D" in res.reasons[1]
 
 
 def test_hard_lock_blocks_and_is_explained():
@@ -177,14 +177,14 @@ def test_hard_lock_blocks_and_is_explained():
     res = propose(ctx, [SetCell("A", 1, "D")])
     assert res.status == "infeasible"
     assert res.blocking == ["전환금지"]
-    assert "A 2일을 D로 하면 N→D 전환 금지에 걸립니다(1일 N" in res.reasons[1]
+    assert "A 2일을 D로 하면 N→D 전환 금지에 걸립니다(바꿀 수 없는 칸: 1일 N" in res.reasons[1]
 
 
 @pytest.mark.parametrize("row,raw0,code,expected", [
     # M 은 전날 D·OFF·M 일 때만 — 1일 E 고정 뒤 2일 M
-    ("EOOOO", "E", "M", "A 2일을 M으로 하면 M 전날 E·N 금지(M 은 전날 D·OFF·M 일 때만)에 걸립니다(1일 E"),
+    ("EOOOO", "E", "M", "A 2일을 M으로 하면 M 전날 E·N 금지(M 은 전날 D·OFF·M 일 때만)에 걸립니다(바꿀 수 없는 칸: 1일 E"),
     # M→D 금지 — 병동이 MID 를 D2 로 쓰면 화면 코드와 대표코드를 함께 보인다
-    ("MOOOO", "D2", "D", "A 2일을 D로 하면 M→D 전환 금지에 걸립니다(1일 D2(M)"),
+    ("MOOOO", "D2", "D", "A 2일을 D로 하면 M→D 전환 금지에 걸립니다(바꿀 수 없는 칸: 1일 D2(M)"),
 ])
 def test_mid_transition_conflicts_name_the_mid_rule(row, raw0, code, expected):
     ctx = make_ctx({"A": row}, config={"not_one_night": False, "use_mid": True})
@@ -219,7 +219,7 @@ def test_setting_bend_is_explained():
     assert res.status == "infeasible"
     assert res.blocking == ["OFF수"]
     # 넘길 설정은 레버 카드가 하나씩 보여 준다 — 같은 묶음을 이유 문장으로 또 늘어놓지 않는다(ui-craft 11-03)
-    assert [lv.lose for lv in res.levers] == [["A 개인 OFF 수 상한을 1개 넘김"]]
+    assert [lv.lose for lv in res.levers] == [["A OFF 수 상한보다 1개 많게"]]
     assert not any("넘기면" in r for r in res.reasons)
 
 
@@ -300,7 +300,7 @@ def test_unavoidable_quality_loss_is_reported_on_the_card():
     assert res.status == "ok"
     best = res.candidates[0]
     assert best.changed_count == 1
-    assert best.quality == ["A 2일 근무 사이 OFF 하루"]
+    assert best.quality == ["A 2일 하루짜리 OFF"]
 
 
 def test_measure_soft_patterns():

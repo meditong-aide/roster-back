@@ -104,7 +104,7 @@ def test_over_coverage_on_days_without_max_is_a_quality_note():
     ctx = make_ctx({"A": "DOD", "B": "DDD"}, cov_min={"D": 1, "E": 0, "N": 0}, cov_max={"E": 2, "N": 2},
                    config={"not_one_night": False})
     grid = {"A": list("DDD"), "B": list("DDD")}
-    assert "2일 필요 인원보다 많이 배정 D" in quality_notes(ctx, build_rules(ctx), grid)
+    assert "2일 D 필요 인원보다 많음" in quality_notes(ctx, build_rules(ctx), grid)
 
 
 def test_result_serializes_to_json_with_lever_ids():

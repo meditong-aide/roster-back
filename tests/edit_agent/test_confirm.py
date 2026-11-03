@@ -15,7 +15,7 @@ from services.schedule_edit.requests import SetCell
 from tests.edit_agent.test_agent import A_OFF, _agent, call, make_ctx, press, say
 
 OFF_KEY = ("OFF수", "A", None, None, "상한")
-BEND = "A 개인 OFF 수 상한을 1개 넘김"
+BEND = "A OFF 수 상한보다 1개 많게"
 
 
 def _tight():
@@ -115,13 +115,13 @@ def test_already_confirmed_bend_is_not_asked_again_at_apply(world, monkeypatch):
     monkeypatch.setattr(skills_mod, "apply_to_new_version", lambda *a, **kw: captured.update(kw) or saved)
     reply = press(agent, world.conv, "apply_edit", {"rank": 1})
     # 동의한 위치·양은 다시 묻지 않고, 새로 나빠지는 근무 모양만 묻는다
-    assert [f["text"] for f in reply.preview["findings"]] == ["사람 간 OFF 수 격차 2→3"]
+    assert [f["text"] for f in reply.preview["findings"]] == ["사람마다 OFF 수 차이 2→3"]
     card = blocks_for(reply, world.conv.state)[-1]["items"][0]
-    assert [line["text"] for line in card["lines"]] == ["근무 모양이 나빠짐: 사람 간 OFF 수 격차 2→3"]
+    assert [line["text"] for line in card["lines"]] == ["근무 모양이 나빠짐: 사람마다 OFF 수 차이 2→3"]
     done = press(agent, world.conv, "apply_edit", card["actions"][0]["input"]["params"])
     # 받아들인 것 전부를 종류와 함께 기록 — 변경 이력이 '넘긴 설정'과 '근무 모양'을 나눠 보인다
     assert done.effects and [(a["kind"], a["text"]) for a in captured["accepted"]] == [
-        ("setting", BEND), ("quality", "사람 간 OFF 수 격차 2→3")]
+        ("setting", BEND), ("quality", "사람마다 OFF 수 차이 2→3")]
 
 
 def test_restore_brings_back_the_pending_question_and_what_was_confirmed(monkeypatch):
@@ -190,14 +190,14 @@ def test_change_history_says_which_setting_the_edit_passed(monkeypatch):
         "request_text": "김태희 17일 OFF",
         "accepted": [{"kind": "setting", "text": "김태희 개인 OFF 수 상한을 1개 넘김"},
                      {"kind": "wanted", "text": "장원영 9일 원티드 칸 E→O"},
-                     {"kind": "quality", "text": "사람 간 OFF 수 격차 2→3"}]})
+                     {"kind": "quality", "text": "사람마다 OFF 수 차이 2→3"}]})
     monkeypatch.setattr(journal, "read_apply_for", lambda db, sid: row if sid == "s2" else None)
     assert journal.edit_origin(None, "s2") == {
         "request": "김태희 17일 OFF", "bends": ["김태희 개인 OFF 수 상한을 1개 넘김", "장원영 9일 원티드 칸 E→O"],
-        "shape": ["사람 간 OFF 수 격차 2→3"], "at": "2026-11-03T14:20:00"}
+        "shape": ["사람마다 OFF 수 차이 2→3"], "at": "2026-11-03T14:20:00"}
     assert journal.edit_origin(None, "s1") is None          # 사람이 직접 고친 버전은 없음
     # 이 기능 전 기록(받아들인 목록 없음) — 고른 레버의 허용 위치로(오전 실화면의 14일 D 미달 버전)
     old_row = SimpleNamespace(created_at=None, payload={"request_text": "장원영 14일 오프로", "allow": [
         [["인원최소", None, 13, "D"], 1]]})
     monkeypatch.setattr(journal, "read_apply_for", lambda db, sid: old_row)
-    assert journal.edit_origin(None, "s3")["bends"] == ["14일 일별 최소 인원(D) 1명 넘김"]
+    assert journal.edit_origin(None, "s3")["bends"] == ["14일 D 최소 근무 인원보다 1명 적게"]

@@ -60,10 +60,10 @@ def test_nothing_left_to_put_in(world):
 
 
 def test_one_more_lever_reads_in_wishes_and_the_count_is_found_again_each_time(world):
-    card = _lever_cards([{"lever_id": "x", "lose": ["8일 일별 최소 인원(N) 1명 넘김"], "gain": "원티드 16개",
+    card = _lever_cards([{"lever_id": "x", "lose": ["8일 N 최소 근무 인원보다 1명 적게"], "gain": "원티드 16개",
                           "changes": {"now": None, "after": 49}, "span_days": {"now": None, "after": 22},
                           "quality": []}])["items"][0]
-    assert card["lines"][0]["text"] == "이 설정을 이번만 넘기시면 원티드 16개를 넣을 수 있습니다(49칸 · 23일 동안)"
+    assert card["lines"][0]["text"] == "이 설정을 이번만 넘기시면 원티드 16개를 넣을 수 있습니다(49칸 바꿈)"
     # 넣을 수는 늘 다시 찾는다 — 앞에서 정한 수가 남아 있으면 넘기기·레버·고쳐 말하기 뒤에 '방법 없음'이 된다(검토 11-03 M1)
     world.ctxs["s1"] = _ward
     agent, _ = _agent(call("propose_edit", changes=[{"kind": "wanted", "nurse": ""}]))

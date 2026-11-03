@@ -30,6 +30,8 @@ CHOICE_NOTE = "선택지마다 미리 한 번 풀어 본 결과입니다. 고르
 CONFIRM_NOTE = ("요청한 칸과 바꿀 수 없는 칸(지난 날·확정 칸·전월 근무)만으로 셈한 것이라 어떤 방법으로도 피할 수 "
                 "없습니다. 진행해도 이번 수정에만 해당하고 병동 설정은 바뀌지 않습니다.")
 APPLY_NOTE = "적용하면 새 버전으로 저장되고 이전 버전은 그대로 남습니다."
+#: 후보 카드 밑 — 카드를 보며 규칙을 물을 수 있다는 것(사용자 지시 11-03 '그레이드는 다 지켜져? 등 추가 문의')
+CANDIDATE_NOTE = "카드를 보며 '1안 등급 다 지켜져?', '연속 근무 괜찮아?'처럼 물어보셔도 됩니다."
 #: 근무 수를 보일 순서(대표코드) — OFF 는 맨 끝
 _COUNT_ORDER = ("D", "E", "N", "M", "OFF")
 
@@ -82,7 +84,8 @@ def _lead(answer: str, preview: Optional[Dict[str, Any]]) -> str:
 
 def _candidate_cards(candidates: List[Dict[str, Any]], focus: Optional[int], source: Optional[str] = None) -> B.Block:
     items = [_candidate_card(c, source) for c in candidates]
-    return B.cards(items, key=_key(candidates), selected=str(focus) if focus else None)
+    return B.cards(items, key=_key(candidates), selected=str(focus) if focus else None,
+                   footnote=None if source else CANDIDATE_NOTE)
 
 
 def _candidate_card(c: Dict[str, Any], source: Optional[str] = None) -> Dict[str, Any]:
@@ -206,13 +209,14 @@ def _lever_cards(levers: List[Dict[str, Any]]) -> B.Block:
     items = []
     for lv in levers:
         # 제목 = 넘기는 설정 — 카드끼리 무엇이 다른지가 제목에서 보인다(같은 제목이 반복됐다 · ui-craft 11-03)
-        now, after, days = lv["changes"]["now"], lv["changes"]["after"], lv["span_days"]["after"] + 1
+        # 기간('n일 동안')은 뺐다 — 칸 수와 나란히 두면 무엇의 기간인지 안 읽혔다(문구 다듬기 11-03)
+        now, after = lv["changes"]["now"], lv["changes"]["after"]
         if lv.get("gain"):    # 원티드 반영 — 얻는 것을 칸 수가 아니라 넣는 원티드 수로
-            lines = [B.line(f"이 설정을 이번만 넘기시면 {lv['gain']}를 넣을 수 있습니다({after}칸 · {days}일 동안)")]
+            lines = [B.line(f"이 설정을 이번만 넘기시면 {lv['gain']}를 넣을 수 있습니다({after}칸 바꿈)")]
         elif now is None:
-            lines = [B.line(f"넘기면 {after}칸을 바꿔 들어줄 수 있습니다({days}일 동안)")]
+            lines = [B.line(f"이 설정을 이번만 넘기시면 {after}칸을 바꿔 요청을 들어줄 수 있습니다")]
         else:   # 후보가 있을 때 — '이 설정을 넘기면 이렇게 줄어든다'(사용자 지시 11-03 '어떤 설정을 바꾸시면 어떻게 가능하다')
-            lines = [B.line(f"이 설정을 이번만 넘기시면 {now}칸 → {after}칸으로 줄어듭니다({days}일 동안)")]
+            lines = [B.line(f"이 설정을 이번만 넘기시면 바꾸는 칸이 {now}칸 → {after}칸으로 줄어듭니다")]
         lines += [B.line(q, tone="warning") for q in lv["quality"]]
         items.append(B.card(lv["lever_id"], " · ".join(lv["lose"]), lines=lines,
                             actions=[B.action("이 설정만 넘기고 다시 찾기", "choose_lever",

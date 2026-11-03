@@ -577,12 +577,19 @@ def _after(ctx: EditContext, rules: Optional[RuleSet], candidate: "Candidate", r
     return ctx, rules, grid, after_ctx, build_rules(after_ctx)
 
 
+def before_after(ctx: EditContext, rules: Optional[RuleSet], candidate: "Candidate",
+                 requests: Sequence[EditRequest]) -> Tuple[RuleSet, Dict[Tuple, int], Dict[Tuple, int]]:
+    """(풀 때 규칙, 지금 근무표의 위반량, 이 후보의 위반량) — 적용 전 확인과 규칙 질문(`rule_check`)이 같이 쓴다."""
+    ctx, rules, grid, after_ctx, after_rules = _after(ctx, rules, candidate, requests)
+    return rules, measure(ctx, ctx.main, rules), measure(after_ctx, grid, after_rules)
+
+
 def candidate_regressions(ctx: EditContext, rules: Optional[RuleSet], candidate: "Candidate",
                           requests: Sequence[EditRequest]) -> Dict[Tuple, Tuple[int, int]]:
     """이 후보로 지금보다 나빠지는 규칙 위치 전부 {위치: (전, 후)} — 고른 레버·그날 인원 요청·직접 짚은 원티드로
     허용한 것도 빼지 않는다(적용 전 확인에서 '무엇을 감수하는지' 보여 줄 것 · 사용자 지시 11-03)."""
-    ctx, rules, grid, after_ctx, after_rules = _after(ctx, rules, candidate, requests)
-    return new_violations(measure(ctx, ctx.main, rules), measure(after_ctx, grid, after_rules))
+    _rules, before, after = before_after(ctx, rules, candidate, requests)
+    return new_violations(before, after)
 
 
 def _allowed_on_screen(v, allow: Dict[Tuple, int]) -> bool:
@@ -605,14 +612,16 @@ def quality_notes(ctx: EditContext, rules: RuleSet, grid: Grid, soft_before: Opt
     for key in sorted(worse, key=str):
         family, nurse, day, extra = (list(key) + [None] * 4)[:4]
         label = SOFT_LABEL.get(family, family)
-        shape = f" {extra}" if family in ("패턴", "인원초과") else ""
         who = f"{ctx.names.get(nurse, nurse)} " if nurse else ""
-        out.append(f"{who}{day + 1}일 {label}{shape}")
+        if family == "인원초과":
+            out.append(f"{day + 1}일 {extra} {label}")            # '11일 E 필요 인원보다 많음'
+        else:
+            out.append(f"{who}{day + 1}일 {label}" + (f" {extra}" if family == "패턴" else ""))
     return out
 
 
-SOFT_LABEL = {"패턴": "근무 순서", "고립OFF": "근무 사이 OFF 하루", "연속OFF": "연속 OFF 상한 초과",
-              "주2회OFF": "주 OFF 2회 미만", "인원초과": "필요 인원보다 많이 배정"}
+SOFT_LABEL = {"패턴": "근무 순서", "고립OFF": "하루짜리 OFF", "연속OFF": "연속 OFF 상한 초과",
+              "주2회OFF": "주 OFF 2회 미만", "인원초과": "필요 인원보다 많음"}
 
 
 def cell_change(ctx: EditContext, nurse_id: str, day: int, after_main: str) -> CellChange:

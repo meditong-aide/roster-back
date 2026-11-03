@@ -147,13 +147,14 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
         first = result.candidates[0]
         lo, hi = first.span
         when = f"{lo + 1}일" if lo == hi else f"{lo + 1}~{hi + 1}일"
-        lines = [f"{head} — 바꿀 방법 {len(result.candidates)}가지를 찾았습니다. "
-                 f"가장 적게 바꾸는 안은 {first.changed_count}칸({when})입니다. 카드를 눌러 표에서 확인해 보세요."]
+        found = (f"바꿀 방법을 찾았습니다: {first.changed_count}칸({when})" if len(result.candidates) == 1 else
+                 f"바꿀 방법 {len(result.candidates)}가지를 찾았습니다. 가장 적게 바꾸는 1안은 {first.changed_count}칸({when})")
+        lines = [f"{head} — {found}. 카드를 누르면 표에서 미리 볼 수 있습니다."]
         moved = _count_changes(ctx, requests, first)
         if moved:
             lines.append(f"근무 수 변화: {moved}")
         if first.quality:
-            lines.append(f"이 안은 규칙은 모두 지키지만 {first.quality[0]} 등 근무 모양이 조금 나빠집니다.")
+            lines.append(f"1안은 규칙을 모두 지키지만 근무 모양이 나빠지는 곳이 있습니다(예: {first.quality[0]}).")
         lines += [n for n in (cover_note(ctx, r) for r in requests if isinstance(r, CoverTarget)) if n]
         lines += [balance_note(ctx, r, first) for r in requests if isinstance(r, BalanceTarget)]
         lines += [wish_note(ctx, r, first) for r in requests if isinstance(r, WishTarget)]
@@ -286,3 +287,67 @@ def lookup_answer(ctx: EditContext, kind: str, nurse, day, code) -> str:
     if not names:
         return f"{day + 1}일 {word}인 사람이 없습니다.{tail} (지금 저장된 근무표 기준)"
     return f"{day + 1}일 {word} {len(names)}명: {', '.join(names)}.{tail} (지금 저장된 근무표 기준)"
+
+
+# ── 규칙 질문(사용자 지시 11-03 — 후보를 본 뒤 '그레이드는 다 지켜져?') ──────────────────────────
+
+#: 규칙 질문에서 한 줄에 보일 곳 수 — 나머지는 '외 n곳'
+CHECK_SHOWN = 3
+#: 규칙이 아니라 근무 모양(품질)을 묻는 주제
+SHAPE = "shape"
+
+
+def check_answer(session, topic: str, candidates: Sequence) -> str:
+    """찾아 둔 후보(없으면 지금 저장된 근무표)가 그 규칙을 지키는지. 후보는 '모두 지킴'으로 뭉뚱그리지 않는다 —
+    원래 어긋나 있던 곳은 그대로 둘 수 있어서(더 나빠지지만 않게 찾는다) 그걸 따로 말한다."""
+    from services.schedule_edit.rule_check import check_candidate, check_current, configured, topic_of
+    ctx = session.ctx
+    if topic == SHAPE:
+        return _shape_answer(candidates)
+    label, families = topic_of(topic)
+    if not configured(session.rules, families):
+        if topic == "wanted":
+            return "지금 근무표에 반영돼 있는 원티드가 없어 따질 것이 없습니다."
+        return f"이 근무표 설정에는 {label} 규칙이 없어 따질 것이 없습니다."
+    if not candidates:
+        row = check_current(ctx, session.rules, families)
+        if not row.kept:
+            return f"{label}: 지금 저장된 근무표는 모두 지킵니다."
+        return f"{label}: 지금 저장된 근무표에서 어긋난 곳 {len(row.kept)}곳 — {_few(row.kept)}."
+    rows = [check_candidate(ctx, session.rules, c, session.requests, families) for c in candidates]
+    if len(rows) == 1:
+        return f"{label}: " + _check_line(rows[0])
+    if len({(tuple(r.new), tuple(r.kept), r.eased) for r in rows}) == 1:
+        # 후보끼리 결과가 같으면 한 줄로(같은 문장을 세 번 읽지 않게)
+        return f"{label}: 후보 {len(rows)}개 모두 " + _check_line(rows[0], name="")
+    return "\n".join([f"{label}:"] + [f"· {_check_line(row)}" for row in rows])
+
+
+def _check_line(row, name: Optional[str] = None) -> str:
+    who = f"{row.rank}안은 " if name is None else name
+    eased = f" 지금 어긋나 있던 {row.eased}곳은 이 안으로 풀립니다." if row.eased else ""
+    if not row.new and not row.kept:
+        return f"{who}지킵니다.{eased}" if name == "" else f"{who}모두 지킵니다.{eased}"
+    parts = []
+    if row.new:
+        parts.append(f"{who}이번만 넘기는 곳이 {len(row.new)}곳 있습니다(고른 설정·요청으로 넘긴 것) — {_few(row.new)}.")
+    else:
+        parts.append(f"{who}새로 어기는 곳이 없습니다.")
+    if row.kept:
+        parts.append(f"원래 근무표에서 어긋나 있던 {len(row.kept)}곳은 그대로입니다(더 나빠지지 않음) — {_few(row.kept)}.")
+    return " ".join(parts) + eased
+
+
+def _shape_answer(candidates: Sequence) -> str:
+    if not candidates:
+        return "근무 모양은 바꿀 안을 찾은 뒤, 그 안이 지금보다 나빠지는지로 알려 드립니다."
+    lines = [(f"{c.rank}안은 나빠지는 곳이 없습니다." if not c.quality else
+              f"{c.rank}안은 나빠지는 곳이 {len(c.quality)}곳 있습니다 — {_few(c.quality)}.") for c in candidates]
+    if len(lines) == 1:
+        return "근무 모양(규칙 위반은 아님): " + lines[0]
+    return "\n".join(["근무 모양(규칙 위반은 아님):"] + [f"· {line}" for line in lines])
+
+
+def _few(items: Sequence[str]) -> str:
+    shown = ", ".join(items[:CHECK_SHOWN])
+    return shown + (f" 외 {len(items) - CHECK_SHOWN}곳" if len(items) > CHECK_SHOWN else "")

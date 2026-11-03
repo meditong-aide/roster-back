@@ -39,8 +39,7 @@ MONTH_FAMILIES = ("개인한도", "OFF수", "월나이트")
 #: 확정 원티드 칸의 위치 이름 — 묶인 칸이라 규칙 부등식이 없다(직접 짚을 때만 풀린다)
 FIXED_WISH = "확정원티드"
 #: 막혔을 때 첫 줄
-BLOCKED_HEAD = ("바꾸기 전에 셈해 보니(전월 근무까지 넣어) 어떤 방법으로도 넘길 수 없는 규칙에 걸려 이 요청은 들어줄 수 "
-                "없습니다.")
+BLOCKED_HEAD = "이 요청은 들어줄 수 없습니다 — 넘길 수 없는 규칙(하드락)에 걸립니다(전월 근무까지 셈함)."
 _WORD = {"O": "OFF"}
 
 
@@ -178,9 +177,8 @@ def _blocked_text(ctx: EditContext, ineq: Ineq, forced: Dict[Cell, str], banned:
         subject = "이" if codes[-1] in ("N", "M") else "가"          # 엔·엠은 받침이 있다
         who = ctx.names.get(key[1], key[1])
         if ineq.terms[0].coef > 0:
-            return f"{who} — 요청대로면 이 달 {word}{subject} 적어도 {low}회라 {family_label(key)} {ineq.cap}회를 넘습니다."
-        return (f"{who} — 요청대로면 이 달 {word}{subject} 많아야 {-low}회라 {family_label(key)} {-ineq.cap}회에 "
-                "못 미칩니다.")
+            return f"{who} — 요청대로면 이 달 {word}{subject} {low}회 이상이라 {family_label(key)}({ineq.cap}회)를 넘습니다."
+        return f"{who} — 요청대로면 이 달 {word}{subject} {-low}회 이하라 {family_label(key)}({-ineq.cap}회)에 못 미칩니다."
     hit = sorted({(t.nurse_id, t.day) for t in ineq.terms if (t.nurse_id, t.day) in forced or
                   (t.nurse_id, t.day) in banned}, key=lambda c: (c[1], c[0]))
     others = [t for t in ineq.terms if (t.nurse_id, t.day) not in hit]
@@ -197,7 +195,7 @@ def _blocked_text(ctx: EditContext, ineq: Ineq, forced: Dict[Cell, str], banned:
             fixed[at] = f"{_day_label(t.day)} {_shown(ctx, t.nurse_id, t.day)}"
     who = " · ".join(dict.fromkeys(ctx.names.get(n, n) for n, _d in hit)) or ctx.names.get(key[1], key[1] or "")
     days = "·".join(str(d + 1) for d in sorted({d for _n, d in hit}))
-    tail = f"({', '.join(fixed.values())} — 이미 정해져 바꿀 수 없는 칸)" if fixed else ""
+    tail = f"(바꿀 수 없는 칸: {', '.join(fixed.values())})" if fixed else ""
     return f"{who} {days}일 요청대로 바꾸면 {family_label(key)}에 걸립니다{tail}."
 
 
@@ -212,10 +210,10 @@ def _cover_findings(ctx: EditContext, requests: Sequence[EditRequest]) -> List[F
         for key in cover_relief(ctx, r):
             if key[0] == "인원최소":
                 total = (need - r.target) - max(0, need - now)
-                text = f"{r.day + 1}일 {r.code} {now}명 → {r.target}명 — 일별 최소 인원 {need}명보다 {need - r.target}명 적음"
+                text = f"{r.day + 1}일 {r.code} {now}명 → {r.target}명 — 최소 근무 인원({need}명)보다 {need - r.target}명 적음"
             elif key[0] == "인원최대" and upper is not None:
                 total = (r.target - upper) - max(0, now - upper)
-                text = f"{r.day + 1}일 {r.code} {now}명 → {r.target}명 — 일별 최대 인원 {upper}명보다 {r.target - upper}명 많음"
+                text = f"{r.day + 1}일 {r.code} {now}명 → {r.target}명 — 최대 근무 인원({upper}명)보다 {r.target - upper}명 많음"
             else:
                 continue                    # 필요 인원보다 많이(품질)는 적용 전 확인에서
             if total > 0:
