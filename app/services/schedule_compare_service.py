@@ -290,8 +290,11 @@ def schedule_changes(db: Session, schedule: Schedule) -> dict:
                   if base is not None and base["kind"] in ("previous_issued", "issued", "source")
                   else ([], CellDiff()))
     names = _nurse_names(db, {str(r["nurse_id"]) for r in rows})
+    from services.schedule_edit.journal import edit_origin
     return {
         "schedule": _schedule_brief(schedule),
+        # 수정 도우미로 만든 버전이면 요청과 이번만 넘긴 설정(11-03) — 아니면 null
+        "edit": edit_origin(db, schedule.schedule_id),
         "group_id": schedule.group_id,
         "year": schedule.year,
         "month": schedule.month,

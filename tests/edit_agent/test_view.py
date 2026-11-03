@@ -134,3 +134,9 @@ def test_step_labels_are_made_from_the_state_before_the_button(world):
     assert step_label("reject_candidate", {"rank": 9}, session) == "9안의 사람들 말고 다시 찾기"
     assert step_label("something_else", {}, session) is None
     assert reply.preview["status"] == "ok"
+
+
+def test_long_shape_lists_are_cut_to_a_few():
+    from schedule_edit_agent.view import _few
+    assert _few([f"모양{i}" for i in range(7)]) == "모양0 · 모양1 · 모양2 · 모양3 · 모양4 외 2개"
+    assert _few(["하나", "둘"]) == "하나 · 둘"

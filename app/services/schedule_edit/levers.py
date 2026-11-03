@@ -77,7 +77,8 @@ class Lever:
 def find_levers(ctx: EditContext, requests: Sequence[EditRequest], best=None, *, rules: Optional[RuleSet] = None,
                 allow: Optional[Dict[Tuple, int]] = None, max_levers: int = MAX_LEVERS,
                 seconds: float = LEVER_SECONDS, screen=None, avoid_people: Sequence = ()) -> List[Lever]:
-    """best: 지금 최선 후보(`Candidate`) — 있으면 그보다 loss 가 줄어드는 레버만, 없으면 '가능해지는' 레버.
+    """best: 지금 최선 후보(`Candidate`) — 있으면 그보다 **바꾸는 칸이 적어지는** 레버만(사용자 제안 11-03 '수정 안건을 더
+    줄일 수 있을 경우만'), 없으면 '가능해지는' 레버.
 
     screen·avoid_people 은 재탐색(`propose_edits`)과 같게 — 화면에서 나빠지는 해와 이 대화에서 넘긴 사람
     묶음은 레버 해로도 쓰지 않는다. 안 그러면 레버를 골라 다시 찾았을 때 후보가 안 나온다(검토 11-02 M4).
@@ -88,7 +89,7 @@ def find_levers(ctx: EditContext, requests: Sequence[EditRequest], best=None, *,
     for people in avoid_people:
         forbid_same_people(em, set(people))
     if best is not None:
-        em.model.Add(em.loss() <= best.loss - 1)
+        em.model.Add(em.total_changes() <= best.changed_count - 1)
     flags = _used_flags(em, slacks)
     # 넘기는 설정 개수가 먼저 — 사용자가 손해를 하나씩 골라 가게(사용자 지시 11-02). 개수 상한을 가정으로
     # 걸던 방식은 상한 안의 해를 2초 안에 못 찾고 시간만 쓰는 일이 잦아(dev 무작위 72건 중 4건 +6초 · 11-02)

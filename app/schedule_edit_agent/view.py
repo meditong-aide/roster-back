@@ -3,6 +3,7 @@
   · 후보(ok)          : 답 문장 + 후보 카드(고른 카드에 사람별 근무 수·나빠지는 모양·바뀌는 칸·버튼·표 미리보기)
   · 방식 고르기       : 묻는 문장 + 하나 고르기(미리 풀어 본 결과·추천·안 되는 이유)
   · 불가(infeasible)  : 이유 문장 + 막는 설정 + 레버 카드(잃는 것·얻는 것·버튼)
+  · 후보(ok)에 레버   : 후보 카드 아래, 설정 하나를 이번만 넘기면 바꾸는 칸이 줄어들 때만 레버 카드(몇 칸 → 몇 칸)
   · 바꾸기 전 확인    : 묻는 문장 + 피할 수 없는 것 카드([그래도 진행]·[바꾸지 않기])
   · 적용 전 확인      : 묻는 문장 + 그 안 카드(나빠지는 것·표 미리보기·[이대로 적용]·[다른 안 보기])
   · 적용              : 저장 안내(새 버전으로 바꾸기는 효과 switch_version)
@@ -51,7 +52,11 @@ def blocks_for(reply: Reply, session: Optional[EditSession]) -> List[B.Block]:
         return shown
     status = preview.get("status")
     if status == "ok":
-        return shown + [_candidate_cards(preview["candidates"], reply.focus, preview.get("source"))]
+        cards = [_candidate_cards(preview["candidates"], reply.focus, preview.get("source"))]
+        if preview.get("levers"):
+            # 후보는 있지만 설정 하나를 이번만 넘기면 더 적게 바꿀 수 있을 때만(사용자 제안 11-03)
+            cards.append(_lever_cards(preview["levers"]))
+        return shown + cards
     if status == "choose_transfer":
         return shown + [_transfer_choice(preview)]
     if status == "confirm":
@@ -86,7 +91,7 @@ def _candidate_card(c: Dict[str, Any], source: Optional[str] = None) -> Dict[str
     people = [p["name"] for p in c["affected"]]
     lines = []
     if c["quality"]:
-        lines.append(B.line("규칙은 모두 지키지만 근무 모양이 나빠집니다: " + " · ".join(c["quality"]), tone="warning"))
+        lines.append(B.line("규칙은 모두 지키지만 근무 모양이 나빠집니다: " + _few(c["quality"]), tone="warning"))
     changes = c["changes"]
     actions = [B.action("이 안 적용", "apply_edit", {"rank": rank}, style="primary")]
     if source is None:
@@ -102,6 +107,15 @@ def _candidate_card(c: Dict[str, Any], source: Optional[str] = None) -> Dict[str
         overlay={"kind": "schedule_cells",
                  "cells": [{"nurse_id": x["nurse_id"], "day": x["day"], "before": x["before"], "after": x["after"]}
                            for x in changes]})
+
+
+#: 근무 모양 항목을 한 줄에 몇 개까지 — 넘으면 '외 n개'(4차 평가: 14개가 한 줄로 이어져 읽히지 않았다 · 전부는 펼친 목록·표에)
+SHAPE_SHOWN = 5
+
+
+def _few(items: List[str]) -> str:
+    more = f" 외 {len(items) - SHAPE_SHOWN}개" if len(items) > SHAPE_SHOWN else ""
+    return " · ".join(items[:SHAPE_SHOWN]) + more
 
 
 def _span(c: Dict[str, Any]) -> str:
@@ -167,7 +181,7 @@ def _apply_confirm_card(preview: Dict[str, Any]) -> B.Block:
     lines = [B.line(f["text"], tone="warning") for f in items if f.get("kind") != "quality"]
     shape = [f["text"] for f in items if f.get("kind") == "quality"]
     if shape:
-        lines.append(B.line("근무 모양이 나빠짐: " + " · ".join(shape), tone="warning"))
+        lines.append(B.line("근무 모양이 나빠짐: " + _few(shape), tone="warning"))
     card = B.card(str(rank), f"{base['title']} · 적용 전 확인", summary=base["summary"], chips=base["chips"],
                   lines=lines, details=base["details"], overlay=base["overlay"],
                   actions=[B.action("이대로 적용", "apply_edit",
@@ -192,8 +206,11 @@ def _lever_cards(levers: List[Dict[str, Any]]) -> B.Block:
     items = []
     for lv in levers:
         # 제목 = 넘기는 설정 — 카드끼리 무엇이 다른지가 제목에서 보인다(같은 제목이 반복됐다 · ui-craft 11-03)
-        lines = [B.line(f"넘기면 {lv['changes']['after']}칸을 바꿔 들어줄 수 있습니다"
-                        f"({lv['span_days']['after'] + 1}일 동안)")]
+        now, after, days = lv["changes"]["now"], lv["changes"]["after"], lv["span_days"]["after"] + 1
+        if now is None:
+            lines = [B.line(f"넘기면 {after}칸을 바꿔 들어줄 수 있습니다({days}일 동안)")]
+        else:   # 후보가 있을 때 — '이 설정을 넘기면 이렇게 줄어든다'(사용자 지시 11-03 '어떤 설정을 바꾸시면 어떻게 가능하다')
+            lines = [B.line(f"이 설정을 이번만 넘기시면 {now}칸 → {after}칸으로 줄어듭니다({days}일 동안)")]
         lines += [B.line(q, tone="warning") for q in lv["quality"]]
         items.append(B.card(lv["lever_id"], " · ".join(lv["lose"]), lines=lines,
                             actions=[B.action("이 설정만 넘기고 다시 찾기", "choose_lever",

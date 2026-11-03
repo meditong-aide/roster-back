@@ -181,9 +181,13 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
         em = build_model(ctx, rules, requests, free_cells(ctx, days), run.max_changes, run.allow)
         _carry_over(em, run)
         found, status = _search(run, em, (days[0], days[-1]), MONTH_SECONDS if step is None else SOLVE_SECONDS)
+        if found and step is not None:
+            found = _wider(run, found) or found
         if found:
+            # 후보가 있어도 바꾸는 칸이 많으면 — 설정 하나를 이번만 넘겨 더 적게 바꿀 수 있는지(그때만 카드로)
+            shortcuts = _shortcuts(run, found) if explain else []
             return EditResult("ok", candidates=[_as_leave(c, leave) for c in found] if leave else found,
-                              notes=list(ctx.notes))
+                              notes=list(ctx.notes), levers=shortcuts)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return EditResult("infeasible", notes=list(ctx.notes), reasons=[
             "찾은 방법이 모두 근무표 화면에 새 위반을 만들어 후보로 내지 않았습니다."])
@@ -192,6 +196,45 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
                           reasons=[f"지금 규칙을 모두 지키면서는 방법을 찾지 못했습니다(바꾸는 칸 {run.max_changes}개까지 살펴봄)."
                                    if status == cp_model.INFEASIBLE else "시간 안에 방법을 찾지 못했습니다."])
     return _no_candidate(run, proven=status == cp_model.INFEASIBLE)
+
+
+#: 좁은 창에서 찾은 뒤 한 달 전체에 더 나은 안이 있는지 보는 첫 풀이 상한(초)
+WIDER_SECONDS = 2.0
+
+
+def _wider(run: "_Run", found: List["Candidate"]) -> Optional[List["Candidate"]]:
+    """좁은 창에서 찾은 안보다 주 loss(2×칸 + 기간)가 작은 안이 한 달 전체에 있으면 그것으로 — 좁은 창부터 푸는 건
+    빨리 찾으려는 것이지 더 나은 안을 버리려는 게 아니다(4차 평가 11-03: 김태희 17일 OFF 가 17~23일 창에서 18칸,
+    한 달 전체로는 7칸). 시간이 없거나 더 나은 안이 없으면 None."""
+    if run.seconds(WIDER_SECONDS) < 0.5:
+        return None
+    days = _window_days(run, None)
+    em = build_model(run.ctx, run.rules, run.requests, free_cells(run.ctx, days), run.max_changes, run.allow)
+    _carry_over(em, run)
+    em.model.Add(em.loss() <= min(c.loss for c in found) - 1)
+    better, _status = _search(run, em, (days[0], days[-1]), WIDER_SECONDS)
+    return better or None
+
+
+#: 가장 적게 바꾸는 안이 이 칸 수 이상일 때만 '설정을 이번만 넘기면 더 적게'를 찾는다 — 작은 안은 줄일 여지가 적고
+#: 찾는 시간(최대 SHORTCUT_SECONDS)만 든다(사용자 제안 11-03 · 4차 평가 'OFF 하나에 18칸')
+SHORTCUT_MIN_CHANGES = 5
+SHORTCUT_SECONDS = 5.0
+#: 레버를 찾고 나서 답을 만들 몫으로 남길 시간(초)
+SHORTCUT_RESERVE = 1.5
+
+
+def _shortcuts(run: "_Run", found: List["Candidate"]) -> List[Any]:
+    """후보보다 바꾸는 칸이 적어지는 레버(레버 대상 설정만 · 하드락은 넘기지 않는다). 줄어들지 않으면 빈 목록 —
+    고르게 맞추기는 칸 상한이 레버 모델(20칸)보다 넓어 비교가 맞지 않아 찾지 않는다."""
+    best = min(found, key=lambda c: (c.changed_count, c.loss))
+    if best.changed_count < SHORTCUT_MIN_CHANGES or any(isinstance(r, BalanceTarget) for r in run.requests):
+        return []
+    seconds = run.seconds(SHORTCUT_SECONDS + SHORTCUT_RESERVE) - SHORTCUT_RESERVE
+    if seconds < 1.0:
+        return []
+    return find_levers(run.ctx, run.requests, best, rules=run.rules, allow=run.allow, max_levers=2,
+                       seconds=seconds, screen=run.screen, avoid_people=run.avoid)
 
 
 def _max_changes(requests: Sequence[EditRequest]) -> int:

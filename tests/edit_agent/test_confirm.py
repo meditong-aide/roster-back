@@ -84,6 +84,7 @@ def test_apply_lists_what_gets_worse_before_saving(world, monkeypatch):
 
     ask = press(agent, world.conv, "apply_edit", {"rank": 1})
     assert ask.preview["status"] == "confirm_apply" and not ask.effects and not captured
+    assert ask.preview["notes"] == []                      # 참고 문구는 후보 때 이미 — 확인 질문에 다시 붙이지 않는다
     assert ask.answer.startswith("1안을 적용하면 지금보다 나빠지는 것이 있습니다. 그래도 적용할까요?")
     assert f"· {BEND}" in ask.answer
     card = blocks_for(ask, world.conv.state)[-1]["items"][0]
@@ -100,7 +101,7 @@ def test_apply_lists_what_gets_worse_before_saving(world, monkeypatch):
     stale = press(agent, world.conv, "apply_edit", {"rank": 1, "confirmed": True, "seen": []})
     assert stale.preview["status"] == "confirm_apply" and not captured
     done = press(agent, world.conv, "apply_edit", {"rank": 1, "confirmed": True, "seen": seen})
-    assert done.effects and BEND in captured["accepted"]          # 받아들인 것은 적용 기록에 남는다
+    assert done.effects and BEND in [a["text"] for a in captured["accepted"]]   # 받아들인 것은 적용 기록에 남는다
     assert step_label("apply_edit", {"rank": 1, "confirmed": True}, None) == "1안 확인하고 적용"
 
 
@@ -118,7 +119,9 @@ def test_already_confirmed_bend_is_not_asked_again_at_apply(world, monkeypatch):
     card = blocks_for(reply, world.conv.state)[-1]["items"][0]
     assert [line["text"] for line in card["lines"]] == ["근무 모양이 나빠짐: 사람 간 OFF 수 격차 2→3"]
     done = press(agent, world.conv, "apply_edit", card["actions"][0]["input"]["params"])
-    assert done.effects and captured["accepted"] == [BEND, "사람 간 OFF 수 격차 2→3"]   # 받아들인 것 전부를 기록
+    # 받아들인 것 전부를 종류와 함께 기록 — 변경 이력이 '넘긴 설정'과 '근무 모양'을 나눠 보인다
+    assert done.effects and [(a["kind"], a["text"]) for a in captured["accepted"]] == [
+        ("setting", BEND), ("quality", "사람 간 OFF 수 격차 2→3")]
 
 
 def test_restore_brings_back_the_pending_question_and_what_was_confirmed(monkeypatch):
@@ -178,3 +181,23 @@ def test_questions_in_a_row_before_solving_cancel_to_the_state_before_the_first(
     back = press(agent, world.conv, "cancel_request", {})
     assert world.conv.state.requests == [SetCell("B", 0, "O")] and world.conv.state.last is before
     assert back.answer.endswith("앞서 찾은 후보는 아래에 그대로 있습니다.")
+
+
+def test_change_history_says_which_setting_the_edit_passed(monkeypatch):
+    # 변경 이력 — 수정 도우미가 만든 버전이면 요청과 이번만 넘긴 설정(사용자 지시 11-03 '어떤 부분을 변경해서 발생한 수정인지')
+    from services.schedule_edit import journal
+    row = SimpleNamespace(created_at=datetime(2026, 11, 3, 14, 20), payload={
+        "request_text": "김태희 17일 OFF",
+        "accepted": [{"kind": "setting", "text": "김태희 개인 OFF 수 상한을 1개 넘김"},
+                     {"kind": "wanted", "text": "장원영 9일 원티드 칸 E→O"},
+                     {"kind": "quality", "text": "사람 간 OFF 수 격차 2→3"}]})
+    monkeypatch.setattr(journal, "read_apply_for", lambda db, sid: row if sid == "s2" else None)
+    assert journal.edit_origin(None, "s2") == {
+        "request": "김태희 17일 OFF", "bends": ["김태희 개인 OFF 수 상한을 1개 넘김", "장원영 9일 원티드 칸 E→O"],
+        "shape": ["사람 간 OFF 수 격차 2→3"], "at": "2026-11-03T14:20:00"}
+    assert journal.edit_origin(None, "s1") is None          # 사람이 직접 고친 버전은 없음
+    # 이 기능 전 기록(받아들인 목록 없음) — 고른 레버의 허용 위치로(오전 실화면의 14일 D 미달 버전)
+    old_row = SimpleNamespace(created_at=None, payload={"request_text": "장원영 14일 오프로", "allow": [
+        [["인원최소", None, 13, "D"], 1]]})
+    monkeypatch.setattr(journal, "read_apply_for", lambda db, sid: old_row)
+    assert journal.edit_origin(None, "s3")["bends"] == ["14일 일별 최소 인원(D) 1명 넘김"]

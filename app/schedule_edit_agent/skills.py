@@ -480,7 +480,7 @@ def apply_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
         saved = apply_to_new_version(turn.db, turn.session, cand, turn.user,
                                      request_text=str(params.get("request_text") or ""), name=params.get("name"),
                                      today=turn.today, conversation_id=turn.conversation_id, turn_no=turn.turn_no,
-                                     accepted=[f.text for f in found])
+                                     accepted=[finding_to_json(f) for f in found])
     except ApplyError as exc:
         turn.record("error", {"action": "apply", "code": exc.code, "message": exc.message},
                     elapsed_ms=_ms(started))
@@ -501,7 +501,8 @@ def _ask_apply(turn: Turn, cand, pending: List[Finding], started: float) -> Outc
     question = f"{which}을 적용하면 지금보다 나빠지는 것이 있습니다. 그래도 적용할까요?"
     answer = "\n".join([question] + [f"· {f.text}" for f in pending])
     preview = result_to_dict(ctx, session.last)
-    preview.update({"status": "confirm_apply", "rank": cand.rank, "question": question,
+    # 참고 문구는 후보를 보일 때 이미 말했다 — 확인 질문에 다시 붙이지 않는다(4차 평가 11-03)
+    preview.update({"status": "confirm_apply", "rank": cand.rank, "question": question, "notes": [],
                     "findings": [finding_to_json(f) for f in pending]})
     turn.record("check", {"rank": cand.rank, "findings": [finding_to_json(f) for f in pending]},
                 elapsed_ms=_ms(started))

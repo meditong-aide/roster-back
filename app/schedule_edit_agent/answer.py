@@ -121,6 +121,9 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
             lines.append(f"근무 수 변화: {moved}")
         if first.quality:
             lines.append(f"이 안은 규칙은 모두 지키지만 {first.quality[0]} 등 근무 모양이 조금 나빠집니다.")
+        if result.levers:
+            fewest = min(lv.changes[1] for lv in result.levers)
+            lines.append(f"설정 하나를 이번만 넘기시면 {first.changed_count}칸 대신 {fewest}칸만 바꾸는 방법도 아래에 있습니다.")
         lines += [n for n in (cover_note(ctx, r) for r in requests if isinstance(r, CoverTarget)) if n]
         lines += [balance_note(ctx, r, first) for r in requests if isinstance(r, BalanceTarget)]
         return "\n".join(lines + notes)

@@ -94,3 +94,56 @@ def read_conversation_head(db: Session, conversation_id: str) -> Optional[Schedu
         db.rollback()
         logger.warning("[schedule_edit] 기록 읽기 실패: %s", conversation_id, exc_info=True)
         return None
+
+
+def read_apply_for(db: Session, schedule_id: str) -> Optional[ScheduleEditLog]:
+    """이 버전을 만든 수정 도우미 적용 기록(없으면 None) — 변경 이력에 '무엇을 넘겨서 나온 수정인지' 보인다."""
+    if not schedule_id or not _table_ready(db):
+        return None
+    try:
+        return (db.query(ScheduleEditLog)
+                .filter(ScheduleEditLog.new_schedule_id == schedule_id, ScheduleEditLog.event == "apply")
+                .order_by(ScheduleEditLog.log_id.desc()).first())
+    except SQLAlchemyError:
+        db.rollback()
+        logger.warning("[schedule_edit] 적용 기록 읽기 실패: %s", schedule_id, exc_info=True)
+        return None
+
+
+#: 변경 이력에 '이번만 넘긴 것'으로 보일 종류(근무 모양 악화는 따로)
+BEND_KINDS = ("setting", "cover", "wanted")
+
+
+def edit_origin(db: Session, schedule_id: str) -> Optional[Dict[str, Any]]:
+    """변경 이력용 — 수정 도우미가 만든 버전이면 {request, bends, shape, at}. 넘긴 설정(bends)은 그 수정이 어떤 설정을
+    이번만 넘겨서 나왔는지다(사용자 지시 11-03 '어떤 부분을 변경해서 발생한 수정인지 알기 위함')."""
+    row = read_apply_for(db, schedule_id)
+    if row is None:
+        return None
+    payload = row.payload or {}
+    items = [a if isinstance(a, dict) else {"kind": "setting", "text": str(a)} for a in payload.get("accepted") or []]
+    if "accepted" not in payload and payload.get("allow"):
+        items = _bends_from_allow(db, payload["allow"])        # 이 기능 전(11-03 오전) 기록 — 고른 레버의 위치로
+    return {
+        "request": payload.get("request_text") or None,
+        "bends": [a.get("text", "") for a in items if a.get("kind") in BEND_KINDS],
+        "shape": [a.get("text", "") for a in items if a.get("kind") == "quality"],
+        "at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+def _bends_from_allow(db: Session, allow_json: List[Any]) -> List[Dict[str, Any]]:
+    """옛 적용 기록에는 받아들인 것 목록이 없다 — 그 대화에서 고른 레버의 허용 위치를 문장으로(레버 카드와 같은 말)."""
+    from db.models import Nurse
+    from services.schedule_edit.explain import Bend, bend_text
+    from services.schedule_edit.serialize import allow_from_json
+    allow = allow_from_json(allow_json)
+    ids = sorted({str(k[1]) for k in allow if len(k) > 1 and k[1]})
+    names: Dict[str, str] = {}
+    if ids:
+        try:
+            names = {str(n): str(m) for n, m in db.query(Nurse.nurse_id, Nurse.name).filter(Nurse.nurse_id.in_(ids))}
+        except SQLAlchemyError:
+            db.rollback()
+    return [{"kind": "setting", "text": bend_text(Bend(k[0], k, amount), names)}
+            for k, amount in sorted(allow.items(), key=lambda kv: str(kv[0]))]
