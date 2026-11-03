@@ -654,9 +654,11 @@ app.include_router(agent_test_router)
 from agents_v2.chat_router import router as agent_chat_router
 app.include_router(agent_chat_router)
 
-# 근무표 수정 도우미(소형 CP-SAT) — SCHEDULE_EDIT_AGENT_ENABLED=1 일 때만 응답(기본 꺼짐 · 아니면 404)
-from schedule_edit_agent.router import router as schedule_edit_router
-app.include_router(schedule_edit_router)
+# 공통 에이전트 경로 /api/agents/{agent_id}/… — 에이전트는 import 할 때 등록된다(각자 스위치 · 꺼지면 404)
+#   근무표 수정 도우미(소형 CP-SAT) = schedule-edit · SCHEDULE_EDIT_AGENT_ENABLED=1 일 때만
+import schedule_edit_agent.spec  # noqa: F401,E402 — 등록
+from agent_kit.router import router as agents_router
+app.include_router(agents_router)
 
 import uvicorn
 

@@ -64,7 +64,12 @@ class Turn:
 class Outcome:
     answer: str
     preview: Optional[Dict[str, Any]] = None
-    ui_actions: List[Dict[str, Any]] = field(default_factory=list)
+    #: 화면에 일으킬 일(agent_kit 효과 어휘) — 적용 뒤 버전 바꾸기
+    effects: List[Dict[str, Any]] = field(default_factory=list)
+    #: 화면에서 펼쳐 둘 후보 번호(이 안에서 다듬기)
+    focus: Optional[int] = None
+    #: 버튼이 지금 상태와 안 맞아 아무것도 안 했다 — 흔적에 남기지 않는다
+    failed: bool = False
 
 
 @dataclass
@@ -245,6 +250,8 @@ def _is_keep(ctx, r: EditRequest) -> bool:
 
 #: 바꾸지 않는 답의 종류 → 정해진 문장(LLM 글을 사용자에게 보내지 않는다 · 검토 M3)
 REPLY_KINDS = ("who", "when", "what", "outside_month", "settings", "unsupported", "other", "status", "unclear")
+#: 아직 못 하는 변경 — 답 문장과 처음 화면 안내가 같은 목록을 쓴다
+UNSUPPORTED = "그날 인원·근무 모양·휴가·원티드·여러 사람 고르게 맞추기, 근무 수 묻기"
 
 
 def reply_text(kind: str, session: EditSession) -> str:
@@ -255,7 +262,7 @@ def reply_text(kind: str, session: EditSession) -> str:
         "what": "어떤 근무로 바꿀까요? (D·E·N·OFF)",
         "outside_month": f"이 근무표는 {ctx.year}년 {ctx.month}월입니다. {ctx.month}월 안의 날짜로 말씀해 주세요.",
         "settings": "인원·규칙·OFF 수 같은 설정은 여기서 바꿀 수 없습니다. 설정 화면에서 바꿔 주세요.",
-        "unsupported": ("그런 종류의 변경(그날 인원·근무 모양·휴가·원티드·여러 사람 고르게 맞추기, 근무 수 묻기)은 "
+        "unsupported": (f"그런 종류의 변경({UNSUPPORTED})은 "
                         "아직 여기서 못 합니다. 누구의 며칠 근무를 어떻게 바꿀지, 또는 누구의 어떤 근무를 몇 개로 할지로 "
                         "말씀해 주시면 찾아 드립니다."),
         "other": "여기서는 이 근무표의 칸을 바꾸는 요청만 도와드릴 수 있습니다.",
@@ -303,14 +310,14 @@ def apply_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     except ApplyError as exc:
         turn.record("error", {"action": "apply", "code": exc.code, "message": exc.message},
                     elapsed_ms=_ms(started))
-        return Outcome(answer=exc.message)
+        return Outcome(answer=exc.message, failed=True)
     turn.switched_to = saved.get("new_schedule_id")
     name = saved.get("new_name") or ""
     return Outcome(
         answer=f"새 버전으로 저장했습니다: {name}(VER{saved.get('new_version')}). 화면을 새 버전으로 바꿉니다.",
-        ui_actions=[{"type": "switch_version", "schedule_id": turn.switched_to,
-                     "version": saved.get("new_version"), "status": saved.get("status", "draft"),
-                     "name": name}])
+        effects=[{"type": "switch_version", "schedule_id": turn.switched_to,
+                  "version": saved.get("new_version"), "status": saved.get("status", "draft"),
+                  "name": name}])
 
 
 @register("reject_candidate", description="이 후보는 싫다 — 같은 사람들을 바꾸는 안은 빼고 다시 찾는다.",
@@ -328,7 +335,8 @@ def keep_candidate(turn: Turn, params: Dict[str, Any]) -> Outcome:
     cand = _candidate(turn, params)
     keep(turn.session, cand)
     turn.record("keep", {"rank": cand.rank, "people": sorted(cand.affected)})
-    return Outcome(answer=f"{cand.rank}번 안을 기준으로 이어서 다듬습니다. 더 바꾸거나 그대로 둘 곳을 말씀해 주세요.")
+    return Outcome(answer=f"{cand.rank}번 안을 기준으로 이어서 다듬습니다. 더 바꾸거나 그대로 둘 곳을 말씀해 주세요.",
+                   focus=cand.rank)
 
 
 @register("choose_lever", description="레버를 고른다 — 그 설정을 그만큼만 넘기도록 허용하고 다시 찾는다.",
@@ -338,7 +346,7 @@ def choose_lever(turn: Turn, params: Dict[str, Any]) -> Outcome:
     try:
         lever = allow_lever_id(turn.session, str(params.get("lever_id") or ""))
     except KeyError:
-        return Outcome(answer="그 레버는 지금 결과에 없습니다. 다시 찾은 결과에서 골라 주세요.")
+        return Outcome(answer="그 레버는 지금 결과에 없습니다. 다시 찾은 결과에서 골라 주세요.", failed=True)
     turn.record("lever", {"lever_id": params.get("lever_id"), "lose": lever.lose,
                           "allow": allow_to_json(lever.allow), "allow_total": allow_to_json(turn.session.allow)})
     return _propose(turn, turn.session.requests)
@@ -396,8 +404,7 @@ def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
                             "allow": allow_to_json(turn.session.allow),
                             "avoid": [sorted(p) for p in turn.session.avoid_people]},
                 elapsed_ms=_ms(started))
-    actions = [{"type": "preview_candidates"}] if result.candidates else []
-    return Outcome(answer=answer, preview=preview, ui_actions=actions)
+    return Outcome(answer=answer, preview=preview)
 
 
 #: 상대를 정하는 방식을 미리 풀 때 하나에 쓰는 시간 상한·하한(초)과, 미리 풀기 뒤 답을 만들 몫으로 남길 시간
@@ -445,15 +452,16 @@ def _choose_transfer(turn: Turn, requests: List[EditRequest], req: CountTarget) 
     word, moved = _word(req), abs(count_in(ctx, ctx.main, req) - req.target)
     ask = (f"빠지는 {word} {moved}개를 어떻게 메울지" if down
            else f"늘어나는 {word} {moved}개를 누구에게서 넘겨받을지")
-    lines = [f"{describe_requests(ctx, requests)} — {ask} 골라 주세요."]
-    lines += [f"{i}. {_choice_line(c)}" for i, c in enumerate(ordered, 1)]
+    question = f"{describe_requests(ctx, requests)} — {ask} 골라 주세요."
+    lines = [question] + [f"{i}. {_choice_line(c)}" for i, c in enumerate(ordered, 1)]
     answer = "\n".join(lines + [f"참고: {n}" for n in ctx.notes])
     preview = {"status": "choose_transfer", "choices": ordered, "direction": "down" if down else "up",
-               "reasons": [], "notes": list(ctx.notes), "candidates": [], "levers": [], "blocking": []}
+               "question": question, "reasons": [], "notes": list(ctx.notes), "candidates": [], "levers": [],
+               "blocking": []}
     turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
                             "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
                             "avoid": [sorted(p) for p in session.avoid_people]}, elapsed_ms=_ms(started))
-    return Outcome(answer=answer, preview=preview, ui_actions=[{"type": "choose_transfer"}])
+    return Outcome(answer=answer, preview=preview)
 
 
 def _word(req: CountTarget) -> str:
@@ -564,6 +572,11 @@ def _recommend(choices: List[Dict[str, Any]]) -> None:
 def _choice_line(c: Dict[str, Any]) -> str:
     if not c["feasible"]:
         return f"{c['label']} — {c['reason']}"
+    return f"{c['label']} — " + " · ".join(choice_parts(c)) + (" [추천]" if c["recommended"] else "")
+
+
+def choice_parts(c: Dict[str, Any], *, quality: bool = True) -> List[str]:
+    """미리 푼 방식 하나의 요약 조각 — 답 문장과 화면 선택지가 같이 쓴다(화면은 근무 모양을 따로 보여 quality=False)."""
     parts = [f"{c['changed_count']}칸"]
     if c["partners"]:
         parts.append(", ".join(f"{r['name']} {r['before']}→{r['after']}" for r in c["partners"][:4]))
@@ -571,11 +584,11 @@ def _choice_line(c: Dict[str, Any]) -> str:
         bound = "최소" if c["choice_id"] == "reduce_coverage" else "최대"
         parts.append(", ".join(f"{x['day']}일 {SHIFT_WORD[x['code']]} {x['before']}→{x['after']}명"
                                for x in c["coverage_changes"][:4]) + f"(일별 {bound} 인원을 이번만 넘김)")
-    if c["quality"]:
+    if quality and c["quality"]:
         parts.append(c["quality"][0])
     if c.get("same_as_auto"):
         parts.append("가장 적게 바꾸기와 같은 안")
-    return f"{c['label']} — " + " · ".join(parts) + (" [추천]" if c["recommended"] else "")
+    return parts
 
 
 def _clarify(turn: Turn, asks: List[str]) -> Outcome:

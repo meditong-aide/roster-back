@@ -14,7 +14,7 @@ from datetime import date
 from typing import Dict, List
 
 from schedule_edit_agent.answer import describe_requests
-from schedule_edit_agent.store import Conversation
+from agent_kit.conversation import Conversation
 from services.schedule_edit.session import EditSession
 
 HISTORY_TURNS = 4
