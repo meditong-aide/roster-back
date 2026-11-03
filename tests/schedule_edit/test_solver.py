@@ -138,10 +138,13 @@ def test_swap_also_rebalances_off_count():
 def test_already_satisfied_and_invalid():
     ctx = _two_nurse_ctx()
     assert propose(ctx, [SetCell("A", 0, "D")]).status == "already"
-    ctx.frozen[("A", 1)] = "확정 원티드"
+    ctx.frozen[("A", 1)] = "관할 밖(파견·이동·휴직·프리셉티)"
     res = propose(ctx, [SetCell("A", 1, "D")])
     assert res.status == "invalid"
-    assert "확정 원티드" in res.reasons[0]
+    assert "관할 밖" in res.reasons[0]
+    # 확정 원티드는 그 칸을 직접 짚으면 바꾼다(사용자 지시 11-03 · tests/schedule_edit/test_wanted_fixed.py)
+    ctx.frozen[("A", 1)] = "확정 원티드"
+    assert propose(ctx, [SetCell("A", 1, "D")]).status == "ok"
 
 
 def test_existing_violation_may_stay_but_no_new_one():

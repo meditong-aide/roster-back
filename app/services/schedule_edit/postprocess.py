@@ -7,6 +7,8 @@
     (생성할 때와 같다).
   · 설정은 그 근무표가 만들어질 때 쓴 것(schedules.config_id · [RVERIFY-08]).
   · 지난 날·바꿀 수 없는 칸은 바꾸지 않는다 — 생성은 앞으로의 달이라 날짜를 보지 않는다.
+  · 원티드 칸도 바꾸지 않는다 — 확정 원티드는 서비스가 이미 빼고, 지금 반영된 제출 원티드는 `protect` 로
+    넘겨 서비스가 다른 OFF 를 고르게 한다(원티드 칸은 수간호사가 그 칸을 직접 짚을 때만 바꾼다 · 사용자 지시 11-03).
 DB 는 읽기만 한다(서비스 함수도 읽기만 한다).
 """
 
@@ -57,8 +59,9 @@ def annual_leave_swap(db: Session, session: EditSession, today: date) -> Postpro
     before = {n: list(ctx.raw[n]) for n in ctx.nurse_ids}
     after = copy.deepcopy(before)
     report: Dict[str, Any] = {}
+    wanted = {(n, d + 1) for (n, d), codes in ctx.wishes.items() if ctx.main[n][d] in codes}
     postprocess_off_swap(db, schedule, after, config, SimpleNamespace(year=ctx.year, month=ctx.month),
-                         report=report)
+                         report=report, protect=wanted)
     open_from = first_open_day(ctx, today)
     changes: List[CellChange] = []
     held = 0

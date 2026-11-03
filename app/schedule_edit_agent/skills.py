@@ -23,7 +23,8 @@ from services.schedule_edit.journal import record_event
 from services.schedule_edit.postprocess import ANNUAL_LEAVE_SWAP, RUNNERS, as_result
 from services.schedule_edit.postprocess import KINDS as POSTPROCESS_KINDS
 from services.schedule_edit.requests import (
-    TRANSFERS, CountTarget, EditRequest, SetCell, count_cells, count_in, first_open_day, transfer_label, work_down,
+    TRANSFERS, CountTarget, CoverTarget, EditRequest, SetCell, count_cells, count_in, first_open_day, transfer_label,
+    work_down,
     work_targets,
 )
 from services.schedule_edit.serialize import allow_to_json, requests_to_json, result_to_dict
@@ -110,11 +111,17 @@ def llm_tools() -> List[Dict[str, Any]]:
 _CHANGE = {
     "type": "object",
     "properties": {
-        "kind": {"type": "string", "enum": ["set", "avoid", "swap", "off_period", "count", "leave"],
+        "kind": {"type": "string", "enum": ["set", "avoid", "swap", "off_period", "count", "leave", "cover"],
                  "description": "set=그 칸을 이 근무로 · avoid=그 칸에서 이 근무(들)를 빼기(무엇으로 바꿀지는 맡김) · "
                                 "swap=두 사람의 그날 근무 맞바꾸기 · off_period=day 부터 to_day 까지 OFF · "
                                 "count=날짜를 정하지 않고 그 사람의 그 근무 개수를 바꾸기(어느 날인지는 맡김) · "
-                                "leave=그 날(또는 day~to_day)에 연차·휴가·공가 같은 휴가 코드 넣기(근무일에만)"},
+                                "leave=그 날(또는 day~to_day)에 연차·휴가·공가 같은 휴가 코드 넣기(근무일에만) · "
+                                "cover=그날 그 근무 인원 늘리기·줄이기(nurse 없이 day·shift + change 또는 target · "
+                                "몇 명인지 말하지 않았으면 둘 다 비운다 · "
+                                "'1등급 넣어'처럼 등급을 말하면 grade)"},
+        "grade": {"type": "integer", "minimum": 1,
+                  "description": "cover: 그 등급까지인 사람을 넣거나 뺄 때('20일 N에 1등급 넣어' → grade 1·change 1 · "
+                                 "'1등급 빼' → grade 1·change -1). grade 를 쓰면 change 도 넣는다"},
         "leave": {"type": "string",
                   "description": "leave 의 휴가 이름 — 사용자가 말한 그대로(연차·병가·공가·생휴 등). 말하지 않았으면 비운다"},
         "nurse": {"type": "string", "description": "사용자가 말한 간호사 이름 그대로(호칭 '선생님' 등은 빼고)"},
@@ -123,8 +130,10 @@ _CHANGE = {
                 "description": "날짜(그 달의 일). count 에서는 기간을 말했을 때만 그 첫날"},
         "to_day": {"type": "integer", "minimum": 1, "maximum": 31,
                    "description": "off_period·count 기간의 마지막 날(포함). count 에서 기간을 말하지 않았으면 비운다"},
-        "change": {"type": "integer", "description": "count: 늘리거나 줄일 개수(2개 빼 → -2, 하나 더 → 1)"},
-        "target": {"type": "integer", "minimum": 0, "description": "count: '6개로' 처럼 목표 개수를 말했을 때"},
+        "change": {"type": "integer",
+                   "description": "count·cover: 늘리거나 줄일 개수·인원(2개 빼 → -2, 하나 더 → 1, 한 명 빼 → -1)"},
+        "target": {"type": "integer", "minimum": 0,
+                   "description": "count·cover: '6개로'·'4명으로' 처럼 목표 개수·인원을 말했을 때"},
         "transfer": {"type": "string", "enum": list(TRANSFERS),
                      "description": "count: 상대를 어떻게 정할지 사용자가 이미 말했을 때만(빠지는 근무를 누가 메울지 / "
                                     "누구 것을 넘겨받을지). same_grade=같은 등급 · same_team=같은 팀 · fair=그 근무가 "
@@ -175,7 +184,7 @@ def propose_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     description=(
         "바로 앞 요청을 고쳐 다시 찾는다. add=요청 더하기, remove=그 칸 요청 빼기, keep=이 칸(또는 그날 전체)은 "
         "지금 근무 그대로 두기. 예) '그리고 이영희 16일도 오프' → add · '15일은 건드리지 마' → keep=[{day:15}] · "
-        "'김민지 14일 건은 취소' → remove=[{nurse:'김민지', day:14}] · "
+        "'김민지 14일 건은 취소' → remove=[{nurse:'김민지', day:14}] · '15일 인원 요청은 빼' → remove=[{day:15}] · "
         "개수 요청에서 빠지는 근무를 메우는 방식을 말하면 transfer('같은 등급으로' → same_grade)"),
     parameters={"type": "object", "properties": {
         "add": {"type": "array", "items": _CHANGE},
@@ -196,18 +205,24 @@ def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     kept = _cells(ctx, params.get("keep") or [], asks)
     if asks:
         return _clarify(turn, asks)
+    # 날만 말한 빼기('15일 요청 빼') — 그날 인원 요청도 같이 뺀다(사람을 짚지 않아 칸으로는 안 걸린다 · 검토 11-03)
+    removed_days = _whole_days(ctx, removed)
     reqs = [r for r in turn.session.requests
-            if (r.nurse_id, r.day) not in removed and (r.nurse_id, None) not in removed]
+            if (r.nurse_id, r.day) not in removed and (r.nurse_id, None) not in removed
+            and not (isinstance(r, CoverTarget) and r.day in removed_days)]
     if params.get("transfer") in TRANSFERS:
         # 말로 바꾼 방식은 이미 고른 방식도 덮어쓴다('아니 같은 팀으로' · 검토 L4) — 버튼은 정하지 않은 것만
         reqs = [_decided(r, params["transfer"], force=True) for r in reqs]
     for r in (add.requests if add else []):
-        if not isinstance(r, CountTarget):     # 같은 칸 요청은 새 것이 덮어쓴다('A 15일 E' 뒤 'A 15일 연차' · 검토 L1)
-            reqs = [x for x in reqs if isinstance(x, CountTarget) or (x.nurse_id, x.day) != (r.nurse_id, r.day)]
+        # 같은 대상 요청은 새 것이 덮어쓴다('A 15일 E' 뒤 'A 15일 연차' · 검토 L1)
+        reqs = [x for x in reqs if not _same_target(x, r)]
         if r not in reqs:
             reqs.append(r)
-    # '21일은 그대로 둬' — 요청한 칸이 그 날이면 그 요청을 뺀다(평가 11-03: 요청은 남기고 그날 다른 칸만 고정해 모순)
-    reqs = [r for r in reqs if isinstance(r, CountTarget) or _is_keep(ctx, r) or (r.nurse_id, r.day) not in kept]
+    # '21일은 그대로 둬' — 요청한 칸이 그 날이면 그 요청을 뺀다(평가 11-03: 요청은 남기고 그날 다른 칸만 고정해 모순).
+    # 그날 전체를 두라면 그날 인원 요청도 뺀다(남기면 그날을 다 묶은 채 인원을 바꾸라는 모순 · 검토 11-03)
+    kept_days = _whole_days(ctx, kept)
+    reqs = [r for r in reqs if isinstance(r, CountTarget) or _is_keep(ctx, r)
+            or (r.day not in kept_days if isinstance(r, CoverTarget) else (r.nurse_id, r.day) not in kept)]
     asked = {(r.nurse_id, r.day) for r in reqs}
     for n, d in sorted(kept - asked):
         if ctx.is_free(n, d):     # 고정 칸은 원래 안 바뀐다
@@ -230,6 +245,21 @@ def _removals(ctx, items, asks: List[str]) -> set:
         else:
             out |= _cells(ctx, [item], asks)
     return out
+
+
+def _same_target(old: EditRequest, new: EditRequest) -> bool:
+    """새 요청이 덮어쓸 앞 요청 — 칸 요청은 같은 칸, 그날 인원은 같은 날·근무·등급끼리. 개수 요청은 쌓는다."""
+    if isinstance(old, CoverTarget) or isinstance(new, CoverTarget):
+        return (isinstance(old, CoverTarget) and isinstance(new, CoverTarget)
+                and (old.day, old.code, old.grade) == (new.day, new.code, new.grade))
+    if isinstance(old, CountTarget) or isinstance(new, CountTarget):
+        return False
+    return (old.nurse_id, old.day) == (new.nurse_id, new.day)
+
+
+def _whole_days(ctx, cells: set) -> set:
+    """그날 모든 사람 칸이 들어 있는 날 — 날만 말한 빼기·두기."""
+    return {d for _n, d in cells if d is not None and all((n, d) in cells for n in ctx.nurse_ids)}
 
 
 def _decided(r: EditRequest, transfer: str, force: bool = False) -> EditRequest:
@@ -263,11 +293,9 @@ def _is_keep(ctx, r: EditRequest) -> bool:
 #: 바꾸지 않는 답의 종류 → 정해진 문장(LLM 글을 사용자에게 보내지 않는다 · 검토 M3)
 REPLY_KINDS = ("who", "when", "what", "outside_month", "settings", "unsupported", "other", "status", "unclear")
 #: 아직 못 하는 변경 — 답 문장과 처음 화면 안내가 같은 목록을 쓴다
-UNSUPPORTED = "그날 인원 늘리기·줄이기, 근무 모양 고치기, 원티드 반영, 여러 사람 고르게 맞추기, 버전 되돌리기"
+UNSUPPORTED = "근무 모양 고치기, 원티드 반영, 여러 사람 고르게 맞추기, 버전 되돌리기"
 #: 아직 못 하는 종류별 안내(reply_only kind=unsupported 의 topic · 평가 11-03: 조회·되돌리기에도 같은 목록이 나갔다)
 UNSUPPORTED_TOPICS = {
-    "coverage": "그날 인원 늘리기·줄이기는 아직 여기서 못 합니다. '15일 김채원 E로'처럼 누구의 며칠 근무를 바꿀지 "
-                "말씀해 주시면 찾아 드립니다.",
     "fairness": "여러 사람의 근무 수를 고르게 맞추기는 아직 못 합니다. '최유진 N 2개만 줄여줘'처럼 한 사람씩 말씀해 주시면 "
                 "찾아 드립니다.",
     "pattern": "연속 근무·주말 몰림 같은 근무 모양 고치기는 아직 못 합니다. 바꿀 사람과 날짜를 말씀해 주시면 찾아 드립니다.",
@@ -302,7 +330,7 @@ def reply_text(kind: str, session: EditSession, topic: Optional[str] = None) -> 
         "when=며칠인지 빠짐 · what=무엇으로 바꿀지 빠짐 · outside_month=근무표 달 밖의 날짜 · settings=병동 설정값 자체"
         "(하루 인원 기준·규칙·OFF 기준 수)를 바꾸는 말이나 근무표 새로 만들기 — '사람들 OFF·근무 수를 맞춰 줘'는 "
         "settings 가 아니라 unsupported(topic=fairness) · unsupported=근무표를 바꾸는 말이지만 아직 못 하는 종류 — "
-        "topic 을 함께 고른다: coverage=그날 인원 늘리기·줄이기 · fairness=여러 사람 근무 수 고르게 맞추기 · "
+        "topic 을 함께 고른다: fairness=여러 사람 근무 수 고르게 맞추기 · "
         "pattern=연속 근무·주말 몰림 같은 근무 모양 · wanted=원티드 반영 · undo=버전 되돌리기·비교 · "
         "postprocess=자동 연차전환 밖의 생성 후처리(보건휴가·수면 OFF 등) · other=근무표와 상관없는 말 · "
         "status=지금 요청·결과가 어떤지 묻는 말"

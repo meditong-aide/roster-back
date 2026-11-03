@@ -66,7 +66,7 @@ def test_unsupported_answer_names_the_kind(world):
                       call("reply_only", kind="unsupported"))
     assert say(agent, world.conv, "방금 버전 되돌려줘").answer.startswith("만든 버전 되돌리기")
     assert say(agent, world.conv, "OFF 다 9개로 맞춰줘").answer.startswith("여러 사람의 근무 수를 고르게 맞추기")
-    assert "그날 인원 늘리기·줄이기" in say(agent, world.conv, "?").answer       # 종류를 모르면 전체 목록
+    assert "근무 모양 고치기" in say(agent, world.conv, "?").answer              # 종류를 모르면 전체 목록
 
 
 def test_status_after_postprocess_is_kept_in_the_session(world):

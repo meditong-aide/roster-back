@@ -12,8 +12,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    TRANSFERS, AvoidCell, CountTarget, EditRequest, LeaveCell, SetCell, eul, swap,
+    TRANSFERS, AvoidCell, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, cover_count, eul, swap,
 )
+from services.schedule_edit.rules import coverage_bounds
 
 SHIFTS = ("D", "E", "N", "M", "OFF")
 #: 기간 OFF 한 번에 받는 최대 날 수 — 그보다 길면 휴가 처리 대상이라 되묻는다
@@ -43,6 +44,8 @@ def ground_changes(ctx: EditContext, changes: Sequence[Dict[str, Any]], open_fro
 
 def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
     kind = change.get("kind")
+    if kind == "cover":                      # 그날 인원 — 사람을 짚지 않는다
+        return _cover(ctx, change)
     nurse, ask = resolve_nurse(ctx, change.get("nurse"))
     if ask:
         return [], ask
@@ -103,6 +106,40 @@ def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List
     return [], "어떤 변경인지 알기 어렵습니다. 예) '김민지 14일 OFF'"
 
 
+def _cover(ctx: EditContext, change: Dict[str, Any]) -> Tuple[List[EditRequest], Optional[str]]:
+    """그날 인원 — '15일 E 한 명 더'·'20일 N 한 명 빼'·'20일 N 에 1등급 넣어'. 인원을 말하지 않았으면 지금 인원을
+    보여 주고 되묻는다(추측하지 않는다)."""
+    day, ask = resolve_day(ctx, change.get("day"))
+    if ask:
+        return [], ask
+    code, ask = resolve_shift(ctx, change.get("shift"))
+    if ask:
+        return [], ask
+    if code == "O":
+        return [], "그날 인원은 근무(D·E·N)로 말씀해 주세요. 예) '15일 E 한 명 더'"
+    nums, bad = _numbers(change, "grade", "target", "change")
+    if bad:
+        return [], "인원·등급은 숫자로 말씀해 주세요. 예) '15일 E 한 명 더' · '20일 N 에 1등급 넣어'"
+    grade = nums["grade"]
+    probe = CoverTarget(day, code, 0, grade)
+    now = cover_count(ctx, ctx.main, probe)
+    who = f"{grade}등급까지인 사람 " if grade is not None else ""
+    if nums["target"] is not None:
+        target = nums["target"]
+    elif nums["change"] is not None:
+        target = now + nums["change"]
+    elif grade is not None:
+        # 넣기·빼기를 모르면 되묻는다 — 한 명 더로 짐작하면 '1등급 빼'가 거꾸로 풀린다(검토 11-03)
+        return [], f"{day + 1}일 {code} 는 지금 {who}{now}명입니다. 한 명 더 넣을까요, 뺄까요?"
+    else:
+        need, upper, _over = coverage_bounds(ctx, day, code)
+        rng = f"(설정 최소 {need}명" + (f" · 최대 {upper}명" if upper is not None else "") + ")"
+        return [], f"{day + 1}일 {code} 는 지금 {who}{now}명입니다{rng}. 몇 명으로 바꿀까요?"
+    if target == now:
+        return [], f"{day + 1}일 {code} 는 이미 {who}{now}명입니다."
+    return [CoverTarget(day, code, target, grade)], None
+
+
 def _count(ctx: EditContext, change: Dict[str, Any], nurse: str,
            open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
     """개수 요청 — '장원영 N 2개만 빼줘'. 기간은 바꿀 수 있는 첫날(또는 말한 날)부터 말일(또는 말한 날)까지.
@@ -127,10 +164,13 @@ def _count(ctx: EditContext, change: Dict[str, Any], nurse: str,
     # OFF 는 휴가·공가 칸을 세지 않는다(순수 OFF · `requests.counts_as`)
     now = sum(1 for d in range(first, last + 1) if row[d] == code and not (code == "O" and (nurse, d) in ctx.vacation))
     word = SHIFT_WORD[code]
-    if change.get("target") is not None:
-        target = int(change["target"])
-    elif change.get("change") is not None:
-        target = now + int(change["change"])
+    nums, bad = _numbers(change, "target", "change")
+    if bad:
+        return [], "개수는 숫자로 말씀해 주세요. 예) '장원영 N 2개만 빼줘'"
+    if nums["target"] is not None:
+        target = nums["target"]
+    elif nums["change"] is not None:
+        target = now + nums["change"]
     else:
         return [], count_status(ctx, nurse, code) + " 몇 회로 바꿀까요?"
     name = ctx.names.get(nurse, nurse)
@@ -226,6 +266,18 @@ def _who(ctx: EditContext, nurse_ids: Sequence[str]) -> str:
     if len(set(names)) < len(names):   # 동명이인 — 사번 끝자리로 구분
         names = [f"{ctx.names.get(n, n)}({str(n)[-4:]})" for n in nurse_ids[:5]]
     return "·".join(names) + (" 등" if len(nurse_ids) > 5 else "")
+
+
+def _numbers(change: Dict[str, Any], *keys: str) -> Tuple[Dict[str, Optional[int]], bool]:
+    """LLM 이 숫자 칸에 넣은 값 — 비었으면 None, 정수가 아닌 값이 있으면 bad(되묻는다 · 검토 11-03: '1등급' 에 예외)."""
+    out, bad = {}, False
+    for key in keys:
+        value = change.get(key)
+        try:
+            out[key] = None if value is None else int(value)
+        except (TypeError, ValueError):
+            out[key], bad = None, True
+    return out, bad
 
 
 def resolve_day(ctx: EditContext, said: Any) -> Tuple[Optional[int], Optional[str]]:

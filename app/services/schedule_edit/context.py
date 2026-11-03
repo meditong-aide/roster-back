@@ -38,6 +38,8 @@ WORK_MAINS = ("D", "E", "N", "M", "W")
 #: 모델이 고를 수 있는 대표코드(M 은 use_mid 일 때만)
 EDIT_MAINS = ("D", "E", "N", "M", "O")
 VACATION_TYPES = {"휴가", "공가"}
+#: 확정 원티드 칸의 고정 이유 — 수간호사가 그 칸을 직접 짚은 요청에서만 풀린다(`with_released`)
+FIXED_WANTED = "확정 원티드"
 #: 전월 꼬리 길이 — 화면(prev-tail 6일)·엔진(lookback 6) 과 같다. N 간격이 더 길면 늘린다.
 TAIL_DAYS = 6
 
@@ -473,7 +475,32 @@ def _freeze_fixed_wanted(ctx: EditContext, rows: List[FixedWantedEntry]) -> None
     for r in rows:
         nid, day = str(r.nurse_id), int(r.shift_date.day) - 1
         if nid in ctx.raw and 0 <= day < ctx.days:
-            ctx.frozen[(nid, day)] = "확정 원티드"
+            ctx.frozen[(nid, day)] = FIXED_WANTED
+
+
+def released_wanted(ctx: EditContext, cells) -> Set[Cell]:
+    """그 칸들 중 확정 원티드로 묶인 칸 — 수간호사가 그 칸을 직접 짚었을 때만 푼다(사용자 지시 11-03)."""
+    return {c for c in cells if ctx.frozen.get(c) == FIXED_WANTED}
+
+
+def with_released(ctx: EditContext, cells) -> EditContext:
+    """직접 짚은 원티드 칸을 바꿀 수 있게 한 재료(사본) — 확정 원티드는 고정을 풀고 그 칸 때문에 걸린 '전날 N 금지'도
+    다시 계산한다. 지금 반영된 제출 원티드는 모델·검증이 짚은 칸에서 면제하니 안내만 붙인다.
+
+    짚지 않은 원티드 칸은 그대로 묶여 있다(개수·인원 요청·연쇄 변경·레버로는 못 바꾼다). 바꿀 원티드 칸이 없으면 그대로.
+    """
+    fixed = released_wanted(ctx, cells)
+    wished = {(n, d) for n, d in cells if ctx.main[n][d] in ctx.wishes.get((n, d), ())} - fixed
+    if not fixed and not wished:
+        return ctx
+    out = dataclasses.replace(ctx, notes=list(ctx.notes))
+    if fixed:
+        out.frozen = {c: r for c, r in ctx.frozen.items() if c not in fixed}
+        out.ban_n_before = set()
+        _load_ban_n_before(out)
+    out.notes += [f"{ctx.names.get(n, n)} {d + 1}일은 {'확정 원티드' if (n, d) in fixed else '원티드로 받은'} 칸이지만 "
+                  "직접 요청하셔서 바꿉니다." for n, d in sorted(fixed | wished, key=lambda c: (c[1], c[0]))]
+    return out
 
 
 def _load_wishes(db: Session, ctx: EditContext, shifts: List[dict], fixed_rows: List[FixedWantedEntry]) -> None:
@@ -567,7 +594,7 @@ def _load_ban_n_before(ctx: EditContext) -> None:
     by_wanted = bool(ctx.config.get("ban_night_before_fixed_wanted_off"))
     for (nid, day), reason in ctx.frozen.items():
         hit_type = by_type and (nid, day) in ctx.vacation
-        hit_wanted = by_wanted and reason == "확정 원티드" and ctx.main[nid][day] == "O"
+        hit_wanted = by_wanted and reason == FIXED_WANTED and ctx.main[nid][day] == "O"
         if (hit_type or hit_wanted) and day >= 1:
             ctx.ban_n_before.add((nid, day - 1))
 

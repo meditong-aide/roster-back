@@ -29,8 +29,8 @@ from services.group_access import assert_caller_can_access_group, caller_is_mana
 from services.schedule_edit.journal import read_conversation, read_conversation_head
 
 MANAGERS_ONLY = "근무표 수정 도우미는 수간호사·그룹관리자만 쓸 수 있습니다."
-EXAMPLES = ["○○○ 14일 오프로", "15일 ○○○, ○○○ 근무 바꿔줘", "○○○ N 2개만 줄여줘", "○○○ 25일 연차 넣어줘",
-            "15일 나이트 누구야", "남는 OFF 연차로 전환해줘"]
+EXAMPLES = ["○○○ 14일 오프로", "15일 ○○○, ○○○ 근무 바꿔줘", "○○○ N 2개만 줄여줘", "15일 이브닝 한 명 더",
+            "○○○ 25일 연차 넣어줘", "15일 나이트 누구야", "남는 OFF 연차로 전환해줘"]
 
 
 class ScheduleEditAgent(Agent):

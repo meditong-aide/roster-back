@@ -33,7 +33,9 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 from ortools.sat.python import cp_model
 
 from services.schedule_edit import distribution as dist
-from services.schedule_edit.context import EditContext, pure_off_count, with_vacation
+from services.schedule_edit.context import (
+    EditContext, pure_off_count, released_wanted, with_released, with_vacation,
+)
 from services.schedule_edit.explain import direct_conflicts, explain_month
 from services.schedule_edit.levers import LEVER_SECONDS, find_levers, lever_allow
 from services.schedule_edit.model import (
@@ -154,7 +156,11 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
         return EditResult("invalid", reasons=problems, notes=list(ctx.notes))
     if all(is_satisfied(ctx, r) for r in requests):
         return EditResult("already", notes=list(ctx.notes))
+    ctx, rules = _release(ctx, rules, requests)
     leave = {(r.nurse_id, r.day): r.code for r in requests if isinstance(r, LeaveCell)}
+    wished = _wished_night_before(ctx, leave, requests)
+    if wished:
+        return EditResult("invalid", reasons=wished, notes=list(ctx.notes))
     if leave:
         # 연차·휴가 칸 — 그 칸을 휴가로 넣은 재료로 OFF 를 지정해 푼다(순수 OFF·패턴 판정이 휴가로 본다 · 빠진 근무는
         # 다른 사람이 메운다). 후보에서 그 칸만 휴가 코드로 바꾼다(`_as_leave`)
@@ -191,6 +197,29 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
                           reasons=[f"지금 규칙을 모두 지키면서 {MAX_CHANGES}칸 이내로는 방법이 없습니다."
                                    if status == cp_model.INFEASIBLE else "시간 안에 방법을 찾지 못했습니다."])
     return _no_candidate(run, proven=status == cp_model.INFEASIBLE)
+
+
+def _release(ctx: EditContext, rules: Optional[RuleSet], requests: Sequence[EditRequest]):
+    """직접 짚어 바꿔야 하는 칸의 확정 원티드만 푼 재료와 규칙. 풀 칸이 없으면 그대로(규칙도 다시 만들지 않는다).
+    이미 그렇게 된 칸은 풀지 않는다 — 기간 OFF 안의 원래 OFF 원티드를 풀면 그 '전날 N 금지'가 빠진다(검토 11-03)."""
+    direct = requested_cells(ctx, list(requests))
+    out = with_released(ctx, direct)
+    if out is ctx:
+        return ctx, rules
+    return out, (None if released_wanted(ctx, direct) else rules)     # 고정을 풀었을 때만 규칙을 다시 만든다
+
+
+def _wished_night_before(ctx: EditContext, leave: Dict[Tuple[str, int], str],
+                         requests: Sequence[EditRequest]) -> List[str]:
+    """휴가 전날 N 금지(설정)로 바꿔야 할 전날 N 이 원티드로 받은 칸이면 — 짚지 않은 원티드 칸은 바꾸지 않는다(사용자 지시
+    11-03). 그 나이트도 함께 짚으면 푼다."""
+    if not ctx.config.get("ban_night_before_fixed_off"):
+        return []
+    named = requested_cells(ctx, list(requests))
+    return [f"{ctx.names.get(n, n)} {d}일 나이트는 원티드로 받은 칸이라 {d + 1}일에 휴가를 넣으려면 그 나이트도 바꿔야 합니다"
+            f"(휴가 전날 나이트 금지 설정). 바꿔도 되면 '{d}일 나이트도 빼줘'라고 함께 말씀해 주세요."
+            for n, d in sorted(leave) if d >= 1 and (n, d - 1) not in leave and (n, d - 1) not in named
+            and ctx.main[n][d - 1] == "N" and "N" in ctx.wishes.get((n, d - 1), ())]
 
 
 def _as_leave(cand: Candidate, leave: Dict[Tuple[str, int], str]) -> Candidate:
@@ -344,7 +373,7 @@ def _candidate(run: _Run, grid: Grid, rank: int, window: Tuple[int, int],
 def rule_regressions(ctx: EditContext, rules: RuleSet, grid: Grid, requests: Sequence[EditRequest],
                      allow: Dict[Tuple, int], before: Optional[Dict] = None) -> List[Tuple]:
     """엔진 기준으로 지금보다 나빠진 곳(요청 칸의 원티드·허용 레버만큼은 뺀다)."""
-    waived = requested_cells(list(requests))
+    waived = requested_cells(ctx, list(requests))
     relief = grid_relief(ctx, rules, list(requests), grid)    # '그날 인원 줄이기' 로 실제 빠진 날만
     base = before if before is not None else measure(ctx, ctx.main, rules)
     return sorted((k, v) for k, v in new_violations(base, measure(ctx, grid, rules)).items()
@@ -368,9 +397,14 @@ def verify_candidate(ctx: EditContext, rules: RuleSet, candidate: "Candidate", r
     후보를 찾은 뒤 자정을 넘기면 그사이 지난 날이 된 칸을 바꾸는 후보가 될 수 있어 날짜도 다시 본다.
     """
     allow = lever_allow(allow)
+    ctx, rules = _release(ctx, rules, requests)
+    rules = rules or build_rules(ctx)
     grid = apply_candidate(ctx, candidate)
     open_from = first_open_day(ctx, today or datetime.now(KST).date())
     found = [f"{c.day + 1}일은 이미 지난 날짜입니다" for c in candidate.changes if c.day < open_from][:1]
+    # 묶인 칸(확정 원티드·파견 등)이 바뀌었으면 — 직접 짚은 확정 원티드 칸은 위에서 풀었다
+    found += [f"{c.day + 1}일은 '{ctx.frozen[(c.nurse_id, c.day)]}' 칸입니다" for c in candidate.changes
+              if not ctx.is_free(c.nurse_id, c.day)][:1]
     found += [f"요청 미충족 {r}" for r in requests if not is_satisfied(ctx, r, grid)]
     # 휴가로 바뀐 칸은 대표코드가 O 그대로라 그대로 세면 순수 OFF 하한 위반을 놓친다(Codex 11-03) —
     # 그 칸을 휴가로 넣은 재료로 규칙을 다시 세어, 지금(원래 재료) 값과 견준다

@@ -32,6 +32,7 @@ def postprocess_off_swap(
     latest_config,
     req,
     report: dict | None = None,
+    protect: set | None = None,
 ) -> dict:
     """초과 OFF 를 연차 코드로 변환.
 
@@ -46,6 +47,8 @@ def postprocess_off_swap(
             no_off_code) 또는 None, 그 밖에 target_shift·baseline·two_offs_per_week·converted·skipped_n_only·
             kept_off_for_week_floor·excess_total(기준을 넘은 OFF 합)·protected(넘었지만 회복 OFF·확정 원티드라
             후보가 모자란 수). 생성 경로는 넘기지 않는다 — 동작은 그대로다.
+        protect: 확정 원티드처럼 바꾸지 않을 칸 {(nurse_id, 1부터 날)} — 수정 도우미가 지금 반영된 제출
+            원티드를 넘긴다(원티드 칸은 직접 짚을 때만 바꾼다 · 11-03). 생성 경로는 넘기지 않는다.
 
     Returns:
         변환된 generated dict (in-place mutation 후 반환).
@@ -109,7 +112,7 @@ def postprocess_off_swap(
     # '주' 셀은 변환 안 하지만 excess 계산엔 반드시 포함시켜야 한다.
     all_off_codes = o_only_codes | weekly_off_codes
 
-    fixed_set = _load_fixed_wanted_set(db, schedule.group_id, req.year, req.month)
+    fixed_set = _load_fixed_wanted_set(db, schedule.group_id, req.year, req.month) | set(protect or ())
     nurses = _load_nurses(db, schedule.group_id)
     # 타병동 전입(inbound) 간호사는 nurses.group_id 가 source 병동이라 위 group 조회에
     #   안 잡혀 nu=None 으로 연차 변환에서 통째로 스킵되던 버그. generated(=이 근무표의

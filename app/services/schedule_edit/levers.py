@@ -32,8 +32,10 @@ from services.schedule_edit.rules import Grid, RuleSet, build_rules, measure, ne
 
 logger = logging.getLogger(__name__)
 
+#: 원티드는 넣지 않는다 — 원티드 칸은 수간호사가 그 칸을 직접 짚을 때만 바꾼다(사용자 지시 11-03). 다른 요청을
+#: 풀려고 원티드를 넘기자는 카드를 내밀지 않는다(불가 설명에서만 알린다 · `explain.Explanation.sentences`).
 LEVER_FAMILIES = {"OFF수", "개인한도", "인원최소", "인원최대", "등급최소", "N간격", "같은근무연속",
-                  "고립근무", "원티드", "상호배제"}
+                  "고립근무", "상호배제"}
 #: 넘김 1 의 비용 — 주 loss 단위(칸 1 = 2). 6 = 칸 3개어치. 병동별 학습으로 조정할 계수(P4).
 BEND_COST = 6
 MAX_LEVERS = 3
@@ -126,7 +128,7 @@ def _lever_model(ctx: EditContext, rules: RuleSet, requests: List[EditRequest], 
     start = min(r.day for r in requests)
     em = EditModel(ctx=ctx, base=ctx.main, free=free_cells(ctx, range(start, ctx.days)), codes=edit_codes(ctx))
     add_cell_vars(em)
-    slacks = add_rules_soft(em, rules, requested_cells(requests), allow,
+    slacks = add_rules_soft(em, rules, requested_cells(ctx, requests), allow,
                              softenable=lambda family: family in LEVER_FAMILIES,
                              relief=model_relief(em, rules, requests))
     add_requests(em, requests)
@@ -174,7 +176,7 @@ def _to_lever(ctx: EditContext, rules: RuleSet, em: EditModel, grid: Grid, used,
 def _within(ctx: EditContext, rules: RuleSet, grid: Grid, granted: Dict[Tuple, int],
             requests: List[EditRequest]) -> bool:
     """레버 해가 허용량 안에서만 넘겼는지 — 모델과 같은 부등식으로 다시 잰다(어긋나면 코드 결함)."""
-    waived, relief = requested_cells(requests), grid_relief(ctx, rules, requests, grid)
+    waived, relief = requested_cells(ctx, requests), grid_relief(ctx, rules, requests, grid)
     worse = {k: v for k, v in new_violations(measure(ctx, ctx.main, rules), measure(ctx, grid, rules)).items()
              if not is_waived(k, waived) and v[1] > v[0] + granted.get(k, 0) + relief.get(k, 0)}
     if worse:

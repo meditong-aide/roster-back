@@ -447,6 +447,25 @@ def _coverage(ctx: EditContext) -> Iterator[Ineq]:
                 yield Ineq(("인원최대", None, d, code), terms, 0, upper)
 
 
+def coverage_bounds(ctx: EditContext, day: int, code: str) -> Tuple[int, Optional[int], Optional[int]]:
+    """그날 그 근무의 (최소, 인원최대 상한, 인원초과 상한) — `_coverage`·`_coverage_over` 와 같은 계산.
+    그날 인원 요청(`requests.CoverTarget`)이 넘길 양을 정할 때 쓴다. 그날 그 근무 설정이 없으면 규칙도 없다
+    (`_coverage` 는 cov_min 에 있는 근무만 돈다 · 검토 11-03: '최대 인원(0명)보다 많이' 라는 틀린 안내)."""
+    mins = ctx.cov_min[day] if day < len(ctx.cov_min) else {}
+    if code not in mins:
+        return 0, None, None
+    need = int(mins.get(code, 0) or 0)
+    cap = int((ctx.cov_max[day] if day < len(ctx.cov_max) else {}).get(code, 0) or 0)
+    upper = _coverage_upper(code, need, cap, bool(ctx.config.get("off_first")))
+    over = need if (not ctx.config.get("off_first") and need > 0 and cap == 0 and code in ("D", "E", "N")) else None
+    return need, upper, over
+
+
+def counted_people(ctx: EditContext, day: int) -> List[str]:
+    """그날 인원에 세는 사람(공개 · `_counted`)."""
+    return _counted(ctx, day)
+
+
 def _coverage_upper(code: str, need: int, cap: int, off_first: bool) -> Optional[int]:
     if cap > 0:
         return cap

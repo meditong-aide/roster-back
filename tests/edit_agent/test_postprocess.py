@@ -31,7 +31,8 @@ def swap(world, monkeypatch):
              "report": dict(skip=None, target_shift="연", baseline=2, two_offs_per_week=True, converted=3,
                             skipped_n_only=1, kept_off_for_week_floor=2, excess_total=6, protected=1)}
 
-    def fake(db, schedule, generated, config, req, report=None):
+    def fake(db, schedule, generated, config, req, report=None, protect=None):
+        state["protect"] = protect
         report.update(state["report"])
         for nid, day in state["cells"]:
             generated[nid][day] = "연"
@@ -52,7 +53,7 @@ def test_swap_previews_one_card_and_holds_past_days(world, swap):
         [("A", 4, "O", "연"), ("B", 5, "O", "연")]                     # 1일은 지난 날이라 뺐다
     assert cand["counts"]["A"]["OFF"] == [3, 2]
     assert "OFF 2칸을 연차로 바꿉니다(2명)" in reply.answer
-    for why in ("주 2회 휴일 하한", "회복 OFF·확정 원티드", "N 전담 1명", "지난 날·바꿀 수 없는 칸 1칸", "연차 잔여는 보지 않습니다"):
+    for why in ("주 2회 휴일 하한", "회복 OFF·원티드", "N 전담 1명", "지난 날·바꿀 수 없는 칸 1칸", "연차 잔여는 보지 않습니다"):
         assert why in reply.answer
     assert world.events[-1].event == "propose" and world.events[-1].payload["postprocess"] == "annual_leave_swap"
 
@@ -122,3 +123,15 @@ def test_postprocess_card_only_takes_apply(world, swap):
         reply = press(agent, world.conv, action, {"rank": 1}, TODAY)
         assert reply.failed and "'적용'만 할 수 있습니다" in reply.answer
     assert world.conv.state.last.source == "annual_leave_swap"           # 미리 본 안은 그대로
+
+
+def test_swap_passes_reflected_wanted_offs_as_protected(world, swap):
+    """지금 반영된 제출 원티드 OFF 는 서비스에 보호 칸으로 넘긴다 — 서비스가 다른 OFF 를 고른다(사용자 지시 11-03)."""
+    def ward():
+        ctx = _ward()
+        ctx.wishes = {("A", 3): {"O"}, ("B", 1): {"D"}, ("B", 4): {"O"}}    # B 2일은 지금 O 라 반영 안 된 원티드
+        return ctx
+    world.ctxs["s1"] = ward
+    agent, _ = _agent(SWAP)
+    say(agent, world.conv, "남는 OFF 연차로 돌려줘", TODAY)
+    assert swap["protect"] == {("A", 4), ("B", 5)}                      # 1부터 날 · B 2일(D 원티드·지금 O)은 빠진다

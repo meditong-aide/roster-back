@@ -6,7 +6,9 @@ from collections import Counter
 from typing import List, Optional, Sequence
 
 from services.schedule_edit.context import EditContext
-from services.schedule_edit.requests import CountTarget, EditRequest, LeaveCell, SetCell, count_in, transfer_label
+from services.schedule_edit.requests import (
+    CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, count_in, cover_count, transfer_label,
+)
 
 _SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
 #: 생성 후처리의 이름(`services.schedule_edit.postprocess.KINDS`)
@@ -31,6 +33,10 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
     keeps = any(not _same(ctx, r) for r in requests)
     kept_by_day = Counter(r.day for r in requests if keeps and _same(ctx, r))
     for r in requests:
+        if isinstance(r, CoverTarget):
+            band = f"(등급≤{r.grade})" if r.grade is not None else ""
+            parts.append(f"{r.day + 1}일 {r.code}{band} {cover_count(ctx, ctx.main, r)}→{r.target}명")
+            continue
         who = ctx.names.get(r.nurse_id, r.nurse_id)
         if isinstance(r, CountTarget):
             parts.append(_describe_count(ctx, who, r))
@@ -87,6 +93,7 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
             lines.append(f"근무 수 변화: {moved}")
         if first.quality:
             lines.append(f"이 안은 규칙은 모두 지키지만 {first.quality[0]} 등 근무 모양이 조금 나빠집니다.")
+        lines += [n for n in (cover_note(ctx, r) for r in requests if isinstance(r, CoverTarget)) if n]
         return "\n".join(lines + notes)
     if result.status == "already":
         return "\n".join([f"{head} — 이미 그렇게 되어 있습니다."] + notes)
@@ -94,6 +101,22 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
     if result.levers:
         lines.append("아래 설정 중 하나를 이번만 넘기도록 고르시면 그 안에서 다시 찾습니다.")
     return "\n".join([f"{head}:"] + lines + notes) if head else "\n".join(lines + notes)
+
+
+def cover_note(ctx: EditContext, r) -> str:
+    """그날 인원 요청으로 넘기는 인원 설정 — 요청한 것이 곧 동의지만 무엇을 넘기는지는 말한다.
+    예) '요청대로 15일 E 를 필요 인원(3명)보다 1명 많이 둡니다(이번만 · 병동 설정은 그대로).'"""
+    from services.schedule_edit.model import cover_relief     # 모델을 답 문장 모듈이 늘 들고 있지 않게
+    from services.schedule_edit.rules import coverage_bounds
+    need, upper, over = coverage_bounds(ctx, r.day, r.code)
+    base = {"인원최소": ("최소 인원", need, "적게"), "인원최대": ("최대 인원", upper, "많이"),
+            "인원초과": ("필요 인원", over, "많이")}
+    parts = [f"{base[k[0]][0]}({base[k[0]][1]}명)보다 {v}명 {base[k[0]][2]}"
+             for k, v in cover_relief(ctx, r).items() if k[0] in base]
+    if not parts:
+        return ""
+    eul = {"N": "을", "M": "을"}.get(r.code, "를")        # 엔·엠은 받침이 있다
+    return f"요청대로 {r.day + 1}일 {r.code}{eul} " + " · ".join(parts) + " 둡니다(이번만 · 병동 설정은 그대로)."
 
 
 def _count_changes(ctx: EditContext, requests: Sequence[EditRequest], cand) -> str:
@@ -146,7 +169,7 @@ def postprocess_answer(ctx: EditContext, result) -> str:
     if report.get("kept_off_for_week_floor"):
         notes.append(f"기준을 넘는 OFF {report['kept_off_for_week_floor']}칸은 주 2회 휴일 하한을 지키려면 그대로 둬야 합니다")
     if report.get("protected"):
-        notes.append(f"{report['protected']}칸은 나이트 뒤 회복 OFF·확정 원티드·주휴라 바꾸지 않습니다")
+        notes.append(f"{report['protected']}칸은 나이트 뒤 회복 OFF·원티드·주휴라 바꾸지 않습니다")
     if report.get("skipped_n_only"):
         notes.append(f"N 전담 {report['skipped_n_only']}명은 바꾸지 않습니다")
     if result.held:

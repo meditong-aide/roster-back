@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Dict, FrozenSet, Iterable, List, Optional, Union
 
-from services.schedule_edit.context import EDIT_MAINS, EditContext
+from services.schedule_edit.context import EDIT_MAINS, FIXED_WANTED, EditContext
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,39 @@ class LeaveCell:
     code: str
 
 
+@dataclass(frozen=True)
+class CoverTarget:
+    """그날 그 근무 인원을 target 명으로 — 예) 15일 E 한 명 더 · 20일 N 에 1등급 넣기(grade).
+
+    누구를 넣고 뺄지는 솔버가 고른다(사람을 짚지 않는다 — 원티드 보호를 면제하지 않는다). grade 가 있으면
+    그 등급까지(등급≤grade)인 사람만 센다. 사용자가 그날 인원을 바꿔 달라고 했으니 그날 그 근무의 최소·최대 인원
+    설정은 요청한 만큼 넘긴다(`model.coverage_relief` · 등급 요청은 넘기지 않는다).
+    """
+
+    day: int
+    code: str
+    target: int
+    grade: Optional[int] = None
+
+    @property
+    def nurse_id(self) -> None:
+        """사람을 짚지 않는다 — 칸 요청을 거르는 자리((간호사, 날) 비교)를 그대로 지나간다."""
+        return None
+
+
+def cover_members(ctx: EditContext, req: "CoverTarget") -> List[str]:
+    """그날 인원에 세는 사람(등급 요청이면 그 등급까지)."""
+    from services.schedule_edit.rules import counted_people
+    people = counted_people(ctx, req.day)
+    if req.grade is None:
+        return people
+    return [n for n in people if ctx.grade_of.get(n) is not None and ctx.grade_of[n] <= req.grade]
+
+
+def cover_count(ctx: EditContext, grid: Dict[str, List], req: "CoverTarget") -> int:
+    return sum(1 for n in cover_members(ctx, req) if grid[n][req.day] == req.code)
+
+
 #: 개수 요청의 '상대' 를 어떻게 정할지(사용자 결정 11-02: 선택지를 미리 풀어 보여 주고 고르게 한다).
 #:   요청자의 근무가 줄면(N 빼기·OFF 늘리기) 빠지는 근무를 누가 메울지, 늘면(N 더·OFF 빼기) 누구 것을 넘겨받을지.
 #:   reduce_coverage = 메우지 않고 그날 인원 줄이기 · add_coverage = 넘겨받지 않고 그날 인원 늘리기(둘 다 그날 인원 설정을
@@ -85,7 +118,7 @@ class CountTarget:
         return range(self.first_day, self.last_day + 1)
 
 
-EditRequest = Union[SetCell, AvoidCell, CountTarget, LeaveCell]
+EditRequest = Union[SetCell, AvoidCell, CountTarget, LeaveCell, CoverTarget]
 
 
 def work_down(ctx: EditContext, req: CountTarget) -> bool:
@@ -160,6 +193,8 @@ def first_open_day(ctx: EditContext, today: date) -> int:
 
 def request_problem(ctx: EditContext, req: EditRequest, open_from: int = 0) -> Optional[str]:
     """요청 자체가 성립하지 않는 이유(사람이 읽는 문장). 성립하면 None."""
+    if isinstance(req, CoverTarget):
+        return _cover_problem(ctx, req, open_from)
     if req.nurse_id not in ctx.main:
         return f"{req.nurse_id} 는 이 근무표에 없습니다."
     if isinstance(req, CountTarget):
@@ -170,7 +205,7 @@ def request_problem(ctx: EditContext, req: EditRequest, open_from: int = 0) -> O
         return f"{req.day + 1}일은 이미 지난 날짜라 바꿀 수 없습니다."
     name = ctx.names.get(req.nurse_id, req.nurse_id)
     reason = ctx.frozen.get((req.nurse_id, req.day))
-    if reason:
+    if reason and reason != FIXED_WANTED:     # 확정 원티드는 그 칸을 직접 짚었으니 푼다(`with_released`)
         return f"{name} {req.day + 1}일은 '{reason}' 칸이라 바꿀 수 없습니다."
     if isinstance(req, LeaveCell):
         if req.code not in ctx.leave_codes:
@@ -192,6 +227,30 @@ def request_problem(ctx: EditContext, req: EditRequest, open_from: int = 0) -> O
         return f"{name} {req.day + 1}일 {req.code} 는 허용 근무가 아니거나 기피 근무입니다."
     if isinstance(req, AvoidCell) and not usable - codes:
         return "그 칸에 넣을 수 있는 근무가 남지 않습니다."
+    return None
+
+
+def _cover_problem(ctx: EditContext, req: CoverTarget, open_from: int) -> Optional[str]:
+    if not 0 <= req.day < ctx.days:
+        return f"{req.day + 1}일은 이 달에 없습니다."
+    if req.day < open_from:
+        return f"{req.day + 1}일은 이미 지난 날짜라 바꿀 수 없습니다."
+    usable = WORK_CODES if ctx.use_mid else WORK_CODES - {"M"}
+    if req.code not in usable:
+        return "그날 인원은 근무(D·E·N" + ("·M" if ctx.use_mid else "") + ")로만 바꿀 수 있습니다."
+    if req.target < 0:
+        return "인원은 0명보다 줄일 수 없습니다."
+    members = cover_members(ctx, req)
+    able = [n for n in members if ctx.main[n][req.day] == req.code or (
+        ctx.is_free(n, req.day) and req.code not in ctx.forbidden.get((n, req.day), set()))]
+    who = f"{req.grade}등급까지인 " if req.grade is not None else ""
+    if req.target > len(able):
+        return f"{req.day + 1}일 {req.code} 를 할 수 있는 {who}사람이 {len(able)}명뿐입니다."
+    # 줄이는 쪽 — 바꿀 수 없는 칸(확정 원티드·파견 등)으로 그 근무에 묶인 사람은 못 뺀다(검토 11-03)
+    locked = sum(1 for n in members if ctx.main[n][req.day] == req.code and not ctx.is_free(n, req.day))
+    if req.target < locked:
+        return (f"{req.day + 1}일 {req.code} 는 바꿀 수 없는 칸(확정 원티드·파견 등)으로 {who}{locked}명이 묶여 있어 "
+                f"{req.target}명으로 줄일 수 없습니다.")
     return None
 
 
@@ -224,6 +283,8 @@ def is_satisfied(ctx: EditContext, req: EditRequest, grid: Optional[Dict[str, Li
     """grid 를 주면 그 격자에서(후보 적용 뒤), 없으면 지금 근무표에서."""
     if isinstance(req, CountTarget):
         return count_in(ctx, grid or ctx.main, req) == req.target
+    if isinstance(req, CoverTarget):
+        return cover_count(ctx, grid or ctx.main, req) == req.target
     current = (grid or ctx.main)[req.nurse_id][req.day]
     if isinstance(req, LeaveCell):
         return current == "O"          # 대표코드는 O — 휴가 코드는 후보 칸(after)에 실린다

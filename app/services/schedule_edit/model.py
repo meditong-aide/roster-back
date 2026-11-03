@@ -17,10 +17,11 @@ from ortools.sat.python import cp_model
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    AvoidCell, CountTarget, EditRequest, SetCell, count_cells, count_in, work_targets,
+    AvoidCell, CountTarget, CoverTarget, EditRequest, SetCell, count_cells, count_in, cover_members, is_satisfied,
+    work_targets,
 )
 from services.schedule_edit.rules import (
-    WISH, Grid, Ineq, RuleSet, Term, TeamCover, cell, team_present, value_of,
+    WISH, Grid, Ineq, RuleSet, Term, TeamCover, cell, coverage_bounds, team_present, value_of,
 )
 
 Cell = Tuple[str, int]
@@ -99,7 +100,7 @@ def build_model(ctx: EditContext, rules: RuleSet, requests: List[EditRequest],
     """allow: 사용자가 레버로 허용한 넘김 {규칙 위치 key: 양} — 그 위치만 상한을 그만큼 올린다."""
     em = EditModel(ctx=ctx, base=ctx.main, free=free, codes=edit_codes(ctx))
     add_cell_vars(em)
-    waived = requested_cells(requests)
+    waived = requested_cells(ctx, requests)
     relief = model_relief(em, rules, requests)
     for ineq in rules.ineqs:
         if not is_waived(ineq.key, waived):
@@ -132,9 +133,14 @@ def add_span(em: EditModel) -> None:
     em.span = span
 
 
-def requested_cells(requests: List[EditRequest]) -> Set[Cell]:
-    """수간호사가 직접 짚은 칸 — 개수 요청은 칸을 짚지 않는다(원티드 보호를 면제하지 않는다)."""
-    return {(r.nurse_id, r.day) for r in requests if not isinstance(r, CountTarget)}
+def requested_cells(ctx: EditContext, requests: List[EditRequest]) -> Set[Cell]:
+    """수간호사가 직접 짚어 지금 칸을 바꿔야 하는 칸 — 원티드 보호는 이 칸에서만 면제한다.
+
+    개수·그날 인원 요청은 칸을 짚지 않는다. 이미 그렇게 된 칸(기간 OFF 안의 원래 OFF · 'D 넣지 마' 인데 지금 O)은
+    바꿀 칸이 아니라 면제하지 않는다(검토 11-03: 면제하면 그 원티드 칸이 다른 근무로 바뀔 수 있었다).
+    """
+    return {(r.nurse_id, r.day) for r in requests
+            if not isinstance(r, (CountTarget, CoverTarget)) and not is_satisfied(ctx, r)}
 
 
 def is_waived(key: Tuple, waived: Set[Cell]) -> bool:
@@ -275,8 +281,15 @@ def add_requests(em: EditModel, requests: List[EditRequest]) -> None:
             outside = _free_days(em, req.nurse_id, exclude=req.days())
             _hold(em, req.nurse_id, req.codes, outside, up=not lower)
             add_transfer(em, req)
+        elif isinstance(req, CoverTarget):
+            em.model.Add(sum(em.ind(Term(n, req.day, frozenset({req.code}))) for n in cover_members(em.ctx, req))
+                         == req.target)
         elif isinstance(req, SetCell):
-            em.model.Add(em.x[req.nurse_id, req.day, req.code] == 1)
+            if (req.nurse_id, req.day) in em.free:
+                em.model.Add(em.x[req.nurse_id, req.day, req.code] == 1)
+            elif cell(em.ctx, em.base, req.nurse_id, req.day) != req.code:
+                # 묶인 칸은 지금 값 그대로다 — 요청 검사를 지난 묶인 칸은 이미 그렇게 된 확정 원티드뿐(기간 OFF 안의 원래 OFF)
+                em.model.AddBoolOr([])
         elif isinstance(req, AvoidCell):
             for c in req.codes:
                 if (req.nurse_id, req.day, c) in em.x:
@@ -354,6 +367,10 @@ def coverage_relief(ctx: EditContext, rules: RuleSet, requests: List[EditRequest
     out: Dict[Tuple, Any] = {}
     grade_keys = [(i.key, *_grade_key(i.key)) for i in rules.ineqs if i.key[0] == "등급최소"]
     for req in requests:
+        if isinstance(req, CoverTarget):
+            for k, v in cover_relief(ctx, req).items():
+                out[k] = out.get(k, 0) + v
+            continue
         if not isinstance(req, CountTarget) or req.transfer not in ("reduce_coverage", "add_coverage"):
             continue
         n, grade, work = req.nurse_id, ctx.grade_of.get(req.nurse_id), work_targets(req)
@@ -372,6 +389,22 @@ def coverage_relief(ctx: EditContext, rules: RuleSet, requests: List[EditRequest
                 for a in sorted(work - {b}):
                     k = ("인원최대", None, d, a)
                     out[k] = out.get(k, 0) + moved(n, d, a, False)
+    return out
+
+
+def cover_relief(ctx: EditContext, req: CoverTarget) -> Dict[Tuple, int]:
+    """그날 인원 요청 — 요청한 만큼 그날 그 근무의 최소·최대 인원 설정을 넘긴다(사용자가 그날 인원을 바꿔 달라고 한
+    것이 곧 동의 · 등급 요청은 전체 인원을 바꾸는 요청이 아니라 넘기지 않는다)."""
+    if req.grade is not None:
+        return {}
+    need, upper, over = coverage_bounds(ctx, req.day, req.code)
+    out: Dict[Tuple, int] = {}
+    if need and req.target < need:
+        out[("인원최소", None, req.day, req.code)] = need - req.target
+    if upper is not None and req.target > upper:
+        out[("인원최대", None, req.day, req.code)] = req.target - upper
+    if over is not None and req.target > over:
+        out[("인원초과", None, req.day, req.code)] = req.target - over
     return out
 
 

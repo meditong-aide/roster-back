@@ -27,8 +27,8 @@ from services.schedule_edit.model import (
     EditModel, add_cell_vars, add_requests, add_team_cover, edit_codes, free_cells, is_waived, model_relief,
     new_solver, read_solution, requested_cells,
 )
-from services.schedule_edit.requests import CountTarget, EditRequest, SetCell
-from services.schedule_edit.rules import Grid, RuleSet, cell, value_of
+from services.schedule_edit.requests import CountTarget, CoverTarget, EditRequest, SetCell
+from services.schedule_edit.rules import WISH, Grid, RuleSet, cell, value_of
 
 #: 넘김 1 의 무게 — 칸 하나 더 바꾸는 것보다 훨씬 무겁게(넘김을 먼저 줄인다)
 BEND_WEIGHT = 1000
@@ -92,9 +92,17 @@ class Explanation:
             head = [] if self.proven else ["(시간 안에 더 나은 방법이 없는지 끝까지 확인하지는 못했습니다)"]
             more = f" 외 {len(self.bends) - 5}곳" if len(self.bends) > 5 else ""
             together = "을 함께" if len(self.bends) > 1 else "을"
+            wish = [b for b in self.bends if b.family == WISH]
+            tail = [f"원티드 칸({', '.join(_wish_cell(b, names) for b in wish[:3])})은 직접 짚어 바꿔 달라고 하실 때만 "
+                    "바꿉니다."] if wish else []
             return head + [f"다음 설정{together} 넘기면 {max_changes}칸 이내로 가능합니다: "
-                           + " · ".join(bend_text(b, names) for b in self.bends[:5]) + more]
+                           + " · ".join(bend_text(b, names) for b in self.bends[:5]) + more] + tail
         return ["시간 안에 이유를 좁히지 못했습니다. 요청을 나눠서 다시 시도해 주세요."]
+
+
+def _wish_cell(bend: Bend, names: Dict[str, str]) -> str:
+    _fam, nurse, day = bend.key[:3]
+    return f"{names.get(nurse, nurse)} {day + 1}일"
 
 
 def explain_month(ctx: EditContext, rules: RuleSet, requests: Sequence[EditRequest],
@@ -106,7 +114,7 @@ def explain_month(ctx: EditContext, rules: RuleSet, requests: Sequence[EditReque
     """
     em = EditModel(ctx=ctx, base=ctx.main, free=free_cells(ctx, days), codes=edit_codes(ctx))
     add_cell_vars(em)
-    slacks = add_rules_soft(em, rules, requested_cells(list(requests)), allow or {},
+    slacks = add_rules_soft(em, rules, requested_cells(ctx, list(requests)), allow or {},
                             relief=model_relief(em, rules, list(requests)))
     add_requests(em, requests)
     em.model.Add(em.total_changes() <= max_changes)
@@ -134,7 +142,8 @@ def direct_conflicts(ctx: EditContext, rules: RuleSet, requests: Sequence[EditRe
     허용하면서(11-02) 불가의 대부분이 이 꼴이라, '하드락에 막힘' 대신 어느 칸 때문인지 알려 준다.
     """
     open_cells = {(n, d) for n in ctx.nurse_ids for d in days if ctx.is_free(n, d)}
-    options = {(r.nurse_id, r.day): _request_options(ctx, r) for r in requests if not isinstance(r, CountTarget)}
+    options = {(r.nurse_id, r.day): _request_options(ctx, r) for r in requests
+               if not isinstance(r, (CountTarget, CoverTarget))}
     out: List[Tuple[str, str]] = []
     for ineq in rules.ineqs:
         if ineq.key[0] not in HARD_LOCK_FAMILIES:
