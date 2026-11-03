@@ -17,9 +17,8 @@ from ortools.sat.python import cp_model
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, count_cells, count_in, cover_members,
-    is_satisfied,
-    work_targets,
+    AGGREGATE, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, WishTarget, count_cells,
+    count_in, cover_members, is_satisfied, wish_targets, work_targets,
 )
 from services.schedule_edit.rules import (
     WISH, Grid, Ineq, RuleSet, Term, TeamCover, cell, coverage_bounds, team_present, value_of,
@@ -60,6 +59,8 @@ class EditModel:
     span: Any = 0
     #: 고르게 맞추기의 최대−최소 차이(차이를 아직 정하지 않은 요청일 때만 · `solver.min_balance_spread` 가 줄인다)
     spread: Any = None
+    #: 넣은 원티드 수(넣을 수를 아직 정하지 않은 요청일 때만 · `solver.max_wish_count` 가 늘린다)
+    wish: Any = None
 
     def ind(self, term: Term):
         """칸이 term.codes 중 하나인가 — 자유 칸이면 변수 합, 아니면 0/1 상수."""
@@ -143,7 +144,7 @@ def requested_cells(ctx: EditContext, requests: List[EditRequest]) -> Set[Cell]:
     바꿀 칸이 아니라 면제하지 않는다(검토 11-03: 면제하면 그 원티드 칸이 다른 근무로 바뀔 수 있었다).
     """
     return {(r.nurse_id, r.day) for r in requests
-            if not isinstance(r, (CountTarget, CoverTarget, BalanceTarget)) and not is_satisfied(ctx, r)}
+            if not isinstance(r, AGGREGATE) and not is_satisfied(ctx, r)}
 
 
 def is_waived(key: Tuple, waived: Set[Cell]) -> bool:
@@ -289,6 +290,8 @@ def add_requests(em: EditModel, requests: List[EditRequest]) -> None:
                          == req.target)
         elif isinstance(req, BalanceTarget):
             add_balance(em, req)
+        elif isinstance(req, WishTarget):
+            add_wish(em, req)
         elif isinstance(req, SetCell):
             if (req.nurse_id, req.day) in em.free:
                 em.model.Add(em.x[req.nurse_id, req.day, req.code] == 1)
@@ -319,6 +322,15 @@ def add_balance(em: EditModel, req: BalanceTarget) -> None:
         em.spread = high - low
     else:
         em.model.Add(high - low <= req.spread)
+
+
+def add_wish(em: EditModel, req: WishTarget) -> None:
+    """넣은 원티드 수 ≥ at_least. at_least 가 None 이면 수를 변수로 두고 묶지 않는다(가장 많이 넣을 수를 찾을 때)."""
+    hit = sum(em.ind(Term(n, d, codes)) for n, d, codes in wish_targets(em.ctx, req))
+    if req.at_least is None:
+        em.wish = hit
+    else:
+        em.model.Add(hit >= req.at_least)
 
 
 def count_expr(em: EditModel, nurse_id: str, codes, days) -> Any:

@@ -148,7 +148,52 @@ class BalanceTarget:
         return self.first_day
 
 
-EditRequest = Union[SetCell, AvoidCell, CountTarget, LeaveCell, CoverTarget, BalanceTarget]
+@dataclass(frozen=True)
+class WishTarget:
+    """반영 안 된 원티드 넣기 — 예) '반영 안 된 원티드 넣어줘' · '장원영 원티드 반영해줘'(사용자 결정 11-03).
+
+    대상 = 기간(first_day~last_day) 안 바꿀 수 있는 칸의 근무·OFF 원티드 중 지금 반영 안 된 것(`wish_targets`).
+    nurses 가 비면 전원. 누구의 어느 칸을 어떻게 바꿀지는 솔버가 고른다(이미 반영된 원티드는 계속 지킨다 — 원티드 규칙).
+      · at_least: 넣을 개수 하한. None 이면 아직 정하지 않은 것 — 스킬이 규칙을 지키며 넣을 수 있는 가장 많은 수를 찾아
+        채운다(`solver.max_wish_count`).
+    """
+
+    nurses: Tuple[str, ...]
+    first_day: int
+    last_day: int
+    at_least: Optional[int] = None
+    #: 사용자가 기간을 말했는가 — 말하지 않았으면 요청 줄에 날짜를 붙이지 않는다(오늘~말일이 보이면 어색하다)
+    ranged: bool = False
+
+    @property
+    def nurse_id(self) -> None:
+        """사람 하나를 짚지 않는다 — 칸 요청을 거르는 자리를 그대로 지나간다."""
+        return None
+
+    @property
+    def day(self) -> int:
+        return self.first_day
+
+
+EditRequest = Union[SetCell, AvoidCell, CountTarget, LeaveCell, CoverTarget, BalanceTarget, WishTarget]
+#: 칸 하나를 짚지 않는 요청 — 원티드 보호 면제·칸 요청 비교에서 빠진다
+AGGREGATE = (CountTarget, CoverTarget, BalanceTarget, WishTarget)
+
+
+def wish_targets(ctx: EditContext, req: "WishTarget") -> List[Tuple[str, int, FrozenSet[str]]]:
+    """넣을 원티드 — (간호사, 날, 원하는 근무). 지금 근무표(ctx.main) 기준으로 반영 안 된 것만."""
+    who = set(req.nurses) if req.nurses else None
+    out = []
+    for (n, d), codes in sorted(ctx.wishes.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        if (who is not None and n not in who) or not req.first_day <= d <= req.last_day:
+            continue
+        if ctx.is_free(n, d) and ctx.main[n][d] not in codes:
+            out.append((n, d, frozenset(codes)))
+    return out
+
+
+def wish_count(ctx: EditContext, grid: Dict[str, List], targets) -> int:
+    return sum(1 for n, d, codes in targets if grid[n][d] in codes)
 
 
 def balance_members(ctx: EditContext, codes, open_from: int) -> Tuple[str, ...]:
@@ -254,6 +299,10 @@ def request_problem(ctx: EditContext, req: EditRequest, open_from: int = 0) -> O
         return _cover_problem(ctx, req, open_from)
     if isinstance(req, BalanceTarget):
         return _balance_problem(ctx, req, open_from)
+    if isinstance(req, WishTarget):
+        if not 0 <= req.first_day <= req.last_day < ctx.days or req.first_day < open_from:
+            return "이 달에 바꿀 수 있는 날이 남아 있지 않습니다."
+        return None
     if req.nurse_id not in ctx.main:
         return f"{req.nurse_id} 는 이 근무표에 없습니다."
     if isinstance(req, CountTarget):
@@ -366,6 +415,10 @@ def is_satisfied(ctx: EditContext, req: EditRequest, grid: Optional[Dict[str, Li
         return count_in(ctx, grid or ctx.main, req) == req.target
     if isinstance(req, CoverTarget):
         return cover_count(ctx, grid or ctx.main, req) == req.target
+    if isinstance(req, WishTarget):
+        targets = wish_targets(ctx, req)
+        need = len(targets) if req.at_least is None else req.at_least
+        return wish_count(ctx, grid or ctx.main, targets) >= need
     if isinstance(req, BalanceTarget):
         counts = balance_counts(ctx, grid or ctx.main, req).values()
         if req.target is not None:

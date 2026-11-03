@@ -96,15 +96,16 @@ def is_stale(db: Session, session: EditSession) -> bool:
 
 
 def propose(session: EditSession, requests: Sequence[EditRequest], *, today: Optional[date] = None,
-            keep_hint: bool = True, time_budget: Optional[float] = None) -> EditResult:
-    """요청을 풀어 후보를 낸다. 같은 대화의 허용 레버·고른 후보는 이어 쓰고, 넘긴 묶음은 같은 요청일 때만."""
+            keep_hint: bool = True, time_budget: Optional[float] = None, start: Optional[Grid] = None) -> EditResult:
+    """요청을 풀어 후보를 낸다. 같은 대화의 허용 레버·고른 후보는 이어 쓰고, 넘긴 묶음은 같은 요청일 때만.
+    start: 이번 탐색에만 쓸 시작 해(원티드 반영에서 '가장 많이 넣은 해') — 고른 후보(hint)보다 앞선다."""
     if set(requests) != set(session.requests):   # 순서만 바뀐 같은 요청은 같은 요청
         session.avoid_people = []
     session.requests = list(requests)
     session.last = propose_edits(
         session.ctx, session.requests, rules=session.rules, screen=session.screen, today=today,
         allow=session.allow, avoid_people=session.avoid_people,
-        hint=session.hint if keep_hint else None,
+        hint=start if start is not None else (session.hint if keep_hint else None),
         **({} if time_budget is None else {"time_budget": time_budget}))
     return session.last
 

@@ -207,7 +207,9 @@ def _lever_cards(levers: List[Dict[str, Any]]) -> B.Block:
     for lv in levers:
         # 제목 = 넘기는 설정 — 카드끼리 무엇이 다른지가 제목에서 보인다(같은 제목이 반복됐다 · ui-craft 11-03)
         now, after, days = lv["changes"]["now"], lv["changes"]["after"], lv["span_days"]["after"] + 1
-        if now is None:
+        if lv.get("gain"):    # 원티드 반영 — 얻는 것을 칸 수가 아니라 넣는 원티드 수로
+            lines = [B.line(f"이 설정을 이번만 넘기시면 {lv['gain']}를 넣을 수 있습니다({after}칸 · {days}일 동안)")]
+        elif now is None:
             lines = [B.line(f"넘기면 {after}칸을 바꿔 들어줄 수 있습니다({days}일 동안)")]
         else:   # 후보가 있을 때 — '이 설정을 넘기면 이렇게 줄어든다'(사용자 지시 11-03 '어떤 설정을 바꾸시면 어떻게 가능하다')
             lines = [B.line(f"이 설정을 이번만 넘기시면 {now}칸 → {after}칸으로 줄어듭니다({days}일 동안)")]

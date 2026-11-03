@@ -72,11 +72,14 @@ class Lever:
     span: Tuple[Optional[int], int]
     #: 레버를 적용한 해에서 나빠지는 품질(분배 격차·근무 모양)
     quality: List[str] = field(default_factory=list)
+    #: 얻는 것을 칸 수가 아닌 말로 보일 때(원티드 반영: '원티드 31개') — 화면 카드가 이 말을 쓴다
+    gain: Optional[str] = None
 
 
 def find_levers(ctx: EditContext, requests: Sequence[EditRequest], best=None, *, rules: Optional[RuleSet] = None,
                 allow: Optional[Dict[Tuple, int]] = None, max_levers: int = MAX_LEVERS,
-                seconds: float = LEVER_SECONDS, screen=None, avoid_people: Sequence = ()) -> List[Lever]:
+                seconds: float = LEVER_SECONDS, screen=None, avoid_people: Sequence = (),
+                max_changes: int = MAX_CHANGES) -> List[Lever]:
     """best: 지금 최선 후보(`Candidate`) — 있으면 그보다 **바꾸는 칸이 적어지는** 레버만(사용자 제안 11-03 '수정 안건을 더
     줄일 수 있을 경우만'), 없으면 '가능해지는' 레버.
 
@@ -85,7 +88,7 @@ def find_levers(ctx: EditContext, requests: Sequence[EditRequest], best=None, *,
     """
     rules = rules or build_rules(ctx)
     allow = lever_allow(allow)
-    em, slacks = _lever_model(ctx, rules, list(requests), allow)
+    em, slacks = _lever_model(ctx, rules, list(requests), allow, max_changes)
     for people in avoid_people:
         forbid_same_people(em, set(people))
     if best is not None:
@@ -125,7 +128,8 @@ def _solve_once(em: EditModel, slacks, seconds: float):
     return [(f, k, solver.Value(s)) for (s, f, k) in slacks if solver.Value(s) > 0], solver
 
 
-def _lever_model(ctx: EditContext, rules: RuleSet, requests: List[EditRequest], allow: Dict[Tuple, int]):
+def _lever_model(ctx: EditContext, rules: RuleSet, requests: List[EditRequest], allow: Dict[Tuple, int],
+                 max_changes: int = MAX_CHANGES):
     start = min(r.day for r in requests)
     em = EditModel(ctx=ctx, base=ctx.main, free=free_cells(ctx, range(start, ctx.days)), codes=edit_codes(ctx))
     add_cell_vars(em)
@@ -134,7 +138,7 @@ def _lever_model(ctx: EditContext, rules: RuleSet, requests: List[EditRequest], 
                              relief=model_relief(em, rules, requests))
     add_requests(em, requests)
     add_span(em)
-    em.model.Add(em.total_changes() <= MAX_CHANGES)
+    em.model.Add(em.total_changes() <= max_changes)
     return em, slacks
 
 

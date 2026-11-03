@@ -95,6 +95,9 @@ class EditContext:
     off_bounds: Dict[str, Tuple[int, int]] = field(default_factory=dict)
     #: 간호사 원티드(희망) — 칸 → 바란 대표코드들. 확정 원티드로 이미 묶인 칸은 뺀다.
     wishes: Dict[Cell, Set[str]] = field(default_factory=dict)
+    #: 원티드 중 도우미가 넣지 않는 것 — (간호사, 날, "code"|"locked", 원하는 코드). code = 근무·OFF 가 아닌 코드(휴가 등),
+    #: locked = 바꿀 수 없는 칸(파견·프리셉티 등). 답이 요청 범위(날·사람) 안만 센다
+    wish_skipped: List[Tuple[str, int, str, str]] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
     def is_free(self, nurse_id: str, day: int) -> bool:
@@ -517,7 +520,13 @@ def _load_wishes(db: Session, ctx: EditContext, shifts: List[dict], fixed_rows: 
     else:
         pairs = _submitted_wishes(db, ctx)
     for nid, day, main in pairs:
-        if main in EDIT_MAINS and nid in ctx.raw and 0 <= day < ctx.days and ctx.is_free(nid, day):
+        if nid not in ctx.raw or not 0 <= day < ctx.days:
+            continue
+        if main not in EDIT_MAINS:
+            ctx.wish_skipped.append((nid, day, "code", str(main)))
+        elif not ctx.is_free(nid, day):
+            ctx.wish_skipped.append((nid, day, "locked", str(main)))
+        else:
             ctx.wishes.setdefault((nid, day), set()).add(main)
 
 

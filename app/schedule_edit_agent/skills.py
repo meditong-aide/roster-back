@@ -28,15 +28,15 @@ from services.schedule_edit.precheck import (
     BLOCKED_HEAD, Finding, Precheck, apply_findings, finding_to_json, precheck,
 )
 from services.schedule_edit.requests import (
-    TRANSFERS, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, balance_counts, count_cells, count_in,
-    first_open_day, transfer_label, work_down,
-    work_targets,
+    TRANSFERS, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, WishTarget, balance_counts, count_cells,
+    count_in, first_open_day, transfer_label, wish_count, wish_targets, work_down, work_targets,
 )
 from services.schedule_edit.serialize import allow_to_json, requests_to_json, result_to_dict
-from services.schedule_edit.levers import lever_allow
+from services.schedule_edit.levers import find_levers, lever_allow
 from services.schedule_edit.session import EditSession, allow_lever_id, keep, propose, reject, stage
 from services.schedule_edit.solver import (
-    BALANCE_MAX_CHANGES, EditResult, apply_candidate, min_balance_spread, propose_edits,
+    BALANCE_MAX_CHANGES, WISH_MAX_CHANGES, EditResult, apply_candidate, max_wish_count, min_balance_spread, prepare,
+    propose_edits,
 )
 
 logger = logging.getLogger(__name__)
@@ -124,7 +124,7 @@ _CHANGE = {
     "type": "object",
     "properties": {
         "kind": {"type": "string",
-                 "enum": ["set", "avoid", "swap", "off_period", "count", "leave", "cover", "balance"],
+                 "enum": ["set", "avoid", "swap", "off_period", "count", "leave", "cover", "balance", "wanted"],
                  "description": "set=그 칸을 이 근무로 · avoid=그 칸에서 이 근무(들)를 빼기(무엇으로 바꿀지는 맡김) · "
                                 "swap=두 사람의 그날 근무 맞바꾸기 · off_period=day 부터 to_day 까지 OFF · "
                                 "count=날짜를 정하지 않고 그 사람의 그 근무 개수를 바꾸기(어느 날인지는 맡김) · "
@@ -133,7 +133,9 @@ _CHANGE = {
                                 "몇 명인지 말하지 않았으면 둘 다 비운다 · "
                                 "'1등급 넣어'처럼 등급을 말하면 grade) · "
                                 "balance=여러 사람의 그 근무 수를 고르게(nurse 없이 shift · '모두 9개로'면 target · "
-                                "'차이 1 이하로'면 spread · 대상은 시스템이 그 근무를 할 수 있는 사람으로 정한다)"},
+                                "'차이 1 이하로'면 spread · 대상은 시스템이 그 근무를 할 수 있는 사람으로 정한다) · "
+                                "wanted=반영 안 된 원티드(간호사가 낸 희망 근무) 넣기(사람·기간을 말했을 때만 nurse·day·to_day · "
+                                "몇 개를 넣을지는 시스템이 정한다)"},
         "spread": {"type": "integer", "minimum": 0,
                    "description": "balance: 사람 사이 개수 차이를 몇 이하로 할지 말했을 때만(말하지 않으면 비운다 — "
                                   "시스템이 줄일 수 있는 만큼 줄인다)"},
@@ -240,7 +242,7 @@ def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     # '21일은 그대로 둬' — 요청한 칸이 그 날이면 그 요청을 뺀다(평가 11-03: 요청은 남기고 그날 다른 칸만 고정해 모순).
     # 그날 전체를 두라면 그날 인원 요청도 뺀다(남기면 그날을 다 묶은 채 인원을 바꾸라는 모순 · 검토 11-03)
     kept_days = _whole_days(ctx, kept)
-    reqs = [r for r in reqs if isinstance(r, (CountTarget, BalanceTarget)) or _is_keep(ctx, r)
+    reqs = [r for r in reqs if isinstance(r, (CountTarget, BalanceTarget, WishTarget)) or _is_keep(ctx, r)
             or (r.day not in kept_days if isinstance(r, CoverTarget) else (r.nurse_id, r.day) not in kept)]
     asked = {(r.nurse_id, r.day) for r in reqs}
     for n, d in sorted(kept - asked):
@@ -273,6 +275,8 @@ def _same_target(old: EditRequest, new: EditRequest) -> bool:
                 and (old.day, old.code, old.grade) == (new.day, new.code, new.grade))
     if isinstance(old, BalanceTarget) or isinstance(new, BalanceTarget):
         return isinstance(old, BalanceTarget) and isinstance(new, BalanceTarget) and old.codes == new.codes
+    if isinstance(old, WishTarget) or isinstance(new, WishTarget):
+        return isinstance(old, WishTarget) and isinstance(new, WishTarget)
     if isinstance(old, CountTarget) or isinstance(new, CountTarget):
         return False
     return (old.nurse_id, old.day) == (new.nurse_id, new.day)
@@ -314,11 +318,10 @@ def _is_keep(ctx, r: EditRequest) -> bool:
 #: 바꾸지 않는 답의 종류 → 정해진 문장(LLM 글을 사용자에게 보내지 않는다 · 검토 M3)
 REPLY_KINDS = ("who", "when", "what", "outside_month", "settings", "unsupported", "other", "status", "unclear")
 #: 아직 못 하는 변경 — 답 문장과 처음 화면 안내가 같은 목록을 쓴다
-UNSUPPORTED = "근무 모양 고치기, 원티드 반영, 버전 되돌리기"
+UNSUPPORTED = "근무 모양 고치기, 버전 되돌리기"
 #: 아직 못 하는 종류별 안내(reply_only kind=unsupported 의 topic · 평가 11-03: 조회·되돌리기에도 같은 목록이 나갔다)
 UNSUPPORTED_TOPICS = {
     "pattern": "연속 근무·주말 몰림 같은 근무 모양 고치기는 아직 못 합니다. 바꿀 사람과 날짜를 말씀해 주시면 찾아 드립니다.",
-    "wanted": "원티드 반영은 아직 여기서 못 합니다. 반영할 사람과 날짜, 근무를 말씀해 주시면 그 칸을 바꿔 드립니다.",
     "undo": "만든 버전 되돌리기·버전 비교는 아직 여기서 못 합니다. 이전 버전은 그대로 남아 있으니 버전 목록에서 골라 주세요.",
     "postprocess": "그 후처리는 아직 여기서 못 합니다. 지금은 자동 연차전환만 할 수 있습니다.",
 }
@@ -349,7 +352,7 @@ def reply_text(kind: str, session: EditSession, topic: Optional[str] = None) -> 
         "when=며칠인지 빠짐 · what=무엇으로 바꿀지 빠짐 · outside_month=근무표 달 밖의 날짜 · settings=병동 설정값 자체"
         "(하루 인원 기준·규칙·OFF 기준 수)를 바꾸는 말이나 근무표 새로 만들기 — '사람들 OFF·근무 수를 고르게 맞춰 줘'는 "
         "reply_only 가 아니라 propose_edit 의 kind=balance · unsupported=근무표를 바꾸는 말이지만 아직 못 하는 종류 — "
-        "topic 을 함께 고른다: pattern=연속 근무·주말 몰림 같은 근무 모양 · wanted=원티드 반영 · undo=버전 되돌리기·비교 · "
+        "topic 을 함께 고른다: pattern=연속 근무·주말 몰림 같은 근무 모양 · undo=버전 되돌리기·비교 · "
         "postprocess=자동 연차전환 밖의 생성 후처리(보건휴가·수면 OFF 등) · other=근무표와 상관없는 말 · "
         "status=지금 요청·결과가 어떤지 묻는 말"
         "(예: '바꿔 줬어?', '지금 뭐 하고 있었지?') · unclear=그 밖에 알아듣기 어려움"),
@@ -570,6 +573,7 @@ def choose_lever(turn: Turn, params: Dict[str, Any]) -> Outcome:
         return Outcome(answer="그 레버는 지금 결과에 없습니다. 다시 찾은 결과에서 골라 주세요.", failed=True)
     turn.record("lever", {"lever_id": params.get("lever_id"), "lose": lever.lose,
                           "allow": allow_to_json(lever.allow), "allow_total": allow_to_json(turn.session.allow)})
+    # 원티드 반영은 넘긴 만큼 더 넣을 수 있다 — 넣을 수는 `_resolve_wish` 가 매번 다시 찾는다
     return _propose(turn, turn.session.requests)
 
 
@@ -632,8 +636,19 @@ def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
                               "remaining_ms": int(turn.remaining() * 1000)})
         return Outcome(answer=OUT_OF_TIME)
     requests, why = _resolve_balance(turn, requests)
-    result = propose(session, requests, today=turn.today, time_budget=turn.remaining())
+    requests, wish = _resolve_wish(turn, requests)
+    # 원티드 반영은 '하나 더' 레버를 찾을 시간을 남긴다(검토 11-03 L2)
+    budget = turn.remaining() if wish is None else max(MIN_SOLVE, turn.remaining() - WISH_LEVER_SECONDS - 2)
+    result = propose(session, requests, today=turn.today, time_budget=budget,
+                     start=wish.get("grid") if wish else None)
+    if wish is not None and result.status != "ok" and wish["best"] > 1 and turn.remaining() >= MIN_SOLVE:
+        # 그 수를 넣는 해가 화면 판정 등으로 다 빠졌다 — 하나 덜 넣는 수로 한 번 더(검토 11-03 M2)
+        requests = [dataclasses.replace(r, at_least=wish["best"] - 1) if isinstance(r, WishTarget) else r
+                    for r in requests]
+        result = propose(session, requests, today=turn.today, time_budget=turn.remaining() - 1)
     result.notes = list(result.notes) + why
+    if wish is not None and result.status == "ok":
+        _wish_followup(turn, requests, result, wish)
     return _finish(turn, requests, result, started)
 
 
@@ -650,11 +665,12 @@ def _finish(turn: Turn, requests: List[EditRequest], result: EditResult, started
     return Outcome(answer=answer, preview=preview)
 
 
-def _precheck(turn: Turn, requests: List[EditRequest]) -> Precheck:
+def _precheck(turn: Turn, requests: List[EditRequest], start: Optional[int] = None) -> Precheck:
     """바꾸기 전 산술 점검(`precheck`) — 점검이 깨져도 수정 흐름은 막지 않는다(풀이·적용 전 확인이 다시 본다)."""
     session = turn.session
     try:
-        return precheck(session.ctx, session.rules, requests, open_from=turn.open_from(), allow=session.allow)
+        return precheck(session.ctx, session.rules, requests, open_from=turn.open_from(), allow=session.allow,
+                        start=start)
     except Exception as exc:   # noqa: BLE001 — 기록만 남기고 점검 없이 이어 간다
         logger.exception("[schedule_edit] 사전 점검 실패")
         turn.record("error", {"stage": "precheck", "error": f"{type(exc).__name__}: {exc}"[:500]})
@@ -744,6 +760,73 @@ def _resolve_balance(turn: Turn, requests: List[EditRequest]) -> Tuple[List[Edit
                    + (f"차이 {best}보다 줄일 방법이 없습니다." if proven
                       else f"시간 안에 차이 {best}보다 작은 방법을 찾지 못했습니다."))
     return [dataclasses.replace(r, spread=spread) if r is pending else r for r in requests], why
+
+
+#: 원티드 반영에서 넣을 수 있는 가장 많은 수를 찾는 데 쓰는 시간 상한(초)과 '하나 더' 레버를 찾는 시간 상한
+WISH_SECONDS = 6.0
+WISH_LEVER_SECONDS = 4.0
+#: 못 넣는 원티드의 이유를 몇 개까지 문장으로, 그 이유를 찾으려 점검할 칸 상한
+WISH_REASONS = 3
+WISH_REASON_TRIES = 10
+
+
+def _resolve_wish(turn: Turn, requests: List[EditRequest]) -> Tuple[List[EditRequest], Optional[Dict[str, Any]]]:
+    """넣을 수를 정하지 않은 원티드 반영 — 규칙을 모두 지키며 넣을 수 있는 가장 많은 수를 찾아 확정 조건으로 바꾼다
+    (사용자 결정 11-03). 하나도 못 넣으면 1개로 풀어 불가 이유·넘길 설정을 보인다. 반환: (요청, {best, total, proven})."""
+    pending = next((r for r in requests if isinstance(r, WishTarget)), None)
+    if pending is None:
+        return requests, None
+    # 넣을 수는 늘 다시 찾는다 — 정해 둔 수가 남으면 넘기기·고쳐 말하기·확인 뒤에 '방법 없음'이 된다(검토 11-03 M1).
+    # 사용자가 넣을 수를 정하는 말은 받지 않으므로 at_least 는 늘 이 함수가 정한 값이다
+    requests = [dataclasses.replace(r, at_least=None) if r is pending else r for r in requests]
+    pending = next(r for r in requests if isinstance(r, WishTarget))
+    best, proven, total, grid = max_wish_count(turn.session.ctx, requests, rules=turn.session.rules,
+                                               today=turn.today,
+                                               seconds=min(WISH_SECONDS, max(0.5, turn.remaining() / 3)),
+                                               allow=turn.session.allow,
+                                               avoid_people=turn.session.avoid_people)
+    if not total:
+        return requests, None                   # 반영 안 된 원티드가 없다 — 풀이가 '이미 그렇게 되어 있음'으로
+    at_least = best if best else 1
+    info = {"best": best or 0, "total": total, "proven": proven, "grid": grid}
+    return [dataclasses.replace(r, at_least=at_least) if r is pending else r for r in requests], info
+
+
+def _wish_followup(turn: Turn, requests: List[EditRequest], result: EditResult, wish: Dict[str, Any]) -> None:
+    """후보를 찾은 원티드 반영 — 못 넣는 원티드의 이유(요청 첫날부터 다 바꿀 수 있다고 봐도 하드락에 걸리는 것)와,
+    설정 하나를 이번만 넘기면 하나 더 넣을 수 있는지(레버 카드 · 얻는 것 = 후보가 넣은 수 + 1)."""
+    session, ctx = turn.session, turn.session.ctx
+    req = next(r for r in requests if isinstance(r, WishTarget))
+    grid = apply_candidate(ctx, result.candidates[0])
+    targets = wish_targets(ctx, req)
+    got = wish_count(ctx, grid, targets)
+    left = [(n, d, codes) for n, d, codes in targets if grid[n][d] not in codes]
+    blocked = []
+    for n, d, codes in left[:WISH_REASON_TRIES]:          # 점검 횟수 상한(검토 11-03 L1)
+        if len(blocked) >= WISH_REASONS:
+            break
+        check = _precheck(turn, [SetCell(n, d, sorted(codes)[0])], start=req.first_day)
+        if check.blocked:
+            blocked.append(check.blocked[0])          # '김태희 8일을 D로 하면 E→D 전환 금지에 걸립니다(7일 E …)'
+    if left:
+        rest = len(left) - len(blocked)
+        # 끝까지 확인하지 못했으면 단정하지 않는다(검토 11-03 M3)
+        why = ("다른 원티드·인원 규칙과 함께 맞출 수 없습니다." if wish["proven"]
+               else "시간 안에 함께 넣는 방법을 찾지 못했습니다.")
+        lines = [f"못 넣는 원티드 {len(left)}개:"] + [f"· {b}" for b in blocked]
+        if rest:
+            lines.append(f"· {'나머지 ' if blocked else ''}{rest}개는 {why}")
+        result.extra = list(result.extra) + lines
+    if not left or turn.remaining() < WISH_LEVER_SECONDS + 2:
+        return
+    more = [dataclasses.replace(r, at_least=got + 1) if r is req else r for r in requests]
+    pctx, prules, preqs = prepare(ctx, session.rules, more)
+    levers = find_levers(pctx, preqs, None, rules=prules, allow=session.allow, max_levers=2,
+                         seconds=min(WISH_LEVER_SECONDS, turn.remaining() - 2), screen=session.screen,
+                         avoid_people=session.avoid_people, max_changes=WISH_MAX_CHANGES)
+    for lv in levers:
+        lv.gain = f"원티드 {got + 1}개"
+    result.levers = levers
 
 
 #: 상대를 정하는 방식을 미리 풀 때 하나에 쓰는 시간 상한·하한(초)과, 미리 풀기 뒤 답을 만들 몫으로 남길 시간

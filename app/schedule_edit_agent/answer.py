@@ -7,8 +7,8 @@ from typing import List, Optional, Sequence
 
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, balance_counts, count_in, cover_count,
-    transfer_label,
+    BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, WishTarget, balance_counts, count_in,
+    cover_count, transfer_label, wish_count, wish_targets,
 )
 
 _SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
@@ -40,6 +40,9 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
             continue
         if isinstance(r, BalanceTarget):
             parts.append(_describe_balance(ctx, r))
+            continue
+        if isinstance(r, WishTarget):
+            parts.append(_describe_wish(ctx, r))
             continue
         who = ctx.names.get(r.nurse_id, r.nurse_id)
         if isinstance(r, CountTarget):
@@ -82,6 +85,36 @@ def _describe_balance(ctx: EditContext, r: BalanceTarget, grid=None) -> str:
     return f"{word} 근무 수 고르게 {low}~{high}회(차이 {high - low}){goal} · {len(r.members)}명"
 
 
+def _describe_wish(ctx: EditContext, r: WishTarget) -> str:
+    """예) '원티드 반영(전원 · 미반영 37개)' · '원티드 반영(장원영 · 15~20일 · 미반영 3개)'."""
+    who = " · ".join(ctx.names.get(n, n) for n in r.nurses) if r.nurses else "전원"
+    when = "" if not r.ranged else (f" · {r.first_day + 1}일" if r.first_day == r.last_day
+                                    else f" · {r.first_day + 1}~{r.last_day + 1}일")
+    return f"원티드 반영({who}{when} · 미반영 {len(wish_targets(ctx, r))}개)"
+
+
+def wish_note(ctx: EditContext, r: WishTarget, cand) -> str:
+    """후보로 넣는 원티드 수 — '미반영 37개 중 30개를 넣습니다.'"""
+    from services.schedule_edit.solver import apply_candidate      # 답 모듈이 솔버를 늘 들고 있지 않게
+    targets = wish_targets(ctx, r)
+    got = wish_count(ctx, apply_candidate(ctx, cand), targets)
+    return f"미반영 {len(targets)}개 중 {got}개를 넣습니다."
+
+
+def wish_skipped_note(ctx: EditContext, r: WishTarget) -> str:
+    """원티드 반영 범위 안에서 도우미가 넣지 않는 원티드(휴가 코드·바꿀 수 없는 칸)."""
+    who = set(r.nurses)
+    seen = [(kind, code) for n, d, kind, code in ctx.wish_skipped
+            if r.first_day <= d <= r.last_day and (not who or n in who)]     # 지난 날·요청 밖은 세지 않는다(검토 L3)
+    leave = sum(1 for kind, code in seen if kind == "code" and code in ctx.leave_codes)
+    other = sum(1 for kind, code in seen if kind == "code" and code not in ctx.leave_codes)
+    locked = sum(1 for kind, _c in seen if kind == "locked")
+    parts = ([f"휴가 원티드 {leave}개는 '○○ ○일 연차 넣어줘'처럼 따로 말씀해 주세요"] if leave else []) + \
+        ([f"근무·OFF·휴가가 아닌 원티드 {other}개는 대상이 아닙니다"] if other else []) + \
+        ([f"바꿀 수 없는 칸(파견·프리셉티 등)의 원티드 {locked}개는 대상이 아닙니다"] if locked else [])
+    return ". ".join(parts) + "." if parts else ""
+
+
 def balance_note(ctx: EditContext, r: BalanceTarget, cand) -> str:
     """맞춘 뒤 범위와 대상에서 뺀 사람 — '맞춘 뒤 5~6회(차이 1). 대상에서 뺀 사람: 임윤아(N 전담·고정 근무·그 근무 불가)'."""
     from services.schedule_edit.solver import apply_candidate   # 답 문장 모듈이 솔버를 늘 들고 있지 않게
@@ -121,13 +154,24 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
             lines.append(f"근무 수 변화: {moved}")
         if first.quality:
             lines.append(f"이 안은 규칙은 모두 지키지만 {first.quality[0]} 등 근무 모양이 조금 나빠집니다.")
-        if result.levers:
-            fewest = min(lv.changes[1] for lv in result.levers)
-            lines.append(f"설정 하나를 이번만 넘기시면 {first.changed_count}칸 대신 {fewest}칸만 바꾸는 방법도 아래에 있습니다.")
         lines += [n for n in (cover_note(ctx, r) for r in requests if isinstance(r, CoverTarget)) if n]
         lines += [balance_note(ctx, r, first) for r in requests if isinstance(r, BalanceTarget)]
+        lines += [wish_note(ctx, r, first) for r in requests if isinstance(r, WishTarget)]
+        lines += [n for n in (wish_skipped_note(ctx, r) for r in requests if isinstance(r, WishTarget)) if n]
+        lines += list(getattr(result, "extra", []) or [])
+        # 설정 카드 안내는 맨 뒤 — 이 안의 결과를 먼저 말한다
+        if result.levers and result.levers[0].gain:
+            lines.append(f"설정 하나를 이번만 넘기시면 {result.levers[0].gain}를 넣는 방법도 아래에 있습니다.")
+        elif result.levers:
+            fewest = min(lv.changes[1] for lv in result.levers)
+            lines.append(f"설정 하나를 이번만 넘기시면 {first.changed_count}칸 대신 {fewest}칸만 바꾸는 방법도 아래에 있습니다.")
         return "\n".join(lines + notes)
     if result.status == "already":
+        wish = next((r for r in requests if isinstance(r, WishTarget)), None)
+        if wish is not None:
+            skipped = wish_skipped_note(ctx, wish)
+            return "\n".join(["바꿀 수 있는 칸의 원티드는 모두 반영되어 있습니다."] + ([skipped] if skipped else [])
+                             + notes)
         return "\n".join([f"{head} — 이미 그렇게 되어 있습니다."] + notes)
     lines = list(result.reasons) or ["방법을 찾지 못했습니다."]
     if result.levers:

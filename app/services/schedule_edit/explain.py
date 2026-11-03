@@ -27,7 +27,7 @@ from services.schedule_edit.model import (
     EditModel, add_cell_vars, add_requests, add_team_cover, edit_codes, free_cells, is_waived, model_relief,
     new_solver, read_solution, requested_cells,
 )
-from services.schedule_edit.requests import BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell
+from services.schedule_edit.requests import AGGREGATE, EditRequest, SetCell
 from services.schedule_edit.rules import WISH, Grid, RuleSet, cell, value_of
 
 #: 넘김 1 의 무게 — 칸 하나 더 바꾸는 것보다 훨씬 무겁게(넘김을 먼저 줄인다)
@@ -145,7 +145,7 @@ def direct_conflicts(ctx: EditContext, rules: RuleSet, requests: Sequence[EditRe
     """
     open_cells = {(n, d) for n in ctx.nurse_ids for d in days if ctx.is_free(n, d)}
     options = {(r.nurse_id, r.day): _request_options(ctx, r) for r in requests
-               if not isinstance(r, (CountTarget, CoverTarget, BalanceTarget))}
+               if not isinstance(r, AGGREGATE)}
     out: List[Tuple[str, str]] = []
     for ineq in rules.ineqs:
         if ineq.key[0] not in HARD_LOCK_FAMILIES:

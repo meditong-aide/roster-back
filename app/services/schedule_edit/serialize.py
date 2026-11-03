@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell,
+    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, WishTarget,
 )
 
 
@@ -40,6 +40,9 @@ def requests_to_json(requests: Sequence[EditRequest]) -> List[Dict[str, Any]]:
         elif isinstance(r, BalanceTarget):
             out.append({"kind": "balance", "codes": sorted(r.codes), "members": list(r.members),
                         "first_day": r.first_day, "last_day": r.last_day, "spread": r.spread, "target": r.target})
+        elif isinstance(r, WishTarget):
+            out.append({"kind": "wanted", "nurses": list(r.nurses), "first_day": r.first_day, "last_day": r.last_day,
+                        "at_least": r.at_least, "ranged": r.ranged})
         else:
             out.append({"kind": "avoid", "nurse_id": r.nurse_id, "day": r.day, "codes": sorted(r.codes)})
     return out
@@ -60,6 +63,9 @@ def requests_from_json(items: Sequence[Dict[str, Any]]) -> List[EditRequest]:
         elif i["kind"] == "balance":
             out.append(BalanceTarget(frozenset(i["codes"]), tuple(i["members"]), int(i["first_day"]),
                                      int(i["last_day"]), i.get("spread"), i.get("target")))
+        elif i["kind"] == "wanted":
+            out.append(WishTarget(tuple(i.get("nurses") or ()), int(i["first_day"]), int(i["last_day"]),
+                                  i.get("at_least"), bool(i.get("ranged"))))
         else:
             out.append(AvoidCell(i["nurse_id"], int(i["day"]), frozenset(i["codes"])))
     return out
@@ -99,6 +105,7 @@ def lever_to_dict(lever) -> Dict[str, Any]:
         "changes": {"now": lever.changes[0], "after": lever.changes[1]},
         "span_days": {"now": lever.span[0], "after": lever.span[1]},
         "quality": list(lever.quality),
+        "gain": getattr(lever, "gain", None),
         "allow": allow_to_json(lever.allow),
     }
 

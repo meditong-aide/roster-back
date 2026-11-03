@@ -46,8 +46,8 @@ from services.schedule_edit.model import (
     requested_cells, subcode_changes,
 )
 from services.schedule_edit.requests import (
-    AvoidCell, BalanceTarget, CountTarget, EditRequest, LeaveCell, SetCell, balance_counts, first_open_day,
-    is_satisfied, request_problem,
+    AvoidCell, BalanceTarget, CountTarget, EditRequest, LeaveCell, SetCell, WishTarget, balance_counts,
+    first_open_day, is_satisfied, request_problem, wish_targets,
 )
 from services.schedule_edit.rules import Grid, RuleSet, build_rules, measure, measure_soft, new_violations
 from services.schedule_edit.screen_check import ScreenBaseline, screen_regressions
@@ -119,6 +119,8 @@ class EditResult:
     levers: List[Any] = field(default_factory=list)
     #: 후보를 낸 곳 — None 이면 솔버, 그 밖은 생성 후처리(`postprocess.KINDS` · 예: annual_leave_swap)
     source: Optional[str] = None
+    #: 답 본문에 더할 줄(참고가 아닌 결과 — 원티드 반영의 '못 넣는 원티드와 이유')
+    extra: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -175,12 +177,14 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
                avoid=[set(p) for p in avoid_people], hint=hint, max_changes=_max_changes(requests))
     status = cp_model.UNKNOWN
     # 개수 요청은 어느 날을 바꿀지 정해지지 않았다 — 좁은 창부터 넓힐 근거가 없어 기간 전체로 바로 푼다
-    steps = (None,) if any(isinstance(r, (CountTarget, BalanceTarget)) for r in requests) else WINDOW_STEPS
+    steps = (None,) if any(isinstance(r, (CountTarget, BalanceTarget, WishTarget)) for r in requests) else WINDOW_STEPS
     for step in steps:
         days = _window_days(run, step)
         em = build_model(ctx, rules, requests, free_cells(ctx, days), run.max_changes, run.allow)
         _carry_over(em, run)
-        found, status = _search(run, em, (days[0], days[-1]), MONTH_SECONDS if step is None else SOLVE_SECONDS)
+        first = (WISH_FIRST_SECONDS if any(isinstance(r, WishTarget) for r in requests) else MONTH_SECONDS) \
+            if step is None else SOLVE_SECONDS
+        found, status = _search(run, em, (days[0], days[-1]), first)
         if found and step is not None:
             found = _wider(run, found) or found
         if found:
@@ -228,7 +232,8 @@ def _shortcuts(run: "_Run", found: List["Candidate"]) -> List[Any]:
     """후보보다 바꾸는 칸이 적어지는 레버(레버 대상 설정만 · 하드락은 넘기지 않는다). 줄어들지 않으면 빈 목록 —
     고르게 맞추기는 칸 상한이 레버 모델(20칸)보다 넓어 비교가 맞지 않아 찾지 않는다."""
     best = min(found, key=lambda c: (c.changed_count, c.loss))
-    if best.changed_count < SHORTCUT_MIN_CHANGES or any(isinstance(r, BalanceTarget) for r in run.requests):
+    if best.changed_count < SHORTCUT_MIN_CHANGES or any(isinstance(r, (BalanceTarget, WishTarget))
+                                                        for r in run.requests):
         return []
     seconds = run.seconds(SHORTCUT_SECONDS + SHORTCUT_RESERVE) - SHORTCUT_RESERVE
     if seconds < 1.0:
@@ -238,7 +243,44 @@ def _shortcuts(run: "_Run", found: List["Candidate"]) -> List[Any]:
 
 
 def _max_changes(requests: Sequence[EditRequest]) -> int:
+    if any(isinstance(r, WishTarget) for r in requests):
+        return WISH_MAX_CHANGES
     return BALANCE_MAX_CHANGES if any(isinstance(r, BalanceTarget) for r in requests) else MAX_CHANGES
+
+
+#: 원티드 반영의 바뀌는 칸 상한 — 넣을 원티드 칸 자체가 수십 개라 평소(20)보다 넓게
+WISH_MAX_CHANGES = 60
+#: 원티드 반영에서 '그 수 이상 넣으며 가장 적게 바꾸기' 첫 풀이 상한(초) — 가장 많이 넣은 해를 시작 해로 받아 첫 해는 바로
+#: 나오고, 남는 시간은 칸 줄이기에 쓴다. 평소(6초)대로면 응답 시간 안에 못 넣는 이유·레버까지 못 냈다(dev 전원 37개 실측)
+WISH_FIRST_SECONDS = 4.0
+
+
+def max_wish_count(ctx: EditContext, requests: Sequence[EditRequest], *, rules: Optional[RuleSet] = None,
+                   today: Optional[date] = None, seconds: float = MONTH_SECONDS,
+                   allow: Optional[Dict[Tuple, int]] = None,
+                   avoid_people: Sequence[FrozenSet[str]] = ()) -> Tuple[Optional[int], bool, int, Optional[Grid]]:
+    """넣을 수를 정하지 않은 원티드 반영 — 규칙을 모두 지키며 칸 상한 안에서 넣을 수 있는 가장 많은 원티드 수.
+    (수, 더 넣을 수 없다고 증명했나, 대상 수, 그 해의 격자). 시간 안에 하나도 못 찾으면 수는 None.
+    격자는 다음 탐색(그 수 이상 넣으며 가장 적게 바꾸기)의 시작 해로 쓴다 — 없으면 전원 반영에서 시간 안에 못 찾았다(dev 실측)."""
+    requests = list(requests)
+    req = next((r for r in requests if isinstance(r, WishTarget) and r.at_least is None), None)
+    if req is None:
+        return None, False, 0, None
+    total = len(wish_targets(ctx, req))
+    open_from = first_open_day(ctx, today or datetime.now(KST).date())
+    if not total or any(request_problem(ctx, r, open_from) for r in requests):
+        return (0 if not total else None), True, total, None
+    pctx, prules, preqs = prepare(ctx, rules, requests)
+    start = min(r.day for r in preqs)
+    em = build_model(pctx, prules, preqs, free_cells(pctx, range(start, pctx.days)), WISH_MAX_CHANGES, lever_allow(allow))
+    for people in avoid_people:            # 넘긴 후보의 사람 묶음은 후보 탐색처럼 빼고 센다(검토 11-03 M2)
+        forbid_same_people(em, set(people))
+    em.model.Maximize(em.wish)
+    solver = new_solver(seconds)
+    status = solver.Solve(em.model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None, status == cp_model.INFEASIBLE, total, None
+    return int(round(solver.Value(em.wish))), status == cp_model.OPTIMAL, total, read_solution(em, solver)
 
 
 def min_balance_spread(ctx: EditContext, requests: Sequence[EditRequest], *, rules: Optional[RuleSet] = None,

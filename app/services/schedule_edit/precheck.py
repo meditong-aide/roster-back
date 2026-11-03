@@ -74,14 +74,16 @@ def finding_id(key: Tuple, amount: int) -> str:
 
 
 def precheck(ctx: EditContext, rules: Optional[RuleSet], requests: Sequence[EditRequest], *, open_from: int,
-             allow: Optional[Dict[Tuple, int]] = None) -> Precheck:
-    """allow: 이 대화에서 이미 허용한 넘김(고른 레버·앞서 동의한 것) — 그만큼은 다시 묻지 않는다."""
+             allow: Optional[Dict[Tuple, int]] = None, start: Optional[int] = None) -> Precheck:
+    """allow: 이 대화에서 이미 허용한 넘김(고른 레버·앞서 동의한 것) — 그만큼은 다시 묻지 않는다.
+    start: 바꿀 수 있는 첫날 — 비우면 요청한 가장 이른 날(솔버와 같다). 원티드 반영의 '못 넣는 이유'처럼 요청 첫날부터
+    다 바꿀 수 있는 탐색을 설명할 때 그 첫날을 준다(검토 11-03 M4: 칸 하나만 보면 바꿀 수 있는 앞날도 고정으로 셌다)."""
     requests = list(requests)
     if not requests or any(request_problem(ctx, r, open_from) for r in requests) \
             or all(is_satisfied(ctx, r) for r in requests):
         return Precheck()          # 성립하지 않거나 이미 된 요청은 풀이가 그대로 알린다
     pctx, prules, preqs = prepare(ctx, rules, requests)
-    start = min(r.day for r in preqs)
+    start = min(r.day for r in preqs) if start is None else min(start, min(r.day for r in preqs))
     free = {(n, d) for n in pctx.nurse_ids for d in range(start, pctx.days) if pctx.is_free(n, d)}
     forced = {(r.nurse_id, r.day): r.code for r in preqs if isinstance(r, SetCell)}
     banned: Dict[Cell, Set[str]] = {}

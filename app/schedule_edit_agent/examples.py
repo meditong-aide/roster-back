@@ -21,7 +21,8 @@ from services.schedule_edit.requests import first_open_day
 logger = logging.getLogger(__name__)
 
 TEMPLATE = ["○○○ 14일 오프로", "15일 ○○○, ○○○ 근무 바꿔줘", "○○○ N 2개만 줄여줘", "15일 이브닝 한 명 더",
-            "○○○ 25일 연차 넣어줘", "15일 나이트 누구야", "N 근무 수 고르게 맞춰줘", "남는 OFF 연차로 전환해줘"]
+            "○○○ 25일 연차 넣어줘", "15일 나이트 누구야", "N 근무 수 고르게 맞춰줘", "반영 안 된 원티드 넣어줘",
+            "남는 OFF 연차로 전환해줘"]
 WORK = ("D", "E", "N")
 
 
@@ -75,6 +76,7 @@ def examples_from(ctx: EditContext, today: date) -> List[str]:
     if first:
         out.append(f"{first[1] + 1}일 나이트 누구야")
     out.append("N 근무 수 고르게 맞춰줘")
+    out.append("반영 안 된 원티드 넣어줘")
     out.append("남는 OFF 연차로 전환해줘")
     return out
 

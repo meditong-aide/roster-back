@@ -12,8 +12,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    TRANSFERS, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, balance_members,
-    cover_count, eul, swap,
+    TRANSFERS, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, WishTarget,
+    balance_members, cover_count, eul, swap,
 )
 from services.schedule_edit.rules import coverage_bounds
 
@@ -49,6 +49,8 @@ def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List
         return _cover(ctx, change)
     if kind == "balance":                    # 여러 사람의 근무 수 고르게 — 사람을 짚지 않는다
         return _balance(ctx, change, open_from)
+    if kind == "wanted":                     # 반영 안 된 원티드 넣기 — 사람·기간은 말했을 때만
+        return _wanted(ctx, change, open_from)
     nurse, ask = resolve_nurse(ctx, change.get("nurse"))
     if ask:
         return [], ask
@@ -123,6 +125,32 @@ def _balance(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[
     codes = frozenset({code})
     return [BalanceTarget(codes, balance_members(ctx, codes, open_from), open_from, ctx.days - 1,
                           nums["spread"], nums["target"])], None
+
+
+def _wanted(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
+    """'반영 안 된 원티드 넣어줘' · '장원영 원티드 반영해줘' · '15~20일 원티드 맞춰줘' — 넣을 수는 스킬이 정한다
+    (규칙을 지키며 넣을 수 있는 가장 많은 수 · 사용자 결정 11-03)."""
+    nurses: Tuple[str, ...] = ()
+    if str(change.get("nurse") or "").strip():
+        nurse, ask = resolve_nurse(ctx, change.get("nurse"))
+        if ask:
+            return [], ask
+        nurses = (nurse,)
+    first, last = open_from, ctx.days - 1
+    if change.get("day") is not None:
+        day, ask = resolve_day(ctx, change.get("day"))
+        if ask:
+            return [], ask
+        first = last = day
+        if change.get("to_day") is not None:
+            end, ask = resolve_day(ctx, change.get("to_day"))
+            if ask:
+                return [], ask
+            last = end
+    first = max(first, open_from)
+    if first > last or first >= ctx.days:
+        return [], "그 기간에는 바꿀 수 있는 날이 남아 있지 않습니다."
+    return [WishTarget(nurses, first, last, ranged=change.get("day") is not None)], None
 
 
 def _cover(ctx: EditContext, change: Dict[str, Any]) -> Tuple[List[EditRequest], Optional[str]]:
