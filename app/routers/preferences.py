@@ -75,8 +75,8 @@ async def _merge_analyzed_request(req: PreferenceData, current_user, db) -> Opti
     """`req.request`(자연어)가 있으면 분석해 `req.wanted_entries` 에 병합한다.
 
     프론트가 `/wanted/invoke` → `/preferences` → `/preferences/submit` 로 나눠 부르던
-    것을 한 번으로 합치기 위한 전처리다. invoke 자체는 모바일이 아직 쓰고 있어
-    그대로 둔다(제거하면 동시 배포 없이 회귀).
+    것을 한 번으로 합치기 위한 전처리다. `/wanted/invoke` 는 PC·모바일이 2026-08-20 운영 반영부터
+    부르지 않아 11-04 에 410 으로 닫았다(`routers/wanted.invoke_graph`).
 
     **캘린더로 찍은 항목이 우선**이다. 같은 날짜가 겹치면 분석 결과를 버린다 —
     사용자가 직접 고른 것이 문장 해석보다 확실하다.

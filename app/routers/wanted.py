@@ -9,8 +9,6 @@ from datetime import datetime, date
 import uuid
 
 from schemas.roster_schema import (
-    WantedInvokeRequest,
-    WantedInvokeResponse,
     WantedDeadlineRequest,
     WantedConfigCreate,
     WantedConfig as WantedConfigSchema,
@@ -40,7 +38,6 @@ from schemas.auth_schema import User as UserSchema
 from services.wanted_service import (
     get_my_wanted_dashboard_service,
     request_wanted_shifts_service,
-    invoke_and_persist_wanted_service,
     get_wanted_config,
     upsert_wanted_config,
     delete_wanted_config,
@@ -382,35 +379,22 @@ def update_wanted_deadline(
     return update_wanted_deadline_service(db, wanted, req, current_user, target_group_id)
 
 
-# @router.post("/invoke", response_model=WantedInvokeResponse)
-@router.post("/invoke")
-async def invoke_graph(request: WantedInvokeRequest, current_user: UserSchema = Depends(require_current_user), db: Session = Depends(get_db)):
+@router.post("/invoke", dependencies=[Depends(require_current_user)])
+def invoke_graph():
+    """닫힌 옛 API — 410(11-04). 원티드 문장은 `POST /preferences`·`/preferences/submit` 의 `request` 로 보낸다
+    (서버가 `analyze_wanted_text` 로 분석해 함께 저장한다).
+
+    ★ 닫은 이유: 저장 단계가 병동·월 잠금 밖이고 머리 행을 먼저 커밋해, 같은 간호사의 동시 제출과 겹치면 마감·일자
+      한도를 거치지 않은 칸이 제출본에 들어갈 수 있었다(11-04 Codex). 운영 호출은 2026-08-20 PC·모바일 반영 뒤
+      0건이다(Athena call_history).
+    ★ 지우지 않고 410 으로 둔다 — 지우면 404 인데 CloudFront 가 404 를 화면으로 바꿔 남은 호출자가 실패를 모른다.
+      로그인한 호출만 410 이라 그 수가 남은 호출자 수다. 1~2주 뒤 410 이 없으면 `invoke_and_persist_wanted_service`
+      와 함께 지운다.
     """
-    그래프를 실행하여 로스터 관련 요청을 처리합니다.
-    """
-    
-    try:
-        
-        import uuid
-        trace_id = str(uuid.uuid4())[:8]
-        print(f"[INVOKE START] trace_id={trace_id} | nurse_id={current_user.nurse_id} | request={request.request}")
-        result = await invoke_and_persist_wanted_service(request, current_user, db)
-        
-        # 서비스 끝난 후 강제 commit + flush
-        db.flush()  # 변경 사항 즉시 반영
-        db.commit() # 한번 더 강제 commit
-        
-        print(f"[INVOKE END] trace_id={trace_id} | 생성된 request_id={result.get('request_id')}")
-        return {"response": result}
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        print(f'error', e)
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        pass
+    raise HTTPException(status_code=410, detail={
+        "code": "WANTED_INVOKE_GONE",
+        "message": "이 기능은 더 이상 쓰지 않아요. 화면을 새로고침한 뒤 다시 저장해 주세요.",
+    })
 
 
 def parse_shift_results(
