@@ -175,9 +175,54 @@ class WishTarget:
         return self.first_day
 
 
-EditRequest = Union[SetCell, AvoidCell, CountTarget, LeaveCell, CoverTarget, BalanceTarget, WishTarget]
+#: 근무 모양 — 사람이 '고쳐 달라'는 것(사용자 결정 11-04 '근무 모양 고치기'). 값 = 답에 쓰는 이름
+SHAPE_LABEL = {"isolated_off": "하루짜리 OFF", "isolated_work": "하루 근무(퐁당퐁당)",
+               "pattern": "N-O-D·N-O-E·E-O-D 순서", "work_run": "연속 근무", "weekend": "주말 근무"}
+#: 그 모양의 개수를 줄이는 종류(나머지는 사람마다 상한)
+SHAPE_COUNTED = ("isolated_off", "isolated_work", "pattern")
+#: 근무 순서 모양(rules._patterns 와 같다) — (이름, 첫 칸, 셋째 칸)
+_SEQUENCES = (("N-O-D", frozenset({"N"}), frozenset({"D"})), ("N-O-E", frozenset({"N"}), frozenset({"E"})),
+              ("E-O-D", frozenset({"E"}), frozenset({"D"})))
+_WORK = frozenset({"D", "E", "N", "M", "W"})
+_OFF = frozenset({"O"})
+
+
+@dataclass(frozen=True)
+class ShapeTarget:
+    """근무 모양 고치기 — 예) '하루짜리 OFF 없애줘' · '장원영 연속 근무 너무 길어' · '김태희 주말 근무 너무 많아'.
+
+    kind 는 SHAPE_LABEL 의 키. nurses 가 비면 전원, 기간은 first_day~last_day(바꿀 수 있는 날 안). 누구의 어느 칸을
+    바꿀지는 솔버가 고른다(가장 적게 바꾸기 · 하드락·설정은 그대로).
+      · isolated_off·isolated_work·pattern: 기간 안 그 모양 개수를 at_most 이하로. 사용자가 수를 말했으면 said=True 로
+        그 수를 그대로 쓴다. 말하지 않았으면(said=False) 스킬이 규칙을 지키며 줄일 수 있는 가장 작은 수를 턴마다 다시 찾아
+        채운다(`solver.min_shape_count` · None = 아직 정하지 않음).
+      · work_run: 사람마다 연속 근무를 at_most 일 이하로 · weekend: 사람마다 기간 안 주말 근무를 at_most 회 이하로
+        (둘 다 말하지 않으면 해석이 채운다 — `grounding._shape`).
+    바꿀 수 있는 칸이 하나도 없는 모양(지난 날·묶인 칸뿐)은 세지 않는다 — 고칠 수 없다. 주말은 바꿀 수 없는 주말 근무가
+    이미 상한을 넘는 사람이면 그 수까지로 본다(`weekend_floor` · 솔버와 판정이 같은 기준).
+    """
+
+    kind: str
+    nurses: Tuple[str, ...]
+    first_day: int
+    last_day: int
+    at_most: Optional[int] = None
+    ranged: bool = False
+    said: bool = False
+
+    @property
+    def nurse_id(self) -> None:
+        """사람 하나를 짚지 않는다 — 칸 요청을 거르는 자리를 그대로 지나간다."""
+        return None
+
+    @property
+    def day(self) -> int:
+        return self.first_day
+
+
+EditRequest = Union[SetCell, AvoidCell, CountTarget, LeaveCell, CoverTarget, BalanceTarget, WishTarget, ShapeTarget]
 #: 칸 하나를 짚지 않는 요청 — 원티드 보호 면제·칸 요청 비교에서 빠진다
-AGGREGATE = (CountTarget, CoverTarget, BalanceTarget, WishTarget)
+AGGREGATE = (CountTarget, CoverTarget, BalanceTarget, WishTarget, ShapeTarget)
 
 
 def wish_targets(ctx: EditContext, req: "WishTarget") -> List[Tuple[str, int, FrozenSet[str]]]:
@@ -194,6 +239,87 @@ def wish_targets(ctx: EditContext, req: "WishTarget") -> List[Tuple[str, int, Fr
 
 def wish_count(ctx: EditContext, grid: Dict[str, List], targets) -> int:
     return sum(1 for n, d, codes in targets if grid[n][d] in codes)
+
+
+# ── 근무 모양(ShapeTarget) ──────────────────────────────────────────────────
+
+
+def shape_people(ctx: EditContext, req: "ShapeTarget") -> List[str]:
+    """고칠 사람 — 짚은 사람(없으면 전원) 중 그 기간에 바꿀 수 있는 칸이 있는 사람."""
+    who = req.nurses or tuple(ctx.nurse_ids)
+    return [n for n in who if n in ctx.main and any(ctx.is_free(n, d) for d in range(req.first_day, req.last_day + 1))]
+
+
+def _changeable(ctx: EditContext, req: "ShapeTarget", n: str, days) -> bool:
+    return any(req.first_day <= d and ctx.is_free(n, d) for d in days)
+
+
+def shape_instances(ctx: EditContext, req: "ShapeTarget") -> List[Tuple[Tuple[str, int, FrozenSet[str]], ...]]:
+    """개수를 줄이는 모양(SHAPE_COUNTED)의 자리 — 칸 셋이 모두 맞으면 그 모양 하나. 가운데(순서는 첫 칸)가 기간 안이고
+    바꿀 수 있는 칸이 하나라도 있는 것만. 휴가·공가가 끼면 엔진처럼 하루짜리 OFF 로 보지 않는다(rules._isolated_off)."""
+    out = []
+    for n in shape_people(ctx, req):
+        row = ctx.main[n]
+        for d in range(req.first_day, req.last_day + 1):
+            if req.kind == "pattern":
+                days = (d, d + 1, d + 2)
+                if days[-1] >= ctx.days or any(row[x] is None for x in days):
+                    continue
+                for _name, a, c in _SEQUENCES:
+                    if _changeable(ctx, req, n, days):
+                        out.append(((n, d, a), (n, d + 1, _OFF), (n, d + 2, c)))
+                continue
+            days = (d - 1, d, d + 1)
+            if days[0] < 0 or days[-1] >= ctx.days or any(row[x] is None for x in days):
+                continue
+            if not _changeable(ctx, req, n, days):
+                continue
+            if req.kind == "isolated_off":
+                if not any((n, x) in ctx.vacation for x in days):
+                    out.append(((n, d - 1, _WORK), (n, d, _OFF), (n, d + 1, _WORK)))
+            elif req.kind == "isolated_work":
+                out.append(((n, d - 1, _OFF), (n, d, frozenset({"D", "E", "M"})), (n, d + 1, _OFF)))
+    return out
+
+
+def shape_count(ctx: EditContext, grid: Dict[str, List], req: "ShapeTarget") -> int:
+    """개수 종류 = 그 모양 개수 · work_run = 사람 중 가장 긴 연속 근무 · weekend = 사람 중 가장 많은 주말 근무."""
+    if req.kind in SHAPE_COUNTED:
+        return sum(1 for inst in shape_instances(ctx, req) if all(grid[n][d] in codes for n, d, codes in inst))
+    values = shape_values(ctx, grid, req)
+    return max(values.values()) if values else 0
+
+
+def shape_values(ctx: EditContext, grid: Dict[str, List], req: "ShapeTarget") -> Dict[str, int]:
+    """사람마다 — work_run 은 기간에 걸친 가장 긴 연속 근무(바꿀 수 있는 칸이 하나도 없는 연속은 뺀다 · 솔버도 묶지
+    않는다), weekend 는 기간 안 주말 근무 수."""
+    out = {}
+    for n in shape_people(ctx, req):
+        row = grid[n]
+        if req.kind == "weekend":
+            out[n] = sum(1 for d in weekend_days(ctx, req) if row[d] in _WORK)
+            continue
+        best = run = 0
+        movable = False
+        for d in range(ctx.days):
+            if row[d] in _WORK:
+                run += 1
+                movable = movable or (d >= req.first_day and ctx.is_free(n, d))
+            else:
+                run, movable = 0, False
+            if run and movable and d >= req.first_day and d - run + 1 <= req.last_day:
+                best = max(best, run)
+        out[n] = best
+    return out
+
+
+def weekend_floor(ctx: EditContext, req: "ShapeTarget", nurse_id: str) -> int:
+    """바꿀 수 없는 주말 근무 수 — 이보다 낮은 상한은 지킬 수 없어 그 사람은 이 수까지로 본다."""
+    return sum(1 for d in weekend_days(ctx, req) if not ctx.is_free(nurse_id, d) and ctx.main[nurse_id][d] in _WORK)
+
+
+def weekend_days(ctx: EditContext, req: "ShapeTarget") -> List[int]:
+    return [d for d in range(req.first_day, req.last_day + 1) if ctx.day_date(d).weekday() >= 5]
 
 
 def balance_members(ctx: EditContext, codes, open_from: int) -> Tuple[str, ...]:
@@ -302,6 +428,19 @@ def request_problem(ctx: EditContext, req: EditRequest, open_from: int = 0) -> O
     if isinstance(req, WishTarget):
         if not 0 <= req.first_day <= req.last_day < ctx.days or req.first_day < open_from:
             return "이 달에 바꿀 수 있는 날이 남아 있지 않습니다."
+        return None
+    if isinstance(req, ShapeTarget):
+        if not 0 <= req.first_day <= req.last_day < ctx.days or req.first_day < open_from:
+            return "이 달에 바꿀 수 있는 날이 남아 있지 않습니다."
+        if req.kind not in SHAPE_LABEL:
+            return "어떤 근무 모양을 고칠지 알아듣지 못했습니다."
+        missing = [n for n in req.nurses if n not in ctx.main]
+        if missing:
+            return f"{missing[0]} 는 이 근무표에 없습니다."
+        if not shape_people(ctx, req):
+            return "그 기간에는 바꿀 수 있는 칸이 없습니다."
+        if req.kind == "work_run" and req.at_most is not None and req.at_most < 1:
+            return "연속 근무는 1일 이상으로 말씀해 주세요."
         return None
     if req.nurse_id not in ctx.main:
         return f"{req.nurse_id} 는 이 근무표에 없습니다."
@@ -419,6 +558,12 @@ def is_satisfied(ctx: EditContext, req: EditRequest, grid: Optional[Dict[str, Li
         targets = wish_targets(ctx, req)
         need = len(targets) if req.at_least is None else req.at_least
         return wish_count(ctx, grid or ctx.main, targets) >= need
+    if isinstance(req, ShapeTarget):
+        limit = 0 if req.at_most is None else req.at_most
+        if req.kind == "weekend":
+            return all(v <= max(limit, weekend_floor(ctx, req, n))
+                       for n, v in shape_values(ctx, grid or ctx.main, req).items())
+        return shape_count(ctx, grid or ctx.main, req) <= limit
     if isinstance(req, BalanceTarget):
         counts = balance_counts(ctx, grid or ctx.main, req).values()
         if req.target is not None:

@@ -6,14 +6,15 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    TRANSFERS, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, WishTarget,
-    balance_members, cover_count, eul, swap,
+    SHAPE_COUNTED, SHAPE_LABEL, TRANSFERS, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell,
+    SetCell, ShapeTarget, WishTarget, balance_members, cover_count, eul, shape_values, swap, weekend_floor,
 )
 from services.schedule_edit.rules import coverage_bounds
 
@@ -51,6 +52,8 @@ def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List
         return _balance(ctx, change, open_from)
     if kind == "wanted":                     # 반영 안 된 원티드 넣기 — 사람·기간은 말했을 때만
         return _wanted(ctx, change, open_from)
+    if kind == "shape":                      # 근무 모양 고치기 — 사람·기간은 말했을 때만
+        return _shape(ctx, change, open_from)
     nurse, ask = resolve_nurse(ctx, change.get("nurse"))
     if ask:
         return [], ask
@@ -151,6 +154,47 @@ def _wanted(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[L
     if first > last or first >= ctx.days:
         return [], "그 기간에는 바꿀 수 있는 날이 남아 있지 않습니다."
     return [WishTarget(nurses, first, last, ranged=change.get("day") is not None)], None
+
+
+SHAPE_ASK = ("어떤 근무 모양을 고칠까요? 예) '하루짜리 OFF 없애줘', '퐁당퐁당 없애줘', 'N-O-D 없애줘', "
+             "'장원영 연속 근무 너무 길어', '김태희 주말 근무 너무 많아'")
+
+
+def _shape(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
+    """'하루짜리 OFF 없애줘' · '장원영 연속 근무 너무 길어' · '김태희 주말 근무 너무 많아'(사용자 결정 11-04).
+    말한 수가 있으면 그대로(said · '하루짜리 OFF 3개까지만'). 없으면 개수 종류는 스킬이 정한다(규칙을 지키며 줄일 수 있는
+    만큼). 연속 근무·주말은 여기서 채운다 — 연속 근무는 그 사람들 중 지금 가장 긴 것 − 1, 주말은 병동 평균(올림 · 짚은
+    사람이 이미 평균 이하면 지금 − 1)."""
+    kind = str(change.get("shape") or "").strip()
+    if kind not in SHAPE_LABEL:
+        return [], SHAPE_ASK
+    probe, ask = _wanted(ctx, change, open_from)            # 사람·기간 읽기는 원티드 반영과 같다
+    if ask:
+        return [], ask
+    base = probe[0]
+    nums, bad = _numbers(change, "target")
+    if bad:
+        return [], "몇 개·몇 일까지인지는 숫자로 말씀해 주세요. 예) '연속 근무 4일까지만'"
+    req = ShapeTarget(kind, base.nurses, base.first_day, base.last_day, nums["target"], ranged=base.ranged,
+                      said=nums["target"] is not None)
+    if kind in SHAPE_COUNTED or req.at_most is not None:
+        return [req], None
+    values = shape_values(ctx, ctx.main, req)
+    if not values:
+        return [], "그 기간에는 바꿀 수 있는 칸이 없습니다."
+    if kind == "work_run":
+        longest = max(values.values())
+        if not longest:
+            return [], "그 기간에는 바꿀 수 있는 연속 근무가 없습니다."
+        if longest == 1:
+            return [], "연속 근무가 이미 하루씩입니다."
+        return [dataclasses.replace(req, at_most=longest - 1)], None
+    if not any(v > weekend_floor(ctx, req, n) for n, v in values.items()):
+        return [], "그 기간의 주말 근무는 모두 바꿀 수 없는 칸(원티드 고정·파견 등)입니다."
+    every = shape_values(ctx, ctx.main, dataclasses.replace(req, nurses=()))
+    average = -(-sum(every.values()) // len(every)) if every else 0      # 올림
+    top = max(values.values())
+    return [dataclasses.replace(req, at_most=average if top > average else max(0, top - 1))], None
 
 
 def _cover(ctx: EditContext, change: Dict[str, Any]) -> Tuple[List[EditRequest], Optional[str]]:

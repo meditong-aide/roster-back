@@ -22,7 +22,7 @@ def test_examples_point_at_cells_that_can_change():
     assert out[2] == "김가람 N 1개만 줄여줘"                   # 남은 날 N 이 가장 많은 사람(셋 다 2개 — 같으면 표 순서)
     # 휴가는 남은 날의 뒤쪽 절반(6~8일)에서 — 앞 예시와 날이 겹치지 않게
     assert out[3:] == ["4일 이브닝 한 명 더", "이나래 7일 연차 넣어줘", "4일 나이트 누구야", "N 근무 수 고르게 맞춰줘",
-                       "반영 안 된 원티드 넣어줘", "남는 OFF 연차로 전환해줘"]
+                       "반영 안 된 원티드 넣어줘", "하루짜리 OFF 없애줘", "남는 OFF 연차로 전환해줘"]
     assert not any("○" in e for e in out)
 
 

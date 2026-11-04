@@ -7,8 +7,9 @@ from typing import List, Optional, Sequence
 
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, WishTarget, balance_counts, count_in,
-    cover_count, transfer_label, wish_count, wish_targets,
+    SHAPE_COUNTED, SHAPE_LABEL, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, ShapeTarget,
+    WishTarget, balance_counts, count_in, cover_count, shape_count, shape_values, transfer_label, wish_count,
+    wish_targets,
 )
 
 _SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
@@ -43,6 +44,9 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
             continue
         if isinstance(r, WishTarget):
             parts.append(_describe_wish(ctx, r))
+            continue
+        if isinstance(r, ShapeTarget):
+            parts.append(_describe_shape(ctx, r))
             continue
         who = ctx.names.get(r.nurse_id, r.nurse_id)
         if isinstance(r, CountTarget):
@@ -91,6 +95,38 @@ def _describe_wish(ctx: EditContext, r: WishTarget) -> str:
     when = "" if not r.ranged else (f" · {r.first_day + 1}일" if r.first_day == r.last_day
                                     else f" · {r.first_day + 1}~{r.last_day + 1}일")
     return f"원티드 반영({who}{when} · 미반영 {len(wish_targets(ctx, r))}개)"
+
+
+def _shape_scope(ctx: EditContext, r: ShapeTarget) -> str:
+    who = "·".join(ctx.names.get(n, n) for n in r.nurses) if r.nurses else "전원"
+    return who + (f" · {r.first_day + 1}~{r.last_day + 1}일" if r.ranged else "")
+
+
+def _describe_shape(ctx: EditContext, r: ShapeTarget) -> str:
+    """예) '하루짜리 OFF 줄이기(전원 · 지금 12개)' · '하루짜리 OFF 3개 이하로(전원 · 지금 12개)'(수를 말했을 때) ·
+    '장원영 연속 근무 4일 이하로(지금 최대 5일)' · '김태희 주말 근무 3회 이하로(지금 최대 5회)'."""
+    now = shape_count(ctx, ctx.main, r)
+    if r.kind in SHAPE_COUNTED:
+        if r.said and r.at_most is not None:
+            limit = f"{r.at_most}개 이하로" if r.at_most else "0개로"
+            return f"{SHAPE_LABEL[r.kind]} {limit}({_shape_scope(ctx, r)} · 지금 {now}개)"
+        return f"{SHAPE_LABEL[r.kind]} 줄이기({_shape_scope(ctx, r)} · 지금 {now}개)"
+    unit = "일" if r.kind == "work_run" else "회"
+    limit = f"{r.at_most}{unit} 이하로" if r.at_most else f"0{unit}로"
+    return f"{_shape_scope(ctx, r)} {SHAPE_LABEL[r.kind]} {limit}(지금 최대 {now}{unit})"
+
+
+def shape_note(ctx: EditContext, r: ShapeTarget, cand) -> str:
+    """1안의 결과 — 예) '하루짜리 OFF 12개 → 3개' · '가장 긴 연속 근무 5일 → 4일' · '주말 근무 김태희 5회 → 3회'."""
+    from services.schedule_edit.solver import apply_candidate
+    grid = apply_candidate(ctx, cand)
+    if r.kind in SHAPE_COUNTED:
+        return f"{SHAPE_LABEL[r.kind]} {shape_count(ctx, ctx.main, r)}개 → {shape_count(ctx, grid, r)}개"
+    if r.kind == "work_run":
+        return f"가장 긴 연속 근무 {shape_count(ctx, ctx.main, r)}일 → {shape_count(ctx, grid, r)}일"
+    before, after = shape_values(ctx, ctx.main, r), shape_values(ctx, grid, r)
+    moved = [f"{ctx.names.get(n, n)} {before[n]}→{after[n]}회" for n in before if before[n] != after.get(n)]
+    return "주말 근무: " + (", ".join(moved[:5]) + (f" 외 {len(moved) - 5}명" if len(moved) > 5 else "") if moved else "변화 없음")
 
 
 def wish_note(ctx: EditContext, r: WishTarget, cand) -> str:
@@ -158,6 +194,7 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
         lines += [n for n in (cover_note(ctx, r) for r in requests if isinstance(r, CoverTarget)) if n]
         lines += [balance_note(ctx, r, first) for r in requests if isinstance(r, BalanceTarget)]
         lines += [wish_note(ctx, r, first) for r in requests if isinstance(r, WishTarget)]
+        lines += [shape_note(ctx, r, first) for r in requests if isinstance(r, ShapeTarget)]
         lines += [n for n in (wish_skipped_note(ctx, r) for r in requests if isinstance(r, WishTarget)) if n]
         lines += list(getattr(result, "extra", []) or [])
         # 설정 카드 안내는 맨 뒤 — 이 안의 결과를 먼저 말한다
@@ -168,6 +205,10 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
             lines.append(f"설정 하나를 이번만 넘기시면 {first.changed_count}칸 대신 {fewest}칸만 바꾸는 방법도 아래에 있습니다.")
         return "\n".join(lines + notes)
     if result.status == "already":
+        shape = next((r for r in requests if isinstance(r, ShapeTarget)), None)
+        if shape is not None and shape.kind in SHAPE_COUNTED and not shape_count(ctx, ctx.main, shape):
+            return "\n".join([f"바꿀 수 있는 칸에는 고칠 곳이 없습니다 — {SHAPE_LABEL[shape.kind]} 0개"
+                              f"({_shape_scope(ctx, shape)})."] + notes)
         wish = next((r for r in requests if isinstance(r, WishTarget)), None)
         if wish is not None:
             skipped = wish_skipped_note(ctx, wish)

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, WishTarget,
+    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, ShapeTarget, WishTarget,
 )
 
 
@@ -43,6 +43,9 @@ def requests_to_json(requests: Sequence[EditRequest]) -> List[Dict[str, Any]]:
         elif isinstance(r, WishTarget):
             out.append({"kind": "wanted", "nurses": list(r.nurses), "first_day": r.first_day, "last_day": r.last_day,
                         "at_least": r.at_least, "ranged": r.ranged})
+        elif isinstance(r, ShapeTarget):
+            out.append({"kind": "shape", "shape": r.kind, "nurses": list(r.nurses), "first_day": r.first_day,
+                        "last_day": r.last_day, "at_most": r.at_most, "ranged": r.ranged, "said": r.said})
         else:
             out.append({"kind": "avoid", "nurse_id": r.nurse_id, "day": r.day, "codes": sorted(r.codes)})
     return out
@@ -66,6 +69,9 @@ def requests_from_json(items: Sequence[Dict[str, Any]]) -> List[EditRequest]:
         elif i["kind"] == "wanted":
             out.append(WishTarget(tuple(i.get("nurses") or ()), int(i["first_day"]), int(i["last_day"]),
                                   i.get("at_least"), bool(i.get("ranged"))))
+        elif i["kind"] == "shape":
+            out.append(ShapeTarget(i["shape"], tuple(i.get("nurses") or ()), int(i["first_day"]), int(i["last_day"]),
+                                   i.get("at_most"), bool(i.get("ranged")), bool(i.get("said"))))
         else:
             out.append(AvoidCell(i["nurse_id"], int(i["day"]), frozenset(i["codes"])))
     return out

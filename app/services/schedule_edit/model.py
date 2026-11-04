@@ -17,8 +17,9 @@ from ortools.sat.python import cp_model
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    AGGREGATE, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, WishTarget, count_cells,
-    count_in, cover_members, is_satisfied, wish_targets, work_targets,
+    AGGREGATE, SHAPE_COUNTED, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, ShapeTarget,
+    WishTarget, count_cells, count_in, cover_members, is_satisfied, shape_count, shape_instances, shape_people,
+    weekend_days, weekend_floor, wish_targets, work_targets,
 )
 from services.schedule_edit.rules import (
     WISH, Grid, Ineq, RuleSet, Term, TeamCover, cell, coverage_bounds, team_present, value_of,
@@ -61,6 +62,8 @@ class EditModel:
     spread: Any = None
     #: 넣은 원티드 수(넣을 수를 아직 정하지 않은 요청일 때만 · `solver.max_wish_count` 가 늘린다)
     wish: Any = None
+    #: 근무 모양 요청 → 그 모양 개수 식(줄일 수를 아직 정하지 않은 요청만 · `solver.min_shape_count` 가 하나씩 줄인다)
+    shape: Dict[Any, Any] = field(default_factory=dict)
 
     def ind(self, term: Term):
         """칸이 term.codes 중 하나인가 — 자유 칸이면 변수 합, 아니면 0/1 상수."""
@@ -292,6 +295,8 @@ def add_requests(em: EditModel, requests: List[EditRequest]) -> None:
             add_balance(em, req)
         elif isinstance(req, WishTarget):
             add_wish(em, req)
+        elif isinstance(req, ShapeTarget):
+            add_shape(em, req)
         elif isinstance(req, SetCell):
             if (req.nurse_id, req.day) in em.free:
                 em.model.Add(em.x[req.nurse_id, req.day, req.code] == 1)
@@ -331,6 +336,44 @@ def add_wish(em: EditModel, req: WishTarget) -> None:
         em.wish = hit
     else:
         em.model.Add(hit >= req.at_least)
+
+
+_SHAPE_WORK = frozenset({"D", "E", "N", "M", "W"})
+
+
+def add_shape(em: EditModel, req: ShapeTarget) -> None:
+    """근무 모양 — 개수 종류는 그 모양 개수 ≤ at_most(None 이면 아직 정하지 않은 것 — 지금보다 늘지만 않게 묶고 식을
+    em.shape[req] 에 둔다 · 가장 작은 수를 찾을 때), work_run 은 사람마다 연속 at_most+1 일 창의 근무 ≤ at_most,
+    weekend 는 사람마다 기간 안 주말 근무 ≤ max(at_most, 바꿀 수 없는 주말 근무 수)."""
+    m, ctx = em.model, em.ctx
+    if req.kind in SHAPE_COUNTED:
+        hits = []
+        for inst in shape_instances(ctx, req):
+            terms = [Term(n, d, codes) for n, d, codes in inst]
+            if not em.touches(terms):
+                hits.append(1 if all(em.ind(t) for t in terms) else 0)
+                continue
+            hit = m.NewBoolVar(f"shape_{len(hits)}")
+            m.Add(hit >= sum(em.ind(t) for t in terms) - (len(terms) - 1))   # 셋이 다 맞으면 1(위로만 묶어도 충분)
+            hits.append(hit)
+        if req.at_most is None:
+            em.shape[req] = sum(hits)
+            m.Add(sum(hits) <= shape_count(ctx, em.base, req))
+        else:
+            m.Add(sum(hits) <= req.at_most)
+        return
+    if req.at_most is None:
+        return
+    for n in shape_people(ctx, req):
+        if req.kind == "weekend":
+            limit = max(req.at_most, weekend_floor(ctx, req, n))
+            m.Add(sum(em.ind(Term(n, d, _SHAPE_WORK)) for d in weekend_days(ctx, req)) <= limit)
+            continue
+        k = req.at_most
+        for start in range(max(0, req.first_day - k), min(req.last_day, ctx.days - k - 1) + 1):
+            terms = [Term(n, d, _SHAPE_WORK) for d in range(start, start + k + 1)]
+            if em.touches(terms):
+                m.Add(sum(em.ind(t) for t in terms) <= k)
 
 
 def count_expr(em: EditModel, nurse_id: str, codes, days) -> Any:

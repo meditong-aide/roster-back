@@ -46,8 +46,8 @@ from services.schedule_edit.model import (
     requested_cells, subcode_changes,
 )
 from services.schedule_edit.requests import (
-    AvoidCell, BalanceTarget, CountTarget, EditRequest, LeaveCell, SetCell, WishTarget, balance_counts,
-    first_open_day, is_satisfied, request_problem, wish_targets,
+    AvoidCell, BalanceTarget, CountTarget, EditRequest, LeaveCell, SetCell, ShapeTarget, WishTarget, balance_counts,
+    first_open_day, is_satisfied, request_problem, shape_count, wish_targets,
 )
 from services.schedule_edit.rules import Grid, RuleSet, build_rules, measure, measure_soft, new_violations
 from services.schedule_edit.screen_check import ScreenBaseline, screen_regressions
@@ -177,7 +177,8 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
                avoid=[set(p) for p in avoid_people], hint=hint, max_changes=_max_changes(requests))
     status = cp_model.UNKNOWN
     # 개수 요청은 어느 날을 바꿀지 정해지지 않았다 — 좁은 창부터 넓힐 근거가 없어 기간 전체로 바로 푼다
-    steps = (None,) if any(isinstance(r, (CountTarget, BalanceTarget, WishTarget)) for r in requests) else WINDOW_STEPS
+    steps = ((None,) if any(isinstance(r, (CountTarget, BalanceTarget, WishTarget, ShapeTarget)) for r in requests)
+             else WINDOW_STEPS)
     for step in steps:
         days = _window_days(run, step)
         em = build_model(ctx, rules, requests, free_cells(ctx, days), run.max_changes, run.allow)
@@ -232,7 +233,7 @@ def _shortcuts(run: "_Run", found: List["Candidate"]) -> List[Any]:
     """후보보다 바꾸는 칸이 적어지는 레버(레버 대상 설정만 · 하드락은 넘기지 않는다). 줄어들지 않으면 빈 목록 —
     고르게 맞추기는 칸 상한이 레버 모델(20칸)보다 넓어 비교가 맞지 않아 찾지 않는다."""
     best = min(found, key=lambda c: (c.changed_count, c.loss))
-    if best.changed_count < SHORTCUT_MIN_CHANGES or any(isinstance(r, (BalanceTarget, WishTarget))
+    if best.changed_count < SHORTCUT_MIN_CHANGES or any(isinstance(r, (BalanceTarget, WishTarget, ShapeTarget))
                                                         for r in run.requests):
         return []
     seconds = run.seconds(SHORTCUT_SECONDS + SHORTCUT_RESERVE) - SHORTCUT_RESERVE
@@ -245,6 +246,8 @@ def _shortcuts(run: "_Run", found: List["Candidate"]) -> List[Any]:
 def _max_changes(requests: Sequence[EditRequest]) -> int:
     if any(isinstance(r, WishTarget) for r in requests):
         return WISH_MAX_CHANGES
+    if any(isinstance(r, ShapeTarget) for r in requests):
+        return SHAPE_MAX_CHANGES
     return BALANCE_MAX_CHANGES if any(isinstance(r, BalanceTarget) for r in requests) else MAX_CHANGES
 
 
@@ -281,6 +284,42 @@ def max_wish_count(ctx: EditContext, requests: Sequence[EditRequest], *, rules: 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None, status == cp_model.INFEASIBLE, total, None
     return int(round(solver.Value(em.wish))), status == cp_model.OPTIMAL, total, read_solution(em, solver)
+
+
+#: 근무 모양 고치기의 바뀌는 칸 상한 — 병동 전체의 하루짜리 OFF 처럼 모양 하나를 고치는 데 칸 2~3개가 든다
+SHAPE_MAX_CHANGES = 40
+
+
+def min_shape_count(ctx: EditContext, requests: Sequence[EditRequest], *, target: Optional[ShapeTarget] = None,
+                    rules: Optional[RuleSet] = None, today: Optional[date] = None, seconds: float = MONTH_SECONDS,
+                    allow: Optional[Dict[Tuple, int]] = None,
+                    avoid_people: Sequence[FrozenSet[str]] = ()) -> Tuple[Optional[int], bool, int, Optional[Grid]]:
+    """줄일 수를 정하지 않은 근무 모양(개수 종류 · target, 없으면 첫 것) — 규칙을 모두 지키며 칸 상한 안에서 줄일 수 있는
+    가장 작은 개수. (수, 더 줄일 수 없다고 증명했나, 지금 개수, 그 해의 격자) — `max_wish_count` 와 같은 틀. 격자는 다음
+    탐색(그 수 이하로 가장 적게 바꾸기)의 시작 해. 시간 안에 못 찾으면 수는 None. 아직 정하지 않은 다른 모양 요청은
+    지금보다 늘지만 않게 묶인다(검토 11-04 M2 — 한 식을 덮어써 엉뚱한 모양을 줄였다)."""
+    requests = list(requests)
+    req = target or next((r for r in requests if isinstance(r, ShapeTarget) and r.at_most is None), None)
+    if req is None or req.at_most is not None:
+        return None, False, 0, None
+    open_from = first_open_day(ctx, today or datetime.now(KST).date())
+    if any(request_problem(ctx, r, open_from) for r in requests):
+        return None, True, shape_count(ctx, ctx.main, req), None
+    pctx, prules, preqs = prepare(ctx, rules, requests)
+    now = shape_count(pctx, pctx.main, req)                  # 함께 온 휴가 요청도 풀 때와 같은 재료로(검토 L1)
+    if not now:
+        return 0, True, 0, None
+    start = min(r.day for r in preqs)
+    em = build_model(pctx, prules, preqs, free_cells(pctx, range(start, pctx.days)), SHAPE_MAX_CHANGES,
+                     lever_allow(allow))
+    for people in avoid_people:
+        forbid_same_people(em, set(people))
+    em.model.Minimize(em.shape[req])
+    solver = new_solver(seconds)
+    status = solver.Solve(em.model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None, status == cp_model.INFEASIBLE, now, None
+    return int(round(solver.Value(em.shape[req]))), status == cp_model.OPTIMAL, now, read_solution(em, solver)
 
 
 def min_balance_spread(ctx: EditContext, requests: Sequence[EditRequest], *, rules: Optional[RuleSet] = None,

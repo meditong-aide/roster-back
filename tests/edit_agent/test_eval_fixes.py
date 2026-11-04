@@ -64,8 +64,8 @@ def test_unsupported_answer_names_the_kind(world):
     agent, _ = _agent(call("reply_only", kind="unsupported", topic="undo"),
                       call("reply_only", kind="unsupported"))
     assert say(agent, world.conv, "방금 버전 되돌려줘").answer.startswith("만든 버전 되돌리기")
-    # (여러 사람 고르게 맞추기는 11-03 부터 지원 — kind=balance · tests/edit_agent/test_balance.py)
-    assert "근무 모양 고치기" in say(agent, world.conv, "?").answer              # 종류를 모르면 전체 목록
+    # (여러 사람 고르게 맞추기는 11-03 · 근무 모양은 11-04 부터 지원 — test_balance.py · test_shape.py)
+    assert "(버전 되돌리기)" in say(agent, world.conv, "?").answer              # 종류를 모르면 전체 목록
 
 
 def test_status_after_postprocess_is_kept_in_the_session(world):

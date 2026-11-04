@@ -31,14 +31,16 @@ from services.schedule_edit.precheck import (
 from services.schedule_edit.rule_check import ALL as CHECK_ALL
 from services.schedule_edit.rule_check import TOPICS as CHECK_RULE_TOPICS
 from services.schedule_edit.requests import (
-    TRANSFERS, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, WishTarget, balance_counts, count_cells,
+    SHAPE_COUNTED, SHAPE_LABEL, TRANSFERS, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, ShapeTarget,
+    WishTarget, balance_counts, count_cells, shape_count,
     count_in, first_open_day, transfer_label, wish_count, wish_targets, work_down, work_targets,
 )
 from services.schedule_edit.serialize import allow_to_json, requests_to_json, result_to_dict
 from services.schedule_edit.levers import find_levers, lever_allow
 from services.schedule_edit.session import EditSession, allow_lever_id, keep, propose, reject, stage
 from services.schedule_edit.solver import (
-    BALANCE_MAX_CHANGES, WISH_MAX_CHANGES, EditResult, apply_candidate, max_wish_count, min_balance_spread, prepare,
+    BALANCE_MAX_CHANGES, SHAPE_MAX_CHANGES, WISH_MAX_CHANGES, EditResult, apply_candidate, max_wish_count,
+    min_balance_spread, min_shape_count, prepare,
     propose_edits,
 )
 
@@ -127,7 +129,7 @@ _CHANGE = {
     "type": "object",
     "properties": {
         "kind": {"type": "string",
-                 "enum": ["set", "avoid", "swap", "off_period", "count", "leave", "cover", "balance", "wanted"],
+                 "enum": ["set", "avoid", "swap", "off_period", "count", "leave", "cover", "balance", "wanted", "shape"],
                  "description": "set=그 칸을 이 근무로 · avoid=그 칸에서 이 근무(들)를 빼기(무엇으로 바꿀지는 맡김) · "
                                 "swap=두 사람의 그날 근무 맞바꾸기 · off_period=day 부터 to_day 까지 OFF · "
                                 "count=날짜를 정하지 않고 그 사람의 그 근무 개수를 바꾸기(어느 날인지는 맡김) · "
@@ -138,7 +140,13 @@ _CHANGE = {
                                 "balance=여러 사람의 그 근무 수를 고르게(nurse 없이 shift · '모두 9개로'면 target · "
                                 "'차이 1 이하로'면 spread · 대상은 시스템이 그 근무를 할 수 있는 사람으로 정한다) · "
                                 "wanted=반영 안 된 원티드(간호사가 낸 희망 근무) 넣기(사람·기간을 말했을 때만 nurse·day·to_day · "
-                                "몇 개를 넣을지는 시스템이 정한다)"},
+                                "몇 개를 넣을지는 시스템이 정한다) · "
+                                "shape=근무 모양 고치기(shape 를 함께 · 사람·기간을 말했을 때만 nurse·day·to_day · "
+                                "몇 개·몇 일·몇 회 이하로라고 말했을 때만 target)"},
+        "shape": {"type": "string", "enum": list(SHAPE_LABEL),
+                  "description": "shape: isolated_off=근무 사이 OFF 하루(하루짜리 OFF·고립 OFF) · isolated_work=OFF 사이 하루 근무"
+                                 "(퐁당퐁당) · pattern=N-O-D·N-O-E·E-O-D 같은 근무 순서 · work_run=연속 근무가 김 · "
+                                 "weekend=주말 근무가 몰림·많음"},
         "spread": {"type": "integer", "minimum": 0,
                    "description": "balance: 사람 사이 개수 차이를 몇 이하로 할지 말했을 때만(말하지 않으면 비운다 — "
                                   "시스템이 줄일 수 있는 만큼 줄인다)"},
@@ -156,7 +164,8 @@ _CHANGE = {
         "change": {"type": "integer",
                    "description": "count·cover: 늘리거나 줄일 개수·인원(2개 빼 → -2, 하나 더 → 1, 한 명 빼 → -1)"},
         "target": {"type": "integer", "minimum": 0,
-                   "description": "count·cover·balance: '6개로'·'4명으로'·'모두 9개로' 처럼 목표 개수·인원을 말했을 때"},
+                   "description": "count·cover·balance: '6개로'·'4명으로'·'모두 9개로' 처럼 목표 개수·인원을 말했을 때 · "
+                                  "shape: '연속 근무 4일까지만'·'주말 2번만'·'하루짜리 OFF 3개까지' 처럼 말했을 때"},
         "transfer": {"type": "string", "enum": list(TRANSFERS),
                      "description": "count: 상대를 어떻게 정할지 사용자가 이미 말했을 때만(빠지는 근무를 누가 메울지 / "
                                     "누구 것을 넘겨받을지). same_grade=같은 등급 · same_team=같은 팀 · fair=그 근무가 "
@@ -192,7 +201,9 @@ _CELL = {
         "'정다은 20일 나이트 빼줘' → [{kind:avoid, nurse:'정다은', day:20, shifts:['N']}] · "
         "'장원영 N 2개만 빼줘' → [{kind:count, nurse:'장원영', shift:'N', change:-2}] · "
         "'장원영 나이트 너무 많아'(개수 없음) → [{kind:count, nurse:'장원영', shift:'N'}](시스템이 현황을 보여 주고 되묻는다) · "
-        "'N 근무 수 고르게 맞춰줘' → [{kind:balance, shift:'N'}] · 'OFF 다 9개로 맞춰줘' → [{kind:balance, shift:'OFF', target:9}]"),
+        "'N 근무 수 고르게 맞춰줘' → [{kind:balance, shift:'N'}] · 'OFF 다 9개로 맞춰줘' → [{kind:balance, shift:'OFF', target:9}] · "
+        "'하루짜리 OFF 없애줘' → [{kind:shape, shape:'isolated_off', nurse:''}] · '장원영 연속 근무 너무 길어' → "
+        "[{kind:shape, shape:'work_run', nurse:'장원영'}] · '김태희 주말 근무 너무 많아' → [{kind:shape, shape:'weekend', nurse:'김태희'}]"),
     parameters={"type": "object", "properties": {"changes": {"type": "array", "items": _CHANGE}},
                 "required": ["changes"]},
     mode="preview", llm=True)
@@ -245,7 +256,7 @@ def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     # '21일은 그대로 둬' — 요청한 칸이 그 날이면 그 요청을 뺀다(평가 11-03: 요청은 남기고 그날 다른 칸만 고정해 모순).
     # 그날 전체를 두라면 그날 인원 요청도 뺀다(남기면 그날을 다 묶은 채 인원을 바꾸라는 모순 · 검토 11-03)
     kept_days = _whole_days(ctx, kept)
-    reqs = [r for r in reqs if isinstance(r, (CountTarget, BalanceTarget, WishTarget)) or _is_keep(ctx, r)
+    reqs = [r for r in reqs if isinstance(r, (CountTarget, BalanceTarget, WishTarget, ShapeTarget)) or _is_keep(ctx, r)
             or (r.day not in kept_days if isinstance(r, CoverTarget) else (r.nurse_id, r.day) not in kept)]
     asked = {(r.nurse_id, r.day) for r in reqs}
     for n, d in sorted(kept - asked):
@@ -280,6 +291,8 @@ def _same_target(old: EditRequest, new: EditRequest) -> bool:
         return isinstance(old, BalanceTarget) and isinstance(new, BalanceTarget) and old.codes == new.codes
     if isinstance(old, WishTarget) or isinstance(new, WishTarget):
         return isinstance(old, WishTarget) and isinstance(new, WishTarget)
+    if isinstance(old, ShapeTarget) or isinstance(new, ShapeTarget):
+        return isinstance(old, ShapeTarget) and isinstance(new, ShapeTarget) and old.kind == new.kind
     if isinstance(old, CountTarget) or isinstance(new, CountTarget):
         return False
     return (old.nurse_id, old.day) == (new.nurse_id, new.day)
@@ -321,10 +334,9 @@ def _is_keep(ctx, r: EditRequest) -> bool:
 #: 바꾸지 않는 답의 종류 → 정해진 문장(LLM 글을 사용자에게 보내지 않는다 · 검토 M3)
 REPLY_KINDS = ("who", "when", "what", "outside_month", "settings", "unsupported", "other", "status", "unclear")
 #: 아직 못 하는 변경 — 답 문장과 처음 화면 안내가 같은 목록을 쓴다
-UNSUPPORTED = "근무 모양 고치기, 버전 되돌리기"
+UNSUPPORTED = "버전 되돌리기"
 #: 아직 못 하는 종류별 안내(reply_only kind=unsupported 의 topic · 평가 11-03: 조회·되돌리기에도 같은 목록이 나갔다)
 UNSUPPORTED_TOPICS = {
-    "pattern": "연속 근무·주말 몰림 같은 근무 모양 고치기는 아직 못 합니다. 바꿀 사람과 날짜를 말씀해 주시면 찾아 드립니다.",
     "undo": "만든 버전 되돌리기·버전 비교는 아직 여기서 못 합니다. 이전 버전은 그대로 남아 있으니 버전 목록에서 골라 주세요.",
     "postprocess": "그 후처리는 아직 여기서 못 합니다. 지금은 자동 연차전환만 할 수 있습니다.",
 }
@@ -355,7 +367,8 @@ def reply_text(kind: str, session: EditSession, topic: Optional[str] = None) -> 
         "when=며칠인지 빠짐 · what=무엇으로 바꿀지 빠짐 · outside_month=근무표 달 밖의 날짜 · settings=병동 설정값 자체"
         "(하루 인원 기준·규칙·OFF 기준 수)를 바꾸는 말이나 근무표 새로 만들기 — '사람들 OFF·근무 수를 고르게 맞춰 줘'는 "
         "reply_only 가 아니라 propose_edit 의 kind=balance · unsupported=근무표를 바꾸는 말이지만 아직 못 하는 종류 — "
-        "topic 을 함께 고른다: pattern=연속 근무·주말 몰림 같은 근무 모양 · undo=버전 되돌리기·비교 · "
+        "topic 을 함께 고른다(연속 근무·주말 몰림·하루짜리 OFF 같은 근무 모양은 reply_only 가 아니라 propose_edit 의 "
+        "kind=shape): undo=버전 되돌리기·비교 · "
         "postprocess=자동 연차전환 밖의 생성 후처리(보건휴가·수면 OFF 등) · other=근무표와 상관없는 말 · "
         "status=지금 요청·결과가 어떤지 묻는 말"
         "(예: '바꿔 줬어?', '지금 뭐 하고 있었지?') · unclear=그 밖에 알아듣기 어려움"),
@@ -672,18 +685,27 @@ def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
         return Outcome(answer=OUT_OF_TIME)
     requests, why = _resolve_balance(turn, requests)
     requests, wish = _resolve_wish(turn, requests)
+    requests, shape = _resolve_shape(turn, requests)
     # 원티드 반영은 '하나 더' 레버를 찾을 시간을 남긴다(검토 11-03 L2)
     budget = turn.remaining() if wish is None else max(MIN_SOLVE, turn.remaining() - WISH_LEVER_SECONDS - 2)
     result = propose(session, requests, today=turn.today, time_budget=budget,
-                     start=wish.get("grid") if wish else None)
+                     start=(wish or shape or {}).get("grid"))
     if wish is not None and result.status != "ok" and wish["best"] > 1 and turn.remaining() >= MIN_SOLVE:
         # 그 수를 넣는 해가 화면 판정 등으로 다 빠졌다 — 하나 덜 넣는 수로 한 번 더(검토 11-03 M2)
         requests = [dataclasses.replace(r, at_least=wish["best"] - 1) if isinstance(r, WishTarget) else r
                     for r in requests]
         result = propose(session, requests, today=turn.today, time_budget=turn.remaining() - 1)
+    loosen = {it["index"]: it["best"] + 1 for it in (shape or {}).get("items", [])
+              if it["best"] is not None and it["best"] + 1 < it["now"]}
+    if shape is not None and result.status != "ok" and loosen and turn.remaining() >= MIN_SOLVE:
+        # 근무 모양도 같다 — 찾은 수로 후보가 다 빠지면 하나 덜 줄이는 수로 한 번 더
+        requests = [dataclasses.replace(r, at_most=loosen[i]) if i in loosen else r for i, r in enumerate(requests)]
+        result = propose(session, requests, today=turn.today, time_budget=turn.remaining() - 1)
     result.notes = list(result.notes) + why
     if wish is not None and result.status == "ok":
         _wish_followup(turn, requests, result, wish)
+    if shape is not None and result.status == "ok":
+        _shape_followup(turn, requests, result, shape)
     return _finish(turn, requests, result, started)
 
 
@@ -825,6 +847,57 @@ def _resolve_wish(turn: Turn, requests: List[EditRequest]) -> Tuple[List[EditReq
     at_least = best if best else 1
     info = {"best": best or 0, "total": total, "proven": proven, "grid": grid}
     return [dataclasses.replace(r, at_least=at_least) if r is pending else r for r in requests], info
+
+
+#: 근무 모양에서 줄일 수 있는 가장 작은 개수를 찾는 시간 상한(초)
+SHAPE_SECONDS = 6.0
+
+
+def _resolve_shape(turn: Turn, requests: List[EditRequest]) -> Tuple[List[EditRequest], Optional[Dict[str, Any]]]:
+    """줄일 수를 말하지 않은 근무 모양(하루짜리 OFF·퐁당퐁당·근무 순서) — 규칙을 지키며 줄일 수 있는 가장 작은 개수를 찾아
+    상한으로 정한다(원티드 반영과 같은 틀 · 사용자 결정 11-04). 하나도 못 줄이면 하나 줄인 상한으로 풀어 불가 이유·넘길
+    설정을 보인다. 정해 둔 수는 늘 다시 찾는다(넘기기·고쳐 말하기 뒤에 '방법 없음'이 되지 않게). 사용자가 말한 수(said)는
+    그대로 둔다(검토 11-04 M1). 여럿이면 말한 순서대로 하나씩 — 앞에서 정한 수를 지킨 채 다음 것을 줄인다(M2 · 앞 요청이
+    먼저 줄어 뒤 요청이 덜 줄 수 있다)."""
+    pending = [i for i, r in enumerate(requests)
+               if isinstance(r, ShapeTarget) and r.kind in SHAPE_COUNTED and not r.said]
+    if not pending:
+        return requests, None
+    requests = [dataclasses.replace(r, at_most=None) if i in pending else r for i, r in enumerate(requests)]
+    seconds = min(SHAPE_SECONDS, max(0.5, turn.remaining() / 3)) / len(pending)
+    items, grid = [], None
+    for i in pending:
+        best, proven, now, found = min_shape_count(turn.session.ctx, requests, target=requests[i],
+                                                   rules=turn.session.rules, today=turn.today, seconds=seconds,
+                                                   allow=turn.session.allow, avoid_people=turn.session.avoid_people)
+        if not now:                             # 바꿀 수 있는 칸에 그 모양이 없다 — 풀이가 '이미 그렇게 되어 있음'으로
+            requests[i] = dataclasses.replace(requests[i], at_most=0)
+            continue
+        at_most = best if best is not None and best < now else now - 1
+        requests[i] = dataclasses.replace(requests[i], at_most=at_most)
+        items.append({"index": i, "best": best, "now": now, "proven": proven})
+        grid = found or grid
+    if not items:
+        return requests, None
+    return requests, {"items": items, "grid": grid}
+
+
+def _shape_followup(turn: Turn, requests: List[EditRequest], result: EditResult, shape: Dict[str, Any]) -> None:
+    """1안으로도 다 없애지 못하면 왜인지 한 줄씩 — 끝까지 확인했으면 단정, 아니면 '시간 안에'(원티드 반영과 같은 규약)."""
+    ctx = turn.session.ctx
+    grid = apply_candidate(ctx, result.candidates[0])
+    lines = []
+    for item in shape["items"]:
+        req = requests[item["index"]] if item["index"] < len(requests) else None
+        if not isinstance(req, ShapeTarget):
+            continue
+        left = shape_count(ctx, grid, req)
+        if not left:
+            continue
+        why = (f"규칙을 모두 지키며 바꾸는 칸 {SHAPE_MAX_CHANGES}개 안에서는 더 줄일 방법이 없습니다." if item["proven"]
+               else "시간 안에 더 줄이는 방법을 찾지 못했습니다.")
+        lines.append(f"남은 {SHAPE_LABEL[req.kind]} {left}개는 {why}")
+    result.extra = list(result.extra) + lines
 
 
 def _wish_followup(turn: Turn, requests: List[EditRequest], result: EditResult, wish: Dict[str, Any]) -> None:
