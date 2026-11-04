@@ -237,7 +237,7 @@ class Common:
              Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
              Inner Join bizwiz20db.Member c WITH(NOLOCK) On a.officeCode = c.officeCode and a.EmpSeqNo=c.EmpSeqNo
               Left Join {roster_db()}.dbo.nurses d WITH(NOLOCK) On d.office_id = a.officecode and d.nurse_id = a.EmpSeqNo
-             Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N'
+             Where b.OfficeCode = CAST(%s AS VARCHAR(10)) And b.EmpSeqNo = CAST(%s AS VARCHAR(10)) And a.PushCode = 'P30' And b.DelYN = 'N'
                And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01'
         ),
         WithKey AS (
@@ -299,6 +299,9 @@ class Common:
     # ★★ 부하: `Base` 가 **내 알림 전부**를 읽고 `TOP` 은 맨 마지막에 걸린다.
     #   즉 커서를 붙여도 스캔량이 새로 늘지 않는다 — 지금도 매 호출이 전수 스캔이다.
     #   `listsize=50` 고정을 커서로 바꾸는 것이 부하 면에서 손해가 아닌 이유다.
+    # ★ 병원 코드·사번은 `CAST(%s AS VARCHAR(10))` 로 받는다(`get_push_list` 도 같다). pymssql 은 str 을
+    #   `N'…'`(NVARCHAR)로 보내는데, 칸이 VARCHAR 라 조인 계획이 무너져 1회 CPU 1.5초를 썼다
+    #   (2026-11-02 실측 101358 간호사 1명: 49,392페이지·1,547ms → 34,446페이지·109ms · 결과 동일).
     #
     # ★ 대표 알림과 unread 판정 순서(프론트 계약):
     #   1) `DerivedLinkCode` 로 묶고 `Idx DESC` 로 **최신 1건**을 대표로 남긴다.
@@ -329,7 +332,7 @@ class Common:
              Inner Join bizwiz20db.TB_Mobile_Push_History_User b WITH(NOLOCK) On a.officeCode = b.officeCode and a.Idx=b.Fk_Idx
              Inner Join bizwiz20db.Member c WITH(NOLOCK) On a.officeCode = c.officeCode and a.EmpSeqNo=c.EmpSeqNo
               Left Join {roster_db()}.dbo.nurses d WITH(NOLOCK) On d.office_id = a.officecode and d.nurse_id = a.EmpSeqNo
-             Where b.OfficeCode = %s And b.EmpSeqNo = %s And a.PushCode = 'P30' And b.DelYN = 'N'
+             Where b.OfficeCode = CAST(%s AS VARCHAR(10)) And b.EmpSeqNo = CAST(%s AS VARCHAR(10)) And a.PushCode = 'P30' And b.DelYN = 'N'
                And Convert(VarChar(10), b.RegDate, 120) >= '2016-04-01'
         ),
         WithKey AS (
