@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from schedule_edit_agent.grounding import SHAPE_ASK, ground_changes
 from schedule_edit_agent.skills import UNSUPPORTED_TOPICS
 from services.schedule_edit.requests import ShapeTarget, is_satisfied, shape_count, shape_values, weekend_days
@@ -179,3 +181,36 @@ def test_cells_that_cannot_change_do_not_make_the_limit_impossible():
     _best, _proven, _now, found = min_shape_count(free, [no_weekend, _shape("isolated_off")], today=BEFORE_MONTH)
     assert found is not None and is_satisfied(free, no_weekend, found) and found["C"][6] == "D"
 
+
+
+def test_asking_about_shapes_counts_them_like_the_fix_does(world):
+    """6차 평가(11-04) — 'N-O-D 같은 거 있어?'(후보 없음)에 셈 없이 '안을 찾은 뒤 알려 드립니다'로만 답하던 것."""
+    world.ctxs["s1"] = _ward
+    agent, _ = _agent(call("check_rules", topic="shape"), call("check_rules", topic="shape"),
+                      call("propose_edit", changes=[{"kind": "shape", "shape": "isolated_off", "nurse": ""}]))
+    answer = say(agent, world.conv, "N-O-D 같은 거 있어?", BEFORE_MONTH).answer
+    assert answer == ("근무 모양(바꿀 수 있는 칸 기준): 하루짜리 OFF 4개(A 2일, B 3일, C 5일 외 1개) · "
+                      "하루 근무(퐁당퐁당) 1개(B 8일) · N-O-D·N-O-E·E-O-D 순서 0개 · 가장 긴 연속 근무 3일(A) · "
+                      "가장 많은 주말 근무 2회(A 외 1명).\n고치려면 '하루짜리 OFF 없애줘'·'퐁당퐁당 없애줘'처럼 말씀해 주세요.")
+    # 달 중간이면 바꿀 수 있는 날부터 — 이어서 고쳐 달라고 할 때의 '지금 n개'와 같은 수
+    today = date(2026, 11, 4)
+    later = say(agent, world.conv, "하루짜리 OFF 있어?", today).answer
+    assert later.startswith("근무 모양(바꿀 수 있는 칸 기준 · 4일부터): 하루짜리 OFF 2개(C 5일, B 9일) · ")
+    fix = say(agent, world.conv, "하루짜리 OFF 없애줘", today).answer
+    assert fix.startswith("하루짜리 OFF 줄이기(전원 · 지금 2개)")
+
+
+def test_a_past_month_does_not_name_a_day_that_is_not_there(world):
+    """지난 달이면 '31일부터'처럼 없는 날을 말하지 않는다(검토 11-04 M1)."""
+    world.ctxs["s1"] = _ward
+    agent, _ = _agent(call("check_rules", topic="shape"))
+    past = say(agent, world.conv, "근무 모양 어때?", date(2026, 12, 15)).answer
+    assert past == "이 달은 바꿀 수 있는 날이 남아 있지 않아 고칠 근무 모양을 세지 않습니다."
+
+
+def test_the_fix_example_names_the_order_that_is_there(world):
+    """N-O-D·N-O-E·E-O-D 는 한 종류로 센다 — 예시는 실제로 나온 순서(E-O-D) 이름으로."""
+    world.ctxs["s1"] = lambda: make_ctx({"A": "DEODDOODDO", "B": "DDDODDDODD"}, config=LOOSE)
+    agent, _ = _agent(call("check_rules", topic="shape"))
+    answer = say(agent, world.conv, "근무 순서 이상한 거 있어?", BEFORE_MONTH).answer
+    assert "N-O-D·N-O-E·E-O-D 순서 1개(A 2~4일)" in answer and "'E-O-D 없애줘'" in answer, answer

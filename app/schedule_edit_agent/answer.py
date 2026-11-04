@@ -8,8 +8,8 @@ from typing import List, Optional, Sequence
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
     SHAPE_COUNTED, SHAPE_LABEL, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, ShapeTarget,
-    WishTarget, balance_counts, count_in, cover_count, shape_count, shape_values, transfer_label, wish_count,
-    wish_targets,
+    WishTarget, balance_counts, count_in, cover_count, shape_count, shape_instances, shape_values, transfer_label,
+    wish_count, wish_targets,
 )
 
 _SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
@@ -350,13 +350,13 @@ CHECK_SHOWN = 3
 SHAPE = "shape"
 
 
-def check_answer(session, topic: str, candidates: Sequence) -> str:
+def check_answer(session, topic: str, candidates: Sequence, open_from: int = 0) -> str:
     """찾아 둔 후보(없으면 지금 저장된 근무표)가 그 규칙을 지키는지. 후보는 '모두 지킴'으로 뭉뚱그리지 않는다 —
     원래 어긋나 있던 곳은 그대로 둘 수 있어서(더 나빠지지만 않게 찾는다) 그걸 따로 말한다."""
     from services.schedule_edit.rule_check import check_candidate, check_current, configured, topic_of
     ctx = session.ctx
     if topic == SHAPE:
-        return _shape_answer(candidates)
+        return _shape_answer(candidates) if candidates else _shape_now(ctx, open_from)
     label, families = topic_of(topic)
     if not configured(session.rules, families):
         if topic == "wanted":
@@ -391,9 +391,48 @@ def _check_line(row, name: Optional[str] = None) -> str:
     return " ".join(parts) + eased
 
 
+#: 근무 모양 질문 답 끝의 고치기 예시 — 개수가 있는 모양만(순서는 실제로 나온 이름으로 만든다)
+_SHAPE_FIX_EXAMPLE = {"isolated_off": "하루짜리 OFF 없애줘", "isolated_work": "퐁당퐁당 없애줘"}
+
+
+def _shape_now(ctx: EditContext, open_from: int) -> str:
+    """후보가 없을 때 — 지금 저장된 근무표의 근무 모양(6차 평가 11-04 · 'N-O-D 같은 거 있어?'에 셈 없이 답하던 것).
+    셈은 고치기와 같다(바꿀 수 있는 날 · 바꿀 수 있는 칸이 낀 것만) — 묻고 이어서 고쳐 달라고 할 때 수가 같아야 한다.
+    그래서 머리말에 '바꿀 수 있는 칸 기준'을 단다(묶인 칸만으로 된 모양은 0개로 나온다 · 검토 11-04 L1)."""
+    if open_from >= ctx.days:
+        return "이 달은 바꿀 수 있는 날이 남아 있지 않아 고칠 근무 모양을 세지 않습니다."
+    parts, examples = [], []
+    for kind in SHAPE_COUNTED:
+        req = ShapeTarget(kind, (), open_from, ctx.days - 1)
+        found = [inst for inst in shape_instances(ctx, req) if all(ctx.main[n][d] in codes for n, d, codes in inst)]
+        if not found:
+            parts.append(f"{SHAPE_LABEL[kind]} 0개")
+            continue
+        # 자리 = 하루짜리 OFF·퐁당퐁당은 가운데 칸, 순서는 첫 칸 — 날짜순(앞 몇 개만 보인다 · 검토 11-04 L2)
+        key = 0 if kind == "pattern" else 1
+        found.sort(key=lambda i: (i[key][1], ctx.nurse_ids.index(i[key][0])))
+        at = [(f"{ctx.names.get(i[0][0], i[0][0])} {i[0][1] + 1}~{i[2][1] + 1}일" if kind == "pattern" else
+               f"{ctx.names.get(i[1][0], i[1][0])} {i[1][1] + 1}일") for i in found]
+        parts.append(f"{SHAPE_LABEL[kind]} {len(found)}개({_few(at, '개')})")
+        if kind == "pattern":                       # 예시는 실제로 나온 순서 이름으로(E-O-D 만 있는데 'N-O-D' 라 하지 않게)
+            (n, d, _), _, (_, d3, _) = found[0]
+            examples.append(f"{ctx.main[n][d]}-O-{ctx.main[n][d3]} 없애줘")
+        else:
+            examples.append(_SHAPE_FIX_EXAMPLE[kind])
+    for kind, unit, head in (("work_run", "일", "가장 긴 연속 근무"), ("weekend", "회", "가장 많은 주말 근무")):
+        values = shape_values(ctx, ctx.main, ShapeTarget(kind, (), open_from, ctx.days - 1))
+        top = max(values.values()) if values else 0
+        if top:
+            who = [ctx.names.get(n, n) for n, v in values.items() if v == top]
+            parts.append(f"{head} {top}{unit}({who[0]}" + (f" 외 {len(who) - 1}명)" if len(who) > 1 else ")"))
+    since = f" · {open_from + 1}일부터" if open_from else ""
+    tail = ("고치려면 " + "·".join(f"'{e}'" for e in examples) + "처럼 말씀해 주세요." if examples
+            else "하루짜리 OFF·퐁당퐁당·N-O-D 순서는 바꿀 수 있는 칸에는 고칠 곳이 없습니다.")
+    # '규칙 위반은 아님'은 달지 않는다 — 고립 근무를 하드로 켠 병동이면 퐁당퐁당은 규칙 위반이다(검토 11-04 L4)
+    return f"근무 모양(바꿀 수 있는 칸 기준{since}): " + " · ".join(parts) + ".\n" + tail
+
+
 def _shape_answer(candidates: Sequence) -> str:
-    if not candidates:
-        return "근무 모양은 바꿀 안을 찾은 뒤, 그 안이 지금보다 나빠지는지로 알려 드립니다."
     lines = [(f"{c.rank}안은 나빠지는 곳이 없습니다." if not c.quality else
               f"{c.rank}안은 나빠지는 곳이 {len(c.quality)}곳 있습니다 — {_few(c.quality)}.") for c in candidates]
     if len(lines) == 1:
@@ -401,9 +440,9 @@ def _shape_answer(candidates: Sequence) -> str:
     return "\n".join(["근무 모양(규칙 위반은 아님):"] + [f"· {line}" for line in lines])
 
 
-def _few(items: Sequence[str]) -> str:
+def _few(items: Sequence[str], unit: str = "곳") -> str:
     shown = ", ".join(items[:CHECK_SHOWN])
-    return shown + (f" 외 {len(items) - CHECK_SHOWN}곳" if len(items) > CHECK_SHOWN else "")
+    return shown + (f" 외 {len(items) - CHECK_SHOWN}{unit}" if len(items) > CHECK_SHOWN else "")
 
 
 # ── 버전 비교·되돌리기(11-04) ───────────────────────────────────────────────

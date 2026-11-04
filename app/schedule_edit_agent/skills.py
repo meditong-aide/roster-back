@@ -469,7 +469,7 @@ def check_rules(turn: Turn, params: Dict[str, Any]) -> Outcome:
         if not 1 <= rank <= len(candidates):
             return Outcome(answer=f"후보는 {len(candidates)}개입니다. 1~{len(candidates)}안 중에서 말씀해 주세요.")
         candidates, focus = [candidates[rank - 1]], rank
-    answer = check_answer(session, topic, candidates)
+    answer = check_answer(session, topic, candidates, turn.open_from())
     turn.record("clarify", {"check": topic, "rank": focus, "answer": answer})
     return Outcome(answer=answer, focus=focus)
 
