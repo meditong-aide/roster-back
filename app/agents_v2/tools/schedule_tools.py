@@ -128,19 +128,32 @@ def update_schedule_entry(
 
     group_id-scoped: ScheduleEntry → Schedule join 으로 group_id 격리 검증
     (cross-group mutation 차단, defense-in-depth).
+    ★ 근무표 행을 잠근 **뒤에** 칸을 읽는다(`_lock_schedule_row`) — 기다리는 사이 저장이 칸을 갈아 끼웠으면
+      그 칸은 없으므로 고치지 않고 오류를 돌려준다.
 
     Returns the updated entry and its previous value.
     """
-    entry = (
-        db.query(ScheduleEntry)
-        .join(Schedule, Schedule.schedule_id == ScheduleEntry.schedule_id)
-        .filter(
-            ScheduleEntry.entry_id == entry_id,
-            Schedule.group_id == group_id,
+    def _find():
+        return (
+            db.query(ScheduleEntry)
+            .join(Schedule, Schedule.schedule_id == ScheduleEntry.schedule_id)
+            .filter(
+                ScheduleEntry.entry_id == entry_id,
+                Schedule.group_id == group_id,
+            )
+            .first()
         )
-        .first()
-    )
+
+    found = _find()
+    if not found:
+        return {"error": f"Entry {entry_id} not found in group {group_id}"}
+    busy = _lock_schedule_row(db, found.schedule_id)
+    if busy:
+        return {"error": busy}
+    db.expire(found)
+    entry = _find()
     if not entry:
+        db.commit()  # 쓴 것 없이 잠금만 푼다(rollback 은 같은 AIDE 턴의 감사 기록까지 날린다)
         return {"error": f"Entry {entry_id} not found in group {group_id}"}
     old_shift = entry.shift_id
     entry.shift_id = new_shift_id
@@ -160,6 +173,27 @@ def update_schedule_entry(
     if warnings:
         result["hard_lock_warnings"] = warnings
     return result
+
+
+def _lock_schedule_row(db: Session, schedule_id: str) -> str | None:
+    """근무표 행 잠금(커밋까지) — `/roster/save` 의 잠금(근무표 행 UPDATE)과 서로 기다린다. 못 잡으면 안내 문구.
+
+    ★ 저장은 이 행을 잠근 뒤 칸 지문(etag)을 비교하고 칸을 갈아 끼운다. 칸 수정이 이 잠금 없이 커밋되면 그 사이에
+      끼어 지문 검사 없이 덮인다(11-04 Codex). `updated_at` 은 건드리지 않는다(저장 시각이 아니다).
+    ★ `with_for_update()` 는 mssql+pymssql 에서 SQL 에 아무것도 붙이지 않아(실측) 테이블 힌트로 건다
+      (`lock_wanted_month` 와 같은 방식). 대기 상한도 같다 — [새 버전으로 저장]·마감이 행을 오래 쥐면 끝없이 기다린다.
+    """
+    from services.preferences_service import PreferenceConflictError
+    from services.wanted_daily_quota_service import _LOCK_TIMEOUT_MS, _lock_wait_limit
+
+    try:
+        with _lock_wait_limit(db, _LOCK_TIMEOUT_MS):
+            db.query(Schedule.schedule_id).with_hint(Schedule, "WITH (UPDLOCK, ROWLOCK)", "mssql").filter(
+                Schedule.schedule_id == schedule_id,
+            ).first()
+    except PreferenceConflictError:
+        return "다른 곳에서 이 근무표를 저장하는 중이에요. 잠시 후 다시 시도해 주세요."
+    return None
 
 
 def find_schedule_entry(

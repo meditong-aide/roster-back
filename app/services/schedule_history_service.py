@@ -29,14 +29,23 @@ def _as_date(v: Any) -> Optional[date]:
     return v.date() if isinstance(v, datetime) else v
 
 
-def snapshot_entries(db: Session, schedule_id: str) -> CellMap:
-    """현재 저장된 셀 상태. **교체 직전에** 부를 것."""
-    rows = (
+def snapshot_rows(db: Session, schedule_id: str) -> list:
+    """현재 저장된 칸 원행 `(nurse_id, work_date, shift_id, id)` — 중복 행도 그대로(내용 지문용)."""
+    return (
         db.query(ScheduleEntry.nurse_id, ScheduleEntry.work_date,
                  ScheduleEntry.shift_id, ScheduleEntry.id)
         .filter(ScheduleEntry.schedule_id == schedule_id)
         .all()
     )
+
+
+def snapshot_entries(db: Session, schedule_id: str) -> CellMap:
+    """현재 저장된 셀 상태. **교체 직전에** 부를 것."""
+    return cells_from_rows(snapshot_rows(db, schedule_id))
+
+
+def cells_from_rows(rows) -> CellMap:
+    """칸 원행을 `{(간호사, 날짜): (근무코드, shifts.id)}` 로 접는다(같은 칸 중복은 마지막 행)."""
     out: CellMap = {}
     for nurse_id, work_date, shift_id, int_id in rows:
         d = _as_date(work_date)

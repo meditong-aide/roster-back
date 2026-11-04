@@ -28,6 +28,7 @@ from routers.auth import get_current_user_from_cookie, require_current_user
 from routers.utils import get_days_in_month
 from schemas.auth_schema import User
 from schemas.auth_schema import User as UserSchema
+from services.schedule_etag import content_etag
 from schemas.roster_schema import RosterConfigCreate, PublishRequest
 from services.roster_service import (
     save_roster_config_service,
@@ -1672,6 +1673,8 @@ def get_roster_by_schedule_id(
         "shift_colors": shift_colors,
         "nurses": [],
         "memo": schedule.memo,
+        # 내용 지문 — 자동 저장이 `base_etag` 로 되돌려 보낸다(화면 표시용 가공 전 DB 칸 기준 · 11-04 결정 D8).
+        "etag": content_etag([(e.nurse_id, e.work_date, e.shift_id, e.id) for e in entries], schedule.memo),
     }
     # Structure data by nurse
     entries_by_nurse = {}
@@ -2598,8 +2601,22 @@ def save_roster(
     month = roster_data.get("month")
     schedule_id = roster_data.get("schedule_id")
     roster = roster_data.get("roster")
+    # ★ memo 키가 없으면 기존 메모를 그대로 둔다 — 예전엔 None 으로 덮어 메모가 지워졌다(11-04 검토).
+    #   PC 는 늘 memo 를 보내므로 지금 화면 동작은 같다.
+    memo_given = "memo" in roster_data
     memo = roster_data.get("memo")
-    if not all([year, month, schedule_id, roster]):
+    # 자동 저장(디바운싱) 계약 — `base_etag` 를 보낸 요청만 내용 지문 검사·본문에 없는 간호사 칸 보존·
+    # 모양 검사를 받는다(11-04 결정 D8). 안 보낸 기존 요청은 예전처럼 전량 교체한다.
+    base_etag = roster_data.get("base_etag")
+    if "base_etag" in roster_data and not base_etag:
+        # ★ null·빈 값을 '안 보냄'으로 받으면 검사 없이 전량 교체돼, 바뀐 행만 보낸 자동 저장이 다른 간호사 칸을 지운다.
+        raise HTTPException(status_code=400, detail="base_etag 가 비어 있습니다. 근무표를 조회해 받은 etag 를 보내 주세요.")
+    # 자동 저장은 바뀐 간호사 행만 보내도 된다 — 메모만 바뀐 저장은 roster 가 빈 목록이다(빈 목록 = 칸은 그대로).
+    if base_etag is None:
+        missing = not all([year, month, schedule_id, roster])
+    else:
+        missing = not all([year, month, schedule_id]) or not isinstance(roster, list)
+    if missing:
         raise HTTPException(
             status_code=400,
             detail="Missing required fields: year, month, schedule_id, roster",
@@ -2611,7 +2628,8 @@ def save_roster(
         not_found_detail="No schedule found for this month",
     )
     target_group_id = schedule.group_id
-    schedule.memo = memo
+    if base_etag is not None:
+        _check_etag_save_shape(schedule, year, month, roster)
     # ★★ 같은 근무표에 대한 저장을 **직렬화**한다.
     #   이 엔드포인트는 근무표를 전량 교체하므로, 두 사람이 동시에 저장하면 뒤늦은 쪽이
     #   앞선 저장을 통째로 덮어쓴다(lost update). 이력도 덩달아 "무엇에서 무엇으로" 를
@@ -2623,6 +2641,12 @@ def save_roster(
     schedule.updated_at = datetime.now()
     db.flush()
     _reject_issued_overwrite(db, schedule)
+    # ★ 저장 전 메모도 잠근 **뒤에** 다시 읽는다 — 잠금 전 값은 그 사이 커밋된 메모 저장을 못 봐
+    #   지문 검사가 그 저장을 덮는다(11-04 검토). 그래서 새 메모는 다시 읽은 뒤에 넣는다.
+    db.refresh(schedule, attribute_names=["memo"])
+    stored_memo = schedule.memo
+    if memo_given:
+        schedule.memo = memo
 
     # ── 수정 이력용 스냅샷 ──
     #   ★ 이 엔드포인트는 근무표 **전체**를 받아 전량 교체한다. 즉 서버는 무엇이 바뀌었는지
@@ -2634,22 +2658,27 @@ def save_roster(
     #     rollback 해서 세션을 되살린다(뒤 작업이 깨끗한 트랜잭션에서 시작하도록).
     try:
         from services.schedule_history_service import (
-            snapshot_entries, log_manual_changes,
+            cells_from_rows, log_manual_changes, snapshot_rows,
         )
-        _hist_before = snapshot_entries(db, schedule.schedule_id)
+        _rows_before = snapshot_rows(db, schedule.schedule_id)
+        _hist_before = cells_from_rows(_rows_before)
     except Exception as _hist_exc:
         print(f"[ScheduleHistory] 스냅샷 실패(이력 생략): {_hist_exc}")
         try:
             db.rollback()
         except Exception:
             pass
+        if base_etag is not None:
+            # 지문을 확인할 수 없으면 검사 없이 저장하지 않는다 — 자동 저장이 최신 근무표를 덮을 수 있다.
+            raise HTTPException(status_code=503, detail="근무표를 확인하지 못해 저장하지 않았습니다. 잠시 후 다시 시도해 주세요.")
         _hist_before = None
         # rollback 으로 위에서 읽은 schedule 객체가 만료되므로 다시 붙인다.
         schedule = _load_schedule_for_caller(
             db, current_user, schedule_id,
             not_found_detail="No schedule found for this month",
         )
-        schedule.memo = memo
+        if memo_given:
+            schedule.memo = memo
         # ★ rollback 이 **직렬화 잠금까지 풀어 버린다.** 다시 잡지 않으면 이 저장만
         #   잠금 없이 진행해 동시 저장 시 lost update 가 그대로 난다(이력이 없는 것과
         #   근무표를 잃는 것은 다른 문제다). 위와 같은 방식으로 재획득한다.
@@ -2658,15 +2687,25 @@ def save_roster(
         _reject_issued_overwrite(db, schedule)
     _hist_after: dict = {}
 
-    # Clear existing roster entries
-    db.query(ScheduleEntry).filter(
-        ScheduleEntry.schedule_id == schedule.schedule_id
-    ).delete()
+    # 케이스 보존을 위해 유효 shift_id 기반 정규화 — `_roster_payload_cells`
+    payload = list(_roster_payload_cells(db, target_group_id, year, month, roster))
+    kept_rows: list = []
+    if base_etag is not None:
+        kept_rows = _etag_guarded_clear(db, schedule, roster_data, roster, payload, _rows_before, stored_memo)
+        if kept_rows is None:
+            # 바뀐 것이 없다 — 잠금용 updated_at 갱신까지 되돌리고 쓰지 않는다.
+            db.rollback()
+            return {"message": "Roster saved successfully", "saved": True, "unchanged": True,
+                    "schedule_id": schedule_id, "etag": base_etag}
+        _hist_after.update(cells_from_rows(kept_rows))
+    else:
+        # Clear existing roster entries
+        db.query(ScheduleEntry).filter(
+            ScheduleEntry.schedule_id == schedule.schedule_id
+        ).delete()
 
-    # Save new roster entries (케이스 보존을 위해 유효 shift_id 기반 정규화 — `_roster_payload_cells`)
-    for nurse_id, work_date, norm_shift, int_id in _roster_payload_cells(
-        db, target_group_id, year, month, roster,
-    ):
+    # Save new roster entries
+    for nurse_id, work_date, norm_shift, int_id in payload:
         db.add(ScheduleEntry(
             entry_id=str(uuid.uuid4().hex)[:16],
             schedule_id=schedule.schedule_id,
@@ -2708,8 +2747,63 @@ def save_roster(
 
     # ★ 마감본은 여기까지 오지 않는다(`_reject_issued_overwrite`). 예전엔 마감본 저장 뒤 N 연번·
     #   연차 장부를 다시 계산했는데, 그 재계산은 마감·철회·삭제가 각각 한다.
+    saved_id, saved_etag = schedule.schedule_id, content_etag(kept_rows + payload, schedule.memo)
     db.commit()
-    return {"message": "Roster saved successfully"}
+    # 응답 지문 = 방금 쓴 칸(보존한 칸 + 본문 칸)과 메모 — 다음 자동 저장이 base_etag 로 보낸다.
+    return {"message": "Roster saved successfully", "saved": True, "unchanged": False,
+            "schedule_id": saved_id, "etag": saved_etag}
+
+
+def _body_nurse_ids(roster: list) -> set:
+    """저장 본문에 행이 있는 간호사(칸이 모두 비어 있어도 — 그 간호사 칸을 비우라는 뜻이다)."""
+    return {str(n.get("nurse_id") or n.get("id")) for n in roster if (n.get("nurse_id") or n.get("id"))}
+
+
+def _check_etag_save_shape(schedule: Schedule, year, month, roster: list) -> None:
+    """자동 저장 계약 요청의 모양 검사(400) — 근무표와 다른 연월 · 월 일수를 넘는 날의 근무 · 같은 간호사 행 중복.
+
+    ★ 빈 칸(null·'-')은 월 일수를 넘어도 괜찮다 — 화면이 31칸으로 채워 보내는 배열을 깨지 않게.
+    """
+    if (int(year), int(month)) != (int(schedule.year), int(schedule.month)):
+        raise HTTPException(status_code=400, detail="year·month 가 근무표와 다릅니다.")
+    days = get_days_in_month(int(year), int(month))
+    seen: set = set()
+    for nurse in roster:
+        nid = str(nurse.get("nurse_id") or nurse.get("id") or "")
+        if nid and nid in seen:
+            raise HTTPException(status_code=400, detail=f"같은 간호사 행이 두 번 왔습니다: {nid}")
+        seen.add(nid)
+        for day_index, code in enumerate(nurse.get("schedule") or []):
+            if day_index >= days and code and str(code).strip() not in ("", "-"):
+                raise HTTPException(status_code=400, detail=f"{month}월에 없는 {day_index + 1}일에 근무가 있습니다.")
+
+
+def _etag_guarded_clear(db: Session, schedule: Schedule, roster_data: dict, roster: list, payload: list,
+                        rows_before: list, stored_memo) -> list | None:
+    """`base_etag` 저장의 지문 검사와 칸 지우기. 반환 = 보존한(본문에 없는 간호사의) 칸 행, 바뀐 것이 없으면 None.
+
+    - 지금 지문(저장 전 칸 + 저장 전 메모)과 다르면 409 `ROSTER_STALE` — 늦게 도착한 옛 요청·다른 탭·AIDE 수정을
+      덮지 않는다. 근무표 행 잠금을 잡은 **뒤에** 비교한다(잠금 전 값은 그 사이 저장을 못 본다).
+    - 본문에 없는 간호사의 칸은 지우지 않는다 — 화면이 비활성 간호사 행을 빼고 보내도 자동 저장이 그 칸을 조용히
+      지우지 않게(11-04 검토). 지우려면 `remove_nurse_ids` 로 밝힌다.
+    """
+    current = content_etag(rows_before, stored_memo)
+    if roster_data.get("base_etag") != current:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={
+            "code": "ROSTER_STALE",
+            "message": "다른 곳에서 근무표가 바뀌었어요. 최신 근무표를 불러온 뒤 다시 저장해 주세요.",
+            "current_etag": current,
+        })
+    touched = _body_nurse_ids(roster) | {str(n) for n in (roster_data.get("remove_nurse_ids") or [])}
+    kept = [r for r in rows_before if str(r[0]) not in touched]
+    if content_etag(kept + payload, schedule.memo) == current:
+        return None
+    db.query(ScheduleEntry).filter(
+        ScheduleEntry.schedule_id == schedule.schedule_id,
+        ScheduleEntry.nurse_id.in_(list(touched)),
+    ).delete(synchronize_session=False)
+    return kept
 
 
 #: 근무표 이름 컬럼 길이(`schedules.name nvarchar(50)`) — 넘기면 저장이 통째로 실패한다.
