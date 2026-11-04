@@ -13,6 +13,11 @@ from services.schedule_edit.requests import (
 )
 
 _SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
+#: 칸 지정이 이보다 많으면 칸마다 쓰지 않고 사람별 칸 수로(버전 되돌리기 · 11-04)
+CELLS_SHOWN = 6
+#: 버전 비교 — 한 사람에 보일 칸·보일 사람 수(넘으면 '외 n') · 전부는 카드의 펼친 목록·표 미리보기에
+COMPARE_CELLS = 4
+COMPARE_PEOPLE = 5
 #: 생성 후처리의 이름(`services.schedule_edit.postprocess.KINDS`)
 SOURCE_WORD = {"annual_leave_swap": "자동 연차전환"}
 #: 자동 연차전환을 건너뛴 이유(off_swap report.skip) → 문장
@@ -33,6 +38,11 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
     """
     parts: List[str] = []
     keeps = any(not _same(ctx, r) for r in requests)
+    cells = [r for r in requests if isinstance(r, (SetCell, LeaveCell)) and not (keeps and _same(ctx, r))]
+    grouped = len(cells) > CELLS_SHOWN            # 버전 되돌리기처럼 칸이 많으면 사람별 칸 수로(11-04)
+    if grouped:
+        per = Counter(r.nurse_id for r in cells)
+        parts.append(", ".join(f"{ctx.names.get(n, n)} 칸 {k}개" for n, k in per.items()) + " 지정")
     kept_by_day = Counter(r.day for r in requests if keeps and _same(ctx, r))
     for r in requests:
         if isinstance(r, CoverTarget):
@@ -59,6 +69,8 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
                 parts.append(f"{who} {r.day + 1}일 그대로")
             elif f"{r.day + 1}일 {kept_by_day[r.day]}명 그대로" not in parts:
                 parts.append(f"{r.day + 1}일 {kept_by_day[r.day]}명 그대로")
+        elif isinstance(r, (SetCell, LeaveCell)) and grouped:
+            continue
         elif isinstance(r, SetCell):
             parts.append(f"{who} {r.day + 1}일 {_SHIFT_WORD.get(r.code, r.code)}")
         elif isinstance(r, LeaveCell):
@@ -392,3 +404,52 @@ def _shape_answer(candidates: Sequence) -> str:
 def _few(items: Sequence[str]) -> str:
     shown = ", ".join(items[:CHECK_SHOWN])
     return shown + (f" 외 {len(items) - CHECK_SHOWN}곳" if len(items) > CHECK_SHOWN else "")
+
+
+# ── 버전 비교·되돌리기(11-04) ───────────────────────────────────────────────
+
+
+def compare_answer(target_label: str, current_label: str, data: dict, nurse: Optional[str] = None,
+                   nurse_name: Optional[str] = None) -> str:
+    """`compare_schedules`(화면 [버전 비교]와 같은 숫자) → 문장. 방향은 '그 버전 → 지금'(그 버전 값→지금 값)."""
+    cells = [c for c in data.get("cells", []) if nurse is None or c["nurse_id"] == nurse]
+    scope = f"{nurse_name or nurse} " if nurse else ""
+    head = f"{target_label} → 지금 버전 {current_label}"
+    if not cells:
+        lines = [f"{head}: {scope}칸이 모두 같습니다."]
+    else:
+        people = list(dict.fromkeys(c["nurse_id"] for c in cells))
+        lines = [f"{head}: {scope}다른 칸 {len(cells)}개 · {len(people)}명"]
+        for n in people[:COMPARE_PEOPLE]:
+            mine = [c for c in cells if c["nurse_id"] == n]
+            shown = " · ".join(f"{int(c['date'][8:10])}일 {_code(c['from'])}→{_code(c['to'])}"
+                               for c in mine[:COMPARE_CELLS])
+            more = f" 외 {len(mine) - COMPARE_CELLS}칸" if len(mine) > COMPARE_CELLS else ""
+            lines.append(f"· {mine[0]['nurse_name'] or n} {len(mine)}칸: {shown}{more}")
+        if len(people) > COMPARE_PEOPLE:
+            lines.append(f"· 외 {len(people) - COMPARE_PEOPLE}명")
+    if not nurse:
+        added, removed = len(data.get("added_nurses") or []), len(data.get("removed_nurses") or [])
+        if added or removed:
+            lines.append(f"명단: 지금 버전에만 있는 사람 {added}명 · {target_label.split('(')[0]}에만 있는 사람 {removed}명")
+    return "\n".join(lines)
+
+
+def _code(cell: Optional[dict]) -> str:
+    code = (cell or {}).get("shift_id")
+    return _SHIFT_WORD.get(str(code).upper(), str(code)) if code else "빈 칸"
+
+
+def revert_lead(target_label: str, scope: str, plan, missing_names: Sequence[str]) -> str:
+    """일부 되돌리기 첫 줄 — 가져오는 칸 수와 그대로 두는 칸(이유별)."""
+    from services.schedule_edit.versions import SKIP_WORD
+    kept = " · ".join(f"{SKIP_WORD.get(k, k)} {v}칸" for k, v in plan.skipped.items() if v)
+    from services.schedule_edit.requests import eun, gwa
+    absent = f" {eun('·'.join(missing_names))} {target_label.split('(')[0]}에 없습니다." if missing_names else ""
+    if not plan.requests:
+        why = (f"다른 칸 {plan.differ}개는 모두 그대로 둬야 하는 칸입니다({kept})" if plan.differ
+               else "칸이 모두 같습니다")
+        return f"{gwa(target_label)} {scope}에서 되돌릴 칸이 없습니다 — {why}.{absent}"
+    rest = f" 다른 칸 {plan.differ}개 중 {kept}은 그대로 둡니다." if kept else ""
+    return f"{target_label}에서 {scope} 칸 {len(plan.requests)}개를 가져옵니다.{rest}{absent}"
+

@@ -17,11 +17,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from schedule_edit_agent.answer import (
-    SHAPE, SOURCE_WORD, answer_for, check_answer, describe_requests, fresh_notes, lookup_answer, postprocess_answer,
-    status_text,
+    SHAPE, SOURCE_WORD, answer_for, check_answer, compare_answer, describe_requests, fresh_notes, lookup_answer,
+    postprocess_answer, revert_lead, status_text,
 )
 from schedule_edit_agent.grounding import SHIFT_WORD, SHIFTS, ground_changes, resolve_day, resolve_nurse, resolve_shift
 from services.schedule_edit.apply import ApplyError, apply_to_new_version
+from db.models import Schedule
+from services.schedule_edit import versions
 from services.schedule_edit.journal import record_event
 from services.schedule_edit.postprocess import ANNUAL_LEAVE_SWAP, RUNNERS, as_result
 from services.schedule_edit.postprocess import KINDS as POSTPROCESS_KINDS
@@ -32,7 +34,7 @@ from services.schedule_edit.rule_check import ALL as CHECK_ALL
 from services.schedule_edit.rule_check import TOPICS as CHECK_RULE_TOPICS
 from services.schedule_edit.requests import (
     SHAPE_COUNTED, SHAPE_LABEL, TRANSFERS, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, ShapeTarget,
-    WishTarget, balance_counts, count_cells, shape_count,
+    WishTarget, balance_counts, count_cells, eul, eun, shape_count,
     count_in, first_open_day, transfer_label, wish_count, wish_targets, work_down, work_targets,
 )
 from services.schedule_edit.serialize import allow_to_json, requests_to_json, result_to_dict
@@ -334,10 +336,9 @@ def _is_keep(ctx, r: EditRequest) -> bool:
 #: 바꾸지 않는 답의 종류 → 정해진 문장(LLM 글을 사용자에게 보내지 않는다 · 검토 M3)
 REPLY_KINDS = ("who", "when", "what", "outside_month", "settings", "unsupported", "other", "status", "unclear")
 #: 아직 못 하는 변경 — 답 문장과 처음 화면 안내가 같은 목록을 쓴다
-UNSUPPORTED = "버전 되돌리기"
+UNSUPPORTED = "자동 연차전환 밖의 후처리(보건휴가·수면 OFF 등)"
 #: 아직 못 하는 종류별 안내(reply_only kind=unsupported 의 topic · 평가 11-03: 조회·되돌리기에도 같은 목록이 나갔다)
 UNSUPPORTED_TOPICS = {
-    "undo": "만든 버전 되돌리기·버전 비교는 아직 여기서 못 합니다. 이전 버전은 그대로 남아 있으니 버전 목록에서 골라 주세요.",
     "postprocess": "그 후처리는 아직 여기서 못 합니다. 지금은 자동 연차전환만 할 수 있습니다.",
 }
 
@@ -367,8 +368,8 @@ def reply_text(kind: str, session: EditSession, topic: Optional[str] = None) -> 
         "when=며칠인지 빠짐 · what=무엇으로 바꿀지 빠짐 · outside_month=근무표 달 밖의 날짜 · settings=병동 설정값 자체"
         "(하루 인원 기준·규칙·OFF 기준 수)를 바꾸는 말이나 근무표 새로 만들기 — '사람들 OFF·근무 수를 고르게 맞춰 줘'는 "
         "reply_only 가 아니라 propose_edit 의 kind=balance · unsupported=근무표를 바꾸는 말이지만 아직 못 하는 종류 — "
-        "topic 을 함께 고른다(연속 근무·주말 몰림·하루짜리 OFF 같은 근무 모양은 reply_only 가 아니라 propose_edit 의 "
-        "kind=shape): undo=버전 되돌리기·비교 · "
+        "topic 을 함께 고른다(연속 근무·주말 몰림·하루짜리 OFF 같은 근무 모양은 propose_edit 의 kind=shape, "
+        "다른 버전과 비교·되돌리기는 compare_versions·revert_version): "
         "postprocess=자동 연차전환 밖의 생성 후처리(보건휴가·수면 OFF 등) · other=근무표와 상관없는 말 · "
         "status=지금 요청·결과가 어떤지 묻는 말"
         "(예: '바꿔 줬어?', '지금 뭐 하고 있었지?') · unclear=그 밖에 알아듣기 어려움"),
@@ -500,6 +501,149 @@ def run_postprocess(turn: Turn, params: Dict[str, Any]) -> Outcome:
                             "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
                             "avoid": []}, elapsed_ms=_ms(started))
     return Outcome(answer=answer, preview=preview)
+
+
+# ── 버전 비교·되돌리기(11-04 · 사용자 결정 '통째는 열기·일부는 새 버전') ──────────────────────
+
+_VERSION_PARAMS = {
+    "which": {"type": "string", "enum": list(versions.WHICH),
+              "description": "어느 버전 — number=VER 번호('VER1') · previous=바로 전·방금 전('방금 거 취소') · "
+                             "first=처음·원본 · latest=가장 최근 · date=그날 만든 버전('어제 만든 거' — 오늘로 계산) · "
+                             "name=버전 이름을 말했을 때"},
+    "number": {"type": "integer", "minimum": 1}, "date": {"type": "string", "description": "YYYY-MM-DD"},
+    "name": {"type": "string"},
+}
+
+
+@register(
+    "compare_versions",
+    description=(
+        "근무표를 바꾸지 않고 같은 달의 다른 저장 버전과 지금 버전의 다른 칸을 보여 준다('VER1과 뭐가 달라?', "
+        "'바로 전 버전이랑 비교해줘', '처음 버전과 비교', '장원영 VER1이랑 뭐가 달라'). nurse 는 말했을 때만."),
+    parameters={"type": "object", "properties": {**_VERSION_PARAMS, "nurse": {"type": "string"}},
+                "required": ["which"]},
+    mode="read", llm=True)
+def compare_versions(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    ctx = turn.session.ctx
+    current, target, ask = _pick_version(turn, params)
+    nurse = None
+    if not ask and str(params.get("nurse") or "").strip():
+        nurse, ask = resolve_nurse(ctx, params.get("nurse"))
+    if ask:
+        return _clarify(turn, [ask])
+    from services.schedule_compare_service import compare_schedules   # 화면 [버전 비교]와 같은 숫자
+    data = compare_schedules(turn.db, target, current)
+    answer = compare_answer(versions.label(target), versions.label(current), data, nurse, ctx.names.get(nurse or ""))
+    # compare_schedules(그 버전, 지금) — from = 그 버전 값, to = 지금 값. 표 미리보기는 지금(before) → 그 버전(after)이고,
+    # 그 버전에 값이 없는 칸은 표에 그릴 값이 없어 뺀다(목록·제목 수는 답 문장과 같게 전부 · 검토 11-04 HIGH)
+    mine = [c for c in data.get("cells", []) if nurse is None or c["nurse_id"] == nurse]
+    preview = {"status": "compare", "target": _version_brief(target), "label": versions.label(target),
+               "cells": [{"nurse_id": c["nurse_id"], "name": c["nurse_name"] or c["nurse_id"],
+                          "day": int(c["date"][8:10]), "before": (c.get("to") or {}).get("shift_id"),
+                          "after": (c.get("from") or {}).get("shift_id")} for c in mine]}
+    turn.record("clarify", {"compare": _version_brief(target), "nurse": nurse, "answer": answer})
+    return Outcome(answer=answer, preview=preview)
+
+
+@register(
+    "revert_version",
+    description=(
+        "같은 달의 다른 저장 버전으로 되돌린다. 사람·기간을 말하지 않으면 그 버전을 화면에 연다(저장 없음 · 지금 버전은 "
+        "그대로 — 'VER1으로 되돌려줘', '방금 거 취소해줘'=which previous). 사람(nurses)·기간(day~to_day)을 말하면 "
+        "그 칸만 그 버전 값으로 바꾸는 안을 찾는다('장원영만 VER1처럼 해줘', '15일부터 VER1로 되돌려줘')."),
+    parameters={"type": "object", "properties": {
+        **_VERSION_PARAMS,
+        "nurses": {"type": "array", "items": {"type": "string"}, "description": "말한 간호사 이름들 그대로"},
+        "day": {"type": "integer", "minimum": 1, "maximum": 31,
+                "description": "기간 첫날 — '15일부터'면 day=15·to_day=그 달 마지막 날, '10일까지'면 day=1·to_day=10"},
+        "to_day": {"type": "integer", "minimum": 1, "maximum": 31}},
+        "required": ["which"]},
+    mode="preview", llm=True)
+def revert_version(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    ctx = turn.session.ctx
+    current, target, ask = _pick_version(turn, params)
+    if ask:
+        return _clarify(turn, [ask])
+    names = [str(n).strip() for n in params.get("nurses") or [] if str(n or "").strip()]
+    if not names and params.get("day") is None:
+        return _open_version(turn, current, target)
+    nurses, asks = [], []
+    for said in names:
+        nid, ask = resolve_nurse(ctx, said)
+        asks += [ask] if ask else []
+        nurses += [nid] if nid and nid not in nurses else []
+    first, last = 0, ctx.days - 1
+    if params.get("day") is not None:
+        first, ask = resolve_day(ctx, params.get("day"))
+        asks += [ask] if ask else []
+        last = first if first is not None else last
+        if params.get("to_day") is not None:
+            last, ask = resolve_day(ctx, params.get("to_day"))
+            asks += [ask] if ask else []
+    if asks:
+        return _clarify(turn, asks)
+    if first > last:
+        first, last = last, first
+    other = versions.load_version_cells(turn.db, ctx, target.schedule_id)
+    plan = versions.revert_plan(ctx, other, nurses, first, last, turn.open_from())
+    who = "·".join(ctx.names.get(n, n) for n in nurses)
+    when = (f"{first + 1}일" if first == last else f"{first + 1}~{last + 1}일") if params.get("day") is not None else ""
+    lead = revert_lead(versions.label(target), " · ".join(p for p in (who, when) if p),
+                       plan, [ctx.names.get(n, n) for n in plan.missing])
+    if not plan.requests:
+        turn.record("clarify", {"revert": _version_brief(target), "answer": lead})
+        return Outcome(answer=lead)
+    if len(plan.requests) > versions.REVERT_MAX_CELLS:
+        # 칸 상한이 지정 칸 수만큼 커진다 — 한 턴에 풀 만큼으로(검토 11-04 M1)
+        ask = (f"{versions.label(target)}에서 가져올 칸이 {len(plan.requests)}개라 한 번에 찾기엔 많습니다. 사람이나 기간을 "
+               f"좁혀 주시거나, 통째로 돌아가려면 'VER{target.version}으로 되돌려줘'(그 버전 열기)라고 말씀해 주세요.")
+        return _clarify(turn, [ask])
+    outcome = _propose(turn, plan.requests)
+    outcome.answer = lead + "\n" + outcome.answer
+    return outcome
+
+
+def _current_schedule(turn: Turn):
+    return turn.db.query(Schedule).filter(Schedule.schedule_id == turn.session.schedule_id).first()
+
+
+def _pick_version(turn: Turn, params: Dict[str, Any]):
+    """(지금 버전 행, 고른 버전 행, 되물을 문장)."""
+    current = _current_schedule(turn)
+    if current is None:
+        return None, None, "지금 근무표를 찾지 못했습니다."
+    target, ask = versions.pick_version(turn.db, current, params.get("which"), number=params.get("number"),
+                                        on=params.get("date"), name=params.get("name"))
+    return current, target, ask
+
+
+def _version_brief(s) -> Dict[str, Any]:
+    return {"schedule_id": s.schedule_id, "version": int(s.version), "status": s.status or "draft",
+            "name": s.name or ""}
+
+
+def _open_version(turn: Turn, current, target) -> Outcome:
+    """통째로 되돌리기 = 그 버전 열기 — 저장하지 않는다. 대화도 그 버전으로 옮겨 간다(적용과 같은 효과)."""
+    turn.switched_to = target.schedule_id
+    brief = _version_brief(target)
+    turn.record("open", {"from": _version_brief(current), "to": brief})
+    return Outcome(
+        answer=(f"{eul(versions.label(target))} 엽니다. 지금 보던 {eun(versions.label(current))} 그대로 남습니다. "
+                f"일부만 되돌리려면 '장원영만 VER{target.version}처럼 해줘'처럼 사람이나 날짜를 말씀해 주세요."),
+        effects=[{"type": "switch_version", "opened": True, **brief}])
+
+
+@register("open_version", description="비교 카드의 '그 버전 열기' — 그 버전을 화면에 연다(저장 없음).",
+          parameters={"type": "object", "properties": {"schedule_id": {"type": "string"}},
+                      "required": ["schedule_id"]},
+          mode="read", llm=False)
+def open_version(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    current = _current_schedule(turn)
+    target = next((v for v in (versions.versions_of(turn.db, current) if current is not None else [])
+                   if v.schedule_id == params.get("schedule_id") and v.schedule_id != current.schedule_id), None)
+    if target is None:
+        raise SkillError("그 버전을 열 수 없습니다. 버전 목록에서 골라 주세요.")
+    return _open_version(turn, current, target)
 
 
 # ── 카드 버튼(LLM 없음) ──────────────────────────────────────────────────────

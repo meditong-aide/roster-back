@@ -27,7 +27,7 @@ from db.models import ScheduleEditLog
 logger = logging.getLogger(__name__)
 
 EVENTS = ("message", "propose", "clarify", "lever", "reject", "keep", "choose", "confirm", "cancel", "check", "apply",
-          "error", "close")
+          "error", "close", "open")
 #: 대화 하나를 다시 읽을 때 상한 — 대화가 이보다 길면 앞부분은 상태 복원에 안 쓴다
 READ_LIMIT = 500
 _ready = False

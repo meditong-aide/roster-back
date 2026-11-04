@@ -130,7 +130,7 @@ def test_saying_it_again_for_one_person_replaces_the_ward_request(world):
 
 
 def test_shapes_are_no_longer_answered_as_unsupported():
-    assert set(UNSUPPORTED_TOPICS) == {"undo", "postprocess"}
+    assert set(UNSUPPORTED_TOPICS) == {"postprocess"}          # 버전 되돌리기도 11-04 부터 지원
 
 
 def test_a_said_count_is_kept_not_searched_again(world):

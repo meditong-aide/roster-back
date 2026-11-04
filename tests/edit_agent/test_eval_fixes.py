@@ -61,11 +61,11 @@ def test_reference_note_is_shown_once_per_conversation(world):
 
 
 def test_unsupported_answer_names_the_kind(world):
-    agent, _ = _agent(call("reply_only", kind="unsupported", topic="undo"),
+    agent, _ = _agent(call("reply_only", kind="unsupported", topic="postprocess"),
                       call("reply_only", kind="unsupported"))
-    assert say(agent, world.conv, "방금 버전 되돌려줘").answer.startswith("만든 버전 되돌리기")
-    # (여러 사람 고르게 맞추기는 11-03 · 근무 모양은 11-04 부터 지원 — test_balance.py · test_shape.py)
-    assert "(버전 되돌리기)" in say(agent, world.conv, "?").answer              # 종류를 모르면 전체 목록
+    assert say(agent, world.conv, "보건휴가 넣어줘").answer.startswith("그 후처리는 아직")
+    # (고르게 맞추기 11-03 · 근무 모양·버전 되돌리기 11-04 부터 지원 — test_balance · test_shape · test_versions)
+    assert "(자동 연차전환 밖의 후처리" in say(agent, world.conv, "?").answer   # 종류를 모르면 전체 목록
 
 
 def test_status_after_postprocess_is_kept_in_the_session(world):

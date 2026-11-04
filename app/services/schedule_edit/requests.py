@@ -31,12 +31,40 @@ class AvoidCell:
     codes: FrozenSet[str]
 
 
-def eul(word: str) -> str:
-    """목적격 조사 — 받침이 있으면 '을', 없으면 '를'('연차를' · '공가를' · '생휴를')."""
-    last = word[-1:] if word else ""
+#: 숫자를 읽었을 때 받침이 있나(영·일·삼·육·칠·팔) — 'VER1을' · 'VER2를'
+_DIGIT_FINAL = {"0": True, "1": True, "2": False, "3": True, "4": False, "5": False, "6": True, "7": True, "8": True,
+                "9": False}
+
+
+def _final(word: str):
+    """끝 글자에 받침이 있나 — 괄호로 끝나면 괄호 안 끝 글자('VER2(… 수정본)'). 모르면 None."""
+    word = (word or "").rstrip()
+    if word.endswith(")"):
+        word = word[:-1]
+    last = word[-1:]
     if "가" <= last <= "힣":
-        return word + ("을" if (ord(last) - 0xAC00) % 28 else "를")
-    return word + "을(를)"
+        return bool((ord(last) - 0xAC00) % 28)
+    return _DIGIT_FINAL.get(last)
+
+
+def _particle(word: str, with_final: str, without: str) -> str:
+    final = _final(word)
+    return word + (f"{with_final}({without})" if final is None else with_final if final else without)
+
+
+def eul(word: str) -> str:
+    """목적격 조사 — 받침이 있으면 '을', 없으면 '를'('연차를' · '공가를' · '생휴를' · 'VER1을' · 'VER2를')."""
+    return _particle(word, "을", "를")
+
+
+def eun(word: str) -> str:
+    """보조사 — '은'/'는'('VER1은' · 'VER2는')."""
+    return _particle(word, "은", "는")
+
+
+def gwa(word: str) -> str:
+    """접속 조사 — '과'/'와'('VER1과' · 'VER2와')."""
+    return _particle(word, "과", "와")
 
 
 @dataclass(frozen=True)

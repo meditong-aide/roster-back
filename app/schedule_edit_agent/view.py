@@ -20,7 +20,7 @@ from agent_kit import blocks as B
 from schedule_edit_agent.agent import Reply
 from schedule_edit_agent.answer import SOURCE_WORD
 from schedule_edit_agent.skills import choice_parts
-from services.schedule_edit.requests import CountTarget, transfer_label, work_down
+from services.schedule_edit.requests import CountTarget, eul, gwa, transfer_label, work_down
 from services.schedule_edit.serialize import lever_id, result_to_dict
 from services.schedule_edit.session import EditSession
 
@@ -42,6 +42,8 @@ def blocks_for(reply: Reply, session: Optional[EditSession]) -> List[B.Block]:
         name = switched.get("name") or "수정본"
         version = switched.get("version")
         where = f"{name}(VER{version})" if version is not None else name
+        if switched.get("opened"):     # 되돌리기·비교에서 연 버전 — 저장한 것이 없다(11-04)
+            return [B.notice(reply.answer, tone="info", title=f"{eul(f'VER{version}')} 열었습니다")]
         return [B.notice(f"{where}으로 저장했습니다. 이전 버전은 그대로 남고, 바뀐 칸은 표에 주황 테두리로 보입니다.",
                          tone="success", title="새 버전으로 저장했습니다")]
     preview = reply.preview
@@ -61,6 +63,10 @@ def blocks_for(reply: Reply, session: Optional[EditSession]) -> List[B.Block]:
         return shown + cards
     if status == "choose_transfer":
         return shown + [_transfer_choice(preview)]
+    if status == "compare":
+        # 사람별 칸은 카드의 펼친 목록·표가 보인다 — 요약과 명단 줄만(같은 숫자를 두 번 보이지 않게)
+        lines = reply.answer.split("\n")
+        return [B.text("\n".join([lines[0]] + [x for x in lines[1:] if x.startswith("명단:")]))] + [_compare_card(preview)]
     if status == "confirm":
         return shown + [_confirm_card(preview)]
     if status == "confirm_apply":
@@ -136,6 +142,30 @@ def _person_chips(c: Dict[str, Any]) -> List[Dict[str, str]]:
         cells = sum(1 for x in c["changes"] if x["nurse_id"] == person["nurse_id"])
         chips.append({"label": person["name"], "text": " · ".join(moved) if moved else f"{cells}칸"})
     return chips
+
+
+def _compare_card(preview: Dict[str, Any]) -> B.Block:
+    """버전 비교 — 다른 칸(펼친 목록·표 미리보기는 그 버전 값)과 [그 버전 열기]. 일부만 되돌리는 말을 안내한다."""
+    target, cells = preview["target"], preview["cells"]
+    people = list(dict.fromkeys(c["name"] for c in cells))
+    version = f"VER{target['version']}"
+    shown = "표에는 {} 값으로 미리 보입니다. ".format(version) if any(c["after"] for c in cells) else ""
+    lines = [B.line(f"{shown}일부만 되돌리려면 '{people[0]}만 {version}처럼 해줘'처럼 말씀해 주세요.")] if people else []
+    card = B.card(
+        f"compare-{target['schedule_id']}", f"{gwa(preview['label'])} 다른 칸 {len(cells)}개",
+        summary=" · ".join(people[:SHAPE_SHOWN]) + (f" 외 {len(people) - SHAPE_SHOWN}명" if len(people) > SHAPE_SHOWN else ""),
+        lines=lines,
+        details={"label": f"다른 칸 {len(cells)}개",
+                 "items": [f"{c['name']} {c['day']}일 지금 {c['before'] or '빈 칸'} · {version} {c['after'] or '빈 칸'}"
+                           for c in cells]},
+        actions=[B.action(f"{version} 열기", "open_version", {"schedule_id": target["schedule_id"]},
+                          style="primary")],
+        # 그 버전이 빈 칸인 곳은 표에 그릴 값이 없다 — 미리보기에서만 뺀다(화면 스키마는 after 가 문자열이라
+        # 하나라도 섞이면 미리보기 전체를 버린다)
+        overlay={"kind": "schedule_cells",
+                 "cells": [{"nurse_id": c["nurse_id"], "day": c["day"], "before": c["before"], "after": c["after"]}
+                           for c in cells if c["after"]]} if any(c["after"] for c in cells) else None)
+    return B.cards([card], key=f"compare-{target['schedule_id']}-{len(cells)}", selected=card["id"])
 
 
 def _key(candidates: List[Dict[str, Any]]) -> str:
@@ -240,6 +270,8 @@ def step_label(action: str, params: Dict[str, Any], session: Optional[EditSessio
         return "다른 안 보기"
     if action == "retry_request":
         return "같은 요청으로 다시 찾기"
+    if action == "open_version":
+        return "그 버전 열기"
     if action == "keep_candidate":
         return f"{rank}안을 기준으로 다듬기"
     if action == "reject_candidate":

@@ -35,10 +35,11 @@ BUTTON_TEXT = {"apply_edit": "{rank}번 안 적용", "reject_candidate": "{rank}
                "keep_candidate": "{rank}번 안을 기준으로 다듬기", "choose_lever": "레버 고르기",
                "choose_transfer": "메우는 방식 고르기({choice_id})", "confirm_request": "그래도 진행",
                "cancel_request": "바꾸지 않기", "back_to_candidates": "다른 안 보기",
-               "retry_request": "같은 요청으로 다시 찾기"}
+               "retry_request": "같은 요청으로 다시 찾기", "open_version": "그 버전 열기"}
 #: 말이 흔적을 바꾸는 방식 — 새 요청은 흔적을 새로, 고쳐 말하면 단계로. 그 밖(상태 질문·안내)은 그대로
 #: (실화면 확인 11-03: '반영 안 된 거지?' 가 요청 줄을 덮어썼다)
-TRAIL = {"propose_edit": "new", "revise_edit": "step", "run_postprocess": "new", "answer_confirm": "step"}
+TRAIL = {"propose_edit": "new", "revise_edit": "step", "run_postprocess": "new", "answer_confirm": "step",
+         "revert_version": "new"}
 
 
 @dataclass

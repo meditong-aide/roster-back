@@ -248,7 +248,15 @@ def _max_changes(requests: Sequence[EditRequest]) -> int:
         return WISH_MAX_CHANGES
     if any(isinstance(r, ShapeTarget) for r in requests):
         return SHAPE_MAX_CHANGES
-    return BALANCE_MAX_CHANGES if any(isinstance(r, BalanceTarget) for r in requests) else MAX_CHANGES
+    base = BALANCE_MAX_CHANGES if any(isinstance(r, BalanceTarget) for r in requests) else MAX_CHANGES
+    # 지정한 칸 자체가 많으면(버전 되돌리기 · 11-04) 그 칸 + 메울 몫 — 평소 요청(칸 몇 개)은 그대로
+    cells = sum(1 for r in requests if isinstance(r, (SetCell, LeaveCell)))
+    return max(base, cells + CELL_EXTRA_CHANGES) if cells > MANY_CELLS else base
+
+
+#: 지정한 칸이 이보다 많으면 칸 상한을 그 칸 수 + CELL_EXTRA_CHANGES 로(그 칸 말고 메우기 몫)
+MANY_CELLS = 5
+CELL_EXTRA_CHANGES = 10
 
 
 #: 원티드 반영의 바뀌는 칸 상한 — 넣을 원티드 칸 자체가 수십 개라 평소(20)보다 넓게
