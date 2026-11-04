@@ -119,6 +119,32 @@ def test_bulk_mutation_other_wanted_cancel_blocked_for_nurse():
     assert err is not None
 
 
+def test_bulk_mutation_other_wanted_by_nurse_ids_blocked_for_nurse():
+    """이름 없이 nurse_ids 로 다른 간호사를 가리켜도 막는다 — 예전엔 이름만 봐서 통과했다(11-04 검토)."""
+    err = _check_permission(
+        "bulk_mutation",
+        {"scope": "wanted_submissions", "action": "add_shift", "nurse_ids": ["N999"]},
+        _ctx("nurse"),
+    )
+    assert err is not None
+
+
+def test_bulk_mutation_own_nurse_ids_allowed_for_nurse_and_others_for_hn():
+    own = {"scope": "wanted_submissions", "action": "add_shift", "nurse_ids": ["N001"]}
+    assert _check_permission("bulk_mutation", own, _ctx("nurse")) is None
+    other = {"scope": "wanted_submissions", "action": "add_shift", "nurse_ids": ["N999"]}
+    assert _check_permission("bulk_mutation", other, _ctx("HN")) is None
+
+
+def test_inject_context_overrides_caller_role_flag():
+    """스킬이 간호사 본인 쓰기 규칙을 걸지 정하는 역할 표시는 세션 역할로 덮어쓴다(LLM 값 무시)."""
+    from agents_v2.middleware import _inject_context
+
+    spoofed = _inject_context({"_caller_is_manager": True}, _ctx("nurse"))
+    assert spoofed["_caller_is_manager"] is False
+    assert _inject_context({}, _ctx("HN"))["_caller_is_manager"] is True
+
+
 def test_bulk_mutation_wanted_adjustment_self_allowed_for_nurse():
     err = _check_permission(
         "bulk_mutation",
@@ -202,3 +228,49 @@ def test_update_monthly_limit_allowed_for_hn():
 def test_read_skills_allowed_for_all_roles(role, skill):
     err = _check_permission(skill, {}, _ctx(role))
     assert err is None
+
+
+# ── 그라운딩 뒤 본인 대상 재확인(간호사 쓰기) ───────────
+
+
+def test_self_target_fills_missing_target_with_self_for_nurse():
+    """대상을 비운 간호사 쓰기는 본인으로 채운다 — 비우면 근무표 일괄 변경이 병동 전원에 쓴다(11-04 리뷰)."""
+    from agents_v2.middleware import _check_self_target
+
+    args = {"scope": "schedule", "action": "change_shift", "group_id": "GRP001", "office_id": "OFF001"}
+    assert _check_self_target("bulk_mutation", args, _ctx("nurse")) is None
+    assert args["nurse_ids"] == ["N001"]
+
+
+def test_self_target_blocks_other_nurse_or_other_ward_for_nurse():
+    from agents_v2.middleware import _check_self_target
+
+    grounded_other = {"nurse_ids": ["N077"], "group_id": "GRP001", "office_id": "OFF001"}  # 이름 해석이 남을 가리킴
+    assert "다른 간호사" in _check_self_target("bulk_mutation", grounded_other, _ctx("nurse"))
+    other_ward = {"nurse_ids": ["N001"], "group_id": "W9", "office_id": "OFF001"}          # LLM 이 다른 병동을 넣음
+    assert "다른 병동" in _check_self_target("bulk_mutation", other_ward, _ctx("nurse"))
+
+
+@pytest.mark.parametrize("role", ["HN", "ADM"])
+def test_self_target_leaves_manager_writes(role):
+    from agents_v2.middleware import _check_self_target
+
+    args = {"scope": "schedule", "group_id": "GRP001", "office_id": "OFF001"}
+    assert _check_self_target("bulk_mutation", args, _ctx(role)) is None
+    assert "nurse_ids" not in args
+
+
+def test_execute_skill_rechecks_target_after_grounding(monkeypatch):
+    """이름 해석(③)이 남을 가리키면 실행 전에 막는다 — ① 권한 검사는 원본 인자(본인 이름)만 본다."""
+    import agents_v2.middleware as mw
+
+    monkeypatch.setattr(mw, "_ground_params", lambda db, gid, params: params.update(nurse_ids=["N077"]))
+    monkeypatch.setattr(mw, "_write_skill_audit", lambda *a, **k: None)
+    ran: list = []
+    monkeypatch.setattr(mw, "run_skill", lambda db, name, args: ran.append(args) or {"ok": True})
+    result = mw.execute_skill(
+        None, "bulk_mutation",
+        {"scope": "wanted_submissions", "action": "add_shift", "nurse_name": "김민지", "date": "2026-05-14"},
+        _ctx("nurse"),
+    )
+    assert result.blocked and ran == []

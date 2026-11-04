@@ -24,6 +24,29 @@ def _wanted_request_month_str(year: int, month: int) -> str:
     return f"{year}-{month:02d}"
 
 
+def _day_in_month(value, year, month) -> tuple[str | None, str | None]:
+    """대상 날짜를 'YYYY-MM-DD' 로 맞춘다 → (날짜, 오류 문구). 요청 연월 밖이면 오류.
+
+    ★ 잠금·마감·일자 한도는 요청 연월로 본다 — 다른 달 날짜를 받으면 그 검사를 모두 비켜 가고, 신청 칸에는 월 칸이
+      없어 다른 달 칸과 섞인다(11-04 Codex).
+    """
+    try:
+        day = _parse_date(value)
+        same_month = isinstance(day, date_type) and (day.year, day.month) == (int(year), int(month))
+    except (TypeError, ValueError):
+        day, same_month = None, False
+    if not same_month:
+        return None, f"{value} 은(는) {year}년 {month}월 날짜가 아닙니다."
+    return date_type(day.year, day.month, day.day).isoformat(), None
+
+
+def _month_bounds(month_str: str) -> tuple[date_type, date_type]:
+    """'YYYY-MM' → [그 달 1일, 다음 달 1일) — 신청 칸(`nurse_shift_requests`)에는 월 칸이 없어 날짜로 그 달을 고른다."""
+    year, month = (int(part) for part in month_str.split("-"))
+    start = date_type(year, month, 1)
+    return start, (date_type(year + 1, 1, 1) if month == 12 else date_type(year, month + 1, 1))
+
+
 def get_wanted_status(
     db: Session, group_id: str, year: int, month: int
 ) -> dict | None:
@@ -314,26 +337,37 @@ def clear_wanted_deadline(
 
 
 def cancel_wanted_request(
-    db: Session, nurse_id: str, group_id: str, year: int, month: int, request_id: int | None = None
+    db: Session, nurse_id: str, group_id: str, year: int, month: int, request_id: int | None = None,
+    *, self_rules: bool = False,
 ) -> dict:
     """Cancel (retract) a wanted request submission.
 
-    group_id 필터로 cross-group mutation 차단 (defense-in-depth).
+    수간호사·관리자 경로는 group_id 필터로 cross-group mutation 차단 (defense-in-depth).
+    병동·월 잠금 뒤에 읽는다 · self_rules=True(간호사 본인)면 화면 철회처럼 마감 뒤에는 막는다(`_lock_for_write`).
     """
     month_str = _wanted_request_month_str(year, month)
+    blocked = _lock_for_write(db, group_id, year, month, self_rules=self_rules)
+    if blocked:
+        return {"error": blocked}
     q = db.query(WantedRequest).filter(
         WantedRequest.nurse_id == nurse_id,
-        WantedRequest.group_id == group_id,
         WantedRequest.month == month_str,
         WantedRequest.is_submitted == True,
     )
+    # ★ 간호사 본인 철회는 화면 철회(`retract_submission_service`)처럼 병동을 보지 않고 그 달 제출본을 모두 내린다 —
+    #   병동을 옮기기 전에 낸 제출본이 남으면 화면 저장이 '이미 제출'로 계속 막힌다(11-04 검증). 수간호사·관리자는 이 병동만.
+    if not self_rules:
+        q = q.filter(WantedRequest.group_id == group_id)
     if request_id:
         q = q.filter(WantedRequest.request_id == request_id)
-    row = q.order_by(desc(WantedRequest.submitted_at)).first()
-    if not row:
-        return {"error": "No submitted request found"}
-    row.is_submitted = False
-    row.submitted_at = None
+    rows = q.order_by(desc(WantedRequest.submitted_at)).all()
+    if not rows:
+        return _write_error(db, "No submitted request found")
+    row = rows[0]
+    # 요청 번호를 안 주면 그 달 제출본을 모두 내린다 — 이전 제출본이 철회 뒤 되살아나지 않게(`_submit_draft` 참고).
+    for r in rows:
+        r.is_submitted = False
+        r.submitted_at = None
     db.commit()
     return {
         "nurse_id": nurse_id,
@@ -421,13 +455,18 @@ def _create_draft_with_copy(
     db.add(draft)
 
     # 3. Copy NurseShiftRequest rows from old request_id (with modifications)
+    #    ★ request_id 는 간호사·**월마다** 1부터 다시 센다(`_next_request_id`) — 이 달 날짜만 복사한다. 월을 안 걸면
+    #      다른 달의 같은 번호 칸까지 새 제출본에 딸려 와 편집할 때마다 쌓인다(11-04 확인).
     detailed_id = 1
     if old_request_id is not None:
+        month_start, month_end = _month_bounds(month_str)
         old_rows = (
             db.query(NurseShiftRequest)
             .filter(
                 NurseShiftRequest.nurse_id == nurse_id,
                 NurseShiftRequest.request_id == old_request_id,
+                NurseShiftRequest.shift_date >= month_start,
+                NurseShiftRequest.shift_date < month_end,
             )
             .all()
         )
@@ -524,8 +563,103 @@ def _resolve_shifts_table_id(db: Session, group_id: str, shift_code: str) -> int
     return row[0] if row else None
 
 
+def _lock_for_write(db: Session, group_id: str, year: int, month: int, *, self_rules: bool) -> str | None:
+    """원티드 쓰기 전 병동·월 잠금 — 간호사 본인(self_rules)이면 화면 제출처럼 마감도 본다.
+
+    ★ 최신 제출본은 잠근 **뒤에** 읽는다. 잠금 전에 읽으면 기다리는 사이 커밋된 편집·철회를 못 보고 옛 제출본을
+      복사해 그 변경을 덮는다(11-04 Codex). 그래서 수간호사·관리자 편집도 같은 잠금에 줄을 선다(마감·한도는
+      보지 않는다 — 관리보드 직접 입력처럼 한도 예외, 10-27 결정 ④).
+    ★ 행을 쓰기 **전에** 잠근다(`lock_wanted_month` 교착 설명). 막아야 하면 사용자에게 보일 문구(잠금은 풀어 둔다),
+      아니면 None.
+    """
+    from services.preferences_service import (
+        PreferenceConflictError,
+        _is_wanted_closed,
+        _load_wanted_window,
+    )
+    from services.wanted_daily_quota_service import lock_wanted_month
+
+    try:
+        lock_wanted_month(db, group_id, year, month)
+    except PreferenceConflictError as exc:
+        return str(exc)
+    if not self_rules:
+        return None
+    wanted = _load_wanted_window(db, group_id, year, month)
+    reason = None
+    if wanted is None:
+        reason = f"{year}년 {month}월 원티드 요청이 아직 생성되지 않았습니다."
+    elif _is_wanted_closed(wanted):
+        reason = f"{year}년 {month}월 원티드가 마감되었습니다."
+    if reason:
+        _unlock(db)
+    return reason
+
+
+def _unlock(db: Session) -> None:
+    """잠근 뒤 쓰지 않고 끝나는 경로 — 커밋으로 병동·월 잠금만 푼다(이 도구는 아직 아무것도 쓰지 않았다).
+
+    ★ rollback 으로 풀지 않는다 — AIDE 한 턴은 끝에 한 번 커밋해서, 앞선 스킬 감사 기록(flush 만 된 행)까지 날아간다.
+    """
+    db.commit()
+
+
+def _write_error(db: Session, message: str, *, locked: bool = True) -> dict:
+    """도구 오류 응답 — 실행 경로(잠근 뒤)면 잠금을 풀고 돌려준다."""
+    if locked:
+        _unlock(db)
+    return {"error": message}
+
+
+def _self_quota_block(
+    db: Session, nurse_id: str, group_id: str, year: int, month: int, request_id: int,
+) -> dict | None:
+    """간호사 본인 제출의 일자 한도 — 넘치면 화면 409 와 같은 내용을 오류로 돌려준다(되돌리기는 `_draft_within_quota`)."""
+    from services.preferences_service import PreferenceQuotaError
+    from services.wanted_daily_quota_service import assert_daily_quota
+
+    try:
+        assert_daily_quota(db, nurse_id=nurse_id, group_id=group_id, year=year, month=month,
+                           request_id=request_id)
+    except PreferenceQuotaError as exc:
+        return {"error": str(exc), "code": exc.code, "detail": exc.detail}
+    return None
+
+
+def _draft_within_quota(
+    db: Session, nurse_id: str, group_id: str, year: int, month: int, old_request_id: int | None,
+    *, self_rules: bool, **changes,
+) -> tuple[WantedRequest | None, int, dict | None]:
+    """초안을 만들고, 간호사 본인이면 일자 한도를 본다. 넘치면 이 초안만 되돌리고 잠금을 푼 뒤 오류를 돌려준다.
+
+    ★ 초안은 savepoint 안에서 만든다 — 세션 rollback 은 같은 AIDE 턴의 감사 기록까지 날린다(`_unlock`).
+    """
+    month_str = _wanted_request_month_str(year, month)
+    savepoint = db.begin_nested()
+    draft, count = _create_draft_with_copy(db, nurse_id, month_str, old_request_id, group_id=group_id, **changes)
+    over = _self_quota_block(db, nurse_id, group_id, year, month, draft.request_id) if self_rules else None
+    if over:
+        savepoint.rollback()
+        _unlock(db)
+        return None, 0, over
+    savepoint.commit()
+    return draft, count, None
+
+
 def _submit_draft(db: Session, draft: WantedRequest) -> None:
-    """Mark a draft as submitted."""
+    """Mark a draft as submitted — 같은 달 이전 제출본은 내린다(제출본은 간호사·달마다 1건).
+
+    ★ 예전엔 이전 제출본을 남겨 두어, 철회(최신 1건만 내림) 뒤 그 제출본이 다시 '최신'이 되어 일자 한도
+      자리를 되살렸다(11-04 검토). 제출 게이트처럼 병동은 보지 않는다.
+    """
+    for row in db.query(WantedRequest).filter(
+        WantedRequest.nurse_id == draft.nurse_id,
+        WantedRequest.month == draft.month,
+        WantedRequest.is_submitted == True,
+        WantedRequest.request_id != draft.request_id,
+    ).all():
+        row.is_submitted = False
+        row.submitted_at = None
     draft.is_submitted = True
     draft.submitted_at = datetime.now()
     db.commit()
@@ -533,13 +667,25 @@ def _submit_draft(db: Session, draft: WantedRequest) -> None:
 
 def delete_wanted_by_date(
     db: Session, nurse_id: str, group_id: str, year: int, month: int, date: str,
-    *, preview_only: bool = True,
+    *, preview_only: bool = True, self_rules: bool = False,
 ) -> dict:
-    """Delete a specific date from wanted submissions."""
+    """Delete a specific date from wanted submissions.
+
+    실행이면 병동·월 잠금 뒤에 읽는다(`_lock_for_write`) · self_rules=True(간호사 본인)면 마감 확인을 거친다
+    (빼기만 하므로 일자 한도는 보지 않는다).
+    """
+    date, bad_date = _day_in_month(date, year, month)
+    if bad_date:
+        return {"error": bad_date}
     month_str = _wanted_request_month_str(year, month)
+    locked = not preview_only
+    if locked:
+        blocked = _lock_for_write(db, group_id, year, month, self_rules=self_rules)
+        if blocked:
+            return {"error": blocked}
     old_wr = _get_latest_submitted_request(db, nurse_id, group_id, month_str)
     if not old_wr:
-        return {"error": "제출된 원티드가 없습니다."}
+        return _write_error(db, "제출된 원티드가 없습니다.", locked=locked)
 
     # Check the target date exists
     target = (
@@ -552,7 +698,7 @@ def delete_wanted_by_date(
         .first()
     )
     if not target:
-        return {"error": f"{date}에 해당하는 원티드가 없습니다."}
+        return _write_error(db, f"{date}에 해당하는 원티드가 없습니다.", locked=locked)
 
     if preview_only:
         return {
@@ -585,10 +731,22 @@ def delete_wanted_by_date(
 def add_wanted_by_date(
     db: Session, nurse_id: str, group_id: str,
     year: int, month: int, date: str, shift_code: str,
-    *, comment: str = "", preview_only: bool = True,
+    *, comment: str = "", preview_only: bool = True, self_rules: bool = False,
 ) -> dict:
-    """Add a new date to wanted submissions."""
+    """Add a new date to wanted submissions.
+
+    실행이면 병동·월 잠금 뒤에 읽는다(`_lock_for_write`) · self_rules=True(간호사 본인)면 화면 제출과 같은
+    마감·일자 한도를 거친다.
+    """
+    date, bad_date = _day_in_month(date, year, month)
+    if bad_date:
+        return {"error": bad_date}
     month_str = _wanted_request_month_str(year, month)
+    locked = not preview_only
+    if locked:
+        blocked = _lock_for_write(db, group_id, year, month, self_rules=self_rules)
+        if blocked:
+            return {"error": blocked}
     old_wr = _get_latest_submitted_request(db, nurse_id, group_id, month_str)
     old_rid = old_wr.request_id if old_wr else None
 
@@ -604,7 +762,9 @@ def add_wanted_by_date(
             .first()
         )
         if dup:
-            return {"error": f"{date}에 이미 {dup.shift} 원티드가 있습니다. 수정을 원하시면 변경 요청을 해주세요."}
+            return _write_error(
+                db, f"{date}에 이미 {dup.shift} 원티드가 있습니다. 수정을 원하시면 변경 요청을 해주세요.", locked=locked,
+            )
 
     shifts_table_id = _resolve_shifts_table_id(db, group_id, shift_code)
 
@@ -622,14 +782,15 @@ def add_wanted_by_date(
             "message": msg,
         }
 
-    draft, count = _create_draft_with_copy(
-        db, nurse_id, month_str, old_rid,
-        group_id=group_id,
+    draft, count, over = _draft_within_quota(
+        db, nurse_id, group_id, year, month, old_rid, self_rules=self_rules,
         add_date=date,
         add_shift=shift_code,
         add_shifts_table_id=shifts_table_id,
         add_comment=comment,
     )
+    if over:
+        return over
     _submit_draft(db, draft)
     return {
         "action": "add_wanted_date",
@@ -646,13 +807,25 @@ def add_wanted_by_date(
 def modify_wanted_by_date(
     db: Session, nurse_id: str, group_id: str,
     year: int, month: int, date: str, new_shift_code: str,
-    *, comment: str | None = None, preview_only: bool = True,
+    *, comment: str | None = None, preview_only: bool = True, self_rules: bool = False,
 ) -> dict:
-    """Modify the shift of an existing wanted date."""
+    """Modify the shift of an existing wanted date.
+
+    실행이면 병동·월 잠금 뒤에 읽는다(`_lock_for_write`) · self_rules=True(간호사 본인)면 화면 제출과 같은
+    마감·일자 한도를 거친다.
+    """
+    date, bad_date = _day_in_month(date, year, month)
+    if bad_date:
+        return {"error": bad_date}
     month_str = _wanted_request_month_str(year, month)
+    locked = not preview_only
+    if locked:
+        blocked = _lock_for_write(db, group_id, year, month, self_rules=self_rules)
+        if blocked:
+            return {"error": blocked}
     old_wr = _get_latest_submitted_request(db, nurse_id, group_id, month_str)
     if not old_wr:
-        return {"error": "제출된 원티드가 없습니다."}
+        return _write_error(db, "제출된 원티드가 없습니다.", locked=locked)
 
     target = (
         db.query(NurseShiftRequest)
@@ -664,7 +837,7 @@ def modify_wanted_by_date(
         .first()
     )
     if not target:
-        return {"error": f"{date}에 해당하는 원티드가 없습니다."}
+        return _write_error(db, f"{date}에 해당하는 원티드가 없습니다.", locked=locked)
 
     old_shift = target.shift
     new_shifts_table_id = _resolve_shifts_table_id(db, group_id, new_shift_code)
@@ -684,14 +857,15 @@ def modify_wanted_by_date(
             "message": msg,
         }
 
-    draft, count = _create_draft_with_copy(
-        db, nurse_id, month_str, old_wr.request_id,
-        group_id=group_id,
+    draft, count, over = _draft_within_quota(
+        db, nurse_id, group_id, year, month, old_wr.request_id, self_rules=self_rules,
         modify_date=date,
         modify_shift=new_shift_code,
         modify_shifts_table_id=new_shifts_table_id,
         modify_comment=comment,
     )
+    if over:
+        return over
     _submit_draft(db, draft)
     return {
         "action": "modify_wanted_date",

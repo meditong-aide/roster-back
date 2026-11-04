@@ -75,6 +75,15 @@ def _mutate_wanted_adjustments(db, params, mutation, preview_only):
     )
 
 
+def _self_rules(params) -> bool:
+    """간호사 본인 원티드 쓰기인지 — 수간호사·관리자가 아니면 화면 제출과 같은 잠금·마감·일자 한도를 건다.
+
+    `_caller_is_manager` 는 미들웨어가 세션 역할로 **덮어써** 넣는다(`_inject_context`). 값이 없으면(미들웨어를
+    거치지 않은 호출) 규칙을 거는 쪽이 안전하다.
+    """
+    return not params.get("_caller_is_manager", False)
+
+
 def _cancel_wanted_request(db, params, preview_only=False):
     nurse_ids = params.get("nurse_ids", [])
     year = params.get("year")
@@ -98,7 +107,9 @@ def _cancel_wanted_request(db, params, preview_only=False):
 
     results = []
     for nid in nurse_ids:
-        result = wanted_tools.cancel_wanted_request(db, nid, group_id, year, month)
+        result = wanted_tools.cancel_wanted_request(
+            db, nid, group_id, year, month, self_rules=_self_rules(params),
+        )
         results.append(result)
 
     if len(results) == 1:
@@ -166,6 +177,7 @@ def _delete_wanted_by_date(db, params, preview_only=False):
         month=params.get("month"),
         date=params["date"],
         preview_only=preview_only,
+        self_rules=_self_rules(params),
     )
 
 
@@ -186,6 +198,7 @@ def _add_wanted_by_date(db, params, preview_only=False):
         shift_code=shift_code,
         comment=params.get("comment", ""),
         preview_only=preview_only,
+        self_rules=_self_rules(params),
     )
 
 
@@ -208,6 +221,7 @@ def _change_wanted_by_date(db, params, preview_only=False):
         new_shift_code=new_shift,
         comment=params.get("comment"),
         preview_only=preview_only,
+        self_rules=_self_rules(params),
     )
 
 

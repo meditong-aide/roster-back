@@ -34,11 +34,14 @@ class PreferenceConflictError(Exception):
 
 
 class PreferenceQuotaError(PreferenceConflictError):
-    """일자별 신청 한도(병동 전체·팀) 초과 (409). detail.dates 에 넘친 날짜·범위(team|ward)."""
+    """일자별 신청 한도(병동 전체·팀) 초과 (409). detail.dates 에 넘친 날짜·적용 기준(basis team|ward)·한도·다른 사람 수.
+
+    ★ code 는 대문자다 — 모바일 오류 처리가 `^[A-Z0-9_]{1,80}$` 코드만 살린다(`roster_mobile api/errors.ts`, 11-04 검토).
+    """
 
     def __init__(self, message: str, detail=None):
         super().__init__(message)
-        self.code = "daily_quota_exceeded"
+        self.code = "DAILY_QUOTA_EXCEEDED"
         self.detail = detail
 
 
@@ -202,6 +205,25 @@ def _assert_wanted_writable(wanted, year: int, month: int, submitted_wr) -> None
         raise PreferenceConflictError(
             "이미 제출된 원티드입니다. 제출을 철회한 뒤 다시 저장해주세요."
         )
+
+
+def _assert_dates_in_month(data_to_save: dict, year: int, month: int) -> None:
+    """구형 data 경로 — 저장할 날짜(값이 있는 것)가 모두 요청 연월인지 쓰기 전에 본다(아니면 422, 새 경로와 같은 code).
+
+    ★ 신청 칸(`nurse_shift_requests`)에는 월 칸이 없고 request_id 는 간호사·월마다 1부터라, 다른 달 날짜가 들어가면
+      그 달의 같은 번호 제출본에 붙어 그 달 마감·일자 한도·잠금을 모두 비켜 간다(11-04 Codex).
+    """
+    for date_str, shift_id in data_to_save.items():
+        if not shift_id:
+            continue  # 빈 값은 저장하지 않는다(아래 삽입과 같은 규칙)
+        try:
+            day = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+        except ValueError:
+            day = None
+        if day is None or (day.year, day.month) != (year, month):
+            raise PreferenceValidationError(
+                f"{year}년 {month}월에 속하지 않는 날짜입니다: {date_str}", code="date_out_of_range",
+            )
 
 
 def _normalize_wanted_entries(entries, year: int, month: int, allowed_shift_ids: set) -> list[dict]:
@@ -598,6 +620,9 @@ def _acquire_draft_request(
             .first()
         )
         if draft is not None:
+            # ★ 다른 병동에서 만든 draft 를 재사용하면 병동을 지금 쓰는 병동으로 맞춘다 — 그대로 두면 제출해도 이 병동
+            #   일자 한도 셈(`_latest_submitted_ids`, 병동 조건)에서 빠져 자리를 안 잡는다(11-04 리뷰).
+            draft.group_id = group_id
             return draft
 
     from services.wanted_service import _next_request_id
@@ -685,10 +710,11 @@ def save_wanted_entries_service(
     nurse_id = current_user.nurse_id
     group_id = _resolve_write_group_id(db, current_user, req.group_id)
 
-    if not is_draft:
-        # 일자별 신청 한도 검사를 위해 병동·월을 **칸을 쓰기 전에** 잠근다(교착 방지 — 함수 설명 참고).
-        from services.wanted_daily_quota_service import lock_wanted_month
-        lock_wanted_month(db, group_id, year, month)
+    # 병동·월을 **칸을 쓰기 전에** 잠근다(교착 방지 — `lock_wanted_month` 설명). 제출은 일자 한도 검사 때문에,
+    # ★ 임시저장도 잠근다 — 안 잠그면 임시저장이 draft 를 잡은 뒤 같은 draft 가 제출·커밋되고, 늦게 끝난 임시저장이
+    #   그 제출본의 칸을 한도 검사 없이 바꾼다(11-04 Codex). 잠근 뒤 draft 를 찾으므로 제출된 건 draft 로 안 잡힌다.
+    from services.wanted_daily_quota_service import lock_wanted_month
+    lock_wanted_month(db, group_id, year, month)
     wanted = _load_wanted_window(db, group_id, year, month)
     _assert_wanted_writable(
         wanted, year, month, _latest_submitted_request(db, nurse_id, month_str)
@@ -844,11 +870,10 @@ def submit_preferences_service(
     # 본인 소속 그룹은 토큰 대신 DB(nurses.group_id)에서 — 토큰 stale 시에도 정합.
     home_gid = resolve_home_group_id(db, current_user)
 
-    if not is_draft:
-        # 일자별 신청 한도 검사를 위해 병동·월을 **어떤 행도 쓰기 전에** 잠근다(아래 draft 생성 포함 ·
-        # 교착 방지 — `lock_wanted_month` 설명 참고).
-        from services.wanted_daily_quota_service import lock_wanted_month
-        lock_wanted_month(db, home_gid, req.year, req.month)
+    # 병동·월을 **어떤 행도 쓰기 전에** 잠근다(아래 draft 생성 포함 · 교착 방지 — `lock_wanted_month` 설명 참고).
+    # 임시저장도 잠근다 — 늦게 끝난 임시저장이 그사이 제출된 draft 의 칸을 바꾸지 않게(`save_wanted_entries_service` 참고).
+    from services.wanted_daily_quota_service import lock_wanted_month
+    lock_wanted_month(db, home_gid, req.year, req.month)
 
     # data가 None이거나 없으면 빈 딕셔너리로 안전하게 처리
     preference_data = req.data if req.data is not None else {}
@@ -861,6 +886,7 @@ def submit_preferences_service(
     ).order_by(WantedRequest.created_at.desc()).first()
     
     if draft:
+        draft.group_id = home_gid  # 다른 병동 draft 재사용 시 병동을 맞춘다(`_acquire_draft_request` 참고)
         request_id = draft.request_id
     else:
         # request_id 는 IDENTITY 가 아니고 복합 PK 라 SQLAlchemy 가 자동 채번하지
@@ -889,6 +915,7 @@ def submit_preferences_service(
         else:
             # 평평한 {날짜: shift} 형식
             data_to_save = preference_data
+    _assert_dates_in_month(data_to_save, req.year, req.month)
 
     # ==================== WantedConfig 검증 (최종 제출 시에만) ====================
     # 주의: 과거에는 `and data_to_save` 조건이 붙어 있어, 프론트가 {year, month} 만
@@ -1028,13 +1055,20 @@ def submit_preferences_service(
 
     # 최종 제출 시에만 이전 데이터 삭제 (data_to_save가 있을 때만)
     if not is_draft and data_to_save:  # ← 이제 안전하게 참조 가능
+        # ★ request_id 는 간호사·**월마다** 1부터 다시 센다(`_next_request_id`) — 이 달 날짜·이 달 짝만 지운다.
+        #   월을 안 걸면 다른 달의 같은 번호 제출 칸·짝 신청까지 지워졌다(11-04 확인).
+        _m_start = date(req.year, req.month, 1)
+        _m_end = date(req.year + 1, 1, 1) if req.month == 12 else date(req.year, req.month + 1, 1)
         db.query(NurseShiftRequest).filter(
             NurseShiftRequest.nurse_id == current_user.nurse_id,
-            NurseShiftRequest.request_id == request_id
+            NurseShiftRequest.request_id == request_id,
+            NurseShiftRequest.shift_date >= _m_start,
+            NurseShiftRequest.shift_date < _m_end,
         ).delete()
         db.query(NursePairRequest).filter(
             NursePairRequest.nurse_id == current_user.nurse_id,
-            NursePairRequest.request_id == request_id
+            NursePairRequest.request_id == request_id,
+            NursePairRequest.month == month_str,
         ).delete()
     
     # ==================== 상세 데이터 저장 ====================
@@ -1181,16 +1215,21 @@ def retract_submission_service(req: PreferenceSubmit, current_user, db: Session)
     #   수동 마감이 끼어들면 '열려 있다'고 보고 철회했는데 마감된 상태가 된다.
     # ★ `with_for_update()` 는 이 환경(mssql+pymssql·SQLAlchemy 2.0)에서 SQL 에 아무것도
     #   붙이지 않는다(실측) — 잠금 없이 지나간다. 테이블 힌트로 건다.
-    wanted = (
-        db.query(Wanted)
-        .with_hint(Wanted, "WITH (UPDLOCK, ROWLOCK)", "mssql")
-        .filter(
-            Wanted.group_id == preference.group_id,
-            Wanted.year == req.year,
-            Wanted.month == req.month,
+    # ★ 대기 상한은 제출·임시저장·AIDE 와 같다(`lock_wanted_month`) — 같은 행을 잡으므로 상한이 없으면 끝없이 기다린다.
+    from services.wanted_daily_quota_service import _LOCK_TIMEOUT_MS, _lock_wait_limit
+
+    with _lock_wait_limit(db, _LOCK_TIMEOUT_MS,
+                          "같은 병동의 다른 원티드를 처리하는 중이에요. 잠시 후 다시 시도해 주세요."):
+        wanted = (
+            db.query(Wanted)
+            .with_hint(Wanted, "WITH (UPDLOCK, ROWLOCK)", "mssql")
+            .filter(
+                Wanted.group_id == preference.group_id,
+                Wanted.year == req.year,
+                Wanted.month == req.month,
+            )
+            .first()
         )
-        .first()
-    )
     # 원티드 행이 없으면 거부한다 — 철회하면 다시 제출할 수 없다(제출·저장 게이트
     # `_assert_wanted_writable` 도 행 부재를 409 로 막는다). 열어 두면 제출본만 잃는다.
     if wanted is None:
@@ -1201,8 +1240,16 @@ def retract_submission_service(req: PreferenceSubmit, current_user, db: Session)
         raise PreferenceConflictError(
             f"{req.year}년 {req.month}월 원티드가 마감되어 제출을 철회할 수 없습니다."
         )
-    preference.is_submitted = False
-    preference.submitted_at = None
+    # ★ 그 달 제출본을 **모두** 내린다. 최신 1건만 내리면 옛 AIDE 편집이 남긴 이전 제출본이 '최신 제출본'으로
+    #   되살아나 일자 한도 자리를 다시 잡고, 제출 게이트(`_latest_submitted_request`)도 다시 닫힌다(11-04 검토).
+    #   게이트처럼 병동은 보지 않는다 — 간호사·달 기준이다.
+    for row in db.query(WantedRequest).filter(
+        WantedRequest.nurse_id == current_user.nurse_id,
+        WantedRequest.month == month_str,
+        WantedRequest.is_submitted == True,
+    ).all():
+        row.is_submitted = False
+        row.submitted_at = None
     db.commit()
     return {"message": "Submission retracted successfully"}
 
@@ -1488,6 +1535,19 @@ def _staff_visible_preference(data_json: dict) -> dict:
     }
 
 
+def _rows_of_latest(rows, latest_wr_map: dict) -> dict:
+    """일괄로 읽은 칸·짝꿍 행을 간호사별로 나누되 **그 간호사의 최신 제출본** 행만 남긴다.
+
+    request_id 는 간호사마다 따로 매기므로(복합 키) IN 조건만으로는 다른 간호사의 같은 번호 요청이 섞인다.
+    """
+    out: dict = {}
+    for r in rows:
+        wr = latest_wr_map.get(r.nurse_id)
+        if wr is not None and r.request_id == wr.request_id:
+            out.setdefault(r.nurse_id, []).append(r)
+    return out
+
+
 def get_all_preferences_service(year: int, month: int, current_user, db: Session, override_group_id: str | None = None):
     """
     모든 간호사의 최신 선호도 데이터 조회 서비스 함수 (새 구조 기반)
@@ -1533,28 +1593,38 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
         if wr.nurse_id not in latest_wr_map:
             latest_wr_map[wr.nurse_id] = wr
     results = []
+    if not latest_wr_map:
+        return results
 
-    # ✅ 4️⃣ 각 nurse_id에 대해 shift/pair 요청 조회 및 JSON 구성
+    # ✅ 4️⃣ 칸·짝꿍·허용 근무코드를 **한 번에** 읽는다 — 예전엔 간호사마다 3쿼리였다(30명이면 약 92쿼리 →
+    #   5쿼리, 11-04 최적화). 결과 모양은 그대로다. 날짜는 문자열 변환 비교 대신 그 달 범위(DATE 열).
+    allowed_shifts = {
+        row[0].upper()
+        for row in db.query(Shift.shift_id).filter(
+            Shift.group_id == target_group_id,
+            Shift.show_in_preference == True
+        ).all()
+    }
+    shift_rows_by_nurse = _rows_of_latest(
+        db.query(NurseShiftRequest).filter(
+            NurseShiftRequest.nurse_id.in_(list(latest_wr_map)),
+            NurseShiftRequest.request_id.in_({wr.request_id for wr in latest_wr_map.values()}),
+            NurseShiftRequest.shift_date >= date(year, month, 1),
+            NurseShiftRequest.shift_date <= date(year, month, calendar.monthrange(year, month)[1]),
+        ).all(),
+        latest_wr_map,
+    )
+    pair_rows_by_nurse = _rows_of_latest(
+        db.query(NursePairRequest).filter(
+            NursePairRequest.nurse_id.in_(list(latest_wr_map)),
+            NursePairRequest.request_id.in_({wr.request_id for wr in latest_wr_map.values()}),
+            NursePairRequest.month == month_str,
+        ).all(),
+        latest_wr_map,
+    )
+
     for nurse_id, wr in latest_wr_map.items():
-        # shift 요청들
-        shift_rows = (
-            db.query(NurseShiftRequest)
-            .filter(
-                NurseShiftRequest.nurse_id == nurse_id,
-                NurseShiftRequest.request_id == wr.request_id,
-                cast(NurseShiftRequest.shift_date, String).like(f"{month_str}-%"),
-            )
-            .all()
-        )
-        
-        allowed_shifts = {
-            row[0].upper()
-            for row in db.query(Shift.shift_id).filter(
-                Shift.group_id == target_group_id,
-                Shift.show_in_preference == True
-            ).all()
-        }
-        
+        shift_rows = shift_rows_by_nurse.get(nurse_id, [])
         shift_data = {}
         
         for s in shift_rows:
@@ -1576,16 +1646,7 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
                 "shifts_table_id": s.shifts_table_id,
             }
 
-        # pair 요청들
-        pair_rows = (
-            db.query(NursePairRequest)
-            .filter(
-                NursePairRequest.nurse_id == nurse_id,
-                NursePairRequest.request_id == wr.request_id,
-                NursePairRequest.month == month_str,
-            )
-            .all()
-        )
+        pair_rows = pair_rows_by_nurse.get(nurse_id, [])
         pair_data = [
             {"id": p.target_id, "weight": p.score}
             for p in pair_rows

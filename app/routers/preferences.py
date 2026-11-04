@@ -10,6 +10,7 @@ from db.client2 import get_db
 from db.models import ShiftPreference, Nurse, Shift
 from schemas.auth_schema import User as UserSchema
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from datetime import datetime
 from services.preferences_service import (
@@ -54,7 +55,7 @@ def _raise_domain_error(exc: Exception) -> None:
     if isinstance(exc, PreferenceForbiddenError):
         raise HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, PreferenceQuotaError):
-        # 화면이 넘친 날짜에 빨간 테두리를 그릴 수 있게 날짜·범위(team|ward)를 함께 내린다.
+        # 화면이 넘친 날짜에 빨간 테두리를 그릴 수 있게 날짜·적용 기준(basis team|ward)을 함께 내린다.
         raise HTTPException(
             status_code=409,
             detail={"code": exc.code, "message": str(exc), "detail": exc.detail},
@@ -157,7 +158,10 @@ async def save_preference_draft(
     """
     try:
         analysis = await _merge_analyzed_request(req, current_user, db)
-        result = submit_preferences_service(req, current_user, db, is_draft=True)
+        # ★ 동기 DB 작업은 스레드풀에서 — 이벤트 루프에서 돌리면 쿼리·잠금 대기 동안 서버 전체가 멈춘다([PY-01]).
+        result = await run_in_threadpool(
+            _rollback_on_error, db, submit_preferences_service, req, current_user, db, is_draft=True,
+        )
         return _with_analysis(result, analysis)
     except HTTPException:
         raise
@@ -167,6 +171,44 @@ async def save_preference_draft(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"임시 저장 실패: {str(e)}")
+
+
+def _rollback_on_error(db: Session, fn, *args, **kwargs):
+    """스레드풀에서 부르는 서비스 호출 — 예외가 나면 **그 스레드에서** rollback 하고 다시 던진다.
+
+    ★ 아래 라우터 except 의 rollback 은 이벤트 루프에서 돈다. 루프가 다른 동기 요청에 묶여 있으면 병동·월 잠금이
+      그동안 풀리지 않아, 그 잠금을 기다리는 요청과 서로 기다린다(11-04 리뷰). 400(HTTPException)도 같다.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _submit_with_shift_check(req: PreferenceData, current_user, db: Session):
+    """제출의 동기 부분 — 허용 근무코드 검사(기존 data 경로 전용) 뒤 제출. 스레드풀에서 부른다.
+
+    wanted_entries 경로는 서비스에서 422 로 검증한다.
+    """
+    preferences = (
+        [shift_id for shift_id in req.data.values() if shift_id]
+        if req.wanted_entries is None else []
+    )
+    if preferences:
+        allowed_shifts = {
+            row[0] for row in db.query(Shift.shift_id).filter(
+                Shift.group_id == resolve_home_group_id(db, current_user),
+                Shift.show_in_preference == True
+            ).all()
+        }
+        invalid_shifts = [s for s in preferences if s not in allowed_shifts]
+        if invalid_shifts:
+            raise HTTPException(
+                status_code=400,
+                detail=f"허용되지 않은 근무코드: {', '.join(set(invalid_shifts))}"
+            )
+    return submit_preferences_service(req, current_user, db, is_draft=False)
 
 
 @router.post("/submit")
@@ -184,27 +226,9 @@ async def submit_preferences(
     try:
         # 자연어가 함께 오면 분석해 병합한다 — 이 호출 하나로 분석·저장·제출이 끝난다.
         analysis = await _merge_analyzed_request(req, current_user, db)
-        # 허용 근무코드 검증 (기존 data 기반 경로 전용).
-        # wanted_entries 경로는 서비스에서 422 로 검증한다.
-        preferences = (
-            [shift_id for shift_id in req.data.values() if shift_id]
-            if req.wanted_entries is None else []
-        )
-        if preferences:
-            allowed_shifts = {
-                row[0] for row in db.query(Shift.shift_id).filter(
-                    Shift.group_id == resolve_home_group_id(db, current_user),
-                    Shift.show_in_preference == True
-                ).all()
-            }
-            invalid_shifts = [s for s in preferences if s not in allowed_shifts]
-            if invalid_shifts:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"허용되지 않은 근무코드: {', '.join(set(invalid_shifts))}"
-                )
-
-        result = submit_preferences_service(req, current_user, db, is_draft=False)
+        # ★ 제출은 병동·월 원티드 행을 잠그고 기다릴 수 있다 — 동기 DB 작업은 스레드풀에서 돌린다.
+        #   이벤트 루프에서 돌리면 잠금을 기다리는 동안 다른 요청·헬스체크까지 멈춘다([PY-01]).
+        result = await run_in_threadpool(_rollback_on_error, db, _submit_with_shift_check, req, current_user, db)
         return _with_analysis(result, analysis)
     except HTTPException:
         raise
@@ -238,7 +262,7 @@ def retract_submission(
     db: Session = Depends(get_db)
 ):
     try:
-        return retract_submission_service(req, current_user, db)
+        return _rollback_on_error(db, retract_submission_service, req, current_user, db)  # 실패하면 잠금을 바로 푼다
     except HTTPException:
         raise
     except PreferenceConflictError as e:

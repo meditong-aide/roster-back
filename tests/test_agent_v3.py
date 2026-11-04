@@ -951,6 +951,7 @@ class TestWantedPerDateCRUD:
             "nurse_ids": ["N001"],
             "date": "2026-04-05",
             "preview_only": False,
+            "_caller_is_manager": True,  # 미들웨어가 수간호사 세션에 넣는 값 — 없으면 간호사 본인 규칙(마감·한도)이 걸린다
         })
         assert "error" not in result
         assert result["status"] == "submitted"
@@ -1037,6 +1038,7 @@ class TestWantedPerDateCRUD:
             "shift_codes": ["D_GRP001"],
             "comment": "개인 사정",
             "preview_only": False,
+            "_caller_is_manager": True,  # 미들웨어가 수간호사 세션에 넣는 값 — 없으면 간호사 본인 규칙(마감·한도)이 걸린다
         })
         assert "error" not in result
         assert result["status"] == "submitted"
@@ -1113,6 +1115,7 @@ class TestWantedPerDateCRUD:
             "new_shift_code": "N_GRP001",
             "comment": "야간 선호 변경",
             "preview_only": False,
+            "_caller_is_manager": True,  # 미들웨어가 수간호사 세션에 넣는 값 — 없으면 간호사 본인 규칙(마감·한도)이 걸린다
         })
         assert "error" not in result
         assert result["status"] == "submitted"
@@ -1173,6 +1176,7 @@ class TestWantedPerDateCRUD:
             "shift_codes": ["E_GRP001"],
             "comment": "첫 원티드",
             "preview_only": False,
+            "_caller_is_manager": True,  # 미들웨어가 수간호사 세션에 넣는 값 — 없으면 간호사 본인 규칙(마감·한도)이 걸린다
         })
         assert "error" not in result
         assert result["status"] == "submitted"
@@ -1208,6 +1212,7 @@ class TestWantedPerDateCRUD:
             "month": 4,
             "nurse_ids": ["N002"],
             "preview_only": False,
+            "_caller_is_manager": True,  # 미들웨어가 수간호사 세션에 넣는 값 — 없으면 간호사 본인 규칙(마감·한도)이 걸린다
         })
         assert "error" not in result
         assert result.get("status") == "retracted"

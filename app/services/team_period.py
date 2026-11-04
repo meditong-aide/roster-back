@@ -256,6 +256,21 @@ def team_layout_from_members(
     return {nid: (tid if tid in names else None) for nid, tid in team_of.items()}, ordered_teams(names)
 
 
+def quota_team_map(db: Session, group_id: str, year: int, month: int) -> dict[str, int | None]:
+    """원티드 일자 한도용 그 달 팀 `{nurse_id: team_id|None}` — 이 병동 활성 간호사에게 근무자관리와 같은 팀 규칙.
+
+    1일을 덮는 구간 우선(없으면 `nurses.team_id`) → 1일을 덮는 구간이 없으면 그 달 첫 구간의 팀(월중 합류,
+    `team_layout_from_members` 와 같다) → 활성 팀이 아니면 None(기타). 명단은 `group_members_in_month` 대신
+    이 병동 재직자만 본다(파견 온 사람은 소속 병동 기준 — 원티드도 소속 병동에 저장·검사된다, 11-04 결정 D6).
+    쿼리 4번 — 제출 검사·작성 화면 조회마다 부르므로 무거운 명단 조회를 쓰지 않는다.
+    """
+    team_of = resolve_teams_for_month(db, group_id, date(year, month, 1))
+    if team_of:
+        team_of.update(_mid_month_teams(db, group_id, list(team_of), year, month))
+    names = active_team_names(db, group_id)
+    return {nid: (tid if tid in names else None) for nid, tid in team_of.items()}
+
+
 def _mid_month_teams(db: Session, group_id: str, nurse_ids: list[str], year: int, month: int) -> dict[str, int | None]:
     """월초를 덮는 구간이 없는 사람의 '그 달 첫 구간' 팀(1쿼리). 덮는 구간이 있으면 담지 않는다."""
     m_start = date(year, month, 1)

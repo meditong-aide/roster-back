@@ -2,18 +2,27 @@
 
 - 세는 대상 = 휴가·휴무 계열 '희망' 원티드. 화면(`Roster_wanted.tsx` targetShiftIds)과 같은 기준:
   shifts.type 이 OFF·휴가·휴무·연차 이거나 코드 'O'. 근무 희망(D·E·N)·기피·공가는 세지 않는다.
-- 자리를 차지하는 것 = 간호사별 그 달 **최신 제출본**(`/preferences/all` 과 같은 범위). 임시저장은
-  자리를 잡지 않는다(제출 선착순). 철회하면 자리가 돌아간다.
-- 팀 = 그 달 1일 기준 팀 배정(`resolve_teams_for_month`). 팀 미배정자는 팀 한도 대상이 아니다.
-- 팀 한도 우선순위 = 날짜 지정 > 팀 기본값 > 제한 없음. 병동 전체 제한(`wanted_config`)과 함께 적용.
+  간호사 1명 × 날짜 1칸이 1건이다. 응답에 `counted_shift_ids` 로 실어 화면이 따로 셈하지 않게 한다.
+- 자리를 차지하는 것 = 이 병동 **활성** 간호사별 그 달 **최신 제출본**. 임시저장은 자리를 잡지 않는다
+  (제출 선착순). 철회하면 자리가 돌아간다(그 달 제출본을 모두 내린다 — `retract_submission_service`).
+- 팀 = 근무자관리와 같은 규칙(`team_period.quota_team_map` — 1일 기준, 월중 합류자는 그 달 첫 팀,
+  비활성 팀은 기타). 팀 미배정(기타)은 팀 한도 대상이 아니다.
+- **적용 기준은 날짜마다 하나다(11-04 결정 '팀 우선, 없으면 병동')**: 내 팀 한도(날짜 지정 > 팀 기본값)가
+  있으면 팀 기준, 없으면 병동 일자 한도(`wanted_config`), 둘 다 없으면 제한 없음. 팀 한도를 정한 팀원에게는
+  그날 병동 일자 한도가 걸리지 않는다(설정 화면 경고 `ward_limit_may_overflow`). 병동 기준의 셈은 병동 전원이다.
+- 0 = 그날 그 기준으로 신청 불가(마감), 행 없음 = 제한 없음(다음 순위).
 - 한도를 낮춰도 이미 제출된 신청은 그대로 두고 새 제출만 막는다.
-- 수간호사가 관리보드에서 직접 넣는 원티드는 이 검사를 타지 않는다(한도 예외). AIDE 에이전트의
-  원티드 추가·삭제·변경(`agents_v2/tools/wanted_tools.py` `_submit_draft`)도 쓰기 스킬이
-  수간호사·ADM 전용(`agents_v2/middleware.py` 권한 게이트)이라 같은 예외로 둔다.
-- 검사하는 제출 경로 = `/preferences/submit` 의 두 갈래(`save_wanted_entries_service` · 구형 data 경로).
+- 수간호사·관리자가 관리보드나 AIDE 에서 직접 넣는 원티드는 이 검사를 타지 않는다(한도 예외 — 10-27 결정 ④).
+  ★ AIDE 의 **간호사 본인** 원티드 추가·변경·삭제·철회는 예외가 아니다 — 화면 제출과 같은 잠금·마감·한도를
+  거친다(`agents_v2/tools/wanted_tools.py` `self_rules`, 11-04 검토).
+- 검사하는 제출 경로 = `/preferences/submit` 의 두 갈래(`save_wanted_entries_service` · 구형 data 경로) ·
+  AIDE 간호사 본인 쓰기.
 """
 import calendar
+import logging
+import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -27,15 +36,28 @@ from db.models import (
     WantedRequest,
     WantedTeamLimit,
 )
-from services.preferences_service import PreferenceQuotaError
-from services.team_period import resolve_teams_for_month, sort_team_ids_by_name
+from services.preferences_service import PreferenceConflictError, PreferenceQuotaError
+from services.team_period import quota_team_map, sort_team_ids_by_name
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+logger = logging.getLogger(__name__)
+
 QUOTA_SHIFT_TYPES = ("OFF", "휴가", "휴무", "연차")
+#: 응답에 싣는 적용 규칙 이름 — 날짜마다 내 팀 한도가 있으면 팀, 없으면 병동(11-04 결정).
+QUOTA_RULE = "team_first"
+
+#: 원티드 행 잠금 대기 상한(ms). 제출 트랜잭션은 짧아 이 안에 풀린다 — 넘으면 409 로 다시 제출하게 한다.
+_LOCK_TIMEOUT_MS = 10000
+#: MSSQL 잠금 대기 시간 초과 오류 번호.
+_MSSQL_LOCK_TIMEOUT = 1222
 
 _TEAM_LIMIT_READY = False
+#: 표가 없다고 확인한 뒤 다시 확인하지 않을 때까지(time.monotonic 기준).
+_TEAM_LIMIT_MISSING_UNTIL = 0.0
+_MISSING_RECHECK_SEC = 60
 
 
 class TeamLimitUnavailableError(Exception):
@@ -90,18 +112,21 @@ def team_limit_storage_ready(db: Session) -> bool:
     """wanted_team_limit 표가 있는지.
 
     DDL 미적용 환경에서 제출·조회까지 깨지지 않게 미리 확인한다(실패한 문장은 MSSQL 트랜잭션을
-    오염시키므로 사후 try/except 로는 안 된다). True 는 캐시, False 는 캐시하지 않는다 —
-    DDL 적용 뒤 서버 재기동 없이 바로 반영되도록.
+    오염시키므로 사후 try/except 로는 안 된다). True 는 계속 캐시, False 는 60초만 캐시한다 —
+    표가 없는 동안 조회마다 카탈로그를 묻지 않으면서도, DDL 적용 뒤 서버 재기동 없이 1분 안에 반영되도록.
     """
-    global _TEAM_LIMIT_READY
+    global _TEAM_LIMIT_READY, _TEAM_LIMIT_MISSING_UNTIL
     if _TEAM_LIMIT_READY:
         return True
+    if time.monotonic() < _TEAM_LIMIT_MISSING_UNTIL:
+        return False
     try:
         _TEAM_LIMIT_READY = sa_inspect(db.get_bind()).has_table("wanted_team_limit")
     except SQLAlchemyError as e:
         print(f"[wanted_quota] 팀 한도 저장소 확인 실패(미사용 처리): {e}")
         return False
     if not _TEAM_LIMIT_READY:
+        _TEAM_LIMIT_MISSING_UNTIL = time.monotonic() + _MISSING_RECHECK_SEC
         print("[wanted_quota] wanted_team_limit 표 없음 — 팀 한도 건너뜀(병동 전체 한도만)")
     return _TEAM_LIMIT_READY
 
@@ -151,8 +176,14 @@ def load_team_limits(db: Session, group_id: str, year: int, month: int) -> TeamL
 
 
 def _latest_submitted_ids(db: Session, group_id: str, month_str: str) -> dict:
-    """{nurse_id: 최신 제출본 request_id} — 이 병동 소속·이 병동에 낸 제출본만(`/preferences/all` 과 같은 범위)."""
-    member_ids = [str(n) for (n,) in db.query(Nurse.nurse_id).filter(Nurse.group_id == group_id).all()]
+    """{nurse_id: 최신 제출본 request_id} — 이 병동 **활성** 소속·이 병동에 낸 제출본만.
+
+    ★ 활성만 센다 — 팀 판정(`quota_team_map`)과 같은 사람들이다. 비활성(퇴사 등) 간호사의 제출본이
+      자리를 잡으면 화면의 팀 인원과 셈이 어긋난다(11-04 검토).
+    """
+    member_ids = [str(n) for (n,) in db.query(Nurse.nurse_id).filter(
+        Nurse.group_id == group_id, Nurse.active == 1,
+    ).all()]
     if not member_ids:
         return {}
     latest: dict = {}
@@ -233,26 +264,76 @@ def lock_wanted_month(db: Session, group_id: str, year: int, month: int) -> None
       서로의 미커밋 칸(행 잠금)과 원티드 행 잠금을 엇갈려 기다려 교착이 난다.
     ★ `with_for_update()` 는 이 환경(mssql+pymssql·SQLAlchemy 2.0)에서 SQL 에 아무것도 붙이지
       않는다(실측) — 테이블 힌트로 건다(`retract_submission_service` 와 같은 방식).
+    ★ 대기 상한 `_LOCK_TIMEOUT_MS` — roster-back 에는 쿼리 타임아웃이 없어, 잠금을 쥔 트랜잭션이 멈추면
+      제출이 끝없이 기다린다. 넘으면 PreferenceConflictError(409 '잠시 후 다시').
     """
-    db.query(Wanted).with_hint(Wanted, "WITH (UPDLOCK, ROWLOCK)", "mssql").filter(
-        Wanted.group_id == group_id, Wanted.year == year, Wanted.month == month,
-    ).first()
+    with _lock_wait_limit(db, _LOCK_TIMEOUT_MS):
+        db.query(Wanted).with_hint(Wanted, "WITH (UPDLOCK, ROWLOCK)", "mssql").filter(
+            Wanted.group_id == group_id, Wanted.year == year, Wanted.month == month,
+        ).first()
+
+
+def _is_lock_timeout(exc: OperationalError) -> bool:
+    args = getattr(exc.orig, "args", ()) or ()
+    return (bool(args) and args[0] == _MSSQL_LOCK_TIMEOUT) or "Lock request time out" in str(exc)
+
+
+@contextmanager
+def _lock_wait_limit(db: Session, timeout_ms: int,
+                     busy_message: str = "같은 병동의 다른 원티드를 처리하는 중이에요. 잠시 후 다시 제출해 주세요."):
+    """이 블록의 잠금 대기를 timeout_ms 로 묶는다(MSSQL 만 — 테스트용 SQLite 는 그대로 통과).
+
+    ★ `SET LOCK_TIMEOUT` 은 **연결(세션) 설정**이다. 되돌리지 않으면 연결 풀로 돌아간 뒤 다른 요청의
+      쿼리까지 상한이 걸린다 — 블록이 끝나면 오류가 나도 무제한(-1)으로 되돌린다.
+    ★ 시간 초과(1222)는 문장만 실패하고 트랜잭션은 살아 있다(XACT_ABORT 꺼짐) — 되돌리는 문장을 그대로 보낸다.
+    """
+    if db.get_bind().dialect.name != "mssql":
+        yield
+        return
+    db.execute(text(f"SET LOCK_TIMEOUT {int(timeout_ms)}"))
+    try:
+        yield
+    except OperationalError as exc:
+        if _is_lock_timeout(exc):
+            raise PreferenceConflictError(busy_message) from exc
+        raise
+    finally:
+        try:
+            db.execute(text("SET LOCK_TIMEOUT -1"))
+        except SQLAlchemyError:
+            logger.warning("[wanted_quota] LOCK_TIMEOUT 되돌리기 실패", exc_info=True)
+
+
+def basis_for(day: date, teams: TeamLimits, ward: dict, team_id: int | None) -> tuple | None:
+    """그날 이 팀(None = 기타)에 적용되는 기준 `(basis, 한도)` — 팀 우선, 없으면 병동, 둘 다 없으면 None.
+
+    팀 한도는 날짜 지정 > 팀 기본값(`TeamLimits.limit`). 기타는 팀 한도를 건너뛴다.
+    """
+    team_limit = teams.limit(team_id, day)
+    if team_limit is not None:
+        return "team", team_limit
+    if day in ward:
+        return "ward", ward[day]
+    return None
 
 
 def _exceeded_dates(mine: set, others: dict, ward: dict, teams: TeamLimits,
                     team_map: dict, my_team: int | None) -> list:
-    """내 신청 날짜 중 넘치는 것 — 다른 사람 제출 수 + 나 1명 > 한도."""
-    ward_used = _count_by_date(others)
-    team_used = _count_by_date(others, team_map, my_team) if my_team is not None else Counter()
+    """내 신청 날짜 중 넘치는 것 — 그날 적용 기준에서 다른 사람 제출 수 + 나 1명 > 한도."""
+    ward_others = _count_by_date(others)
+    team_others = _count_by_date(others, team_map, my_team) if my_team is not None else Counter()
     over = []
     for day in sorted(mine):
-        limit = ward.get(day)
-        if limit is not None and ward_used[day] + 1 > limit:
-            over.append({"date": day.isoformat(), "scope": "ward", "limit": limit, "used": ward_used[day]})
-        team_limit = teams.limit(my_team, day)
-        if team_limit is not None and team_used[day] + 1 > team_limit:
-            over.append({"date": day.isoformat(), "scope": "team", "team_id": my_team,
-                         "limit": team_limit, "used": team_used[day]})
+        rule = basis_for(day, teams, ward, my_team)
+        if rule is None:
+            continue
+        basis, limit = rule
+        n_others = (team_others if basis == "team" else ward_others)[day]
+        if n_others + 1 > limit:
+            item = {"date": day.isoformat(), "basis": basis, "limit": limit, "others": n_others}
+            if basis == "team":
+                item["team_id"] = my_team
+            over.append(item)
     return over
 
 
@@ -264,8 +345,8 @@ def _days_text(items: list) -> str:
 def _quota_message(over: list, team_name: str | None) -> str:
     """'14일·21일은 A팀 휴가·휴무 신청이 마감됐어요' 형식(화면 기획 5-4)."""
     parts = []
-    team_items = [i for i in over if i["scope"] == "team"]
-    ward_items = [i for i in over if i["scope"] == "ward"]
+    team_items = [i for i in over if i["basis"] == "team"]
+    ward_items = [i for i in over if i["basis"] == "ward"]
     if team_items:
         parts.append(f"{_days_text(team_items)}은 {team_name or '우리 팀'} 휴가·휴무 신청이 마감됐어요")
     if ward_items:
@@ -276,7 +357,7 @@ def _quota_message(over: list, team_name: str | None) -> str:
 def assert_daily_quota(
     db: Session, *, nurse_id: str, group_id: str, year: int, month: int, request_id: int,
 ) -> None:
-    """제출 직전 검사. 넘치면 PreferenceQuotaError(409 · detail.dates 에 날짜·범위).
+    """제출 직전 검사. 넘치면 PreferenceQuotaError(409 · detail.dates 에 날짜·적용 기준·한도·다른 사람 수).
 
     호출 전제: `lock_wanted_month` 로 병동·월을 잠갔고, 제출할 칸이 flush 돼 있다.
     """
@@ -286,9 +367,9 @@ def assert_daily_quota(
         return
     ward = ward_limits(db, group_id, year, month)
     teams = load_team_limits(db, group_id, year, month)
-    team_map = resolve_teams_for_month(db, group_id, date(year, month, 1)) if teams.any() else {}
+    team_map = quota_team_map(db, group_id, year, month) if teams.any() else {}
     my_team = team_map.get(str(nurse_id))
-    if not any(d in ward or teams.limit(my_team, d) is not None for d in mine):
+    if not any(basis_for(d, teams, ward, my_team) for d in mine):
         return
     others = submitted_quota_dates(db, group_id, year, month, quota_ids, exclude_nurse_id=str(nurse_id))
     over = _exceeded_dates(mine, others, ward, teams, team_map, my_team)
@@ -296,35 +377,42 @@ def assert_daily_quota(
         return
     team_name = _team_name(db, group_id, my_team)
     for item in over:
-        if item["scope"] == "team":
+        if item["basis"] == "team":
             item["team_name"] = team_name
     print(f"[wanted_quota] 제출 거절: nurse={nurse_id}, {year}-{month:02d}, {over}")
     raise PreferenceQuotaError(_quota_message(over, team_name), detail={"dates": over})
 
 
-def _quota_cell(day: date, ward: dict, ward_used: Counter, team_limit: int | None,
-                team_used: Counter | None, mine: set) -> dict:
+def _quota_cell(basis: str, limit: int, taken: int, own: bool) -> dict:
+    """날짜 칸 하나 — 화면은 이 값을 그리기만 한다(PC·모바일 같은 숫자).
+
+    taken = 그 기준 묶음에서 제출본이 잡은 자리(나 포함) · remaining = 남은 자리 · mine = 내 제출본이 그날
+    자리를 잡았는지 · available = 지금 이 날짜를 넣어 제출하면 통과하는지(제출 검사 '다른 사람 + 1 ≤ 한도'와 같은 식).
+    """
     return {
-        "ward_limit": ward.get(day),
-        "ward_used": ward_used[day],
-        "team_limit": team_limit,
-        "team_used": team_used[day] if team_used is not None else None,
-        "mine": day in mine,
+        "basis": basis,
+        "limit": limit,
+        "taken": taken,
+        "remaining": max(limit - taken, 0),
+        "mine": own,
+        "available": taken - (1 if own else 0) < limit,
     }
 
 
 def daily_quota_view(db: Session, *, nurse_id: str, group_id: str, year: int, month: int) -> dict:
-    """원티드 작성 화면용 — 한도가 걸린 날짜별 '병동 전체'·'우리 팀' 한도와 현재 제출 수.
+    """원티드 작성 화면용 — 날짜마다 **나에게 적용되는** 기준(team|ward)·한도·자리 수(11-04 결정).
 
-    used 는 나를 포함한 제출 수다(화면 기존 dailyRequestCounts 와 같음). mine = 내 제출본이 그날
-    자리를 잡고 있는지. 다른 팀 수는 싣지 않는다.
+    ★ 적용 기준의 숫자만 싣는다 — 다른 팀 수, 팀 기준인 날의 병동 수는 싣지 않는다(11-04 '본인에게 적용되는
+      정보만'). 제한이 없는 날은 dates 에 없다. team = 내 팀(그 달 팀 한도가 있을 때만 계산 — 없으면 null).
     """
     ward = ward_limits(db, group_id, year, month)
     teams = load_team_limits(db, group_id, year, month)
-    team_map = resolve_teams_for_month(db, group_id, date(year, month, 1)) if teams.any() else {}
+    quota_ids = quota_shift_ids(db, group_id)
+    team_map = quota_team_map(db, group_id, year, month) if teams.any() else {}
     my_team = team_map.get(str(nurse_id))
     view = {
-        "team_limit_enabled": teams.any(),
+        "rule": QUOTA_RULE,
+        "counted_shift_ids": sorted(quota_ids),
         "team": ({"team_id": my_team, "team_name": _team_name(db, group_id, my_team)}
                  if my_team is not None else None),
         "dates": {},
@@ -332,13 +420,17 @@ def daily_quota_view(db: Session, *, nurse_id: str, group_id: str, year: int, mo
     days = set(ward) | teams.limited_days(my_team, year, month)
     if not days:
         return view
-    subs = submitted_quota_dates(db, group_id, year, month, quota_shift_ids(db, group_id))
-    ward_used = _count_by_date(subs)
-    team_used = _count_by_date(subs, team_map, my_team) if my_team is not None else None
+    subs = submitted_quota_dates(db, group_id, year, month, quota_ids)
+    ward_taken = _count_by_date(subs)
+    team_taken = _count_by_date(subs, team_map, my_team) if my_team is not None else Counter()
     mine = subs.get(str(nurse_id), set())
     for day in sorted(days):
-        view["dates"][day.isoformat()] = _quota_cell(
-            day, ward, ward_used, teams.limit(my_team, day), team_used, mine)
+        rule = basis_for(day, teams, ward, my_team)
+        if rule is None:
+            continue
+        basis, limit = rule
+        taken = (team_taken if basis == "team" else ward_taken)[day]
+        view["dates"][day.isoformat()] = _quota_cell(basis, limit, taken, day in mine)
     return view
 
 
@@ -369,31 +461,93 @@ def _submitted_counts(subs: dict, team_map: dict) -> dict:
     return dict(sorted(out.items()))
 
 
+def _members(db: Session, team_map: dict) -> list:
+    """모달 근무자 목록 — 셈 대상과 같은 사람·같은 팀(`quota_team_map`). 근무자관리 순서(sequence, 이름)."""
+    if not team_map:
+        return []
+    rows = db.query(Nurse.nurse_id, Nurse.name, Nurse.sequence).filter(
+        Nurse.nurse_id.in_(list(team_map)),
+    ).all()
+    rows.sort(key=lambda r: (r.sequence if r.sequence is not None else 1 << 30, r.name or ""))
+    return [{"nurse_id": str(r.nurse_id), "name": r.name, "team_id": team_map.get(str(r.nurse_id))}
+            for r in rows]
+
+
+def _limit_days(limits: TeamLimits, ward: dict, year: int, month: int) -> list:
+    """한도가 걸린 날짜 — 병동 일자 한도 · 팀 날짜 지정 · (팀 기본값이 있으면) 한 달 전체."""
+    days = set(ward) | {d for d, _tid in limits.by_date}
+    if limits.defaults:
+        days |= set(_month_days(year, month))
+    return sorted(days)
+
+
+def _effective_cell(day: date, team_id, limits: TeamLimits, ward: dict, group_taken: dict,
+                    ward_taken: Counter) -> dict:
+    """그날 한 묶음(팀 · None=기타)의 적용 결과. taken = 적용 기준 묶음의 제출 수(병동 기준이면 병동 전원),
+    기준이 없으면 그 묶음 자신의 제출 수."""
+    rule = basis_for(day, limits, ward, team_id)
+    if rule is None:
+        return {"basis": None, "limit": None, "taken": group_taken[team_id][day]}
+    basis, limit = rule
+    taken = group_taken[team_id][day] if basis == "team" else ward_taken[day]
+    return {"basis": basis, "limit": limit, "taken": taken}
+
+
+def _effective(limits: TeamLimits, ward: dict, teams: dict, team_map: dict, subs: dict,
+               year: int, month: int) -> dict:
+    """날짜 × (팀 + 기타) 적용 결과 — 모달 달력·관리보드가 분기 계산 없이 그리게(크기 = 날짜 × (팀 수 + 1))."""
+    ward_taken = _count_by_date(subs)
+    group_taken = {tid: _count_by_date(subs, team_map, tid) for tid in teams}
+    group_taken[None] = _count_by_date({n: d for n, d in subs.items() if team_map.get(n) is None})
+    order = sort_team_ids_by_name(teams)
+    return {
+        day.isoformat(): {
+            "ward": {"limit": ward[day], "taken": ward_taken[day]} if day in ward else None,
+            "teams": [{"team_id": tid, **_effective_cell(day, tid, limits, ward, group_taken, ward_taken)}
+                      for tid in order],
+            "unassigned": _effective_cell(day, None, limits, ward, group_taken, ward_taken),
+        }
+        for day in _limit_days(limits, ward, year, month)
+    }
+
+
 def get_team_limits(db: Session, group_id: str, year: int, month: int) -> dict:
-    """설정 창·관리보드용 — 팀 목록(1일 기준 인원)·기본값·날짜 예외·날짜×팀 제출 수."""
+    """설정 창·관리보드용 — 팀 목록·기본값·날짜 예외·근무자 목록·병동 일자 한도·날짜×(팀+기타) 적용 결과·
+    날짜×팀 제출 수·경고. 팀과 셈 대상은 제출 검사와 같다(`quota_team_map`)."""
     _assert_year_month(year, month)
     teams = _active_teams(db, group_id)
     limits = load_team_limits(db, group_id, year, month)
-    team_map = resolve_teams_for_month(db, group_id, date(year, month, 1))
+    team_map = quota_team_map(db, group_id, year, month)
+    quota_ids = quota_shift_ids(db, group_id)
+    subs = submitted_quota_dates(db, group_id, year, month, quota_ids)
+    ward = ward_limits(db, group_id, year, month)
     members = Counter(t for t in team_map.values() if t in teams)
-    subs = submitted_quota_dates(db, group_id, year, month, quota_shift_ids(db, group_id))
-    return {
+    view = {
         "year": year,
         "month": month,
         "group_id": group_id,
         "storage_ready": team_limit_storage_ready(db),
+        "rule": QUOTA_RULE,
+        "counted_shift_ids": sorted(quota_ids),
         "teams": [
             {"team_id": tid, "team_name": teams[tid], "member_count": members.get(tid, 0),
              "default_limit": limits.defaults.get(tid)}
             for tid in sort_team_ids_by_name(teams)
         ],
         "unassigned_count": sum(1 for t in team_map.values() if t not in teams),
+        "members": _members(db, team_map),
+        "ward_limits": {d.isoformat(): v for d, v in sorted(ward.items())},
+        # ★ 활성 팀 행만 — 비활성 팀 행을 실으면 화면이 받은 그대로 되보낸 저장(통째 교체)이 400 이 된다(11-04 리뷰).
+        #   판정에서도 비활성 팀원은 기타라 그 행은 쓰이지 않는다.
         "dates": [
             {"target_date": d.isoformat(), "team_id": tid, "max_requests": v}
-            for (d, tid), v in sorted(limits.by_date.items())
+            for (d, tid), v in sorted(limits.by_date.items()) if tid in teams
         ],
         "submitted_counts": _submitted_counts(subs, team_map),
+        "effective": _effective(limits, ward, teams, team_map, subs, year, month),
     }
+    view["warnings"] = _limit_warnings(view, limits, ward, teams, team_map)
+    return view
 
 
 def _assert_year_month(year: int, month: int) -> None:
@@ -428,9 +582,8 @@ def _validated_rows(defaults: list, dates: list, teams: dict, year: int, month: 
     return rows
 
 
-def _over_limit_warnings(db: Session, group_id: str, year: int, month: int, view: dict) -> list:
-    """이미 제출된 신청이 새 한도를 넘는 날짜·팀 — 경고만(기존 신청 유지, 새 신청만 막힘)."""
-    limits = load_team_limits(db, group_id, year, month)
+def _over_limit_warnings(view: dict, limits: TeamLimits) -> list:
+    """이미 제출된 신청이 팀 한도를 넘는 날짜·팀 — 기존 신청은 유지되고 새 신청만 막힌다."""
     names = {t["team_id"]: t["team_name"] for t in view["teams"]}
     warnings = []
     for day_iso, cell in view["submitted_counts"].items():
@@ -438,9 +591,36 @@ def _over_limit_warnings(db: Session, group_id: str, year: int, month: int, view
         for key, submitted in cell["by_team"].items():
             limit = limits.limit(int(key), day)
             if limit is not None and submitted > limit:
-                warnings.append({"date": day_iso, "team_id": int(key), "team_name": names.get(int(key)),
-                                 "limit": limit, "submitted": submitted})
+                warnings.append({"kind": "over_limit", "date": day_iso, "team_id": int(key),
+                                 "team_name": names.get(int(key)), "limit": limit, "submitted": submitted})
     return warnings
+
+
+def _ward_overflow_warnings(limits: TeamLimits, ward: dict, teams: dict, team_map: dict) -> list:
+    """그날 병동 전체 신청이 병동 일자 한도를 넘을 수 있는 날 — 팀 한도를 정한 팀원에게는 병동 한도가 걸리지 않는다
+    (팀 우선 · 11-04 결정 D1 의 대가).
+
+    ★ 최대 인원 = min(병동 한도, 병동 기준 인원) + Σ min(팀 한도, 팀 인원). 병동 기준 인원(기타 + 그날 팀 한도가
+      없는 팀원)이 병동 자리를 먼저 채우면 팀 기준 인원이 그 위에 더해진다 — 팀 한도 합만 보면 이 경우를 놓친다(11-04 리뷰).
+    """
+    sizes = Counter(t if t in teams else None for t in team_map.values())
+    warnings = []
+    for day in sorted(ward):
+        limited = {tid: limits.limit(tid, day) for tid in sort_team_ids_by_name(teams)}
+        limited = {tid: v for tid, v in limited.items() if v is not None}
+        if not limited:
+            continue
+        ward_basis = sum(n for tid, n in sizes.items() if tid not in limited)
+        max_total = min(ward[day], ward_basis) + sum(min(v, sizes[tid]) for tid, v in limited.items())
+        if max_total > ward[day]:
+            warnings.append({"kind": "ward_limit_may_overflow", "date": day.isoformat(),
+                             "ward_limit": ward[day], "max_total": max_total, "team_ids": list(limited)})
+    return warnings
+
+
+def _limit_warnings(view: dict, limits: TeamLimits, ward: dict, teams: dict, team_map: dict) -> list:
+    """설정 경고(저장은 막지 않는다) — `over_limit` · `ward_limit_may_overflow`. 조회·저장 응답에 같이 싣는다."""
+    return _over_limit_warnings(view, limits) + _ward_overflow_warnings(limits, ward, teams, team_map)
 
 
 def replace_team_limits(
@@ -451,6 +631,12 @@ def replace_team_limits(
     if not team_limit_storage_ready(db):
         raise TeamLimitUnavailableError("팀 한도 저장소(wanted_team_limit)가 아직 준비되지 않았습니다.")
     rows = _validated_rows(defaults, dates, _active_teams(db, group_id), year, month)
+    # 같은 병동·달 저장끼리 줄 세운다 — 둘이 동시에 '지우고 넣기'를 하면 두 저장의 행이 섞인다.
+    # (제출과는 따로다 — 제출은 원티드 행을 잠근다. 시간 초과 409 · 잠금 오류 500, MSSQL 만.)
+    from services.schedule_versioning import _applock
+
+    _applock(db, f"wanted_team_limit:{group_id}:{year}:{month}", _LOCK_TIMEOUT_MS,
+             "다른 팀 한도 저장이 진행 중입니다. 잠시 후 다시 시도해 주세요.")
     db.query(WantedTeamLimit).filter(
         WantedTeamLimit.group_id == group_id,
         WantedTeamLimit.year == year,
@@ -462,6 +648,4 @@ def replace_team_limits(
         for team_id, day, limit in rows
     ])
     db.commit()
-    view = get_team_limits(db, group_id, year, month)
-    view["warnings"] = _over_limit_warnings(db, group_id, year, month, view)
-    return view
+    return get_team_limits(db, group_id, year, month)

@@ -748,7 +748,11 @@ def get_wanted_team_limits_endpoint(
     current_user: UserSchema = Depends(require_current_user),
     db: Session = Depends(get_db),
 ):
-    """팀별 일자별 원티드 신청 한도 조회 — 팀 목록(1일 기준 인원)·팀 기본값·날짜 예외·날짜×팀 제출 수."""
+    """팀별 일자별 원티드 신청 한도 조회 — 팀 OFF 개수 모달·관리보드용.
+
+    팀 목록·팀 기본값·날짜 예외·근무자 목록(`members` — 제출 검사와 같은 팀 판정)·병동 일자 한도(`ward_limits`)·
+    날짜×(팀+기타) 적용 결과(`effective` — 팀 우선, 없으면 병동)·날짜×팀 제출 수·경고(`warnings`).
+    """
     target_group_id = _team_limit_target_group(db, current_user, group_id)
     try:
         return get_team_limits(db, target_group_id, year, month)
@@ -767,8 +771,9 @@ def put_wanted_team_limits_endpoint(
 ):
     """팀별 일자별 원티드 신청 한도 저장 — 그 달 통째 교체(빈 목록 = 팀 한도 끔).
 
-    응답은 조회와 같은 모양 + `warnings`(이미 제출된 신청이 새 한도를 넘는 날짜·팀 — 기존 신청은
-    유지되고 새 신청만 막힌다).
+    응답은 조회와 같은 모양이다. `warnings` = `over_limit`(이미 제출된 신청이 새 한도를 넘는 날짜·팀 — 기존 신청은
+    유지되고 새 신청만 막힌다) · `ward_limit_may_overflow`(그날 최대 신청 인원 `max_total` > 병동 일자 한도 — 팀
+    우선이라 병동 전체가 병동 한도를 넘을 수 있음). 같은 병동·달 저장끼리는 앱 잠금으로 줄 세운다(시간 초과 409).
     """
     target_group_id = _team_limit_target_group(db, current_user, group_id)
     try:

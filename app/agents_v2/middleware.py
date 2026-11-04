@@ -186,6 +186,22 @@ def execute_skill(
         detail=", ".join(f"{k}: {args_before_ground.get(k)}→{v}" for k, v in grounded.items()) if grounded else "no grounding needed",
     ))
 
+    # ── ③-1 본인 대상 재확인(간호사 쓰기 · 그라운딩 뒤) ──
+    block = _check_self_target(skill_name, args, ctx)
+    if block:
+        steps.append(MiddlewareStep("permission", "block", detail=block))
+        dt = (time.time() - t0) * 1000
+        _write_skill_audit(db, ctx, skill_name, args_original, "DENIED", block, dt)
+        return SkillResult(
+            data={"error": block, "permission_denied": True},
+            duration_ms=dt,
+            skill_name=skill_name,
+            grounded_params=args,
+            blocked=True,
+            block_reason=block,
+            middleware_steps=steps,
+        )
+
     # ── ④ Skill Execution ──
     status = "SUCCESS"
     err_msg: str | None = None
@@ -278,7 +294,37 @@ def _check_permission(
         nurse_name = args.get("nurse_name", "")
         if nurse_name and nurse_name != ctx.nurse_name and nurse_name not in _SELF_REFERENCE_ALIASES:
             return f"다른 간호사({nurse_name})의 데이터를 수정할 권한이 없습니다."
+        # ★ 이름 없이 nurse_ids 로 다른 간호사를 가리키는 길도 막는다 — 이름만 봐서 통과했다(11-04 검토).
+        raw_ids = args.get("nurse_ids") or []
+        if isinstance(raw_ids, (str, int)):
+            raw_ids = [raw_ids]
+        if any(str(n) != str(ctx.nurse_id) for n in raw_ids):
+            return "다른 간호사의 데이터를 수정할 권한이 없습니다."
 
+    return None
+
+
+def _check_self_target(skill_name: str, args: dict, ctx: SessionContext) -> str | None:
+    """간호사(HN·ADM 아님) 쓰기는 그라운딩 **뒤에** 대상이 본인·본인 병동인지 다시 본다. 막을 문구 또는 None.
+
+    ★ ① 권한 검사는 원본 인자만 본다 — 대상을 비우면 스킬이 병동 전원에 쓰고(예: 근무표 일괄 변경), 이름 해석
+      (③)은 부분 일치로 남을 가리킬 수 있으며, LLM 이 준 group_id 는 `_inject_context` 가 그대로 둔다(11-04 리뷰).
+    ★ 대상을 비운 간호사 쓰기는 본인으로 채운다(간호사가 고칠 수 있는 건 본인 데이터뿐이다).
+    """
+    if skill_name.replace("-", "_") not in _MUTATION_SKILLS or _is_head_or_admin(ctx):
+        return None
+    if str(args.get("group_id")) != str(ctx.group_id) or str(args.get("office_id")) != str(ctx.office_id):
+        return "다른 병동의 데이터를 수정할 권한이 없습니다."
+    if not ctx.nurse_id:
+        return "본인 정보를 확인할 수 없어 수정할 수 없습니다."
+    raw_ids = args.get("nurse_ids") or []
+    if isinstance(raw_ids, (str, int)):
+        raw_ids = [raw_ids]
+    if not raw_ids:
+        args["nurse_ids"] = [ctx.nurse_id]
+        return None
+    if {str(n) for n in raw_ids} != {str(ctx.nurse_id)}:
+        return "다른 간호사의 데이터를 수정할 권한이 없습니다."
     return None
 
 
@@ -294,6 +340,9 @@ def _inject_context(args: dict, ctx: SessionContext) -> dict:
     args.setdefault("office_id", ctx.office_id)
     args.setdefault("year", ctx.year)
     args.setdefault("month", ctx.month)
+    # 호출자 역할 — 스킬이 간호사 본인 쓰기 규칙(원티드 잠금·마감·일자 한도)을 걸지 정한다.
+    # ★ LLM 이 넣은 값은 무시하고 세션 역할로 **덮어쓴다**(setdefault 금지 — 역할을 사칭하지 못하게).
+    args["_caller_is_manager"] = _is_head_or_admin(ctx)
 
     # "나/내/제/본인" → current user
     if args.get("nurse_name") in ("나", "내", "제", "본인"):
