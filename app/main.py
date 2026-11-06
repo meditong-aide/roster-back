@@ -334,8 +334,23 @@ def _start_wanted_close_task() -> asyncio.Task | None:
     return task
 
 
+def _schedulers_disabled() -> bool:
+    """같은 DB 에 서버를 하나 더 띄울 때(테스트 인스턴스) 주기 작업을 끄는 스위치(int-0b·M15).
+
+    미설정이면 지금처럼 다 켠다(운영·dev 그대로). 끄지 않으면 병동이동 flush·간호사 동기화·
+    stale job·push 발송기·원티드 자동 마감이 두 벌 돈다.
+    """
+    return os.getenv("BACKGROUND_SCHEDULERS_DISABLED") == "1"
+
+
 @asynccontextmanager
 async def lifespan(app):
+    if _schedulers_disabled():
+        _scheduler_logger.warning(
+            "[Scheduler] BACKGROUND_SCHEDULERS_DISABLED=1 — 주기 작업을 하나도 띄우지 않습니다(테스트 인스턴스 전용)"
+        )
+        yield
+        return
     flush_task = asyncio.create_task(_daily_flush_scheduler())
     sync_task = asyncio.create_task(_daily_nurse_sync_scheduler())
     janitor_task = asyncio.create_task(_stale_jobs_janitor())
@@ -646,13 +661,18 @@ app.include_router(ontology_router.router)
 from routers import nurse_period as nurse_period_router
 app.include_router(nurse_period_router.router)
 
-# Agent v2 test chat UI (dev-only — 별도 페이지에서 컨텍스트 수동 선택)
-from agents_v2.test_chat_router import router as agent_test_router
-app.include_router(agent_test_router)
+# Agent v2 라우터 — 마운트는 agents_v2.surface 한 곳에서 env 스위치로 정한다(int-3a, 10-08).
+#   대화 send·reset: AIDE_AGENT_CHAT=1 · 테스트 화면 /agent/test/*: AIDE_AGENT_TEST_ROUTER=1 이고 운영
+#   환경·운영 DB 가 아닐 때(무인증 실 DB 조회 N66) · 사용량 화면: AIDE_AGENT_USAGE_VIEW=1(무인증 /view N57).
+#   whoami 는 늘 붙는다(위젯이 agent_enabled 로 자기를 숨긴다). 기본 설정 = 대화·테스트·사용량 전부 미마운트.
+# import 는 스위치 밖에 둔다 — 이미지 빌드 게이트(`import app.main`)가 기본 설정에서도 이 모듈들의
+# import 깨짐을 잡게 한다. 마운트만 스위치 안이다.
+from agents_v2 import chat_router as _agent_chat_module  # noqa: E402,F401
+from agents_v2 import test_chat_router as _agent_test_module  # noqa: E402,F401
+from agents_v2 import usage_router as _agent_usage_module  # noqa: E402,F401
+from agents_v2.surface import mount_agent_routes  # noqa: E402
 
-# Agent v2 production chat — 인증 사용자 컨텍스트 자동, floating widget 호출용
-from agents_v2.chat_router import router as agent_chat_router
-app.include_router(agent_chat_router)
+mount_agent_routes(app)
 
 # 공통 에이전트 경로 /api/agents/{agent_id}/… — 에이전트는 import 할 때 등록된다(각자 스위치 · 꺼지면 404)
 #   근무표 수정 도우미(소형 CP-SAT) = schedule-edit · SCHEDULE_EDIT_AGENT_ENABLED=1 일 때만
@@ -663,4 +683,8 @@ app.include_router(agents_router)
 import uvicorn
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    # PORT/RELOAD 를 env 로 덮어쓸 수 있게 (기본은 기존과 동일: 8000, reload on).
+    # 다른 포트로 동시 기동 테스트: PORT=8001 RELOAD=0 python app/main.py
+    _port = int(os.getenv("PORT", "8000"))
+    _reload = os.getenv("RELOAD", "1").lower() not in ("0", "false", "no")
+    uvicorn.run("main:app", host="0.0.0.0", port=_port, reload=_reload)

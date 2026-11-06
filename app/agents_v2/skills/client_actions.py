@@ -1,0 +1,176 @@
+"""Client-action tools — 에이전트가 프론트에 위임하는 '선언형' UI 액션.
+
+server-tool(skill)과 달리 백엔드에서 실행되지 않는다. 에이전트 루프가 이 tool
+호출을 감지하면 DB를 건드리지 않고 ui_action 으로 변환해 응답에 싣고, 프론트
+(roster_front)가 이름 붙은 의도를 실제 route/tab/modal 로 해석·실행한다.
+
+설계: docs/AGENT_CLIENT_ACTION_TOOL_SPEC_2026-05-28.md
+- target 은 closed enum (route SSOT). enum 밖이면 emit 불가 → 텍스트 안내.
+- 백엔드는 컴포넌트/route 문자열을 모른다. 논리적 target/sub 만 emit.
+- role-aware: HN 전용 화면은 일반 간호사에게 navigate 금지.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+# target → 화면 메타.
+#   subs:    허용 섹션/탭/모달 (closed)
+#   hn_only: HN/ADM 전용 화면 여부
+# route 문자열은 프론트(SSOT)가 소유하므로 여기에 담지 않는다.
+NAVIGATE_TARGETS: dict[str, dict[str, Any]] = {
+    "home": {"subs": set(), "hn_only": False},
+    "dashboard": {"subs": set(), "hn_only": False},
+    "wanted": {"subs": set(), "hn_only": False},
+    "roster_view": {"subs": set(), "hn_only": False},
+    "roster_view_my": {"subs": set(), "hn_only": False},
+    "nurse_management": {"subs": {"team_setting", "grade_setting"}, "hn_only": True},
+    # roster_create: 2026-07 프론트 개편으로 '근무표 만들기'가 모달 중심 워크스페이스가
+    # 됐다. 설정이 별도 route(config)가 아니라 이 화면 안 모달로 들어옴. 각 sub 는 프론트의
+    # 모달 1:1 매핑(핸드오프 계약: docs/AGENT_ROSTER_CREATE_NAV_HANDOFF_2026-07-07.md).
+    #   manpower      → ModalManpower (필요인원/인력 설정)
+    #   wanted_config → ModalWantedConfig (원티드 반영 설정)
+    #   deadline      → SetDeadLine (원티드 마감일 설정)
+    #   off_request   → ModalOffRequestList (오프 요청 목록)
+    #   quick_config  → RosterCreateConfigModal (생성 옵션 퀵 설정)
+    #   emergency     → ModalEmergencyReplacement (긴급 대체 찾기)
+    #   version       → 버전 선택 패널
+    "roster_create": {
+        "subs": {
+            "manpower", "wanted_config", "deadline",
+            "off_request", "quick_config", "emergency", "version",
+        },
+        "hn_only": True,
+    },
+    # config = /roster_configure. 2026-07 dev 리팩터로 이 화면이 '근무코드 설정'(ConfTab1)
+    # 단일 뷰로 평탄화됨(탭 제거). weekoff/wanted_setting/month_off 는 roster_create 모달
+    # 등으로 이동 → config 서브에서 제거(잘못 도착 방지). 원티드 설정은 roster_create 의
+    # wanted_config 서브로 안내. (주휴/월오프의 새 위치는 확인 후 remap — 후속)
+    "config": {"subs": {"shift_codes", "wanted_setting"}, "hn_only": True},
+    # 원티드 조정판(관리보드) — 수간호사가 확정/금지 원티드를 조정하는 화면.
+    #   ★ 프론트에서 dev/LOCAL 로만 노출되는 route 다(featureVisibility.isWantedBackVisible).
+    #     백엔드는 그 게이팅을 모르므로 emit 은 하고, 화면이 없으면 프론트 resolver 가
+    #     null 을 돌려 텍스트 안내로 폴백한다(잘못된 이동보다 안내가 낫다).
+    "wanted_board": {"subs": set(), "hn_only": True},
+    # mWorks 등록(엑셀 업로드) — 직위/부서/직원 등록. 신규 병원 온보딩의 진입점.
+    #   ★ **마스터 관리자 전용**이다(Nav 가 is_master_admin 으로 게이팅). HN 은 못 본다 —
+    #     hn_only 로 두면 HN 도 통과하므로 adm_only 를 따로 둔다.
+    "mworks_register": {
+        "subs": {"position", "division", "member"},
+        "hn_only": True,
+        "adm_only": True,
+    },
+    "mypage": {"subs": set(), "hn_only": False},
+    "support": {"subs": {"inquiry"}, "hn_only": False},
+}
+
+# invoke 안전 명령 레지스트리 — 화면의 '버튼 클릭'을 에이전트가 대행하는 client-action.
+# ⚠️ 부수효과 없는(비파괴) 명령만 등록한다. 발행/저장/삭제 같은 파괴적 액션은 여기 없다 —
+# 그런 요청은 navigate 로 화면만 열고 사용자가 직접 UI 확인모달에서 누른다(설계 결정 2026-07-07).
+#   excel_download: 현재 워크스페이스에 표시 중인 근무표를 엑셀로 내보내기(읽기 전용).
+INVOKE_COMMANDS: dict[str, dict[str, Any]] = {
+    "excel_download": {"hn_only": True},
+}
+
+# client-action tool 이름 (registry skill 과 구분). hyphen/underscore 모두 허용.
+# - navigate/prefill: 화면 이동/폼 프리필 (route SSOT 기반 closed enum).
+# - switch_ward: 상단 병동 셀렉터 컨텍스트 전환. route 변경 X, group_id 전환.
+#   ward_name 은 freeform — 프론트가 자신의 ward 셀렉터 목록과 매칭(SSOT).
+# - invoke: 비파괴 UI 명령 대행 (INVOKE_COMMANDS closed enum).
+_CLIENT_ACTION_NAMES = frozenset({"navigate", "prefill", "switch_ward", "invoke"})
+
+
+def normalize_action_name(name: str) -> str:
+    return (name or "").replace("-", "_")
+
+
+def is_client_action(name: str) -> bool:
+    """name 이 client-action tool(navigate/prefill)인지."""
+    return normalize_action_name(name) in _CLIENT_ACTION_NAMES
+
+
+def _is_hn(ctx: Any) -> bool:
+    return getattr(ctx, "user_role", "") in ("HN", "ADM")
+
+
+def target_permission_error(target: Any, ctx: Any) -> str | None:
+    """HN 전용 target 을 일반 간호사가 navigate/prefill 하려 하면 차단 메시지.
+
+    알 수 없는 target 은 None (권한 문제 아님 — build 단계에서 '화면 없음' 처리).
+    switch_ward 는 target 이 없는 client-action 이므로 본 함수가 항상 None 반환 — 권한은
+    프론트의 셀렉터(접근 가능 ward 목록)가 SSOT 로 강제.
+    """
+    meta = NAVIGATE_TARGETS.get(target)
+    if not meta:
+        return None
+    # adm_only 가 hn_only 보다 좁다 — HN 도 막는다(프론트 Nav 의 is_master_admin 게이팅과 일치).
+    if meta.get("adm_only") and getattr(ctx, "user_role", "") != "ADM":
+        return "해당 화면은 마스터 관리자(ADM) 전용입니다."
+    if meta["hn_only"] and not _is_hn(ctx):
+        return "해당 화면은 수간호사(HN) 또는 관리자(ADM) 전용입니다."
+    return None
+
+
+def command_permission_error(command: Any, ctx: Any) -> str | None:
+    """HN 전용 invoke 명령을 일반 간호사가 호출하면 차단 메시지.
+
+    알 수 없는 command 는 None (권한 문제 아님 — build 단계에서 '실행 불가' 처리).
+    """
+    meta = INVOKE_COMMANDS.get(command)
+    if not meta:
+        return None
+    if meta["hn_only"] and not _is_hn(ctx):
+        return "해당 기능은 수간호사(HN) 또는 관리자(ADM) 전용입니다."
+    return None
+
+
+def build_ui_action(name: str, args: dict) -> tuple[dict | None, str | None]:
+    """client-action tool 호출 → ui_action dict. ``(ui_action, error)`` 반환.
+
+    error 가 있으면 ui_action 은 None — 에이전트가 텍스트로 사용자에게 안내한다.
+    내부 id/route 문자열은 담지 않고 논리적 target/sub/query/values 만 담는다.
+    """
+    norm = normalize_action_name(name)
+    args = args or {}
+
+    # switch_ward: 화면 이동이 아니라 상단 셀렉터 컨텍스트 전환. target enum 적용 X.
+    if norm == "switch_ward":
+        ward_name = (args.get("ward_name") or "").strip()
+        if not ward_name:
+            return None, "전환할 병동 이름이 필요합니다 (예: '9A')."
+        action: dict[str, Any] = {"action": norm, "ward_name": ward_name}
+        return action, None
+
+    # invoke: 비파괴 UI 명령 대행 (엑셀 다운로드 등). target enum 대신 command enum.
+    if norm == "invoke":
+        command = args.get("command")
+        if command not in INVOKE_COMMANDS:
+            allowed = ", ".join(sorted(INVOKE_COMMANDS)) or "없음"
+            return None, f"'{command}'는 실행 가능한 명령이 아닙니다. (가능: {allowed})"
+        invoke_action: dict[str, Any] = {"action": norm, "command": command}
+        params = args.get("params")
+        if params:
+            invoke_action["params"] = params
+        return invoke_action, None
+
+    target = args.get("target")
+    meta = NAVIGATE_TARGETS.get(target)
+    if meta is None:
+        return None, f"'{target}'에 해당하는 화면이 없습니다."
+
+    sub = args.get("sub")
+    if sub is not None and sub not in meta["subs"]:
+        allowed = ", ".join(sorted(meta["subs"])) or "없음"
+        return None, f"'{target}' 화면에는 '{sub}' 섹션이 없습니다. (가능: {allowed})"
+
+    action = {"action": norm, "target": target}
+    if sub is not None:
+        action["sub"] = sub
+    query = args.get("query")
+    if query:
+        action["query"] = query
+    if norm == "prefill":
+        values = args.get("values")
+        if values:
+            action["values"] = values
+    return action, None

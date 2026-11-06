@@ -98,6 +98,11 @@ def _job_dict(row: RosterJob) -> dict:
     if em and em.lstrip().startswith("{"):
         try:
             payload = json.loads(em)
+            # worker.py 가 끼워둔 month 식별 메타 (RosterJob 모델 변경 회피용).
+            if payload.get("_year") is not None:
+                d["year"] = int(payload["_year"])
+            if payload.get("_month") is not None:
+                d["month"] = int(payload["_month"])
             narrative = format_infeasibility(payload)
             if narrative:
                 d["infeasibility"] = narrative

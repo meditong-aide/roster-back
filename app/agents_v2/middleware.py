@@ -17,10 +17,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-
-
 from sqlalchemy.orm import Session
 
+from agents_v2.auth_context import bind_auth_user
+from agents_v2.errors import ErrorType, classify
 from agents_v2.grounding.internal import (
     resolve_date,
     resolve_date_range,
@@ -81,6 +81,12 @@ def _safe_args_json(args: dict, max_len: int = _AUDIT_ARGS_MAX_LEN) -> str | Non
     return s
 
 
+# audit 테이블 존재 여부 프로브 캐시 (process-wide).
+# None=미확인, True/False=확인됨. 운영 MSSQL 에 agent_skill_invocation 이 아직
+# 마이그레이션 안 됐을 때 매 스킬마다 실패 INSERT 로 세션을 오염시키는 것을 막는다.
+_audit_table_present: bool | None = None
+
+
 def _write_skill_audit(
     db: Session,
     ctx: SessionContext,
@@ -90,12 +96,33 @@ def _write_skill_audit(
     error_message: str | None,
     latency_ms: float,
 ) -> None:
-    """Skill 호출 audit row insert. 실패 시 silent — skill 실행 자체에 영향 X.
+    """Skill 호출 audit row insert. 실패해도 skill 실행/세션에 절대 영향 X.
 
     의료 도메인 audit 요건 + RBAC 추적 + 디버깅용.
+
+    견고성: 실패한 INSERT 의 flush 는 SQLAlchemy 세션을 오염(PendingRollbackError)시켜
+    같은 턴의 다음 스킬 쿼리를 500 으로 만든다(운영 MSSQL 에 테이블 미마이그레이션 시 발생).
+    그래서 테이블 존재를 has_table 로 1회 프로브해서 **부재면 INSERT 자체를 회피**(영구 skip)한다.
+    INSERT 시도 자체가 없으니 세션이 오염될 일도 없다.
     """
+    global _audit_table_present
+    if _audit_table_present is False:
+        return
     try:
+        from sqlalchemy import inspect as _sa_inspect
+
         from db.models import AgentSkillInvocation
+
+        if _audit_table_present is None:
+            _audit_table_present = _sa_inspect(db.get_bind()).has_table(
+                AgentSkillInvocation.__tablename__
+            )
+            if not _audit_table_present:
+                logger.warning(
+                    "[middleware] agent_skill_invocation 테이블이 없습니다 — skill audit "
+                    "비활성화 (이후 skip). 마이그레이션(2026_05_19_add_agent_memory_tables) 적용 필요."
+                )
+                return
 
         row = AgentSkillInvocation(
             agent_run_id=ctx.conversation_id,
@@ -111,6 +138,11 @@ def _write_skill_audit(
         db.add(row)
         db.flush()
     except Exception as e:
+        # 의도적으로 db.rollback() 하지 않는다: 스킬은 자체 commit 을 하지 않으므로
+        # 이 시점에 미커밋 mutation 이 세션에 남아 있을 수 있고, 롤백하면 그 변경이
+        # 조용히 사라진다. 테이블 부재(운영의 실제 원인)는 위 has_table 프로브가 이미
+        # INSERT 자체를 막으므로 여기 도달하지 않는다. 테이블이 존재하는데도 INSERT 가
+        # 실패하는 경우(스키마 정상 가정상 드묾)는 audit 만 포기하고 로그로 남긴다.
         logger.warning("[middleware] skill audit insert failed: %s", e)
 
 
@@ -190,7 +222,9 @@ def execute_skill(
     status = "SUCCESS"
     err_msg: str | None = None
     try:
-        result = run_skill(db, skill_name, args)
+        # 인증 사용자는 args 가 아니라 실행 순간에만 묶는다(감사·승인 대기 직렬화 차단).
+        with bind_auth_user(ctx.auth_user):
+            result = run_skill(db, skill_name, args)
         steps.append(MiddlewareStep("execution", "ok", detail=skill_name))
     except KeyError as e:
         result = {"error": f"Unknown skill: {e}"}
@@ -202,6 +236,50 @@ def execute_skill(
         steps.append(MiddlewareStep("execution", "error", detail=str(e)))
         status = "ERROR"
         err_msg = str(e)
+
+    # ── ④b Postcondition 검증 (5요소의 '검증' 게이트) ──
+    # 매니페스트 스킬이 postcondition 을 선언했고, error/preview/clarification 이 아닌
+    # 완료 결과(classify OK)인데 성공조건을 통과 못 하면 VERIFICATION_FAILED 로 승격한다.
+    # silent 부분실패(error 없이 반환했으나 실제로 성립 안 함)를 차단.
+    if status == "SUCCESS" and classify(result) is ErrorType.OK:
+        from agents_v2.skills.manifest import SKILL_SPECS, load_manifest_skills
+
+        load_manifest_skills()
+        spec = SKILL_SPECS.get(skill_name.replace("-", "_"))
+        if spec is not None and spec.postcondition is not None:
+            try:
+                passed = bool(spec.postcondition(result))
+            except Exception as e:  # noqa: BLE001
+                passed = False
+                logger.warning("[middleware] postcondition raised for %s: %s", skill_name, e)
+            if not passed:
+                result = {
+                    "error": "실행 결과가 성공 조건(postcondition)을 통과하지 못했습니다.",
+                    "verification_failed": True,
+                }
+                steps.append(
+                    MiddlewareStep("verification", "block", detail="postcondition failed")
+                )
+                status = "VERIFICATION_FAILED"
+                err_msg = "postcondition failed"
+
+    # ── ④c Read-back 검증 (L1) — 실행 후 DB 대조로 '조용한 거짓완료' 차단 ──
+    # postcondition(shape 검사)을 통과했어도, 등록된 read-back 이 실제 DB 반영을 확인한다.
+    # (postcondition 이 이미 실패했으면 result 에 verification_failed 가 있어 classify≠OK → 건너뜀)
+    if status == "SUCCESS" and classify(result) is ErrorType.OK:
+        from agents_v2.verify import run_readback
+
+        vr = run_readback(db, skill_name, args, result)
+        if not vr.ok:
+            result = {
+                "error": f"실행됐다고 보고됐으나 실제 반영이 확인되지 않았습니다: {vr.reason}",
+                "verification_failed": True,
+            }
+            steps.append(
+                MiddlewareStep("verification", "block", detail=f"readback: {vr.reason}")
+            )
+            status = "VERIFICATION_FAILED"
+            err_msg = f"readback failed: {vr.reason}"
 
     dt = (time.time() - t0) * 1000
     _write_skill_audit(db, ctx, skill_name, args, status, err_msg, dt)
@@ -223,6 +301,13 @@ _MUTATION_SKILLS = frozenset({
     "update_person_attr",
     "generate_schedule",
     "update_monthly_limit",
+    "manage_grade",
+    "manage_team_min",
+    "manage_wanted_deadline",
+    "manage_teams",
+    "manage_wanted_limits",
+    "publish_schedule",
+    "manage_mutual_exclusion",
 })
 
 _SELF_REFERENCE_ALIASES = ("나", "내", "제", "본인")
@@ -247,6 +332,42 @@ def _check_permission(
     normalized = skill_name.replace("-", "_")
     is_hn = _is_head_or_admin(ctx)
 
+    # (0) client-action (navigate/prefill/switch_ward) — HN 전용 화면 게이팅.
+    # target 별 hn_only 여부는 client_actions 모듈(route SSOT 매핑)이 소유.
+    # switch_ward 는 target 없는 컨텍스트 전환 — 권한은 프론트 셀렉터(접근 가능 ward 목록)가 강제.
+    if normalized in ("navigate", "prefill", "switch_ward"):
+        from agents_v2.skills.client_actions import target_permission_error
+
+        return target_permission_error(args.get("target"), ctx)
+
+    # invoke: 비파괴 UI 명령 대행. command 별 hn_only 게이트(client_actions SSOT).
+    if normalized == "invoke":
+        from agents_v2.skills.client_actions import command_permission_error
+
+        return command_permission_error(args.get("command"), ctx)
+
+    # 매니페스트 스킬: 권한을 SkillSpec 에서 파생 — 하드코딩 불필요.
+    # (신규 스킬은 @skill(mutation=..., hn_only=...) 선언만으로 게이트가 걸린다.)
+    # load 보장: execute_skill 은 _check_permission(초반)→run_skill(후반 로드) 순서라,
+    # 프로세스 첫 스킬 호출 시 매니페스트가 아직 로드 안 됐을 수 있다. idempotent 로드로
+    # 권한 게이트가 스킵되는 것을 방지(방어적).
+    from agents_v2.skills.manifest import SKILL_SPECS, load_manifest_skills
+
+    load_manifest_skills()
+    spec = SKILL_SPECS.get(normalized)
+    if spec is not None:
+        if spec.hn_only and not is_hn:
+            return "이 작업은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+        if spec.mutation and not is_hn:
+            nurse_name = args.get("nurse_name", "")
+            if (
+                nurse_name
+                and nurse_name != ctx.nurse_name
+                and nurse_name not in _SELF_REFERENCE_ALIASES
+            ):
+                return f"다른 간호사({nurse_name})의 데이터를 수정할 권한이 없습니다."
+        return None
+
     # (1) 병동 전체 영향 mutation
     if normalized in {"update_constraint", "generate_schedule"} and not is_hn:
         return "병동 전체 설정 변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
@@ -254,6 +375,15 @@ def _check_permission(
     # (4) 다른 간호사의 월 한도 설정
     if normalized == "update_monthly_limit" and not is_hn:
         return "다른 간호사의 월 한도 설정은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (1b) 등급 정책 — 조회·변경 모두 HN/ADM 전용.
+    # 등급(역량) 정보는 일반 간호사에게 노출되어선 안 되는 민감 정보.
+    if normalized == "manage_grade" and not is_hn:
+        return "등급 정책 조회·변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
+
+    # (1c) 팀 최소 인원 — 조회·변경 모두 HN/ADM 전용.
+    if normalized == "manage_team_min" and not is_hn:
+        return "팀 최소 인원 조회·변경은 수간호사(HN) 또는 관리자(ADM) 권한이 필요합니다."
 
     # (2) bulk_mutation 의 ward-wide action
     if normalized == "bulk_mutation" and not is_hn:
@@ -294,6 +424,12 @@ def _inject_context(args: dict, ctx: SessionContext) -> dict:
     args.setdefault("office_id", ctx.office_id)
     args.setdefault("year", ctx.year)
     args.setdefault("month", ctx.month)
+    # 변경 주체 (audit / updated_by 용). mutation skill 이 참조.
+    args.setdefault("acting_user_id", ctx.nurse_id)
+    # 호출자 역할 — 같은 스킬 안에서 read 범위를 갈라야 할 때 쓴다(예: 개인이 쓴
+    # 원티드 메모는 본인 것만, HN 은 병동 전체). 권한 게이트(_check_permission)를
+    # 대체하지 않는다; 스코프 결정용 컨텍스트다.
+    args.setdefault("acting_role", ctx.user_role)
 
     # "나/내/제/본인" → current user
     if args.get("nurse_name") in ("나", "내", "제", "본인"):

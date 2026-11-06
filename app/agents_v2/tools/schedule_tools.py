@@ -118,6 +118,31 @@ def get_schedule_versions(
     return [_schedule_meta(r) for r in rows]
 
 
+# dev 정본(`routers/roster.py` _reject_issued_overwrite)과 같은 문구 — 성남 ③ 결정(10-02).
+ISSUED_OVERWRITE_MSG = (
+    "마감된 근무표는 덮어쓸 수 없습니다. 마감 철회 후 저장하거나 [새 버전으로 저장]을 이용해 주세요."
+)
+
+
+def issued_overwrite_error(db: Session, schedule_id: str, *, lock: bool) -> dict | None:
+    """마감본(status='issued')이면 거절 dict, 아니면 None. 에이전트 칸 쓰기는 draft 만(int-0b).
+
+    lock=True 면 근무표 행을 먼저 잠그고(UPDLOCK) 상태를 다시 읽는다. 잠금 전 값은 그 사이
+    끝난 마감을 못 본다(dev 정본과 같은 순서). 미리보기는 lock=False 로 현재 상태만 본다.
+    정본 셀 저장 서비스가 추출되면(dev-8b) 이 판정은 그쪽으로 넘어간다(int-8a).
+    """
+    query = db.query(Schedule).filter(Schedule.schedule_id == schedule_id)
+    if lock:
+        query = query.with_hint(Schedule, "WITH (UPDLOCK, ROWLOCK)", "mssql")
+    schedule = query.first()
+    if schedule is None:
+        return None
+    db.refresh(schedule, attribute_names=["status"])
+    if str(schedule.status or "") == "issued":
+        return {"error": ISSUED_OVERWRITE_MSG, "issued": True}
+    return None
+
+
 def update_schedule_entry(
     db: Session,
     entry_id: str,
@@ -142,6 +167,12 @@ def update_schedule_entry(
     )
     if not entry:
         return {"error": f"Entry {entry_id} not found in group {group_id}"}
+    issued = issued_overwrite_error(db, entry.schedule_id, lock=True)
+    if issued:
+        # 잡은 행 잠금을 바로 푼다(성공 경로와 같은 경계). dev 정본은 409 로 요청이 끝나지만
+        # 에이전트는 턴이 이어져 LLM 호출 동안 화면 저장·마감이 기다리게 된다.
+        db.commit()
+        return issued
     old_shift = entry.shift_id
     entry.shift_id = new_shift_id
     db.commit()

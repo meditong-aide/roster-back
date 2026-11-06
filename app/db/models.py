@@ -1644,3 +1644,53 @@ class AgentSkillInvocation(Base):
         nullable=False,
         index=True,
     )
+
+
+class AgentLlmUsage(Base):
+    """LLM 토큰 사용량/비용 — 병동(group)·간호사(user_id)별 추적.
+
+    매 LLM 호출(turn/router/memory/preview)마다 1행. cost_usd 는 호출 시점
+    cost.MODEL_PRICING 기준 산출값(USD). group/nurse/월별 집계로 비용 모니터링.
+    테이블 부재 시 record_llm_usage 가 graceful skip (운영 마이그레이션 전 무해).
+    """
+
+    __tablename__ = "agent_llm_usage"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    conversation_id = Column(VARCHAR(64), nullable=True, index=True)
+    group_id = Column(VARCHAR(64), nullable=False, index=True)
+    user_id = Column(VARCHAR(64), nullable=True, index=True)
+    model = Column(VARCHAR(64), nullable=True, index=True)
+    purpose = Column(VARCHAR(32), nullable=True, index=True)  # turn|router|memory|preview
+    input_tokens = Column(INTEGER, nullable=False, default=0)
+    output_tokens = Column(INTEGER, nullable=False, default=0)
+    cost_usd = Column(FLOAT, nullable=False, default=0.0)
+    timestamp = Column(
+        DATETIME,
+        default=datetime.utcnow,
+        nullable=False,
+        index=True,
+    )
+
+
+class AgentFeedback(Base):
+    """수간호사 불만/건의/버그신고 접수 — 에이전트가 못 처리하는 concern 을 적재.
+
+    triage 정책: 스킬로 처리 못 하는 버그신고/기능건의는 log_feedback 스킬이 여기 1행씩
+    적재 → 개발팀이 실사용 피드백을 데이터로 확인. 테이블 부재 시 skill 이 graceful skip.
+    """
+
+    __tablename__ = "agent_feedback"
+
+    id = Column(INTEGER, primary_key=True, autoincrement=True)
+    conversation_id = Column(VARCHAR(64), nullable=True, index=True)
+    office_id = Column(VARCHAR(64), nullable=True, index=True)   # 병원
+    group_id = Column(VARCHAR(64), nullable=True, index=True)    # 병동
+    nurse_id = Column(VARCHAR(64), nullable=True)                # 제출자 id
+    nurse_name = Column(NVARCHAR(64), nullable=True)             # 제출자 이름(한글)
+    kind = Column(VARCHAR(16), nullable=True, index=True)        # bug | suggestion | complaint
+    content = Column(NVARCHAR(1000), nullable=False)             # 해당 항목(concern) 원문(한글)
+    original_query = Column(NVARCHAR(2000), nullable=True)       # 사용자 원 발화 전체(한글)
+    summary = Column(NVARCHAR(1000), nullable=True)              # 결론/우리가 알아야 할 사항(한글)
+    status = Column(VARCHAR(16), nullable=False, default="open")  # open|triaged|resolved
+    created_at = Column(DATETIME, default=datetime.utcnow, nullable=False, index=True)

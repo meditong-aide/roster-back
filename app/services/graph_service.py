@@ -14,7 +14,10 @@ class GraphService:
         year: int = None,
         month: int = None,
         allowed_shifts: str = "없음",
-        allowed_shift_map: Optional[Dict[str, str]] = None
+        allowed_shift_map: Optional[Dict[str, str]] = None,
+        db: Any = None,
+        group_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> List[Any]:
         cleaned_request = self._clean_request(request)
         
@@ -40,7 +43,27 @@ class GraphService:
         }
 
         print("[GraphService] 그래프 실행 시작")
-        graph_output = await self._graph.ainvoke(input_state)
+        # 원티드 agent LLM 사용량 포집 — 그래프 전체 LLM 호출을 콜백으로 집계.
+        _usage_cb = None
+        try:
+            from langchain_core.callbacks import UsageMetadataCallbackHandler
+            _usage_cb = UsageMetadataCallbackHandler()
+        except Exception:
+            _usage_cb = None
+        _cfg = {"callbacks": [_usage_cb]} if _usage_cb is not None else None
+        graph_output = await self._graph.ainvoke(input_state, config=_cfg)
+
+        # 포집한 사용량을 agent_llm_usage 로 통합 적재(실패해도 흐름 무영향).
+        try:
+            if _usage_cb is not None and db is not None and group_id:
+                from agents_v2.usage import record_graph_usage
+                record_graph_usage(
+                    db, group_id=group_id, user_id=user_id,
+                    usage_metadata=getattr(_usage_cb, "usage_metadata", None),
+                    purpose="wanted",
+                )
+        except Exception as _usage_err:
+            print(f"[GraphService] usage 기록 실패(무시): {_usage_err}")
 
         print(f"[GraphService] ainvoke 반환 타입: {type(graph_output)}")
 

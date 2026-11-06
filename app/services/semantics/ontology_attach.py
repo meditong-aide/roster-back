@@ -24,13 +24,19 @@ def _ontology_payload(*, constraint_id: str | None, mode: str, ontology: Constra
     if entry is None:
         return None
     mode_entry = ontology.get_mode(mode)
-    return {
+    payload = {
         "constraint_id": entry.constraint_id,
         "group": entry.parent,
         "scope": list(entry.scope),
         "mode": mode,
         "severity": (mode_entry.severity if mode_entry else entry.default_severity),
+        "runtime_lever": entry.runtime_lever,
     }
+    if entry.runtime_note:
+        payload["runtime_note"] = entry.runtime_note
+    if entry.value_source:
+        payload["value_source"] = entry.value_source
+    return payload
 
 
 def attach_constraint_ontology(fact: dict[str, Any], ontology: ConstraintOntology | None = None) -> dict[str, Any]:

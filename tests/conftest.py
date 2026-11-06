@@ -12,7 +12,7 @@ from datetime import datetime, date, time
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, func, event, Integer
+from sqlalchemy import BIGINT, create_engine, func, event, Integer
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.dialects.mysql import TINYINT
@@ -33,6 +33,14 @@ from sqlalchemy.ext.compiler import compiles as sa_compiles
 def _compile_tinyint_sqlite(type_, compiler, **kw):
     return "INTEGER"
 
+
+# BIGINT 기본키는 SQLite 에서 자동증가하지 않는다(INTEGER PRIMARY KEY 만 rowid 별칭) — push_outbox 등
+# BIGINT IDENTITY 테이블에 행을 넣으면 'NOT NULL constraint failed: <표>.id' 가 났다(int-0b·W72).
+# SQLite 의 INTEGER 는 64비트라 값 범위는 같다.
+@sa_compiles(BIGINT, "sqlite")
+def _compile_bigint_sqlite(type_, compiler, **kw):
+    return "INTEGER"
+
 _TestBase = declarative_base()
 _test_engine = create_engine(
     "sqlite:///:memory:",
@@ -46,6 +54,15 @@ _fake_client2.engine = _test_engine
 _fake_client2.SessionLocal = sessionmaker(bind=_test_engine)
 _fake_client2.get_db = lambda: None
 _fake_client2.msdb_manager = None
+# push_outbox_service 가 import 때 읽는다(발송기의 3-part 이름용). 없으면 import 가 실패해
+# 알림 적재가 테스트에서 늘 조용히 실패했다(int-0b·W72). 발송기는 테스트에서 돌지 않는다.
+_fake_client2.EUN_DB_NAME = "eun_roster_test"
+
+# 수집하지 않는 스크립트 — `python -m tests.test_real_llm_*` 로 돌리는 실 LLM 스크립트(테스트 함수 0개)다.
+# 수집되면 import 때 sys.modules['db.client2'] 를 자기 가짜(EUN_DB_NAME·msdb_manager 없음)로 바꿔
+# 끝까지 남겨서, 전체 스위트에서 지연 import(main·push_outbox_service)를 하는 테스트가 순서에 따라
+# ImportError 로 깨졌다(int-0b).
+collect_ignore = ["test_real_llm_constraint.py", "test_real_llm_wanted.py"]
 
 # Register the fake client2 in sys.modules.
 # The real 'db' package directory exists at app/db/, so Python will find
@@ -56,14 +73,15 @@ sys.modules["db.client2"] = _fake_client2
 from db.models import (  # noqa: E402
     Office, Group, Team, Nurse, Shift,
     Schedule, ScheduleEntry, RosterConfig, RosterJob,
-    Wanted, WantedRequest, NurseShiftRequest, NursePairRequest, FixedWantedEntry,
-    BannedWantedEntry,
-    IssuedRoster, ShiftManage, DailyShift, RosterGradeConfig, NurseMonthlyLimit, NurseAssignment,
+    Wanted, WantedConfig, WantedRequest, NurseShiftRequest, NursePairRequest, FixedWantedEntry,
+    BannedWantedEntry, WantedMonthlyMemo,
+    IssuedRoster, IssuedRosterSnapshot, ShiftManage, DailyShift, RosterGradeConfig, NurseMonthlyLimit, NurseAssignment,
     NurseTeamPeriod, WeeklyOffSetting,
     NurseGradePeriod, NurseAllowedShiftPeriod, NurseWeekendOffPeriod,
-    NursePrecepteePeriod, NurseMutualExclusionPeriod,
+    NursePrecepteePeriod, NurseMutualExclusionPeriod, NurseLeavePeriod, NurseNightCycle,
     AgentConversation, AgentConversationMessage, AgentUserMemory,
-    AgentMemoryAudit, AgentSkillInvocation,
+    AgentMemoryAudit, AgentSkillInvocation, AgentLlmUsage, AgentFeedback,
+    PushOutbox, ScheduleLineage, RosterChangeAck, ScheduleEntryLog, NurseAnnualLeaveBalance,
 )
 
 
@@ -87,16 +105,25 @@ _REQUIRED_TABLES = [
     RosterConfig.__table__, RosterGradeConfig.__table__, RosterJob.__table__,
     Wanted.__table__, WantedRequest.__table__, NurseShiftRequest.__table__,
     NursePairRequest.__table__,
-    FixedWantedEntry.__table__, BannedWantedEntry.__table__, ShiftManage.__table__, DailyShift.__table__, IssuedRoster.__table__,
+    FixedWantedEntry.__table__, WantedConfig.__table__, BannedWantedEntry.__table__,
+    WantedMonthlyMemo.__table__,
+    ShiftManage.__table__, DailyShift.__table__,
+    IssuedRoster.__table__, IssuedRosterSnapshot.__table__,
     NurseMonthlyLimit.__table__, NurseAssignment.__table__, NurseTeamPeriod.__table__,
     WeeklyOffSetting.__table__,
     NurseGradePeriod.__table__, NurseAllowedShiftPeriod.__table__,
     NurseWeekendOffPeriod.__table__, NursePrecepteePeriod.__table__,
-    NurseMutualExclusionPeriod.__table__,
+    NurseMutualExclusionPeriod.__table__, NurseLeavePeriod.__table__,
+    NurseNightCycle.__table__,
     AgentConversation.__table__, AgentConversationMessage.__table__,
     AgentUserMemory.__table__,
     AgentMemoryAudit.__table__,
     AgentSkillInvocation.__table__,
+    AgentLlmUsage.__table__,
+    AgentFeedback.__table__,
+    # dev 10-02 이후 테이블(int-0b·W72) — 알림 대기열·버전 계보·재마감 확인·칸 이력·연차 장부
+    PushOutbox.__table__, ScheduleLineage.__table__, RosterChangeAck.__table__,
+    ScheduleEntryLog.__table__, NurseAnnualLeaveBalance.__table__,
 ]
 
 
@@ -123,7 +150,15 @@ def engine():
 
 @pytest.fixture
 def db(engine) -> Session:
-    """Provide a transactional DB session that rolls back after each test."""
+    """Provide a transactional DB session that rolls back after each test.
+
+    격리 이중화(StaticPool 단일 in-memory conn 공유):
+      1) 정상 케이스는 transaction.rollback() 으로 테스트 변경 되돌림.
+      2) 코드가 SessionLocal 등으로 **commit** 해 트랜잭션을 escape 하면(예: seed_data 의
+         db.commit(), DAG 병렬세션) 그 행은 rollback 으로 안 지워지고 **다음 테스트 seed 와
+         PK 충돌**(shift_manage UNIQUE 등). 그래서 종료 시 전 테이블을 비우고 commit 해
+         하드 격리한다(FK OFF 라 삭제 순서 무관). 이것이 풀스위트 교차오염(23 errors)의 근본 수정.
+    """
     connection = engine.connect()
     transaction = connection.begin()
     session = Session(bind=connection)
@@ -131,8 +166,27 @@ def db(engine) -> Session:
     yield session
 
     session.close()
-    transaction.rollback()
+    try:
+        transaction.rollback()
+    except Exception:  # 이미 commit 으로 deassociated 됐을 수 있음 — 아래 하드 정리로 커버
+        pass
+    # 하드 정리: escape 한 커밋 행까지 확정 삭제(persisted) → 다음 테스트는 빈 스키마에서 시작.
+    with connection.begin():
+        for table in reversed(_REQUIRED_TABLES):
+            connection.execute(table.delete())
     connection.close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_skill_audit_cache():
+    """middleware._audit_table_present 는 process-wide 캐시 — 테스트 간 누수 방지.
+
+    한 테스트(예: 테이블 없는 격리 세션)가 False 로 둔 채 끝나면 다음 테스트가
+    audit 를 건너뛰어 오탐할 수 있으므로, 매 테스트 시작 시 None 으로 초기화한다.
+    """
+    import agents_v2.middleware as _mw
+    _mw._audit_table_present = None
+    yield
 
 
 @pytest.fixture

@@ -92,6 +92,13 @@ constraints:
     relaxation_priority: 2
     tier: T2
     scope_explosion: high
+    # [2026-06-19] 운영 모델 갱신:
+    #   - value_source: 활성 팀 디폴트 (D=1, E=1, [use_mid면 M=0], N=0). teams.min_shift 컬럼 미사용.
+    #   - runtime_lever=false: 사용자 직접 lever 없음. 엔진(fallback_lex)이 hard 실패 시
+    #     자동으로 soft escalation 처리.
+    runtime_lever: false
+    value_source: backend_default_active_team
+    runtime_note: "활성 팀 디폴트 D1·E1 강제. fallback_lex 가 hard→soft 자동 escalate."
 
   GradeMin:
     label: Grade Minimum Coverage
@@ -105,6 +112,9 @@ constraints:
     relaxation_priority: 3
     tier: T2
     scope_explosion: high
+    # [2026-06-19] TeamMin 패턴과 동일 — 엔진 자동 escalation.
+    runtime_lever: false
+    runtime_note: "엔진(constraint_impact)이 hard→soft 자동 escalate (_force_grade_min_soft_fallback)."
 
   GradeMax:
     label: Grade Maximum Coverage
@@ -118,6 +128,9 @@ constraints:
     relaxation_priority: 2
     tier: T2
     scope_explosion: high
+    # [2026-06-19] 운영 미사용 family. resolve_infeasibility 옵션 노출 금지.
+    runtime_lever: false
+    runtime_note: "운영 미사용 family — 사용자/엔진 어느 쪽도 활용 안 함."
 
   ConsecutiveWorkLimit:
     label: Consecutive Work Limit
@@ -831,6 +844,9 @@ treatments:
     rationale_ko: "등급 상한을 hard 에서 soft 로 전환. 일부 시프트에서 등급 한계 1~2명 초과 가능."
     trade_off_ko: "특정 (day, shift)에서 grade=N 간호사가 max 를 초과 가능. 다음 달 운영에서 보정 권장."
     applies_to_causes: [cause:grade:max_sum_below_need]
+    # [2026-06-19] GradeMax family 운영 미사용. lever 효력 없음.
+    runtime_lever: false
+    runtime_note: "운영 미사용 family — lever 효력 없음."
 
   treatment:soft:grade_min:
     label: "Grade min 을 soft fallback"
@@ -841,6 +857,9 @@ treatments:
     rationale_ko: "등급 최저 인원을 soft 화. 특정 day 에서 일부 등급이 1~2명 부족할 수 있음."
     trade_off_ko: "선임 grade 부족 시프트가 일부 발생 — 위험 시점 manual check 필요."
     applies_to_causes: [cause:grade:min_sum_over_need]
+    # [2026-06-19] 엔진(constraint_impact)이 hard→soft 자동 escalate. 사용자 토글 없음.
+    runtime_lever: false
+    runtime_note: "엔진 자동 처리 — 사용자 lever 아님."
 
   treatment:soft:team_min:
     label: "팀 최소 인원을 soft fallback"
@@ -851,6 +870,10 @@ treatments:
     rationale_ko: "팀 최소 인원이 반드시 지켜지지 않을 수 있지만 최대한 충족하도록 노력합니다. 일부 시프트에서 팀 부족이 발생할 수 있습니다."
     trade_off_ko: "특정 시프트에서 팀 인원이 min 보다 1~2명 부족할 수 있음. 인계 시 주의 필요."
     applies_to_causes: [cause:team:min_over_need]
+    # [2026-06-19] runtime_lever=false. 엔진(fallback_lex)이 hard→soft 자동 escalate.
+    # 사용자 토글 없음. resolve_infeasibility 에서 옵션으로 노출 금지.
+    runtime_lever: false
+    runtime_note: "엔진 자동 처리 — 사용자 lever 아님."
 
   treatment:disable:team_min:
     label: "팀 최소 인원 비활성화"
@@ -861,6 +884,10 @@ treatments:
     rationale_ko: "팀 단위 최소 인원 강제 완전 해제. 팀 균형이 daily coverage 차원으로만 보장됨."
     trade_off_ko: "팀별 시프트 안정성 보장 사라짐. 팀 운영 매뉴얼 보정 필수."
     applies_to_causes: [cause:team:size_insufficient, cause:team:min_over_need]
+    # [2026-06-19] runtime_lever=false. team_min_by_team(teams.min_shift) 컬럼 미사용 —
+    # 활성 팀 디폴트 강제로 본 lever 효력 없음.
+    runtime_lever: false
+    runtime_note: "DB 컬럼 무력화 — 효력 없는 stale lever."
 
   treatment:disable:transition_ban:
     label: "전이 금지 비활성화"
@@ -917,6 +944,9 @@ treatments:
     rationale_ko: "팀 단위 최소 인원을 1 감소."
     trade_off_ko: "특정 팀의 시프트 안정성 약화."
     applies_to_causes: [cause:team:min_over_need]
+    # [2026-06-19] runtime_lever=false. team_min_by_team 컬럼 미사용. stale.
+    runtime_lever: false
+    runtime_note: "DB 컬럼 무력화 — 효력 없는 stale lever."
 
   treatment:scope:team_min_remove:
     label: "특정 팀의 team_min 만 제거"
@@ -927,6 +957,9 @@ treatments:
     rationale_ko: "전체 팀 일괄이 아닌 특정 팀의 team_min 만 해제. 다른 팀은 유지."
     trade_off_ko: "해당 팀의 안정성 일시 약화."
     applies_to_causes: [cause:team:min_over_need]
+    # [2026-06-19] runtime_lever=false. team_min_by_team 컬럼 미사용. stale.
+    runtime_lever: false
+    runtime_note: "DB 컬럼 무력화 — 효력 없는 stale lever."
 
   treatment:data:fix_config:
     label: "Config 데이터 수정 (manual)"

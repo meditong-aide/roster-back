@@ -12,6 +12,7 @@ from starlette.responses import FileResponse
 from datalayer.setting import Setting
 from db.client2 import msdb_manager
 from routers.auth import require_current_user
+from services.group_access import assert_master_admin
 from schemas.auth_schema import User as UserSchema
 from utils import utils
 from utils.security import create_access_token
@@ -208,6 +209,8 @@ DOWNLOAD_FOLDER = "downloads"
 
 @router.get("/member_upload", summary="회원 엑셀 업로드 화면을 출력합니다.")
 def excelupload_form(request: Request, current_user: UserSchema = Depends(require_current_user)):
+    # ADM 전용 — office 전체 인사 마스터를 갈아끼우고 그룹웨어로 역전파한다.
+    assert_master_admin(current_user)
     OfficeCode = current_user.office_id
     EmpSeqNo = current_user.EmpSeqNo
 
@@ -222,6 +225,8 @@ def create_upload_file(
     current_user: UserSchema = Depends(require_current_user),
     file: UploadFile = File(...)
 ):
+    # ADM 전용 — office 전체 인사 마스터를 갈아끼우고 그룹웨어로 역전파한다.
+    assert_master_admin(current_user)
     OfficeCode = current_user.office_id
     EmpSeqNo = current_user.EmpSeqNo
     RegDate = datetime.datetime.now()

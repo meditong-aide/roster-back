@@ -123,3 +123,79 @@ def test_original_messages_list_not_mutated():
     _truncate_for_llm(msgs, max_chars=10)
     for original, after in zip(snapshot, msgs):
         assert original == after
+
+
+def _tc(name: str = "query_schedule") -> list:
+    return [{"id": "call_1", "function": {"name": name, "arguments": "{}"}}]
+
+
+def _assert_valid_chain(result: list[dict]) -> None:
+    """OpenAI 규칙: tool 메시지는 직전에 assistant(tool_calls) 또는 동일 group 의
+    tool 메시지가 있어야 한다. body 가 tool 로 시작하면 안 됨."""
+    body = [m for m in result if m.get("role") != "system"]
+    if body:
+        assert body[0]["role"] != "tool", "body 가 orphan tool 로 시작하면 안 됨"
+    for i, m in enumerate(result):
+        if m.get("role") == "tool":
+            prev = result[i - 1]
+            assert prev["role"] in ("assistant", "tool"), (
+                f"index {i} tool 메시지가 부모 assistant(tool_calls)와 분리됨"
+            )
+            if prev["role"] == "assistant":
+                assert prev.get("tool_calls"), "tool 직전 assistant 는 tool_calls 보유 필수"
+
+
+def test_huge_latest_tool_keeps_parent_assistant():
+    """최신 메시지가 거대한 tool 결과(예: 한 달 근무표 JSON)면 부모 assistant(tool_calls)
+    도 함께 보존해야 한다 — 분리 시 OpenAI 400(messages[1].role='tool')."""
+    msgs = [
+        _sys("S" * 1000),
+        _user("5월 근무표 보여줘"),
+        _assistant("", tool_calls=_tc()),
+        _tool("{\"roster\": \"" + "X" * 50000 + "\"}"),
+    ]
+    result = _truncate_for_llm(msgs, max_chars=10_000)
+    _assert_valid_chain(result)
+    # 부모 assistant(tool_calls)가 결과에 포함돼야 한다
+    assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in result)
+    # 거대한 tool 결과 본문도 유지 (latest unit 무조건 보존)
+    assert result[-1]["role"] == "tool"
+
+
+def test_boundary_does_not_orphan_tool_group():
+    """budget 경계가 tool group 중간을 자르면 tool 이 orphan 되면 안 된다."""
+    msgs = [
+        _sys("S"),
+        _user("old " + "a" * 3000),
+        _assistant("", tool_calls=_tc()),
+        _tool("t" * 3000),
+        _user("최신"),
+    ]
+    result = _truncate_for_llm(msgs, max_chars=4000)
+    _assert_valid_chain(result)
+    assert result[-1]["content"] == "최신"
+
+
+def test_parallel_tool_calls_stay_with_assistant():
+    """병렬 tool_calls(assistant + 여러 tool)도 한 unit 으로 보존."""
+    parallel = [
+        {"id": "c1", "function": {"name": "a", "arguments": "{}"}},
+        {"id": "c2", "function": {"name": "b", "arguments": "{}"}},
+    ]
+    msgs = [
+        _sys("S"),
+        _assistant("", tool_calls=parallel),
+        _tool("r1"),
+        _tool("r2"),
+        _user("최신"),
+    ]
+    result = _truncate_for_llm(msgs, max_chars=10_000)
+    _assert_valid_chain(result)
+
+
+def test_leading_orphan_tool_dropped():
+    """손상된 history(부모 없는 tool 로 시작)는 안전하게 drop 해 유효 chain 유지."""
+    msgs = [_sys("S"), _tool("orphan"), _user("최신")]
+    result = _truncate_for_llm(msgs, max_chars=10_000)
+    _assert_valid_chain(result)
+    assert result[-1]["content"] == "최신"

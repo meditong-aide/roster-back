@@ -22,21 +22,37 @@ def get_monthly_limit(
     group_id: str,
     year: int,
     month: int,
+    *,
+    as_of: bool = True,
 ) -> dict | None:
-    """단일 간호사의 월 한도 조회. row 없으면 None."""
-    row = (
-        db.query(NurseMonthlyLimit)
-        .filter(
-            NurseMonthlyLimit.nurse_id == nurse_id,
-            NurseMonthlyLimit.group_id == group_id,
-            NurseMonthlyLimit.year == year,
-            NurseMonthlyLimit.month == month,
+    """단일 간호사의 월 한도 조회. 적용 한도 없으면 None.
+
+    as_of=True(기본): 대상 (year, month) '이하 가장 최근' 행을 이월 적용한다 —
+    생성 로더(fetch_effective_monthly_limits_by_nurse)·조회 서비스(_list_by_year_month)와
+    동일한 as-of 의미. 월별 재설정을 안 해도 마지막 설정이 유지돼, 에이전트 조회가
+    실제 생성에 쓰이는 값과 일치한다(과거엔 exact-month .first() 라 '이월된 값'을 못 보고
+    '설정 없음'으로 잘못 답했다). 반환 dict 는 대상월로 표시하되 applied_from_* 에 실제
+    출처 월을, carried_over 에 이월 여부를 담는다.
+
+    as_of=False: 정확히 그 (year, month) 행만(이력·감사용).
+    """
+    if not as_of:
+        row = (
+            db.query(NurseMonthlyLimit)
+            .filter(
+                NurseMonthlyLimit.nurse_id == nurse_id,
+                NurseMonthlyLimit.group_id == group_id,
+                NurseMonthlyLimit.year == year,
+                NurseMonthlyLimit.month == month,
+            )
+            .first()
         )
-        .first()
-    )
-    if not row:
+        return _to_dict(row) if row else None
+
+    row = _resolve_asof_row(db, nurse_id, group_id, year, month)
+    if row is None:
         return None
-    return _to_dict(row)
+    return _to_dict(row, target_year=year, target_month=month)
 
 
 def list_monthly_limits(
@@ -46,21 +62,50 @@ def list_monthly_limits(
     month: int,
     *,
     nurse_ids: list[str] | None = None,
+    as_of: bool = True,
 ) -> list[dict]:
-    """병동 전체 (또는 일부) 의 월 한도 목록."""
+    """병동 전체 (또는 일부) 의 월 한도 목록.
+
+    as_of=True(기본): (nurse, group)별 대상월 이하 가장 최근 행 1건씩 이월 적용
+    (get_monthly_limit 과 동일 의미). as_of=False: 정확히 그 달 행만.
+    """
+    if not as_of:
+        q = (
+            db.query(NurseMonthlyLimit, Nurse.name)
+            .outerjoin(Nurse, Nurse.nurse_id == NurseMonthlyLimit.nurse_id)
+            .filter(
+                NurseMonthlyLimit.group_id == group_id,
+                NurseMonthlyLimit.year == year,
+                NurseMonthlyLimit.month == month,
+            )
+        )
+        if nurse_ids:
+            q = q.filter(NurseMonthlyLimit.nurse_id.in_(nurse_ids))
+        return [{**_to_dict(r), "nurse_name": name} for r, name in q.all()]
+
+    target_ym = year * 12 + month
     q = (
         db.query(NurseMonthlyLimit, Nurse.name)
         .outerjoin(Nurse, Nurse.nurse_id == NurseMonthlyLimit.nurse_id)
         .filter(
             NurseMonthlyLimit.group_id == group_id,
-            NurseMonthlyLimit.year == year,
-            NurseMonthlyLimit.month == month,
+            (NurseMonthlyLimit.year * 12 + NurseMonthlyLimit.month) <= target_ym,
         )
     )
     if nurse_ids:
         q = q.filter(NurseMonthlyLimit.nurse_id.in_(nurse_ids))
-    rows = q.all()
-    return [{**_to_dict(r), "nurse_name": name} for r, name in rows]
+    q = q.order_by(NurseMonthlyLimit.year.desc(), NurseMonthlyLimit.month.desc())
+    seen: set[str] = set()
+    out: list[dict] = []
+    for r, name in q.all():
+        nid = str(r.nurse_id)
+        if nid in seen:
+            continue  # 이미 더 최근(대상월에 가까운) 행을 담음
+        seen.add(nid)
+        out.append(
+            {**_to_dict(r, target_year=year, target_month=month), "nurse_name": name}
+        )
+    return out
 
 
 def upsert_monthly_limit(
@@ -153,17 +198,198 @@ def upsert_monthly_limit(
     }
 
 
+def unset_monthly_limit(
+    db: Session,
+    nurse_id: str,
+    group_id: str,
+    year: int,
+    month: int,
+    *,
+    shifts: list[str] | None = None,
+    preview_only: bool = False,
+) -> dict:
+    """월 한도 '해제'(설정 안 함) — 지정 시프트(없으면 전체)의 min/max/exact 를 NULL 로.
+
+    행을 **삭제하지 않고** 해당 필드를 NULL 로 기록한다. 전체 해제 시 all-null '묘비' 행이
+    되어 as-of 조회가 이 달에서 멈추고 과거 non-null 한도를 재상속하지 않는다(canonical
+    upsert 서비스의 tombstone 규칙과 동일). shifts 미지정/["all"] = 12필드 전부 NULL.
+    shifts=["n"] = n_min/n_max/n_exact 만 NULL(나머지 기존값 유지).
+    """
+    codes = _resolve_unset_shifts(shifts)
+    if codes is None:
+        return {
+            "error": f"unknown shift codes: {shifts}",
+            "allowed": list(_SHIFT_CODES) + ["all"],
+        }
+    updates = {f: None for f in LIMIT_FIELDS if f.split("_")[0] in codes}
+    res = upsert_monthly_limit(
+        db, nurse_id, group_id, year, month, updates, preview_only=preview_only
+    )
+    if "error" not in res:
+        res["unset"] = True
+        res["unset_shifts"] = sorted(codes)
+    return res
+
+
 # ── private ──────────────────────────────────────────────
 
+_SHIFT_CODES = ("d", "e", "n", "o")
 
-def _to_dict(row: NurseMonthlyLimit) -> dict:
+
+def _resolve_unset_shifts(shifts: list[str] | None) -> set[str] | None:
+    """해제 대상 시프트 코드 집합. None/['all']/[] → 전체. 미지 코드 있으면 None(에러)."""
+    if not shifts or any(str(s).lower() == "all" for s in shifts):
+        return set(_SHIFT_CODES)
+    codes = {str(s).lower() for s in shifts}
+    if not codes <= set(_SHIFT_CODES):
+        return None
+    return codes
+
+
+def _resolve_asof_row(
+    db: Session, nurse_id: str, group_id: str, year: int, month: int
+) -> NurseMonthlyLimit | None:
+    """대상 (year, month) 이하 '가장 최근' 한도 행. 생성 로더와 동일 as-of 쿼리."""
+    target_ym = year * 12 + month
+    return (
+        db.query(NurseMonthlyLimit)
+        .filter(
+            NurseMonthlyLimit.nurse_id == nurse_id,
+            NurseMonthlyLimit.group_id == group_id,
+            (NurseMonthlyLimit.year * 12 + NurseMonthlyLimit.month) <= target_ym,
+        )
+        .order_by(NurseMonthlyLimit.year.desc(), NurseMonthlyLimit.month.desc())
+        .first()
+    )
+
+
+def _to_dict(
+    row: NurseMonthlyLimit,
+    *,
+    target_year: int | None = None,
+    target_month: int | None = None,
+) -> dict:
+    # target_* 지정 시(as-of 조회) '표시 월'은 대상월로 스탬프하고, 값의 실제 출처
+    # (applied_from_*)는 행의 연/월로 둔다. 이월이면 carried_over=True.
+    disp_year = target_year if target_year is not None else row.year
+    disp_month = target_month if target_month is not None else row.month
     d = {
         "id": row.id,
         "nurse_id": row.nurse_id,
         "group_id": row.group_id,
-        "year": row.year,
-        "month": row.month,
+        "year": disp_year,
+        "month": disp_month,
+        "applied_from_year": row.year,
+        "applied_from_month": row.month,
+        "carried_over": (row.year != disp_year or row.month != disp_month),
     }
     for f in LIMIT_FIELDS:
         d[f] = getattr(row, f)
     return d
+
+
+# ── 병동 전체 일괄 (나이트 개수) ──────────────────────────
+# 단일 간호사 upsert 와 달리 **기존 서비스(night_bulk_apply_service)를 그대로 재사용**한다.
+# 그 서비스가 대상자 선정(야간 가능자만)·검증·조합 에러(_ko)·upsert 를 이미 SSOT 로
+# 갖고 있어, 에이전트가 자체 루프를 돌면 규칙이 갈라진다(월한도 검증이 두 벌이 됨).
+
+_BULK_KIND = {"고정": "fixed", "최대": "max", "fixed": "fixed", "max": "max"}
+
+
+def _n_capable_nurses(db: Session, group_id: str) -> list:
+    """야간 가능 active 근무자 — night_bulk_apply_service 와 동일 기준(미리보기용)."""
+    from services.precheck.monthly_limit_validator import _allowed_work_shifts
+
+    rows = db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.active == 1).all()
+    return [n for n in rows if "N" in (_allowed_work_shifts(n) or {"D", "E", "N"})]
+
+
+def _acting_user(db: Session, acting_user_id: str | None):
+    """SessionContext 의 nurse_id → 권한 검사용 UserSchema.
+
+    ★ 우회가 아니다 — 서비스의 권한 판정은 `account_id` 로 **DB(nurses)를 다시 읽어**
+      수간호사 여부를 확인한다. 여기서는 실제 간호사 행의 account_id 를 실어 보낼 뿐이라
+      판정 권위는 그대로 DB 에 있다. 표시용 필드는 검사에 쓰이지 않아 빈 값으로 채운다.
+    """
+    from schemas.auth_schema import User as UserSchema
+
+    n = db.query(Nurse).filter(Nurse.nurse_id == str(acting_user_id or "")).first()
+    if n is None:
+        return None
+    return UserSchema(
+        nurse_id=str(n.nurse_id),
+        account_id=str(getattr(n, "account_id", "") or ""),
+        office_id=str(getattr(n, "office_id", "") or ""),
+        group_id=str(getattr(n, "group_id", "") or ""),
+        is_head_nurse=bool(getattr(n, "is_head_nurse", False)),
+        name=str(getattr(n, "name", "") or ""),
+        mb_part="", office_name="", mb_part_name="",
+        gw_useYN="", qpis_useYN="", official_title_name=None,
+        hn_auth=getattr(n, "hn_auth", None),
+    )
+
+
+def bulk_night_limit(
+    db: Session,
+    group_id: str,
+    year: int,
+    month: int,
+    *,
+    kind: str,
+    value: int,
+    acting_user_id: str | None = None,
+    preview_only: bool = True,
+) -> dict:
+    """병동 전체(야간 가능자)에 나이트 개수를 일괄 적용. kind='고정'|'최대'.
+
+    preview_only=True 면 DB 를 건드리지 않고 대상 인원만 세어 돌려준다.
+    """
+    resolved = _BULK_KIND.get(str(kind).strip().lower())
+    if resolved is None:
+        return {"error": f"kind 는 '고정'(n_exact) 또는 '최대'(n_max) 여야 합니다: {kind}"}
+    if value is None or int(value) < 0:
+        return {"error": "나이트 개수를 0 이상으로 지정해 주세요."}
+
+    targets = _n_capable_nurses(db, group_id)
+    if not targets:
+        return {"error": "이 병동에 야간 가능 근무자가 없습니다."}
+
+    label = "고정(정확히)" if resolved == "fixed" else "최대"
+    summary = {
+        "scope": "ward",
+        "year": year,
+        "month": month,
+        "kind": label,
+        "value": int(value),
+        "대상_인원": len(targets),
+        "대상": sorted(str(getattr(n, "name", n.nurse_id)) for n in targets),
+    }
+    if preview_only:
+        return {"preview": True, "operation": "bulk_night", "summary": summary}
+
+    user = _acting_user(db, acting_user_id)
+    if user is None:
+        return {"error": "요청자 정보를 확인할 수 없어 일괄 적용을 할 수 없습니다."}
+
+    from services.nurse_monthly_limit_service import night_bulk_apply_service
+
+    try:
+        items, _meta, warnings = night_bulk_apply_service(
+            db, user, group_id=group_id, year=year, month=month,
+            kind=resolved, value=int(value),
+        )
+    except Exception as exc:  # noqa: BLE001 — 422 조합 에러를 문장으로 전달
+        detail = getattr(exc, "detail", None)
+        return {"error": str(detail) if detail else str(exc)}
+
+    return {
+        "ok": True,
+        "operation": "bulk_night",
+        "summary": summary,
+        "applied_count": len(items or []),
+        "warnings": [getattr(w, "message_ko", None) or str(w) for w in (warnings or [])],
+        "message": (
+            f"{year}년 {month}월 야간 가능 근무자 {len(targets)}명의 나이트 개수를 "
+            f"{label} {value}회로 일괄 적용했습니다."
+        ),
+    }

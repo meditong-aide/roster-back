@@ -17,6 +17,8 @@ _POLICY_LOCKED_FIELDS: dict[str, dict[str, str]] = {
         "label_ko": "야간 최대 횟수",
         "alternative": "개인별 한도가 필요하시면 `update_monthly_limit` 으로 간호사별 N 한도를 설정할 수 있습니다.",
     },
+    # preceptor_gauge / team_balance_* 는 dev 에서 컬럼 DROP → 여기 명시 lock 불필요.
+    # constraint_tools._AGENT_SETTABLE_FIELDS 화이트리스트가 비허용 필드를 이미 거절한다.
 }
 
 

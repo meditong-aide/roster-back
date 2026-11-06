@@ -13,16 +13,28 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from agents_v2.errors import (
+    ErrorType,
+    classify as _classify_outcome,
+    extract_apply_hint_question as _extract_apply_hint_question,
+    is_error as _is_error,
+)
+from agents_v2.harness.dev_query_log import log_dev_query
 from agents_v2.harness.prompt_builder import build_system_prompt
-from agents_v2.llm_client import LLMClient, LLMResponse
-from agents_v2.middleware import SkillResult, execute_skill
+from agents_v2.llm_client import LLMClient
+from agents_v2.middleware import SkillResult, _check_permission, execute_skill
+from agents_v2.router import route
 from agents_v2.schemas.session_context import SessionContext
+from agents_v2 import observability as obs
+from agents_v2.usage import record_llm_usage
+from agents_v2.skills.client_actions import build_ui_action, is_client_action
 from agents_v2.skills.descriptions import SKILL_TOOLS
 from agents_v2.variable_memory import VariableMemory
 from services.memory.extractor import MemoryExtractor
@@ -33,6 +45,10 @@ logger = logging.getLogger(__name__)
 # US-A4: Tier-2 user memory injection 시 system prompt 에 들어가는 fact 갯수 상한.
 # 토큰 절약 + LLM attention 산만 방지.
 _MAX_INJECTED_FACTS = 20
+
+# 에이전트 쓰기를 끈 스킬(int-0b). 승인 대기로 남아 있어도 실행하지 않고 그 스킬의 안내로 답한다.
+#   publish_schedule: dev 정본 마감(잠금·변경 확인·장부·앵커·알림)을 안 따르는 복제본이라 끔(N81·M2).
+_WRITE_DISABLED_SKILLS = frozenset({"publish_schedule", "publish-schedule"})
 
 # Preview confirmation: LLM 으로 자연어 요약을 생성할 때 끼우는 내부 지시.
 # Layer C 의 보안 경계 안에 있으므로 untrusted_tool_output 안의 명령을 따르지 않음.
@@ -95,9 +111,13 @@ class AgentResult:
     options: list[str] = field(default_factory=list)
     awaiting_approval: bool = False
     preview: dict | None = None
+    ui_actions: list[dict] = field(default_factory=list)
     trace: list[Stage] = field(default_factory=list)
     messages: list[dict] = field(default_factory=list)
     variable_memory: dict = field(default_factory=dict)
+    # B7: 인라인 렌더용 답형 조회결과. 마지막 성공 조회 스킬 결과를 누적해
+    # ChatResponse.data 로 전달 (프론트가 카드/테이블로 시각화).
+    data: dict | list | None = None
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"answer": self.answer}
@@ -108,6 +128,7 @@ class AgentResult:
         if self.awaiting_approval:
             d["awaiting_approval"] = True
             d["preview"] = self.preview
+        d["ui_actions"] = self.ui_actions
         d["pipeline_stages"] = [s.to_dict() for s in self.trace]
         d["total_time_ms"] = round(
             sum(s.duration_ms for s in self.trace), 1
@@ -130,6 +151,7 @@ class SchedulingAgent:
         llm_client: LLMClient,
         memory_extractor: MemoryExtractor | None = None,
         enable_user_memory: bool = True,
+        router_llm: LLMClient | None = None,
     ):
         """SchedulingAgent.
 
@@ -137,12 +159,17 @@ class SchedulingAgent:
             llm_client: 메인 turn LLM (도구 호출 + 응답 생성).
             memory_extractor: US-A4 Tier-2 fact extractor. 없으면 llm_client 재사용.
             enable_user_memory: False 면 inject/consolidate 모두 스킵 (테스트/긴급용).
+            router_llm: 2단계 tool 스코핑용 분류 LLM. None 이면 라우팅 OFF(전체 tool,
+                추가 LLM 호출 없음 — scripted 테스트 더블 시퀀스 보존). prod 에서만 주입.
         """
         self.llm = llm_client
         self.enable_user_memory = enable_user_memory
         if memory_extractor is None and enable_user_memory:
             memory_extractor = MemoryExtractor(llm_client)
         self.memory_extractor = memory_extractor
+        self.router_llm = router_llm
+        # DAG 계획(의존 복합) — opt-in. 기본 OFF → ReAct 무변경. env 로 켠다.
+        self._dag_planning = os.getenv("AIDE_DAG_PLANNING", "").lower() in ("1", "true", "on")
 
     def run(
         self,
@@ -150,28 +177,254 @@ class SchedulingAgent:
         user_message: str,
         ctx: SessionContext,
     ) -> AgentResult:
-        """Turn entry — inject_user_memory_context → _run_impl → consolidate_after_turn."""
+        """Turn entry — inject_user_memory_context → _run_impl → consolidate_after_turn.
+
+        턴 전체를 Langfuse trace 로 감싼다(키 있을 때만; 없으면 no-op). 내부 LLM 호출은
+        generation, Stage 는 span, 결과 outcome 은 score 로 적재.
+        """
+        from agents_v2.errors import classify
+
         # US-A4 Tier-2 memory inject + run + consolidate 흐름은 _run_impl 이 핸들링.
         # consolidate 는 응답 반환 직전에 호출 (silent on failure).
         current_user_facts: list[dict] = (
             self._load_user_facts(db, ctx) if self.enable_user_memory else []
         )
 
-        result = self._run_impl(db, user_message, ctx, current_user_facts)
+        with obs.turn(conversation_id=getattr(ctx, "conversation_id", None),
+                      user_id=getattr(ctx, "nurse_id", None),
+                      group_id=getattr(ctx, "group_id", None),
+                      user_message=user_message):
+            result = self._run_impl(db, user_message, ctx, current_user_facts)
 
-        # ── US-A4 consolidate_after_turn (turn 종료 후) ──
-        if self.enable_user_memory and self.memory_extractor is not None:
+            # ── US-A4 consolidate_after_turn (turn 종료 후) ──
+            if self.enable_user_memory and self.memory_extractor is not None:
+                try:
+                    self._consolidate_after_turn(
+                        db, ctx, result.messages, current_user_facts
+                    )
+                except Exception as e:
+                    # silent log — agent 응답에 영향 X
+                    logger.warning(
+                        "[agent_v3] consolidate_after_turn failed: %s", e
+                    )
+
             try:
-                self._consolidate_after_turn(
-                    db, ctx, result.messages, current_user_facts
-                )
-            except Exception as e:
-                # silent log — agent 응답에 영향 X
-                logger.warning(
-                    "[agent_v3] consolidate_after_turn failed: %s", e
-                )
+                obs.finish_turn(result.answer, result.trace,
+                                score_name="outcome", score_value=classify(result.data).name)
+            except Exception:  # noqa: BLE001
+                pass
+            return result
 
-        return result
+    # ── DAG 계획 (opt-in) ────────────────────────────────────
+    def _plan_answer(self, user_message, run) -> str:
+        """플랜 답변 합성 + L2 정합성 검증(답변↔task 출력). 어긋나면 데이터 근거로 1회 재생성."""
+        from agents_v2.planning.orchestrate import join_answer
+        from agents_v2.verify import verify_answer
+
+        answer = join_answer(self.llm, user_message, run)
+        data = run.exec.outputs
+        # L2 정합 게이트(공유). 어긋나면 데이터 근거로 1회 재생성(=re-join, 계획 경로 고유).
+        cons = verify_answer(self.router_llm or self.llm, user_message, data, answer)
+        if cons and not cons.consistent:
+            answer = join_answer(self.llm, user_message, run, correction=cons.reason) or answer
+        return answer
+
+    def _try_dag_plan(self, db, user_message, ctx, messages):
+        """의존 복합이면 plan→execute. read-only 는 즉시 답변, mutate 는 승인 대기.
+        plan 없음/실패면 None → 호출부가 ReAct 로 진행."""
+        from agents_v2.middleware import execute_skill
+        from agents_v2.planning.orchestrate import try_plan_run
+        from db.client2 import SessionLocal
+
+        # 계획은 복합 의존 추론이라 **메인 LLM** 사용(nano 라우터는 과생성/오류).
+        planner_llm = self.llm
+        try:
+            with obs.purpose("planner"):
+                # collect_clarifications: 여러 태스크가 각각 되물음 필요 시 첫 것에서 안 멈추고
+                # 독립 브랜치의 되물음까지 모아 한 번에 clarify_form 으로 물어본다.
+                run = try_plan_run(db, user_message, ctx, planner_llm, SKILL_TOOLS, execute_skill,
+                                   session_factory=SessionLocal,  # read 세션 격리 병렬
+                                   collect_clarifications=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[agent_v3] DAG plan 실패 → ReAct: %s", e)
+            return None
+        if run is None or run.failed:
+            return None
+        return self._finalize_plan(run, ctx, user_message, messages, db)
+
+    def _resume_clarify(self, db, ctx, messages):
+        """clarify_form 답변(ctx.clarify_answers)을 계획 args 에 병합 후 재실행.
+
+        여전히 빠진 정보 있으면 다시 clarify_form, 아니면 승인/답변으로 진행.
+        """
+        from agents_v2.middleware import execute_skill
+        from agents_v2.planning.executor import execute_plan
+        from agents_v2.planning.orchestrate import PlanRun, apply_clarify_answers
+        from agents_v2.planning.plan import Plan
+        from db.client2 import SessionLocal
+
+        pend = ctx.pending_clarify or {}
+        answers = ctx.clarify_answers or []
+        orig = pend.get("user_message", "")
+        plan_dict = apply_clarify_answers(pend.get("plan") or {}, answers)
+        ctx.pending_clarify = None
+        ctx.clarify_answers = None
+        try:
+            plan = Plan.from_dict(plan_dict)
+            run = PlanRun(plan=plan, exec=execute_plan(
+                db, plan, ctx, execute_skill, session_factory=SessionLocal,
+                collect_clarifications=True))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[agent_v3] clarify 재개 실패 → ReAct: %s", e)
+            return self._run_impl(db, orig, ctx, [])
+        if run.failed:
+            return self._run_impl(db, orig, ctx, [])  # 재개 중 STOP → ReAct fallback
+        return self._finalize_plan(run, ctx, orig, messages, db)
+
+    def _finalize_plan(self, run, ctx, user_message, messages, db):
+        """plan 실행 결과 → clarify_form / 승인대기 / 답변 분기(_try_dag_plan·_resume_clarify 공유)."""
+        from agents_v2.middleware import execute_skill
+        from agents_v2.planning.orchestrate import build_clarify_form, preview_fingerprint
+
+        trace = [Stage("plan", "ok",
+                       {"tasks": [(t.id, t.skill, t.kind, t.deps) for t in run.plan.tasks]}, 0)]
+        last = run.exec.outputs.get(run.plan.tasks[-1].id) if run.plan.tasks else None
+        # 되물음 수집됐으면 승인/답변보다 먼저 — 구조화 clarify_form 으로 한 번에 질문.
+        if run.exec.clarifications:
+            form = build_clarify_form(run.exec.clarifications, plan=run.plan, ctx=ctx,
+                                      skill_tools=SKILL_TOOLS, db=db)
+            qs = form["questions"]
+            summary = "진행하려면 몇 가지 확인이 필요합니다:\n" + "\n".join(
+                f"- {q['question']}" + (f" (선택: {', '.join(q['options'])})" if q["options"] else "")
+                for q in qs)
+            # 프론트가 답을 채워 보내면(ctx.clarify_answers) _resume_clarify 로 재개.
+            ctx.pending_clarify = {"plan": run.plan.to_dict(), "user_message": user_message}
+            return AgentResult(needs_clarification=True, question=summary, ui_actions=[form],
+                               trace=trace, messages=messages, variable_memory=ctx.variable_memory)
+        if run.needs_approval:
+            ctx.pending_approval = {"type": "plan", "plan": run.plan.to_dict(),
+                                    "user_message": user_message,
+                                    "preview_fp": preview_fingerprint(run.exec.previews)}
+            previews = run.exec.previews
+            preview = ({"type": "batch", "count": len(previews), "items": previews}
+                       if len(previews) > 1 else previews[0])
+            answer = self._plan_answer(user_message, run)
+            if run.exec.deferred:  # 승인 시 커밋 후 생성 등 async 시작 예정
+                answer += " (승인하면 설정 반영 후 근무표 생성이 시작됩니다.)"
+            answer += "\n\n진행할까요?"
+            return AgentResult(awaiting_approval=True, preview=preview, answer=answer,
+                               trace=trace, messages=messages,
+                               variable_memory=ctx.variable_memory, data=last)
+        # read-only(승인 불필요): 커밋할 mutation 이 없으니 deferred(async) 를 바로 실행.
+        from agents_v2.planning.plan import resolve_args
+        async_done: list[str] = []
+        for t in run.exec.deferred:
+            try:
+                execute_skill(db, t.skill, resolve_args(t.args, run.exec.outputs), ctx)
+                async_done.append(t.skill)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[agent_v3] deferred %s 실행 실패: %s", t.skill, e)
+        answer = self._plan_answer(user_message, run)
+        if async_done:
+            answer += "\n\n(**근무표 생성을 시작**했습니다 — 완료까지 잠시 걸립니다.)"
+        return AgentResult(answer=answer, trace=trace, messages=messages,
+                           variable_memory=ctx.variable_memory, data=last)
+
+    def _commit_plan(self, db, user_message, ctx, messages):
+        """계획 승인 후 mutate 를 위상순서로 실제 commit(dry_run 해제) → 답변 합성."""
+        from agents_v2.middleware import execute_skill
+        from agents_v2.planning.executor import PlanExecResult, execute_plan
+        from agents_v2.planning.orchestrate import PlanRun, preview_fingerprint
+        from agents_v2.planning.plan import Plan, resolve_args
+
+        pending = ctx.pending_approval or {}
+        plan = Plan.from_dict(pending.get("plan") or {})
+        orig = pending.get("user_message", user_message)
+        approved_fp = pending.get("preview_fp")
+        ctx.pending_approval = None
+
+        # ── #5 staleness: 승인 시점 미리보기와 지금이 다르면 커밋 말고 재확인 ──
+        # dry-run 을 flush+rollback 로 재실행(부수효과 없이) → 지문 비교.
+        if approved_fp is not None:
+            _rc = db.commit
+            db.commit = db.flush  # type: ignore[method-assign]
+            try:
+                dry = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=True)
+            except Exception:  # noqa: BLE001
+                dry = None
+            finally:
+                db.commit = _rc  # type: ignore[method-assign]
+                try:
+                    db.rollback()  # dry-run 부수효과(get_or_init 등) 되돌림
+                except Exception:  # noqa: BLE001
+                    pass
+            if dry is not None and not dry.failed and preview_fingerprint(dry.previews) != approved_fp:
+                fresh_fp = preview_fingerprint(dry.previews)
+                ctx.pending_approval = {"type": "plan", "plan": plan.to_dict(),
+                                        "user_message": orig, "preview_fp": fresh_fp}
+                previews = dry.previews
+                preview = ({"type": "batch", "count": len(previews), "items": previews}
+                           if len(previews) > 1 else (previews[0] if previews else None))
+                return AgentResult(
+                    awaiting_approval=True, preview=preview,
+                    answer="승인 이후 상황이 바뀌어 미리보기가 달라졌습니다. 바뀐 내용으로 진행할까요?",
+                    trace=[Stage("plan_staleness", "block", {}, 0)],
+                    messages=messages, variable_memory=ctx.variable_memory)
+
+        # ── 원자성: 플랜의 전 mutation 을 한 트랜잭션으로 (공유 경계) ──
+        # atomic_commit 이 내부 db.commit()→flush 리다이렉트 + 단일 commit / 실패 시 rollback 을
+        # 담당. 실패(read-back 위반 포함)는 AbortCommit 로 전체 롤백을 유도한다(부분 반영 방지).
+        from agents_v2.commit_gate import AbortCommit, atomic_commit
+        try:
+            with atomic_commit(db):
+                try:
+                    exec_res = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=False)
+                except Exception as e:  # noqa: BLE001
+                    exec_res = PlanExecResult(
+                        failed={"task": "plan", "skill": "", "data": {"error": str(e)}})
+                if exec_res.failed:
+                    raise AbortCommit()  # 전체 롤백
+        except AbortCommit:
+            err = exec_res.failed.get("data") or {}
+            reason = err.get("error") or err.get("question") or "알 수 없는 오류"
+            return AgentResult(
+                answer=f"실행 중 문제가 있어 **전체 취소(롤백)**했습니다 — 부분 반영 없음. ({reason})",
+                trace=[Stage("plan_commit", "error",
+                             {"order": exec_res.order, "atomic": "rolled_back"}, 0)],
+                messages=messages, variable_memory=ctx.variable_memory)
+        except Exception as e:  # noqa: BLE001 — commit() 자체 실패(이미 롤백됨)
+            return AgentResult(
+                answer=f"커밋 중 오류로 **전체 취소**했습니다: {e}",
+                trace=[Stage("plan_commit", "error", {"atomic": "rolled_back"}, 0)],
+                messages=messages, variable_memory=ctx.variable_memory)
+        # ── 커밋 성공 후: deferred(async, 예: 근무표 생성) 실행 ──
+        # 커밋된 상태를 읽고 enqueue(트랜잭션 밖). 롤백됐으면 여기 안 옴 → 잘못된 설정으로 생성 안 됨.
+        async_done: list[str] = []
+        for t in exec_res.deferred:
+            try:
+                aargs = resolve_args(t.args, exec_res.outputs)
+                execute_skill(db, t.skill, aargs, ctx)
+                async_done.append(t.skill)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[agent_v3] deferred %s 실행 실패: %s", t.skill, e)
+
+        run = PlanRun(plan=plan, exec=exec_res)
+        last = exec_res.outputs.get(plan.tasks[-1].id) if plan.tasks else None
+        answer = self._plan_answer(orig, run)
+        if async_done:
+            answer += "\n\n(설정을 반영하고 **근무표 생성을 시작**했습니다 — 완료까지 잠시 걸립니다.)"
+        trace = [Stage("plan_commit", "ok",
+                       {"order": exec_res.order, "atomic": "committed", "async": async_done}, 0)]
+        # ── P5 자동검증(공유): 근무표 셀을 직접 커밋했고, 플랜에 검증 task 도 없고, 생성(async)
+        # 대기도 아니면 ReAct 커밋과 동일하게 proactive validate. (생성 대기면 새 표 미완성이라 보류.)
+        plan_skills = {t.skill for t in plan.tasks}
+        if (any(_is_schedule_mutation(t.skill, t.args) for t in plan.tasks if t.kind == "mutate")
+                and not (plan_skills & {"validate_schedule", "repair_schedule"})
+                and not any(t.skill in ("generate_schedule", "generate-schedule")
+                            for t in exec_res.deferred)):
+            answer += self._auto_validate(db, ctx, trace)
+        return AgentResult(answer=answer, trace=trace,
+                           messages=messages, variable_memory=ctx.variable_memory, data=last)
 
     def _run_impl(
         self,
@@ -212,8 +465,20 @@ class SchedulingAgent:
             ]
 
         # ── Handle pending approval ──
+        # clarify 재개: 프론트가 clarify_form 답을 채워 보내면(ctx.clarify_answers) 계획 재실행.
+        if getattr(ctx, "pending_clarify", None) and getattr(ctx, "clarify_answers", None):
+            return self._resume_clarify(db, ctx, messages)
+
         if ctx.pending_approval:
             ptype = ctx.pending_approval.get("type")
+            if ptype == "plan":
+                # DAG 계획 승인 라운드트립: 확인이면 mutate 를 위상순서로 실제 commit.
+                if _is_confirmation(user_message):
+                    return self._commit_plan(db, user_message, ctx, messages)
+                if _is_denial(user_message):
+                    ctx.pending_approval = None
+                    return AgentResult(answer="계획을 취소했습니다. 다음에 무엇을 할까요?",
+                                       messages=messages, variable_memory=ctx.variable_memory)
             if ptype == "apply_hint":
                 # apply_hint 재시도 흐름: 확인/거부/모호 분기
                 if _is_denial(user_message):
@@ -244,15 +509,108 @@ class SchedulingAgent:
                     variable_memory=ctx.variable_memory,
                 )
 
+        # ── DAG 계획 (opt-in, 의존 복합) — plan 없음/실패면 아래 ReAct 로 fallthrough ──
+        if self._dag_planning and not ctx.pending_approval:
+            planned = self._try_dag_plan(db, user_message, ctx, messages)
+            if planned is not None:
+                return planned
+
         tools = SKILL_TOOLS
         trace: list[Stage] = []
         vm = VariableMemory()
-        _prev_calls: set[str] = set()  # dedup signatures
-        _failed_shift_terms: list[str] = []  # Track failed shift names for auto-learn
+        ui_actions: list[dict] = []
+        _prev_calls: set[str] = set()
+        _failed_shift_terms: list[str] = []
+        # B7: 마지막 성공 조회 결과 — 인라인 렌더용 ChatResponse.data 채움.
+        last_query_data: dict | list | None = None
+        # 이번 턴의 모든 OK 조회 결과 — L2 는 (마지막 하나가 아니라) 턴 전체 데이터로 대조해야
+        # 복합쿼리("A랑 B 각각")에서 오탐이 안 난다.
+        turn_query_data: list = []
+        # 이번 턴이 사용자에게 되물었는가(스킬이 CLARIFICATION 을 냈는가).
+        # DAG 경로는 AgentResult(needs_clarification=True) 를 이미 세팅하는데 ReAct 경로는
+        # 안 해서 비대칭이었다 — 다음 턴이 "그 물음의 답"인지 알 수 없었다.
+        turn_clarified = False
 
         # Restore VM from previous turns
         if ctx.variable_memory:
             vm._store.update(ctx.variable_memory)
+
+        # ── US-R2: Router (2단계 tool 스코핑) — main path only ──
+        # 질의를 LLM이 카테고리로 분류 → scoped tool subset 으로 (a) system prompt 의
+        # '## 사용 가능한 도구' 섹션, (b) chat(tools=) 둘 다 스코핑. fallback(분류 실패/
+        # 저신뢰)이면 전체 tool 유지(턴 안 깨짐). pending_approval 턴은 tools= 를 안 쓰므로 스킵.
+        # ── 후속 턴 스코프 재사용 (라우터 호출 0회) ──────────────────────
+        # 직전 턴이 사용자에게 되물었으면(awaited_reply) 이번 발화는 그 답이다 —
+        # "아무거나" / "그래" / "1" 처럼 단독으로는 분류 불가라 라우터가 fallback 하고
+        # tool 전체(29개)를 싣던 구간(실측 703턴 중 108턴, 15%). 직전 스코프를 그대로
+        # 재사용해 호출과 토큰을 둘 다 없앤다.
+        #
+        # ★ 안전 방향: 판단 근거는 발화 길이가 아니라 **직전 턴의 구조적 상태**다.
+        #   틀려도 "정상 라우팅"으로만 떨어지도록, 재사용 조건이 아니면 기존 경로를 탄다.
+        #   메인 에이전트는 어차피 대화 이력 전체를 보므로 답변 맥락은 손실되지 않는다.
+        reused_route: dict | None = None
+        if (
+            self.router_llm is not None
+            and not ctx.pending_approval
+            and getattr(ctx, "awaited_reply", False)
+            and getattr(ctx, "last_route", None)
+        ):
+            reused_route = ctx.last_route
+            allowed = list(reused_route.get("tool_names") or [])
+            if allowed:
+                scoped_prompt = build_system_prompt(ctx, allowed_tools=allowed)
+                if self.enable_user_memory:
+                    _mb = self._format_memory_block(current_user_facts)
+                    if _mb:
+                        scoped_prompt = f"{scoped_prompt}\n\n---\n\n{_mb}"
+                if messages and messages[0].get("role") == "system":
+                    messages[0] = {"role": "system", "content": scoped_prompt}
+                _allowed_set = set(allowed)
+                tools = [t for t in SKILL_TOOLS if t["name"] in _allowed_set] or SKILL_TOOLS
+                trace.append(Stage(
+                    "router_reuse", "ok",
+                    {"categories": reused_route.get("categories"), "tools": len(allowed)}, 0,
+                ))
+                log_dev_query(
+                    reused_route.get("categories"), user_message, ctx.conversation_id
+                )
+            else:
+                reused_route = None
+
+        if self.router_llm is not None and not ctx.pending_approval and reused_route is None:
+            t_route = time.time()
+            with obs.purpose("router"):
+                router_result = route(self.router_llm, user_message)
+            route_ms = (time.time() - t_route) * 1000
+            log_dev_query(
+                router_result.categories, user_message, ctx.conversation_id
+            )
+            if not router_result.fallback_used:
+                allowed = router_result.tool_names
+                scoped_prompt = build_system_prompt(ctx, allowed_tools=allowed)
+                if self.enable_user_memory:
+                    mb = self._format_memory_block(current_user_facts)
+                    if mb:
+                        scoped_prompt = f"{scoped_prompt}\n\n---\n\n{mb}"
+                if messages and messages[0].get("role") == "system":
+                    messages[0] = {"role": "system", "content": scoped_prompt}
+                allowed_set = set(allowed)
+                tools = [t for t in SKILL_TOOLS if t["name"] in allowed_set]
+                # 다음 턴이 "이 물음의 답"이면 재사용할 스코프로 기억한다.
+                # fallback(분류 실패) 스코프는 전체 tool 이라 기억할 값어치가 없다.
+                ctx.last_route = {
+                    "categories": list(router_result.categories),
+                    "tool_names": list(allowed),
+                }
+            trace.append(
+                Stage("routing", "ok", router_result.to_dict(), route_ms)
+            )
+            record_llm_usage(
+                db, conversation_id=ctx.conversation_id, group_id=ctx.group_id,
+                user_id=ctx.nurse_id, model=router_result.model, purpose="router",
+                input_tokens=router_result.input_tokens,
+                output_tokens=router_result.output_tokens,
+            )
 
         for turn in range(self.MAX_TURNS):
             # ── LLM call ──
@@ -260,25 +618,83 @@ class SchedulingAgent:
             # MSSQL/Redis save_messages 에는 전체 messages 가 저장되어 감사 trail 손실 없음.
             inject_messages = _truncate_for_llm(messages, max_chars=_MAX_INJECT_CHARS)
             t0 = time.time()
-            response = self.llm.chat(inject_messages, tools=tools)
+            with obs.purpose("turn"):
+                response = self.llm.chat(inject_messages, tools=tools)
             llm_ms = (time.time() - t0) * 1000
+
+            record_llm_usage(
+                db, conversation_id=ctx.conversation_id, group_id=ctx.group_id,
+                user_id=ctx.nurse_id, model=response.model, purpose="turn",
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+            )
 
             # ── Text response → final answer ──
             if response.is_text:
-                trace.append(
-                    Stage("answer", "ok", {"text": response.text}, llm_ms)
+                answer_text = response.text or ""
+                # ── L2 answer-consistency: 조회 데이터가 있으면 답변↔데이터 정합성 검증 ──
+                # (read 답변의 환각 방지. mutation "완료"류는 조회 데이터 없어 skip → L1 담당)
+                #
+                # 정합성 최우선(오탐 금지):
+                #  - 턴 '전체' 조회 데이터로 대조(복합쿼리 오탐 방지). 마지막 하나만 보면
+                #    "A랑 B" 답변에서 A 를 근거없다고 오탐한다.
+                #  - 데이터가 크면(잘림 불가피) judge 가 '부분만 보고' 오탐하므로 skip.
+                #    대용량 조회는 L2 미적용(recall↓ 감수, false-positive 0 우선).
+                from agents_v2.verify import verify_answer
+
+                _judge_data = (turn_query_data[0] if len(turn_query_data) == 1
+                               else turn_query_data)
+                # L2 정합 게이트(공유). None=검증 대상 아님(skip). 재생성은 ReAct 고유(=re-chat).
+                cons = verify_answer(
+                    self.router_llm or self.llm, user_message, _judge_data, answer_text
                 )
+                if cons is not None:
+                    trace.append(Stage(
+                        "answer_consistency",
+                        "ok" if cons.consistent else "block",
+                        {"reason": cons.reason}, 0,
+                    ))
+                    if not cons.consistent:
+                        # LLM-Modulo 루프: 어긋나면 데이터에만 근거해 1회 재생성.
+                        fix = inject_messages + [{
+                            "role": "system",
+                            "content": (
+                                f"[검증] 직전 답변이 도구 데이터와 어긋난다: {cons.reason}. "
+                                "도구가 반환한 데이터에만 근거해 다시 답하라. "
+                                "데이터에 없는 수치·이름·상태를 지어내지 마라."
+                            ),
+                        }]
+                        try:
+                            regen = self.llm.chat(fix, tools=[])
+                            if regen.is_text and (regen.text or "").strip():
+                                answer_text = regen.text
+                                trace.append(Stage(
+                                    "answer_regenerated", "ok", {"text": answer_text}, 0
+                                ))
+                        except Exception:  # noqa: BLE001
+                            pass
+                trace.append(Stage("answer", "ok", {"text": answer_text}, llm_ms))
                 return AgentResult(
-                    answer=response.text or "",
+                    answer=answer_text,
+                    ui_actions=ui_actions,
                     trace=trace,
                     messages=messages,
                     variable_memory=vm.to_dict(),
+                    data=last_query_data,
+                    needs_clarification=turn_clarified,
                 )
 
             # ── Tool call(s) → middleware pipeline ──
             if response.is_tool_call:
                 # Append the single assistant message (may contain N tool_calls)
                 messages.append(response.as_assistant_message())
+
+                # 병렬 tool_call 배치 중 preview/apply_hint 가 나와도 즉시 return 하지 않고
+                # 여기 capture 해둔다. 그 자리에서 return 하면 같은 assistant 메시지의 나머지
+                # tool_call 이 tool 응답 없이 남아 메시지 체인이 무효화된다(OpenAI 400).
+                # 배치를 끝까지 실행해 모든 tool_call 응답을 채운 뒤(체인 완결) return 한다.
+                pending_previews: list[dict] = []
+                pending_apply_hint: dict | None = None
 
                 # Execute each tool call (parallel calls executed sequentially)
                 for tc in response.tool_calls:
@@ -317,6 +733,42 @@ class SchedulingAgent:
                         )
                     )
 
+                    # ── Client-action tool (navigate/prefill) — 프론트 위임, 서버 실행 X ──
+                    if is_client_action(skill_name):
+                        perm_err = _check_permission(skill_name, skill_args, ctx)
+                        ui_action = None
+                        ca_err = perm_err
+                        if not perm_err:
+                            ui_action, ca_err = build_ui_action(skill_name, skill_args)
+                        if ca_err:
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.call_id,
+                                "content": json.dumps(
+                                    {"error": ca_err, **({"permission_denied": True} if perm_err else {})},
+                                    ensure_ascii=False,
+                                ),
+                            })
+                            trace.append(Stage(
+                                "execution", "error",
+                                {"skill": skill_name, "result": {"error": ca_err}}, 0.0,
+                            ))
+                            continue
+                        ui_actions.append(ui_action)
+                        vm.store(skill_name, {"dispatched": True, "action": ui_action})
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.call_id,
+                            "content": json.dumps(
+                                {"dispatched": True, "action": ui_action}, ensure_ascii=False
+                            ),
+                        })
+                        trace.append(Stage(
+                            "execution", "ok",
+                            {"skill": skill_name, "result": {"ui_action": ui_action}}, 0.0,
+                        ))
+                        continue
+
                     # ── Execute via middleware ──
                     result = execute_skill(db, skill_name, skill_args, ctx)
 
@@ -339,57 +791,54 @@ class SchedulingAgent:
                     # Store result in Variable Memory
                     vm.store(skill_name, result.data)
 
+                    # B7: 인라인 렌더용 데이터 누적 — 마지막 성공 조회 결과가 이긴다.
+                    # error / needs_clarification / preview 는 데이터 의미가 없어 제외.
+                    # §3.C: 3개 판별식을 outcome taxonomy 단일 분류(OK)로 통합.
+                    _outcome = _classify_outcome(result.data)
+                    if result.data is not None and _outcome is ErrorType.OK:
+                        last_query_data = result.data
+                        turn_query_data.append(result.data)
+                    elif _outcome is ErrorType.CLARIFICATION:
+                        # 되물음으로 끝난 턴 — 다음 발화는 그 답이다(라우터 스코프 재사용 근거).
+                        turn_clarified = True
+
                     # ── Auto-learn abbreviation tracking ──
                     _track_shift_learning(
                         skill_args, result, _failed_shift_terms,
                     )
 
-                    # ── apply_hint 흐름 — generate_schedule INFEASIBLE 재시도 ──
+                    # ── apply_hint 흐름 — capture, don't return (배치 완결 후 처리) ──
                     apply_hint_q = _extract_apply_hint_question(skill_name, result.data)
                     if apply_hint_q is not None:
-                        hint_data = result.data["infeasibility"]["apply_hint"]
-                        pending = {
-                            "type": "apply_hint",
-                            "apply_hint": hint_data,
-                            "original_args": skill_args,
-                            "question": apply_hint_q,
-                        }
+                        if pending_apply_hint is None:
+                            pending_apply_hint = {
+                                "type": "apply_hint",
+                                "apply_hint": result.data["infeasibility"]["apply_hint"],
+                                "original_args": skill_args,
+                                "question": apply_hint_q,
+                            }
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.call_id,
                             "content": _wrap_untrusted_tool_output(skill_name, result.data),
                         })
-                        return AgentResult(
-                            awaiting_approval=True,
-                            preview=pending,
-                            answer=apply_hint_q,
-                            trace=trace,
-                            messages=messages,
-                            variable_memory=vm.to_dict(),
-                        )
+                        continue
 
-                    # ── Approval flow (preview) — must exit for user confirmation ──
-                    if _is_preview_result(result.data):
-                        preview_with_context = {
+                    # ── Approval flow (preview) — capture all, don't return (배치 완결 후 처리) ──
+                    # §3.C: outcome taxonomy 단일 분류로 dispatch. consolidated 승인을 위해
+                    # 배치의 모든 mutation preview 를 모은다(다중 mutation 도 1회 승인으로).
+                    if _classify_outcome(result.data) is ErrorType.PREVIEW:
+                        pending_previews.append({
                             **result.data,
                             "skill_name": skill_name,
                             "args": skill_args,
-                        }
-                        # Still need to append result for message consistency
+                        })
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.call_id,
                             "content": _wrap_untrusted_tool_output(skill_name, result.data),
                         })
-                        preview_answer = self._generate_preview_answer(messages, trace)
-                        return AgentResult(
-                            awaiting_approval=True,
-                            preview=preview_with_context,
-                            answer=preview_answer,
-                            trace=trace,
-                            messages=messages,
-                            variable_memory=vm.to_dict(),
-                        )
+                        continue
 
                     # ── Append tool result for LLM to observe ──
                     messages.append(
@@ -400,8 +849,91 @@ class SchedulingAgent:
                         }
                     )
 
+                # ── 배치 완결 후: pending 승인 처리 (메시지 체인 무결성 보존) ──
+                # 모든 tool_call 이 응답을 가진 상태이므로 _generate_preview_answer 의
+                # LLM 호출이 400 나지 않는다. apply_hint 우선(생성 재시도).
+                if pending_apply_hint is not None:
+                    return AgentResult(
+                        awaiting_approval=True,
+                        preview=pending_apply_hint,
+                        answer=pending_apply_hint["question"],
+                        ui_actions=ui_actions,
+                        trace=trace,
+                        messages=messages,
+                        variable_memory=vm.to_dict(),
+                    )
+                # ── autonomy_mode "auto": auto_safe mutation 은 승인 없이 즉시 commit ──
+                # manual(기본)이면 no-op. auto 여도 auto_safe=True 스킬만 자동(안전 opt-in).
+                auto_committed: list[tuple[str, Any]] = []
+                if pending_previews and getattr(ctx, "autonomy_mode", "manual") == "auto":
+                    from agents_v2.skills.manifest import SKILL_SPECS, load_manifest_skills
+
+                    load_manifest_skills()
+                    still_pending: list[dict] = []
+                    for p in pending_previews:
+                        spec = SKILL_SPECS.get(str(p.get("skill_name", "")).replace("-", "_"))
+                        if spec is not None and spec.auto_safe:
+                            r = execute_skill(
+                                db, p["skill_name"],
+                                {**p.get("args", {}), "preview_only": False}, ctx,
+                            )
+                            trace.append(Stage(
+                                "auto_execution",
+                                "error" if _is_error(r.data) else "ok",
+                                {"skill": p["skill_name"], "result": _truncate(r.data)},
+                                r.duration_ms,
+                            ))
+                            auto_committed.append((p["skill_name"], r.data))
+                        else:
+                            still_pending.append(p)
+                    pending_previews = still_pending
+
+                if pending_previews:
+                    # 단일이면 기존 shape 유지(하위호환). 다중이면 consolidated batch.
+                    if len(pending_previews) == 1:
+                        preview_payload = pending_previews[0]
+                    else:
+                        preview_payload = {
+                            "type": "batch",
+                            "count": len(pending_previews),
+                            "items": pending_previews,
+                        }
+                    preview_answer = self._generate_preview_answer(messages, trace)
+                    if auto_committed:
+                        ok_n = sum(1 for _, d in auto_committed if not _is_error(d))
+                        preview_answer = (
+                            f"{ok_n}건은 자동 실행했습니다. 나머지는 확인이 필요합니다.\n\n"
+                            + preview_answer
+                        )
+                    return AgentResult(
+                        awaiting_approval=True,
+                        preview=preview_payload,
+                        answer=preview_answer,
+                        ui_actions=ui_actions,
+                        trace=trace,
+                        messages=messages,
+                        variable_memory=vm.to_dict(),
+                    )
+
+                if auto_committed:
+                    # 전부 auto_safe → 승인 없이 실행 완료 (text 답변)
+                    ok_n = sum(1 for _, d in auto_committed if not _is_error(d))
+                    err_n = len(auto_committed) - ok_n
+                    ans = f"{ok_n}건의 변경을 자동 실행했습니다."
+                    if err_n:
+                        ans += f" ({err_n}건 실패)"
+                    return AgentResult(
+                        answer=ans,
+                        ui_actions=ui_actions,
+                        trace=trace,
+                        messages=messages,
+                        variable_memory=vm.to_dict(),
+                        data=last_query_data,
+                    )
+
         return AgentResult(
             answer="처리 단계가 너무 많습니다. 좀 더 구체적으로 말씀해 주세요.",
+            ui_actions=ui_actions,
             trace=trace,
             messages=messages,
             variable_memory=vm.to_dict(),
@@ -510,6 +1042,27 @@ class SchedulingAgent:
             messages=recent,
             existing_facts=existing_facts,
         )
+
+        # B6: memory consolidate LLM 호출 사용량 회계. decisions 가 비어도(=NOOP)
+        # 토큰은 소비됐으므로 항상 기록.
+        in_tok, out_tok, ext_model = getattr(
+            self.memory_extractor, "last_usage", (0, 0, None)
+        )
+        if in_tok or out_tok:
+            try:
+                record_llm_usage(
+                    db,
+                    conversation_id=getattr(ctx, "conversation_id", None),
+                    group_id=ctx.group_id,
+                    user_id=user_id,
+                    model=ext_model,
+                    purpose="memory_consolidate",
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                )
+            except Exception as e:
+                logger.warning("[agent_v3] memory usage record failed: %s", e)
+
         if not decisions:
             return
 
@@ -648,9 +1201,44 @@ class SchedulingAgent:
         if not approval:
             return AgentResult(answer="승인 대기 중인 작업이 없습니다.", messages=messages)
 
-        # Re-execute with preview_only=false
-        args = {**approval.get("args", {}), "preview_only": False}
+        # consolidated batch 승인 — 여러 mutation 을 한 번에 실행 (multi-mutation 복합 쿼리).
+        if approval.get("type") == "batch":
+            return self._execute_approval_batch(db, ctx, messages, approval.get("items", []))
+
         skill_name = approval.get("skill_name", "bulk_mutation")
+        base_args = approval.get("args", {})
+        if skill_name in _WRITE_DISABLED_SKILLS:
+            return self._write_disabled_answer(db, ctx, skill_name, base_args, messages)
+
+        # ── #5 staleness(ReAct): 승인 시점 미리보기와 지금이 다르면 커밋 말고 재확인 ──
+        # 미리보기를 preview_only 로 재실행(부수효과 없음)해 body 지문 비교. DAG 경로가 하던
+        # staleness 가드를 ReAct 승인에도 대칭 적용(docs/AGENT_SHARED_GATE_REFACTOR.md P2).
+        from agents_v2.verify import approval_body_fp
+        stored_fp = approval_body_fp(approval)
+        if stored_fp:
+            try:
+                fresh = execute_skill(db, skill_name, {**base_args, "preview_only": True}, ctx)
+                fresh_data = fresh.data if isinstance(fresh.data, dict) else {}
+                fresh_fp = approval_body_fp({**fresh_data, "skill_name": skill_name, "args": base_args})
+            except Exception:  # noqa: BLE001 — 재프리뷰 실패 시 기존 동작 보존(통과)
+                fresh_fp = stored_fp
+            if fresh_fp and fresh_fp != stored_fp:
+                if _is_error(fresh_data):
+                    # 다시 만든 미리보기가 오류(예: 그사이 마감됨)면 재승인을 묻지 않고 그 오류로 끝낸다(int-0b).
+                    return AgentResult(
+                        answer=f"실행 중 오류가 발생했습니다: {fresh_data.get('error', '')}",
+                        trace=[Stage("approval_staleness", "error", {"skill": skill_name}, 0)],
+                        messages=messages)
+                fresh_preview = {**fresh_data, "skill_name": skill_name, "args": base_args}
+                ctx.pending_approval = fresh_preview  # 바뀐 미리보기로 갱신
+                return AgentResult(
+                    awaiting_approval=True, preview=fresh_preview,
+                    answer="승인 이후 상황이 바뀌어 미리보기가 달라졌습니다. 바뀐 내용으로 진행할까요?",
+                    trace=[Stage("approval_staleness", "block", {"skill": skill_name}, 0)],
+                    messages=messages, variable_memory=ctx.variable_memory)
+
+        # Re-execute with preview_only=false
+        args = {**base_args, "preview_only": False}
 
         trace: list[Stage] = []
         result = execute_skill(db, skill_name, args, ctx)
@@ -671,30 +1259,10 @@ class SchedulingAgent:
                 messages=messages,
             )
 
-        # ── Proactive post-mutation validation ──
+        # ── Proactive post-mutation validation (공유 게이트 P5) ──
         answer = "변경이 완료되었습니다."
-        if skill_name in ("bulk_mutation", "bulk-mutation") and args.get("scope") in (
-            "schedule", "draft_schedule", "published_schedule",
-        ):
-            val_result = execute_skill(
-                db, "validate_schedule",
-                {"group_id": ctx.group_id, "year": ctx.year, "month": ctx.month},
-                ctx,
-            )
-            trace.append(
-                Stage(
-                    "auto_validation",
-                    "error" if _is_error(val_result.data) else "ok",
-                    {"result": _truncate(val_result.data)},
-                    val_result.duration_ms,
-                )
-            )
-            if not _is_error(val_result.data):
-                v_count = val_result.data.get("violation_count", 0)
-                if v_count > 0:
-                    answer += f"\n\n⚠️ 자동 검증 결과: {v_count}건의 제약조건 위반이 감지되었습니다. '위반사항 보여줘'로 상세 내역을 확인하세요."
-                else:
-                    answer += "\n\n✅ 자동 검증 완료: 제약조건 위반 없음."
+        if _is_schedule_mutation(skill_name, args):
+            answer += self._auto_validate(db, ctx, trace)
 
         return AgentResult(
             answer=answer,
@@ -702,8 +1270,117 @@ class SchedulingAgent:
             messages=messages,
         )
 
+    def _write_disabled_answer(
+        self, db: Session, ctx: SessionContext, skill_name: str, args: dict, messages: list[dict],
+    ) -> AgentResult:
+        """쓰기를 끈 스킬(int-0b)의 승인 대기 — 실행하지 않고 그 스킬의 안내로 답한다.
+
+        병합 전 스킬이 남긴 발행 승인 대기가 대화 저장소에 남아 있어도 '응' 이 '변경이 완료되었습니다.'
+        (실제 마감 0건)로 끝나지 않게 한다.
+        """
+        res = execute_skill(db, skill_name, {**args, "preview_only": True}, ctx)
+        data = res.data if isinstance(res.data, dict) else {}
+        answer = data.get("message") or data.get("error") or "이 작업은 에이전트가 실행하지 않습니다."
+        return AgentResult(
+            answer=answer,
+            trace=[Stage("write_disabled", "block", {"skill": skill_name}, res.duration_ms)],
+            messages=messages)
+
+    def _auto_validate(self, db, ctx, trace: list) -> str:
+        """스케줄 셀 mutation 커밋 후 proactive validate_schedule — 답변에 붙일 요약 반환.
+
+        세 커밋 경로(단일/배치/DAG plan)가 공유(docs/AGENT_SHARED_GATE_REFACTOR.md P5).
+        이전엔 ReAct 만 자동검증하고 DAG 커밋은 안 해 비대칭이었다.
+        """
+        val = execute_skill(
+            db, "validate_schedule",
+            {"group_id": ctx.group_id, "year": ctx.year, "month": ctx.month}, ctx,
+        )
+        trace.append(Stage("auto_validation", "error" if _is_error(val.data) else "ok",
+                           {"result": _truncate(val.data)}, val.duration_ms))
+        if _is_error(val.data):
+            return ""
+        v_count = val.data.get("violation_count", 0)
+        if v_count > 0:
+            return (f"\n\n⚠️ 자동 검증 결과: {v_count}건의 제약조건 위반이 감지되었습니다. "
+                    "'위반사항 보여줘'로 상세 내역을 확인하세요.")
+        return "\n\n✅ 자동 검증 완료: 제약조건 위반 없음."
+
+    def _execute_approval_batch(
+        self,
+        db: Session,
+        ctx: SessionContext,
+        messages: list[dict],
+        items: list[dict],
+    ) -> AgentResult:
+        """Consolidated 승인 — 여러 mutation preview 를 **원자적으로** 실행(공유 경계).
+
+        복합 쿼리에서 한 턴에 여러 변경이 preview 됐을 때, 사용자 1회 승인으로 전부 실행.
+        원자성(P4): AIDE_DAG_PLANNING 기본 OFF 라 의존 복합도 이 배치로 오므로, 중간 실패 시
+        **전체 롤백**(부분 반영 방지). 즉 하나라도 실패하면 나머지도 반영 안 됨(all-or-nothing).
+        schedule mutation 이 하나라도 있으면 커밋 후 proactive 검증 1회.
+        """
+        from agents_v2.commit_gate import AbortCommit, atomic_commit
+
+        disabled = [it for it in items if it.get("skill_name") in _WRITE_DISABLED_SKILLS]
+        if disabled:  # 쓰기를 끈 스킬이 섞인 배치는 통째로 실행하지 않는다(fail-closed, int-0b)
+            res = self._write_disabled_answer(
+                db, ctx, disabled[0]["skill_name"], disabled[0].get("args", {}), messages)
+            res.answer += " 함께 요청한 다른 변경도 실행하지 않았습니다. 필요하면 다시 요청해 주세요."
+            return res
+
+        trace: list[Stage] = []
+        done: list[str] = []
+        needs_validate = False
+        fail_reason: str | None = None
+
+        try:
+            with atomic_commit(db):
+                for item in items:
+                    skill_name = item.get("skill_name", "bulk_mutation")
+                    args = {**item.get("args", {}), "preview_only": False}
+                    result = execute_skill(db, skill_name, args, ctx)
+                    trace.append(
+                        Stage(
+                            "execution",
+                            "error" if _is_error(result.data) else "ok",
+                            {"skill": skill_name, "result": _truncate(result.data)},
+                            result.duration_ms,
+                        )
+                    )
+                    if _is_error(result.data):
+                        fail_reason = f"{skill_name}: {result.data.get('error', '')}"
+                        raise AbortCommit()  # 전체 롤백 — 부분 반영 없음
+                    done.append(skill_name)
+                    if _is_schedule_mutation(skill_name, args):
+                        needs_validate = True
+        except AbortCommit:
+            return AgentResult(
+                answer=(f"{len(done) + 1}번째 변경('{fail_reason}')이 실패해 "
+                        "**전체 취소(롤백)**했습니다 — 부분 반영 없음. 다시 시도해 주세요."),
+                trace=trace, messages=messages)
+        except Exception as e:  # noqa: BLE001 — commit() 자체 실패(이미 롤백됨)
+            return AgentResult(
+                answer=f"커밋 중 오류로 **전체 취소**했습니다: {e}", trace=trace, messages=messages)
+
+        answer = (f"{len(done)}건의 변경을 완료했습니다." if done else "실행할 변경이 없습니다.")
+
+        if needs_validate:  # 공유 게이트 P5
+            answer += self._auto_validate(db, ctx, trace)
+
+        return AgentResult(answer=answer, trace=trace, messages=messages)
+
 
 # ── Helpers ─────────────────────────────────────────────────
+
+_SCHEDULE_SCOPES = ("schedule", "draft_schedule", "published_schedule")
+
+
+def _is_schedule_mutation(skill_name: str, args: dict) -> bool:
+    """근무표 셀 직접 수정(bulk_mutation schedule scope)인가 — 커밋 후 자동검증 트리거 판정."""
+    return (skill_name in ("bulk_mutation", "bulk-mutation")
+            and (args or {}).get("scope") in _SCHEDULE_SCOPES)
+
 
 _CONFIRM_WORDS = frozenset({
     "응",
@@ -721,6 +1398,24 @@ _CONFIRM_WORDS = frozenset({
     "실행해",
     "변경해",
     "확인했어",
+    # 2026-06-01 추가: 일상 발화에서 자주 쓰는 컨펌. "그래"가 누락돼 LLM 추론에
+    # 의존했고, 일관성 낮은 처리가 발견됨(S5.B).
+    "그래",
+    "그렇게",
+    "그렇게 해",
+    "그렇게해",
+    "맞아",
+    "맞아요",
+    "맞습니다",
+    "오케이",
+    "okay",
+    "응응",
+    "yep",
+    "y",
+    # B9 (2026-06-12): apply_hint 컨텍스트에서 제안된 옵션 적용을 표하는 어휘.
+    "적용",
+    "적용해",
+    "적용해줘",
 })
 
 
@@ -738,6 +1433,10 @@ _DENY_WORDS = frozenset({
     "괜찮아",
     "skip",
     "건너뛰기",
+    # B9 (2026-06-12): apply_hint 컨텍스트에서 옵션 거부를 표하는 어휘.
+    "싫어",
+    "말고",
+    "원래대로",
 })
 
 
@@ -762,34 +1461,6 @@ def _is_denial(msg: str) -> bool:
 
     tokens = [t for t in _re.split(r"[\s.,!?~…]+", cleaned) if t]
     return any(t in _DENY_WORDS for t in tokens)
-
-
-def _extract_apply_hint_question(skill_name: str, data: Any) -> str | None:
-    """generate_schedule 결과에 user_actionable apply_hint가 있으면 재시도 질문 반환.
-
-    None 반환 시 apply_hint 흐름 미진입.
-    """
-    if skill_name not in ("generate_schedule", "generate-schedule"):
-        return None
-    if not isinstance(data, dict):
-        return None
-
-    infeasibility = data.get("infeasibility")
-    if not isinstance(infeasibility, dict):
-        return None
-
-    apply_hint = infeasibility.get("apply_hint")
-    if not isinstance(apply_hint, dict):
-        return None
-
-    # user_consent_required=True 인 경우만 사용자에게 질의
-    if not apply_hint.get("user_consent_required", False):
-        return None
-
-    human_msg = apply_hint.get("human_message_ko") or ""
-    if human_msg:
-        return human_msg
-    return "제약 조건을 조정하고 근무표 생성을 재시도하시겠습니까?"
 
 
 def _call_signature(skill_name: str, args: dict) -> str:
@@ -819,20 +1490,6 @@ def _is_confirmation(msg: str) -> bool:
 
     tokens = [t for t in _re.split(r"[\s.,!?~…]+", cleaned) if t]
     return any(t in _CONFIRM_WORDS for t in tokens)
-
-
-def _is_error(data: Any) -> bool:
-    return isinstance(data, dict) and "error" in data
-
-
-def _needs_clarification(data: Any) -> bool:
-    return isinstance(data, dict) and data.get("needs_clarification") is True
-
-
-def _is_preview_result(data: Any) -> bool:
-    return isinstance(data, dict) and (
-        data.get("preview_only") is True or data.get("preview") is True
-    )
 
 
 def _truncate(data: Any, max_len: int = 500) -> Any:
@@ -928,8 +1585,13 @@ def _sanitize_messages(messages: list[dict]) -> list[dict]:
 #
 # 정책:
 #   - system message (index 0) 항상 head 에 유지
-#   - 최신 메시지 (마지막) 항상 유지 — LLM 호출이 의미를 가지려면 최소 latest user 보존
+#   - 최신 unit (마지막) 항상 유지 — LLM 호출이 의미를 가지려면 최소 latest 보존
 #   - 중간 history 는 budget 안에서 최신순으로 포함
+#   - tool-call group (assistant.tool_calls + 뒤따르는 tool 메시지들) 은 분리 불가:
+#     truncation 이 group 을 쪼개 tool 메시지를 부모 assistant 와 떼어놓으면
+#     OpenAI 가 "messages with role 'tool' must be a response to a preceding
+#     message with 'tool_calls'" 400 을 던진다. 그래서 message 단위가 아니라
+#     unit(=group) 단위로 자른다.
 
 _MAX_INJECT_CHARS = 96000  # ≈ 24k tokens
 
@@ -947,12 +1609,34 @@ def _message_size(m: dict) -> int:
     return n
 
 
+def _group_message_units(rest: list[dict]) -> list[list[dict]]:
+    """메시지 시퀀스를 truncation 원자 단위(unit)로 묶는다.
+
+    - assistant(tool_calls) + 뒤따르는 연속 tool 메시지 → 하나의 unit (분리 금지)
+    - 그 외(user, tool_calls 없는 assistant, orphan tool) → 단독 unit
+    """
+    units: list[list[dict]] = []
+    i, n = 0, len(rest)
+    while i < n:
+        m = rest[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            j = i + 1
+            while j < n and rest[j].get("role") == "tool":
+                j += 1
+            units.append(rest[i:j])
+            i = j
+        else:
+            units.append([rest[i]])
+            i += 1
+    return units
+
+
 def _truncate_for_llm(
     messages: list[dict], *, max_chars: int = _MAX_INJECT_CHARS
 ) -> list[dict]:
-    """LLM injection 용 messages truncation — system + latest 필수 + 중간 history budget.
+    """LLM injection 용 messages truncation — system + latest unit 필수 + budget.
 
-    원본 messages list 는 변경하지 않음. 영구 저장 흐름과 분리.
+    tool-call group 을 쪼개지 않도록 unit 단위로 자른다. 원본 list/ dict 는 변경 안 함.
     """
     if not messages:
         return []
@@ -967,23 +1651,24 @@ def _truncate_for_llm(
     if not rest:
         return head
 
-    # 최신 메시지는 반드시 보존 (LLM 호출의 baseline)
-    latest = rest[-1]
-    older = rest[:-1]
-    must_chars = sum(_message_size(m) for m in head) + _message_size(latest)
+    budget = max_chars - sum(_message_size(m) for m in head)
+    units = _group_message_units(rest)
 
-    if must_chars >= max_chars or not older:
-        # 예산 초과해도 필수만 반환 / older 없으면 즉시 반환
-        return head + [latest]
-
-    budget = max_chars - must_chars
-    selected_reversed: list[dict] = []
+    # 최신 unit 부터 역순으로 budget 안에서 포함 (첫 unit 은 예산 초과해도 무조건 보존).
+    selected: list[list[dict]] = []
     used = 0
-    for m in reversed(older):
-        size = _message_size(m)
-        if used + size > budget:
+    for unit in reversed(units):
+        size = sum(_message_size(m) for m in unit)
+        if selected and used + size > budget:
             break
-        selected_reversed.append(m)
+        selected.append(unit)
         used += size
+    selected.reverse()
 
-    return head + list(reversed(selected_reversed)) + [latest]
+    flat = [m for unit in selected for m in unit]
+
+    # 안전장치: 손상된 history(앞단 orphan tool)가 들어와도 무효 chain 을 만들지 않음.
+    while flat and flat[0].get("role") == "tool":
+        flat.pop(0)
+
+    return head + flat

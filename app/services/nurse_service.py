@@ -1024,36 +1024,30 @@ def bulk_update_nurses_service(
     # source 경로에서 exclusion_partner_id 받은 간호사 기록 (commit 후 상호배제 period 양방향 동기화용)
     exclusion_changes: List[Tuple[NurseModel, Optional[str]]] = []
 
+    # 발행된 달 가드는 **모든 간호사의** 배정 op 를 루프 전에 한꺼번에 본다 — 간호사 k 에서 409 가 나도
+    #   1..k-1 이 먼저 커밋되지 않게(dev-7). 실제 쓰기는 사람마다 잠근 뒤 다시 판정한다.
+    _preflight_issued_guard(db, [
+        (p.nurse_id, _p) for p in nurses_data if p.nurse_id in db_nurses_dict
+        for _p in _profile_assignment_payloads(p.model_dump(exclude_unset=True))
+    ], current_user)
+    # === 배정(파견/병동이동/휴직/퇴사/프리셉티) payload 는 **모든 간호사 먼저** 처리 ===
+    _assignment_modes = _apply_bulk_assignment_ops(db, nurses_data, db_nurses_dict, target_group_id, current_user)
+
     for profile in nurses_data:
         db_nurse = db_nurses_dict.get(profile.nurse_id)
         if not db_nurse:
             continue
 
         update_data = profile.dict(exclude_unset=True)
-
-        # === 배정(파견/병동이동/휴직/퇴사/프리셉티) payload 먼저 처리 ===
-        # 단건(assignment) + 다건(assignments) 모두 지원. 다건이 먼저 적용된 후 단건이 뒤따른다.
-        assignment_payload = update_data.pop("assignment", None)
-        assignments_payload = update_data.pop("assignments", None)
+        update_data.pop("assignment", None)   # 위에서 처리했다
+        update_data.pop("assignments", None)
         # 상호 근무 배제 파트너: nurses 컬럼 아님(진실=nurse_mutual_exclusion_period). 소스모드 commit 후 동기화.
         _exclusion_field_present = "exclusion_partner_id" in update_data
         _exclusion_after = update_data.pop("exclusion_partner_id", None)
-        _payloads_to_apply: List[Dict[str, Any]] = []
-        if assignments_payload:
-            _payloads_to_apply.extend([p for p in assignments_payload if p])
-        if assignment_payload is not None:
-            _payloads_to_apply.append(assignment_payload)
-        # 처리 순서 정합: cancel → update → create (단건 PATCH 와 동일)
-        _op_order = {"cancel": 0, "update": 1, "create": 2}
-        _payloads_to_apply.sort(key=lambda p: _op_order.get(p.get("operation"), 99))
-        if _payloads_to_apply:
-            for _p in _payloads_to_apply:
-                _dispatch_assignment_payload(
-                    db, profile.nurse_id, _p, current_user
-                )
-            db.refresh(db_nurse)
-            # 배정 dispatch로 edit mode가 바뀔 수 있음 → 재평가
-            mode, assign_row = resolve_edit_target(db, target_group_id, profile.nurse_id)
+        _had_assignment_ops = profile.nurse_id in _assignment_modes
+        if _had_assignment_ops:
+            # 배정 dispatch로 edit mode가 바뀔 수 있음 → dispatch 직후 재평가한 값
+            mode, assign_row = _assignment_modes[profile.nurse_id]
         else:
             mode, assign_row = _edit_modes.get(profile.nurse_id, ("none", None))
 
@@ -1065,7 +1059,7 @@ def bulk_update_nurses_service(
 
         if mode != "source":
             # 배정 payload만 처리하고 프로필 필드 업데이트 권한은 없을 수 있음
-            if _payloads_to_apply and not update_data:
+            if _had_assignment_ops and not update_data:
                 updated_count += 1
                 continue
             logging.warning(
@@ -1962,6 +1956,8 @@ def update_nurse_profile_service(
     _op_order = {"cancel": 0, "update": 1, "create": 2}
     _payloads_to_apply.sort(key=lambda p: _op_order.get(p.get("operation"), 99))
     if _payloads_to_apply:
+        # 발행된 달 가드는 첫 op 커밋 전에 한꺼번에 본다(일부만 저장된 채 409 방지 · dev-7).
+        _preflight_issued_guard(db, [(nurse_id, _p) for _p in _payloads_to_apply], current_user)
         for _p in _payloads_to_apply:
             _dispatch_assignment_payload(db, nurse_id, _p, current_user)
         # assignment 저장 직후 resolve_edit_target 재평가 위해 세션 refresh
@@ -2500,6 +2496,129 @@ def _dispatch_preceptee_self_period(
         raise HTTPException(status_code=400, detail=f"preceptee_period.operation 값이 올바르지 않습니다: {op!r}")
 
 
+def _build_assignment_create_req(db: Session, nurse_id: str, payload: Dict[str, Any]):
+    """배정 create payload → NurseAssignmentCreate. 쓰기와 발행 가드 선행 판정이 같은 요청을 본다.
+
+    편의를 위해 source_group_id / office_id 가 비어 있으면 nurses.group_id / office_id 로 채운다.
+    """
+    from schemas.roster_schema import NurseAssignmentCreate as _CreateReq
+
+    data = {k: payload.get(k) for k in _ASSIGNMENT_CREATE_FIELDS}
+    data["nurse_id"] = nurse_id
+    # 프론트 호환: end_date 키로 들어온 값을 expected_end_date 로 fold
+    if data.get("expected_end_date") is None and data.get("end_date") is not None:
+        data["expected_end_date"] = data["end_date"]
+    data.pop("end_date", None)
+    # source_group_id / office_id 자동 보정 (프론트 전송 필수항목 최소화)
+    if not data.get("source_group_id") or not data.get("office_id"):
+        _n = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
+        if _n is None:
+            raise HTTPException(status_code=404, detail=f"assignment.create: 간호사({nurse_id}) 조회 실패")
+        data["source_group_id"] = data.get("source_group_id") or _n.group_id
+        data["office_id"] = data.get("office_id") or _n.office_id
+    try:
+        return _CreateReq(**{k: v for k, v in data.items() if v is not None})
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"assignment.create payload 오류: {e}")
+
+
+def _build_assignment_update_req(payload: Dict[str, Any]):
+    """배정 update payload → NurseAssignmentUpdate(값이 있는 필드만)."""
+    from schemas.roster_schema import NurseAssignmentUpdate as _UpdateReq
+
+    data = {k: payload.get(k) for k in _ASSIGNMENT_UPDATE_FIELDS if payload.get(k) is not None}
+    try:
+        return _UpdateReq(**data)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"assignment.update payload 오류: {e}")
+
+
+def _profile_assignment_payloads(fields: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """프로필 수정 요청의 배정 op 목록(다건 → 단건). 꺼내지 않고 읽기만 한다(선행 판정용)."""
+    out = [p for p in (fields.get("assignments") or []) if p]
+    if fields.get("assignment") is not None:
+        out.append(fields["assignment"])
+    return out
+
+
+def _apply_bulk_assignment_ops(
+    db: Session,
+    nurses_data: List[NurseProfile],
+    db_nurses_dict: Dict[str, NurseModel],
+    target_group_id: str,
+    current_user: UserSchema,
+) -> Dict[str, Tuple[str, Any]]:
+    """일괄 수정의 배정 op 를 **모든 간호사 먼저** 처리한다. 처리한 간호사의 edit mode(dispatch 직후 재평가)를 돌려준다.
+
+    ★ 프로필 필드 쓰기(setattr·upsert_period flush)보다 앞에 둔다. 앞 간호사의 nurses·period 행이 flush 로 잠긴 채
+      뒤 간호사의 발행 가드가 마감 달 잠금을 기다리면, 그 잠금을 쥐고 그 병동 간호사를 읽는 마감과 서로 기다린다
+      (잠금 → 행 순서 · dev-7 리뷰). 배정 op 는 op 마다 커밋하므로 가드가 돌 때 미커밋 쓰기가 남지 않는다.
+    간호사마다 다건(assignments) 먼저·단건 뒤, cancel → update → create 순서(단건 PATCH 와 같다).
+    """
+    op_order = {"cancel": 0, "update": 1, "create": 2}
+    modes: Dict[str, Tuple[str, Any]] = {}
+    for profile in nurses_data:
+        db_nurse = db_nurses_dict.get(profile.nurse_id)
+        payloads = _profile_assignment_payloads(profile.model_dump(exclude_unset=True))
+        if db_nurse is None or not payloads:
+            continue
+        payloads.sort(key=lambda p: op_order.get(p.get("operation"), 99))
+        for payload in payloads:
+            _dispatch_assignment_payload(db, profile.nurse_id, payload, current_user)
+        db.refresh(db_nurse)
+        modes[profile.nurse_id] = resolve_edit_target(db, target_group_id, profile.nurse_id)
+    return modes
+
+
+def _payload_guard_scope(db: Session, nurse_id: str, payload: Dict[str, Any], current_user: UserSchema):
+    """배정 op 한 건의 발행 가드 범위 — 쓰기 경로와 **같은 함수**(create/update_guard_scope·취소)를 쓴다.
+
+    ★ 실제 쓰기와 같은 권한·병원 경계 검사(`assert_*_boundary`)를 먼저 통과한 op 만 범위를 만든다. 안 보면
+      다른 병원 병동·배정을 넣었을 때 403/400 대신 409 가 나고 그 병동 이름·발행 월이 실린다(dev-7 리뷰).
+    요청을 만들 수 없거나 검사에 걸리는 payload(422·404·403·400)는 None — 그 오류는 실제 dispatch 가 그대로 낸다.
+    """
+    from services import assignment_service as asg
+    from services.issued_month_guard import state_of_row, transfer_guard_scope
+
+    op = (payload or {}).get("operation")
+    try:
+        if op == "create":
+            req = _build_assignment_create_req(db, nurse_id, payload)
+            asg.assert_create_boundary(db, req, current_user)
+            return asg.create_guard_scope(req)
+        row = db.get(NurseAssignment, payload.get("assignment_id")) if payload.get("assignment_id") else None
+        if row is not None and op == "update":
+            req = _build_assignment_update_req(payload)
+            asg.assert_update_boundary(db, row, req, current_user)
+            return asg.update_guard_scope(row, req)
+        if row is not None and op == "cancel":
+            asg.assert_cancel_boundary(db, row, current_user)
+            return transfer_guard_scope(state_of_row(row), None)
+    except HTTPException:
+        return None
+    return None
+
+
+def _preflight_issued_guard(
+    db: Session, items: List[Tuple[str, Dict[str, Any]]], current_user: UserSchema,
+) -> None:
+    """배정 op 들을 **쓰기 전에** 한꺼번에 발행 가드로 본다 — 막히면 첫 op 커밋 전에 409(dev-7).
+
+    ★ op 마다 따로 커밋한다(cancel→update→create). 앞 op 가 커밋된 뒤 뒤 op 가 409 를 맞으면 일부만
+      저장된다(예: 파견 취소는 저장되고 병동이동 생성은 거절). 일괄 수정은 간호사 k 의 409 전에 1..k-1 이
+      커밋된다. 잠금 없는 판정이고, 실제 쓰기는 잠근 뒤 다시 판정한다(정본). 조회는 1회.
+    """
+    from services.issued_month_guard import IssuedVerdict, judge_many, raise_for_verdict
+
+    scopes = [s for s in (_payload_guard_scope(db, nid, p, current_user) for nid, p in items) if s]
+    if not scopes:
+        return
+    merged = IssuedVerdict()
+    for verdict in judge_many(db, scopes):
+        merged = merged.merge(verdict)
+    raise_for_verdict(db, merged)
+
+
 def _dispatch_assignment_payload(
     db: Session,
     nurse_id: str,
@@ -2512,10 +2631,6 @@ def _dispatch_assignment_payload(
     nurses.group_id / nurses.office_id 값을 자동으로 채운다.
     (프론트가 nurse_id 만으로 assignment 생성 요청을 할 수 있도록 함)
     """
-    from schemas.roster_schema import (
-        NurseAssignmentCreate as _CreateReq,
-        NurseAssignmentUpdate as _UpdateReq,
-    )
     from services.assignment_service import (
         create_assignment as _create_assignment,
         update_assignment as _update_assignment,
@@ -2531,42 +2646,13 @@ def _dispatch_assignment_payload(
             detail="프리셉티는 assignment 로 처리하지 않습니다. preceptor_periods(period) 경로를 사용하세요.",
         )
     if op == "create":
-        data = {k: payload.get(k) for k in _ASSIGNMENT_CREATE_FIELDS}
-        data["nurse_id"] = nurse_id
-        # 프론트 호환: end_date 키로 들어온 값을 expected_end_date 로 fold
-        if data.get("expected_end_date") is None and data.get("end_date") is not None:
-            data["expected_end_date"] = data["end_date"]
-        data.pop("end_date", None)
-        # source_group_id / office_id 자동 보정 (프론트 전송 필수항목 최소화)
-        _src_gid = data.get("source_group_id")
-        _office = data.get("office_id")
-        if not _src_gid or not _office:
-            _n = db.query(NurseModel).filter(NurseModel.nurse_id == nurse_id).first()
-            if _n is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"assignment.create: 간호사({nurse_id}) 조회 실패",
-                )
-            if not _src_gid:
-                data["source_group_id"] = _n.group_id
-            if not _office:
-                data["office_id"] = _n.office_id
-        try:
-            req = _CreateReq(**{k: v for k, v in data.items() if v is not None})
-        except Exception as e:
-            raise HTTPException(status_code=422, detail=f"assignment.create payload 오류: {e}")
-        _create_assignment(req, db, current_user=current_user)
+        _create_assignment(_build_assignment_create_req(db, nurse_id, payload), db, current_user=current_user)
         return
     if op == "update":
         aid = payload.get("assignment_id")
         if aid is None:
             raise HTTPException(status_code=422, detail="assignment.update: assignment_id 필수")
-        data = {k: payload.get(k) for k in _ASSIGNMENT_UPDATE_FIELDS if payload.get(k) is not None}
-        try:
-            req = _UpdateReq(**data)
-        except Exception as e:
-            raise HTTPException(status_code=422, detail=f"assignment.update payload 오류: {e}")
-        _update_assignment(aid, req, db, current_user=current_user)
+        _update_assignment(aid, _build_assignment_update_req(payload), db, current_user=current_user)
         return
     if op == "cancel":
         aid = payload.get("assignment_id")

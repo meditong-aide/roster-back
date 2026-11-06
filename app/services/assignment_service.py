@@ -17,7 +17,15 @@ from schemas.roster_schema import (
     AssignmentStatusCounts,
 )
 from schemas.auth_schema import User as UserSchema
-import json
+from services.issued_month_guard import (
+    GuardScope,
+    TransferState,
+    assert_transfer_not_on_issued,
+    json_dict,
+    preview_guard,
+    state_of_row,
+    transfer_guard_scope,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -561,16 +569,43 @@ def _validate_assignment_team_grade_or_raise(
         )
 
 
-def create_assignment(
-    req: NurseAssignmentCreate,
-    db: Session,
-    current_user: Optional[UserSchema] = None,
-    notify: bool = True,
-) -> NurseAssignmentResponse:
-    """배정/상태 변경 등록.
 
-    notify=False: 당사자 알림(S06) 생략. 병동재분배도 사람마다 보낸다(2026-10-07 결정 — 기본 True).
-    """
+def _create_state(req: NurseAssignmentCreate) -> TransferState:
+    """생성 요청의 판정 입력 — 새 배정은 늘 active, 병동이동의 종료 경계는 expected_end_date."""
+    return TransferState(req.reason, "active", req.source_group_id, req.target_group_id,
+                         req.start_date, req.expected_end_date)
+
+
+def _update_states(row: NurseAssignment, req: NurseAssignmentUpdate) -> Tuple[TransferState, TransferState]:
+    """수정 전후 판정 입력 — 요청에 없는 값은 행 값 그대로(update_assignment 의 반영 규칙과 같다)."""
+    reason = req.reason if req.reason is not None else row.reason
+    expected = req.expected_end_date if req.expected_end_date is not None else row.expected_end_date
+    end_date = req.end_date if req.end_date is not None else row.end_date
+    new = TransferState(
+        reason=reason,
+        status=req.status if req.status is not None else row.status,
+        source=row.source_group_id,
+        target=req.target_group_id if req.target_group_id is not None else row.target_group_id,
+        start=req.start_date if req.start_date is not None else row.start_date,
+        end=expected if reason == "병동이동" else (end_date or expected),
+    )
+    return state_of_row(row), new
+
+
+def update_guard_scope(row: NurseAssignment, req: NurseAssignmentUpdate) -> GuardScope:
+    """수정의 발행 가드 범위(PATCH 선행 판정도 같은 함수를 쓴다)."""
+    return transfer_guard_scope(*_update_states(row, req))
+
+
+def create_guard_scope(req: NurseAssignmentCreate) -> GuardScope:
+    """생성의 발행 가드 범위(PATCH 선행 판정도 같은 함수를 쓴다)."""
+    return transfer_guard_scope(None, _create_state(req))
+
+
+def _assert_create_access(
+    db: Session, req: NurseAssignmentCreate, current_user: Optional[UserSchema],
+) -> NurseModel:
+    """생성의 권한·병원 검사(create_assignment 첫머리) — 통과하면 대상 간호사를 돌려준다."""
     _assert_caller_owns_source(current_user, req.source_group_id, db=db)
 
     nurse = db.query(NurseModel).filter(NurseModel.nurse_id == req.nurse_id).first()
@@ -585,6 +620,49 @@ def create_assignment(
     from services.group_access import can_caller_access_nurse
     if not can_caller_access_nurse(db, current_user, req.nurse_id):
         raise HTTPException(status_code=403, detail="이 간호사의 배정을 등록할 권한이 없습니다.")
+    return nurse
+
+
+# ── 발행 가드 선행 판정의 경계 검사 ───────────────────────────────────
+# ★ 선행 판정(PATCH·일괄 수정)은 실제 쓰기보다 먼저 돈다. 권한·병원 경계를 안 보고 범위를 만들면 다른 병원 병동의
+#   발행본을 읽고 409 에 그 병동 이름·발행 월이 실렸다(원래는 403/400 — dev-7 리뷰). 실제 쓰기와 **같은 검사**를
+#   먼저 부르고, 걸리면 HTTPException — 호출부는 범위를 비워 그 오류를 실제 쓰기가 그대로 내게 한다.
+
+
+def assert_create_boundary(db: Session, req: NurseAssignmentCreate, current_user: Optional[UserSchema]) -> None:
+    """생성 쓰기의 권한·병원 경계 검사(create_assignment 와 같은 기준)."""
+    _assert_create_access(db, req, current_user)
+    if req.reason in _INBOUND_REASONS and req.target_group_id:
+        _assert_target_in_same_office(db, req.office_id, req.target_group_id)
+
+
+def assert_update_boundary(
+    db: Session, row: NurseAssignment, req: NurseAssignmentUpdate, current_user: Optional[UserSchema],
+) -> None:
+    """수정 쓰기의 권한·병원 경계 검사(update_assignment 와 같은 기준 — 출발 병동 소유 + 바뀐 도착 병동의 병원)."""
+    _assert_caller_owns_source(current_user, row.source_group_id, db=db)
+    new_reason = req.reason if req.reason is not None else row.reason
+    if (req.target_group_id is not None and req.target_group_id != row.target_group_id
+            and new_reason in _INBOUND_REASONS):
+        _assert_target_in_same_office(db, row.office_id, req.target_group_id)
+
+
+def assert_cancel_boundary(db: Session, row: NurseAssignment, current_user: Optional[UserSchema]) -> None:
+    """취소 쓰기의 권한 검사(cancel_assignment 와 같은 기준 — 출발·도착 병동 어느 쪽 소유든)."""
+    _assert_caller_owns_source(current_user, row.source_group_id, db=db, target_group_id=row.target_group_id)
+
+
+def create_assignment(
+    req: NurseAssignmentCreate,
+    db: Session,
+    current_user: Optional[UserSchema] = None,
+    notify: bool = True,
+) -> NurseAssignmentResponse:
+    """배정/상태 변경 등록.
+
+    notify=False: 당사자 알림(S06) 생략. 병동재분배도 사람마다 보낸다(2026-10-07 결정 — 기본 True).
+    """
+    nurse = _assert_create_access(db, req, current_user)
 
     # 퇴사자 검증: resignation_date가 존재하고 start_date 이전이면 거부
     _resign = getattr(nurse, "resignation_date", None)
@@ -630,6 +708,9 @@ def create_assignment(
             old_target_grade=None,
             new_target_grade=req.target_grade,
         )
+
+    # 발행된 달 가드(dev-7) — 출발·도착 병동을 마감 달 잠금 **뒤에** 판정한다. 모든 검증 뒤·어떤 쓰기보다 먼저.
+    assert_transfer_not_on_issued(db, create_guard_scope(req))
 
     row = NurseAssignment(
         nurse_id=req.nurse_id,
@@ -937,6 +1018,9 @@ def update_assignment(
             new_target_grade=_new_grade_for_check,
         )
 
+    # 발행된 달 가드(dev-7) — 값이 실제로 바뀐 기간·병동만, 행 잠금(위) → 마감 달 잠금 → 판정 순. 반영 전에.
+    assert_transfer_not_on_issued(db, update_guard_scope(row, req))
+
     if req.start_date is not None:
         row.start_date = req.start_date
     if req.expected_end_date is not None:
@@ -1021,6 +1105,9 @@ def cancel_assignment(
     _assert_caller_owns_source(
         current_user, row.source_group_id, db=db, target_group_id=row.target_group_id
     )
+    # 발행된 달 가드(dev-7) — 취소도 발행된 달 표를 바꾸므로 옛 기간 전체를 판정한다(사용자 결정 10-08).
+    #   수정의 status=cancelled 와 같은 함수를 타 두 경로가 같게 움직인다.
+    assert_transfer_not_on_issued(db, transfer_guard_scope(state_of_row(row), None))
 
     _old_window = (row.start_date, _effective_end_date(row))
     _old_reason = row.reason
@@ -1598,6 +1685,12 @@ def preview_assignment_impact(
     if target_group_id and target_group_id != source_group_id:
         notifications.append(f"head_nurse:{target_group_id}")
 
+    # 6. 발행된 달 가드(dev-7) — 쓰기와 같은 범위·판정(잠금 없음). 막히면 적용도 409 다.
+    issued_guard = preview_guard(db, _preview_guard_scope(
+        db, nurse, reason=reason, start_date=start_date, target_group_id=target_group_id,
+        expected_end_date=expected_end_date, exclude_id=exclude_id,
+    ))
+
     return {
         "nurse_id": nurse_id,
         "nurse_name": nurse.name,
@@ -1611,7 +1704,66 @@ def preview_assignment_impact(
         "wanted_affected": wanted_affected,
         "schedules_to_check": schedules_to_check,
         "notifications": notifications,
+        "issued_guard": issued_guard,
     }
+
+
+def _preview_guard_scope(
+    db: Session,
+    nurse: NurseModel,
+    *,
+    reason: str,
+    start_date: date,
+    target_group_id: Optional[str],
+    expected_end_date: Optional[date],
+    exclude_id: Optional[int],
+) -> GuardScope:
+    """미리보기의 발행 가드 범위 — exclude_id 가 없으면 생성, 있으면 그 행을 옛 상태로 둔 수정과 같은 의미.
+
+    생성의 출발 병동은 체인 검증(`_assert_transfer_chain_source`)을 통과하는 유일한 값으로 본다 —
+    진행 중인 병동이동이 있으면 그 도착 병동, 없으면 현재 소속. 그래야 적용 때 판정과 같은 병동을 본다.
+    ★ 도착 병동이 간호사와 다른 병원이면 판정하지 않는다(빈 범위) — 적용은 병원 경계 400 이라 409 가 날 일이 없고,
+      판정하면 다른 병원 병동 이름·발행 여부가 issued_guard 에 실린다(dev-7 리뷰).
+    """
+    from schemas.roster_schema import _normalize_assignment_reason  # 생성 요청과 같은 사유 정규화(부서이동→병동이동)
+
+    if target_group_id and not _group_in_office(db, target_group_id, nurse.office_id):
+        return GuardScope()
+    reason = _normalize_assignment_reason(reason)
+    old_row = None
+    if exclude_id is not None:
+        old_row = (
+            db.query(NurseAssignment)
+            .filter(NurseAssignment.id == exclude_id, NurseAssignment.nurse_id == nurse.nurse_id)
+            .first()
+        )
+    if old_row is not None:
+        source = old_row.source_group_id
+    else:
+        source = _chain_source_group(db, nurse) if reason == "병동이동" else nurse.group_id
+    new = TransferState(reason, "active", source, target_group_id, start_date, expected_end_date)
+    return transfer_guard_scope(state_of_row(old_row) if old_row is not None else None, new)
+
+
+def _group_in_office(db: Session, group_id: str, office_id: Optional[str]) -> bool:
+    """그 병동이 그 병원 소속인가(`_assert_target_in_same_office` 와 같은 기준 — 없는 병동이면 False)."""
+    row = db.query(Group.office_id).filter(Group.group_id == group_id).first()
+    return row is not None and row[0] == office_id
+
+
+def _chain_source_group(db: Session, nurse: NurseModel) -> Optional[str]:
+    """다음 병동이동의 출발 병동 — 진행 중인 병동이동의 도착 병동, 없으면 현재 소속(체인 검증과 같은 기준)."""
+    prev = (
+        db.query(NurseAssignment.target_group_id)
+        .filter(
+            NurseAssignment.nurse_id == nurse.nurse_id,
+            NurseAssignment.reason == "병동이동",
+            NurseAssignment.status == "active",
+        )
+        .order_by(NurseAssignment.start_date.desc())
+        .first()
+    )
+    return prev[0] if prev is not None else nurse.group_id
 
 
 def reconcile_nurse_attrs(
@@ -2553,14 +2705,7 @@ def _target_issued_nurse_ids(
         .all()
     )
 
-    def _as_dict(value):
-        """JSON 컬럼 값을 dict 로. 문자열이면 파싱하고, dict 가 아니면 버린다."""
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except (ValueError, TypeError):
-                return {}
-        return value if isinstance(value, dict) else {}
+    _as_dict = json_dict  # 발행 가드와 같은 파싱(services.issued_month_guard)
 
     out: dict[str, set[str]] = {}
     for r in rows:

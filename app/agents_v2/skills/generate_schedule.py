@@ -26,24 +26,35 @@ def generate_schedule(db: Session, params: dict) -> Any:
     # Verify config exists
     config = constraint_tools.get_roster_config(db, group_id)
     if not config:
-        return {"error": "No roster config found — configure constraints first"}
+        return {
+            "error": "no_config",
+            "message": "근무표 생성 전에 제약 설정을 먼저 완료해주세요.",
+        }
 
     # Check for existing running jobs
     latest = generation_tools.get_latest_job(db, group_id)
     if latest and latest.get("status") in ("QUEUED", "RUNNING"):
         return {
-            "error": "A generation job is already in progress",
-            "existing_job": latest,
+            "error": "already_in_progress",
+            "message": (
+                f"{year}년 {month}월 근무표를 이미 생성 중이에요. "
+                "끝나면 알려드릴게요."
+            ),
+            "_existing_job_status": latest.get("status"),
         }
 
     if preview_only:
         return {
             "preview": True,
-            "group_id": group_id,
             "year": year,
             "month": month,
-            "config_id": config.get("config_id"),
-            "message": "Will create a new roster generation job",
+            "message": (
+                f"{year}년 {month}월 근무표 생성을 시작하려고 합니다. 진행할까요?"
+            ),
+            "_internal": {
+                "group_id": group_id,
+                "config_id": config.get("config_id"),
+            },
         }
 
     # Create job record
@@ -55,11 +66,23 @@ def generate_schedule(db: Session, params: dict) -> Any:
         db, job_id, group_id, office_id, nurse_id,
     )
 
-    # Return job info — the agent.py layer handles SQS dispatch
-    job["_sqs_dispatch_required"] = True
-    job["_generation_params"] = {
+    # User-facing 응답은 message 만, 시스템 키(job_id/_sqs_*)는 _internal 로 격리.
+    # (agent.py layer 가 _internal 을 읽어 SQS dispatch.)
+    return {
         "year": year,
         "month": month,
-        "config_id": config.get("config_id"),
+        "status": "queued",
+        "message": (
+            f"{year}년 {month}월 근무표 생성을 시작했어요. "
+            "완료되면 알려드릴게요. 진행 상황을 확인하시려면 '생성 어디까지?' 라고 물어보세요."
+        ),
+        "_internal": {
+            "job_id": job.get("job_id"),
+            "sqs_dispatch_required": True,
+            "generation_params": {
+                "year": year,
+                "month": month,
+                "config_id": config.get("config_id"),
+            },
+        },
     }
-    return job

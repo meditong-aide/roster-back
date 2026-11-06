@@ -1,6 +1,15 @@
-"""Nurse data tools — search, filter, read nurse info."""
+"""Nurse data tools — search, filter, read nurse info.
+
+[Phase 0 / Group Scope] year/month 가 주어지면 시점 기반 SSOT 를 사용한다.
+- 멤버십: services.assignment_service.group_members_in_month (전입/전출 반영)
+- 팀: services.team_period.resolve_team_for_roster (NurseTeamPeriod SSOT)
+year/month 가 None 이면 기존 캐시 컬럼(Nurse.group_id / Nurse.team_id) 동작 보존 —
+호출부가 시점 컨텍스트 없이 부르는 경우의 후방 호환.
+"""
 
 from __future__ import annotations
+
+from typing import Any
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func as sa_func
@@ -8,9 +17,51 @@ from sqlalchemy import func as sa_func
 from db.models import Nurse, Team
 
 
-def search_nurses_by_name(db: Session, group_id: str, name_query: str) -> list[dict]:
+def _month_member_ids(
+    db: Session, group_id: str, year: int | None, month: int | None
+) -> set[str] | None:
+    """year/month 가 모두 주어지면 그 달 effective 멤버 nurse_id set 반환.
+
+    소속 외(전출/휴직/퇴사) 는 제외 — group_members_in_month 정책 그대로 위임.
+    한쪽이라도 None 이면 None 반환 → 호출부는 캐시 경로 사용.
+    """
+    if year is None or month is None:
+        return None
+    try:
+        from services.assignment_service import group_members_in_month
+
+        snap = group_members_in_month(db, group_id, int(year), int(month))
+        return {m["nurse_id"] for m in snap.get("members", [])}
+    except Exception:
+        # SSOT 헬퍼가 실패하면 캐시 경로로 폴백 (silent — 안전).
+        return None
+
+
+def _resolve_month_team(
+    db: Session, nurse_id: str, group_id: str, year: int | None, month: int | None
+) -> int | None:
+    """year/month 가 있으면 NurseTeamPeriod SSOT 로 effective team_id."""
+    if year is None or month is None:
+        return None
+    try:
+        from services.team_period import resolve_team_for_roster
+
+        return resolve_team_for_roster(db, nurse_id, group_id, int(year), int(month))
+    except Exception:
+        return None
+
+
+def search_nurses_by_name(
+    db: Session,
+    group_id: str,
+    name_query: str,
+    *,
+    year: int | None = None,
+    month: int | None = None,
+) -> list[dict]:
     """Search nurses in a group by name (partial match).
 
+    year/month 가 주어지면 그 달 effective 멤버로 한정 (전입/전출 반영).
     Returns list of candidates with nurse_id, name, team, grade, experience.
     """
     rows = (
@@ -23,17 +74,32 @@ def search_nurses_by_name(db: Session, group_id: str, name_query: str) -> list[d
         .order_by(Nurse.sequence)
         .all()
     )
+    month_ids = _month_member_ids(db, group_id, year, month)
+    if month_ids is not None:
+        rows = [r for r in rows if r.nurse_id in month_ids]
     return [_nurse_summary(r) for r in rows]
 
 
-def get_nurses_in_group(db: Session, group_id: str) -> list[dict]:
-    """Return all active nurses in a group."""
+def get_nurses_in_group(
+    db: Session,
+    group_id: str,
+    *,
+    year: int | None = None,
+    month: int | None = None,
+) -> list[dict]:
+    """Return all active nurses in a group.
+
+    year/month 가 주어지면 그 달 effective 멤버만 반환(전입/전출 반영).
+    """
     rows = (
         db.query(Nurse)
         .filter(Nurse.group_id == group_id, Nurse.active == 1)
         .order_by(Nurse.sequence)
         .all()
     )
+    month_ids = _month_member_ids(db, group_id, year, month)
+    if month_ids is not None:
+        rows = [r for r in rows if r.nurse_id in month_ids]
     return [_nurse_summary(r) for r in rows]
 
 
@@ -57,17 +123,30 @@ def filter_nurses(
     has_preceptor: bool | None = None,
     joined_after: str | None = None,
     joined_before: str | None = None,
+    year: int | None = None,
+    month: int | None = None,
 ) -> list[dict]:
-    """Filter nurses by various attributes."""
+    """Filter nurses by various attributes.
+
+    year/month 주어지면:
+      - 멤버십: group_members_in_month (전입/전출 반영)
+      - team_id 필터: NurseTeamPeriod SSOT 시점 매칭 (캐시 컬럼 의존 해소)
+    """
     q = db.query(Nurse).filter(Nurse.group_id == group_id, Nurse.active == 1)
     if grade is not None:
         q = q.filter(Nurse.grade == grade)
     if team_id is not None:
         # 팀 소속은 시점(period) 기준 — nurses.team_id 는 NULL 이행 대상이라 캐시 비교 불가.
+        # year/month 가 주어지면 그 달 1일, 아니면 오늘 기준 SSOT 조회.
         from datetime import date as _d
         from services.team_period import resolve_teams_for_month as _rtfm
+        on_date = (
+            _d(int(year), int(month), 1)
+            if year is not None and month is not None
+            else _d.today()
+        )
         _tids = {
-            nid for nid, tv in _rtfm(db, group_id, _d.today()).items()
+            nid for nid, tv in _rtfm(db, group_id, on_date).items()
             if tv is not None and int(tv) == int(team_id)
         }
         q = q.filter(Nurse.nurse_id.in_(_tids or [""]))
@@ -80,6 +159,12 @@ def filter_nurses(
     if joined_before:
         q = q.filter(Nurse.joining_date <= joined_before)
     rows = q.order_by(Nurse.sequence).all()
+
+    # 멤버십 시점 필터 (전입/전출 반영)
+    month_ids = _month_member_ids(db, group_id, year, month)
+    if month_ids is not None:
+        rows = [r for r in rows if r.nurse_id in month_ids]
+
     result = [_nurse_summary(r) for r in rows]
     if night_only is not None:
         # N전담 = allowed_shifts == ["N"] (리스트 기준). Python 측 필터.
@@ -99,6 +184,7 @@ UPDATABLE_FIELDS = {
     "weekly_off_enabled", "weekly_off_weekday",
     "personal_off_adjustment",
     "team_id", "group_id",
+    "resignation_date",
 }
 
 
@@ -107,11 +193,12 @@ UPDATABLE_FIELDS = {
 _VALID_SHIFT_CODES = {"D", "E", "N", "M"}
 
 _KOREAN_PHRASE_ALIASES = {
-    # Korean substring matches (compound phrases like '야간 전담')
-    "야간": "N", "나이트": "N",
-    "데이": "D",
-    "이브닝": "E",
-    "미드": "M",
+    # Korean substring matches (compound phrases like '야간 전담').
+    # 2026-06-01: '주간'/'저녁'/'낮'/'밤' 추가 — _shift_category.SHIFT_CATEGORY 와 정렬.
+    "야간": "N", "나이트": "N", "밤": "N",
+    "데이": "D", "주간": "D", "낮": "D",
+    "이브닝": "E", "저녁": "E", "초번": "E",
+    "미드": "M", "미들": "M", "중간": "M",
 }
 _LATIN_TOKEN_ALIASES = {
     # Exact lowercase match (avoids false positives like 'invalid' → 'n')
@@ -123,6 +210,7 @@ _LATIN_TOKEN_ALIASES = {
 
 _CLEAR_TOKENS = {"해제", "없음", "off", "none", "전담해제", "해지", ""}
 
+_DATE_FIELDS = {"resignation_date"}  # DATETIME 컬럼 — 문자열 날짜 → datetime 파싱
 _BOOL_FIELDS = {"is_head_nurse", "is_weekend_off", "weekly_off_enabled", "enable_aide"}
 _INT_FIELDS = {
     "grade", "experience", "wanted_max_requests",
@@ -131,9 +219,22 @@ _INT_FIELDS = {
 _VALID_FIXED_SHIFT_CODES = {"D", "E", "N", "M", "O"}
 
 
+_FIXED_SHIFT_OFF_ALIASES = {"오프", "휴무", "쉼", "쉬는날", "off", "o"}
+
+
 def _normalize_fixed_shift(value):
-    """fixed_shift는 단일 enum. 한글 별칭 매핑은 LLM에 위임 (description으로 강제).
-    빈 문자열/None → '' (해제).
+    """fixed_shift는 단일 enum (D/E/N/M/O). 한글 별칭도 직접 수용.
+
+    값 매핑:
+      None / '' / '해제' / '없음' → '' (해제)
+      'D'/'데이'/'주간'           → 'D'
+      'E'/'이브닝'/'저녁'         → 'E'
+      'N'/'나이트'/'야간'         → 'N'
+      'M'/'미드'                  → 'M'
+      'O'/'오프'/'휴무'/'쉼'      → 'O'
+
+    2026-06-01: LLM 위임에서 직접 수용으로 전환 — [[skill-internal-grounding]] 원칙
+    일관화. is_night_nurse 는 _coerce_shift_code 로 이미 한글 받음, fixed_shift 만 누락.
     """
     if value is None:
         return ""
@@ -142,9 +243,19 @@ def _normalize_fixed_shift(value):
     s = value.strip()
     if s == "":
         return ""
+    low = s.lower()
+    if low in _CLEAR_TOKENS:
+        return ""
     up = s.upper()
     if up in _VALID_FIXED_SHIFT_CODES:
         return up
+    # 'O' alias (fixed_shift 전용 — is_night_nurse 엔 'O' 없음)
+    if low in _FIXED_SHIFT_OFF_ALIASES:
+        return "O"
+    # D/E/N/M 한글 별칭 — _coerce_shift_code 재사용
+    coerced = _coerce_shift_code(s)
+    if coerced in _VALID_FIXED_SHIFT_CODES:
+        return coerced
     return None
 
 
@@ -168,7 +279,68 @@ def _coerce_shift_code(raw) -> str | None:
     upper = s.upper()
     if upper in _VALID_SHIFT_CODES:
         return upper
+    # middleware 가 이미 해석한 shift_id (예: "N_GRP001", "OFF_GRP001", "N2_GRP001") 통과.
+    # group_id 마커("_GRP") 를 명시 인장으로 사용 — 사용자 입력엔 나오지 않는 패턴.
+    if "_GRP" in upper:
+        return upper
     return None
+
+
+# ── Shift-grounding helpers (B4/B5 공용) ────────────────────────
+# query_schedule / bulk_mutation 등에서 LLM 이 보내는 shift 코드·이름을 정규화하고
+# 모르는 값은 needs_clarification 으로 즉시 반환. silent skip 회귀 차단.
+
+_SHIFT_CLARIFY_OPTIONS = ["D (데이)", "E (이브닝)", "N (나이트)", "M (미드)"]
+
+
+def normalize_shift_codes(codes: Any) -> tuple[list[str] | None, dict | None]:
+    """codes(list/str/None) → 정규화된 ['D','N',...] 또는 (None, clarification).
+
+    None → (None, None) passthrough. 빈 list → ([], None).
+    한글/별칭/대소문자 수용. 인식 불가 1개라도 있으면 즉시 clarification.
+    """
+    if codes is None:
+        return None, None
+    if not isinstance(codes, (list, tuple)):
+        codes = [codes]
+    if len(codes) == 0:
+        return [], None
+    out: list[str] = []
+    unrecognized: list[str] = []
+    for raw in codes:
+        norm = _coerce_shift_code(raw)
+        if norm in (None, ""):
+            unrecognized.append(str(raw))
+        elif norm not in out:
+            out.append(norm)
+    if unrecognized:
+        return None, {
+            "needs_clarification": True,
+            "question": (
+                f"'{', '.join(unrecognized)}' 근무 코드를 인식하지 못했습니다. "
+                "어떤 근무인가요?"
+            ),
+            "options": _SHIFT_CLARIFY_OPTIONS,
+        }
+    return out, None
+
+
+def normalize_single_shift_code(value: Any) -> tuple[str | None, dict | None]:
+    """단일 shift → 'D' 등 또는 (None, clarification). None passthrough.
+
+    allowed_shifts/fixed_shift 가 아닌, 단일 '근무 코드'(예: bulk_mutation 의 new_shift_code,
+    add_shift 의 shift)용. 'O'(off) 도 허용.
+    """
+    if value is None or value == "":
+        return None, None
+    norm = _coerce_shift_code(value)
+    if norm in (None, ""):
+        return None, {
+            "needs_clarification": True,
+            "question": f"'{value}' 근무 코드를 인식하지 못했습니다. 어떤 근무인가요?",
+            "options": _SHIFT_CLARIFY_OPTIONS,
+        }
+    return norm, None
 
 
 def _normalize_allowed_shifts(value) -> list[str] | None:
@@ -244,8 +416,31 @@ def _coerce_int(value):
     return None
 
 
+def _coerce_date(value):
+    """문자열/None → datetime|None. 빈값/해제 토큰 → None(퇴사일 해제). 반환 (dt|None, err|None)."""
+    from datetime import datetime as _dt
+
+    if value is None:
+        return None, None
+    if isinstance(value, _dt):
+        return value, None
+    s = str(value).strip()
+    if s == "" or s.lower() in {"해제", "취소", "none", "null"}:
+        return None, None
+    for sep in ("-", ".", "/"):
+        s = s.replace(sep, "-")
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m"):
+        try:
+            return _dt.strptime(s, fmt), None
+        except ValueError:
+            continue
+    return None, f"퇴사일은 YYYY-MM-DD 형식이어야 합니다 (받은 값: {value!r})."
+
+
 def _normalize_value(field: str, value):
     """Normalize value per field. Returns (normalized, error_msg)."""
+    if field in _DATE_FIELDS:
+        return _coerce_date(value)
     if field == "allowed_shifts":
         norm = _normalize_allowed_shifts(value)
         if norm is None:
@@ -476,11 +671,24 @@ def compute_batch_changeset(
 
 
 def update_nurse_attributes_batch(
-    db: Session, nurse_id: str, group_id: str, mutations: list[dict]
+    db: Session,
+    nurse_id: str,
+    group_id: str,
+    mutations: list[dict],
+    *,
+    year: int | None = None,
+    month: int | None = None,
 ) -> dict:
     """단일 간호사에 여러 mutation을 트랜잭션으로 적용.
 
     group_id-scoped: cross-group mutation 차단.
+
+    시점(period) 일원화:
+      - grade/allowed_shifts/fixed_shift/is_weekend_off 는 각 nurse_*_period(SSOT)로
+        upsert. 물리 컬럼은 upsert_period 가 단방향 투영(직접 setattr 금지).
+      - team_id 는 NurseTeamPeriod SSOT 로 기록(캐시 컬럼도 함께 갱신, 구 화면 호환).
+      - valid_from 은 year/month 가 주어지면 그 달 1일(월 셀렉터 발효 정합),
+        미지정 시 오늘 날짜.
     """
     cs = compute_batch_changeset(db, nurse_id, group_id, mutations)
     if not cs["ok"]:
@@ -491,10 +699,21 @@ def update_nurse_attributes_batch(
         .filter(Nurse.nurse_id == nurse_id, Nurse.group_id == group_id)
         .first()
     )
-    # ④ 역방향 정합: 근무유형(allowed_shifts)을 특정 시프트 제외로 바꾸는데 현재/미래월에
+    from datetime import date as _date
+
+    # 공유 valid_from: 선택월 1일 우선, 없으면 오늘 (period 쓰기 전 경로 일관).
+    if year is not None and month is not None:
+        valid_from = _date(int(year), int(month), 1)
+    else:
+        valid_from = _date.today()
+
+    changed_fields = cs["changed_fields"]
+    team_change = "team_id" in changed_fields
+
+    # ④ 역방향 정합(dev): 근무유형(allowed_shifts)을 특정 시프트 제외로 바꾸는데 현재/미래월에
     #   그 시프트 양수 월한도(min/max/exact)가 있으면 생성 시 infeasible → 저장 차단
     #   (monthly_limit._check_work_shifts 게이트의 역방향. 과거월은 무관).
-    _new_allowed = cs["changed_fields"].get("allowed_shifts")
+    _new_allowed = changed_fields.get("allowed_shifts")
     if _new_allowed is not None:
         from services.cp_sat.allowed_shift_types import normalize_allowed_shift_codes
         from db.models import NurseMonthlyLimit
@@ -502,7 +721,7 @@ def update_nurse_attributes_batch(
         _allowed = normalize_allowed_shift_codes(_new_allowed if isinstance(_new_allowed, list) else [])
         if _allowed:  # 빈=제한없음 → skip
             _ym = (lambda t: t.year * 100 + t.month)(_d.today())
-            for _lim in db.query(NurseMonthlyLimit).filter(NurseMonthlyLimit.nurse_id == nurse_id).all():
+            for _lim in db.query(NurseMonthlyLimit).filter(NurseMonthlyLimit.nurse_id == nurse.nurse_id).all():
                 if (int(_lim.year or 0) * 100 + int(_lim.month or 0)) < _ym:
                     continue
                 for _p in ("d", "e", "n"):
@@ -517,49 +736,67 @@ def update_nurse_attributes_batch(
                                 f"먼저 해당 월한도를 해제하세요."
                             )}
 
-    for f, v in cs["changed_fields"].items():
+    for f, v in changed_fields.items():
         if f == "allowed_shifts":
             # 허용 근무형 → nurse_allowed_shift_period 일원화. 컬럼은 단방향 투영(직접쓰기 금지).
-            from datetime import date as _date
             from db.models import NurseAllowedShiftPeriod
             from services.nurse_period_resolver import upsert_period
             upsert_period(
-                db, NurseAllowedShiftPeriod, nurse.nurse_id, _date.today(),
+                db, NurseAllowedShiftPeriod, nurse.nurse_id, valid_from,
                 "allowed_shifts", v if isinstance(v, list) else [],
                 nurse=nurse, cache_attr="allowed_shifts", source="edited",
             )
         elif f == "grade":
             # grade → nurse_grade_period 일원화(병동귀속). 컬럼은 단방향 투영(직접쓰기 금지).
-            from datetime import date as _date
             from db.models import NurseGradePeriod
             from services.nurse_period_resolver import upsert_period
             upsert_period(
-                db, NurseGradePeriod, nurse.nurse_id, _date.today(),
+                db, NurseGradePeriod, nurse.nurse_id, valid_from,
                 "grade", v, group_id=group_id,
                 nurse=nurse, cache_attr="grade", source="edited",
             )
         elif f == "fixed_shift":
             # 고정 근무형 → nurse_allowed_shift_period(통합 satellite)의 fixed_shift 컬럼.
-            from datetime import date as _date
             from db.models import NurseAllowedShiftPeriod
             from services.nurse_period_resolver import upsert_period
             upsert_period(
-                db, NurseAllowedShiftPeriod, nurse.nurse_id, _date.today(),
+                db, NurseAllowedShiftPeriod, nurse.nurse_id, valid_from,
                 "fixed_shift", v, nurse=nurse, cache_attr="fixed_shift",
                 carry_attrs=["allowed_shifts"], source="edited",
             )
         elif f == "is_weekend_off":
             # 주말휴무 → nurse_weekendoff_period. 컬럼은 단방향 투영(직접쓰기 금지).
-            from datetime import date as _date
             from db.models import NurseWeekendOffPeriod
             from services.nurse_period_resolver import upsert_period
             upsert_period(
-                db, NurseWeekendOffPeriod, nurse.nurse_id, _date.today(),
+                db, NurseWeekendOffPeriod, nurse.nurse_id, valid_from,
                 "weekend_off", 1 if v else 0,
                 nurse=nurse, cache_attr="is_weekend_off", source="edited",
             )
         else:
             setattr(nurse, f, v)
+
+    if team_change:
+        try:
+            from services.team_period import set_team_period
+
+            set_team_period(
+                db,
+                nurse_id=nurse_id,
+                group_id=group_id,
+                valid_from=valid_from,
+                team_id=changed_fields["team_id"],
+                source="agent",
+                commit=False,
+            )
+        except Exception:
+            # SSOT 기록 실패해도 캐시는 이미 갱신됨 — 부분 안전. 로그만.
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "[nurse_tools] set_team_period SSOT 기록 실패 nurse=%s group=%s",
+                nurse_id, group_id,
+            )
+
     db.commit()
     db.refresh(nurse)
 

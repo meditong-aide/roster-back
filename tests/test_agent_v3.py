@@ -330,7 +330,17 @@ class TestConversationStore:
 
 class TestSkillDescriptions:
     def test_count(self):
-        assert len(SKILL_TOOLS) == 10
+        # 12 domain + 2 Wave-1 (query_generation_job, manage_wanted_deadline)
+        # + 2 Wave-2 (manage_teams, manage_wanted_limits)
+        # + 1 Wave-3 (resolve_infeasibility)
+        # + 3 client-action (navigate, prefill, switch_ward) = 20.
+        # + 1 client-action (invoke, 2026-07-07 비파괴 UI 명령/엑셀) = 21.
+        # + 1 manifest 첫 시민 (manage_assignment, 파견) = 22.
+        # + 1 lookup_guide (help-doc RAG) = 23.
+        # + 1 manage_daily_shift (시프트별 필요인원) = 24.
+        # + 3 publish_schedule / manage_mutual_exclusion / log_feedback = 27.
+        # + 2 manage_leave_targets(휴가 대상 3-state) / manage_banned_wanted(금지 원티드) = 29.
+        assert len(SKILL_TOOLS) == 29
 
     def test_required_fields(self):
         for tool in SKILL_TOOLS:
@@ -344,6 +354,10 @@ class TestSkillDescriptions:
         assert "bulk_mutation" in names
         assert "generate_schedule" in names
         assert "update_monthly_limit" in names
+        assert "manage_grade" in names
+        assert "manage_team_min" in names
+        assert "navigate" in names
+        assert "prefill" in names
 
 
 # ── Scope Routing (Bug #35) ────────────────────────────────

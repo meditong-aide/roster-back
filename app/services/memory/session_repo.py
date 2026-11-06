@@ -219,6 +219,27 @@ class SessionMemoryRepo:
         pipe.expire(key, self.TTL_SECONDS)
         pipe.execute()
 
+    @staticmethod
+    def _repair_tool_call_ids(messages: list[dict]) -> list[dict]:
+        """role='tool' 메시지의 tool_call_id 복원.
+
+        영속화 스키마(AgentConversationMessage)에 tool_call_id 컬럼이 없어 저장 시
+        소실된다. 하지만 직전 assistant.tool_calls 의 id 는 tool_calls_json 으로 보존되고,
+        tool 응답은 tool_call 순서대로 뒤따르므로 위치 페어링으로 재구성한다.
+        (미복원 시 OpenAI 가 "role 'tool' must have a 'tool_call_id'" 400 을 던짐.)
+        """
+        pending: list[str] = []
+        for m in messages:
+            role = m.get("role")
+            if role == "assistant" and m.get("tool_calls"):
+                pending = [
+                    tc.get("id") for tc in m["tool_calls"] if isinstance(tc, dict) and tc.get("id")
+                ]
+            elif role == "tool" and not m.get("tool_call_id"):
+                if pending:
+                    m["tool_call_id"] = pending.pop(0)
+        return messages
+
     def load_messages(
         self, session_id: str, group_id: str | None = None
     ) -> list[dict]:
@@ -236,7 +257,7 @@ class SessionMemoryRepo:
         cached = self.redis.lrange(key, 0, -1)
         if cached:
             self.redis.expire(key, self.TTL_SECONDS)
-            return [json.loads(item) for item in cached]
+            return self._repair_tool_call_ids([json.loads(item) for item in cached])
 
         if conv is None:
             # SOT 비활성 또는 row 없음 — MSSQL fallback 스킵
@@ -269,6 +290,9 @@ class SessionMemoryRepo:
                         r.turn_idx,
                     )
             messages.append(m)
+
+        # tool_call_id 재구성(저장 스키마 미보존분) — 캐시 채우기 전에 복원해 캐시도 정상화.
+        self._repair_tool_call_ids(messages)
 
         # Redis 캐시 채우기 + EXPIRE
         if messages:

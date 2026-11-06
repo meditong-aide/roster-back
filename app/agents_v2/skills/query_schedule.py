@@ -15,7 +15,9 @@ from agents_v2.tools import (
     constraint_tools,
     generation_tools,
     nurse_monthly_limit_tools,
+    leave_tools,
 )
+from agents_v2.tools.nurse_tools import normalize_shift_codes as _normalize_shift_codes  # noqa: F401
 
 
 @register("query-schedule")
@@ -25,6 +27,13 @@ def query_schedule(db: Session, params: dict) -> Any:
     group_id = params["group_id"]
     year = params.get("year")
     month = params.get("month")
+
+    # shift_codes 정규화 + 검증 (B5). 모르는 코드는 즉시 clarification.
+    normalized_codes, clar = _normalize_shift_codes(params.get("shift_codes"))
+    if clar is not None:
+        return clar
+    if normalized_codes is not None:
+        params = {**params, "shift_codes": normalized_codes}
 
     if scope == "wanted_campaign":
         return _query_wanted_campaign(db, group_id, year, month)
@@ -44,9 +53,77 @@ def query_schedule(db: Session, params: dict) -> Any:
         return generation_tools.get_latest_job(db, group_id)
     elif scope == "monthly_limit":
         return _query_monthly_limits(db, group_id, year, month, params)
+    elif scope == "leave_summary":
+        return _query_leave_summary(db, group_id, year, month)
+    elif scope == "wanted_memo":
+        return _query_wanted_memo(db, group_id, year, month, params)
+    elif scope == "sleep_off_status":
+        return _query_sleep_off_status(db, group_id, year, month, params)
     else:
         # Fallback: try schedule
         return _query_schedule_entries(db, group_id, year, month, params)
+
+
+def _query_wanted_memo(db, group_id, year, month, params):
+    """원티드 월별 메모 조회 (read-only).
+
+    ★ 개인이 쓴 글이라 범위를 역할로 가른다 — HN/ADM 은 병동 전체(관리보드와 동일),
+      일반 간호사는 **본인 것만**. 이름을 지정해도 남의 메모로 넘어가지 않는다.
+    """
+    if year is None or month is None:
+        return {"error": "year/month required for wanted_memo scope"}
+
+    is_hn = params.get("acting_role") in ("HN", "ADM")
+    nurse_ids = params.get("nurse_ids") or None
+    if not is_hn:
+        me = params.get("acting_user_id")
+        if not me:
+            return {"error": "본인 확인이 되지 않아 메모를 조회할 수 없습니다."}
+        if nurse_ids and [str(n) for n in nurse_ids] != [str(me)]:
+            return {"error": "다른 간호사의 원티드 메모는 볼 수 없습니다."}
+        nurse_ids = [str(me)]
+
+    memos = wanted_tools.read_monthly_memos(
+        db, group_id, int(year), int(month), nurse_ids=nurse_ids
+    )
+    return {
+        "year": int(year),
+        "month": int(month),
+        "scope_kind": "ward" if (is_hn and not nurse_ids) else "nurse",
+        "count": len(memos),
+        "memos": memos,
+        "message": (
+            f"{year}년 {month}월 원티드 메모 {len(memos)}건입니다."
+            if memos
+            else f"{year}년 {month}월에 작성된 원티드 메모가 없어요."
+        ),
+    }
+
+
+def _query_sleep_off_status(db, group_id, year, month, params):
+    """수면OFF 자동부여 적용 여부 + 간호사별 주기 상태 (읽기 전용).
+
+    ★ 조회만 연다 — 주기/on-off 는 생성 설정이고 연번·이월은 근무표 확정이 만드는
+      파생 상태라, 에이전트가 값을 고치면 다음 달 판정이 통째로 어긋난다.
+    """
+    if year is None or month is None:
+        return {"error": "year/month required for sleep_off_status scope"}
+    return leave_tools.read_sleep_off_status(
+        db, group_id, int(year), int(month), nurse_ids=params.get("nurse_ids") or None
+    )
+
+
+def _query_leave_summary(db, group_id, year, month):
+    """휴가 자동부여(보건휴가·수면OFF) 결과 — 확정된 그 달 표에서 되읽는다."""
+    if year is None or month is None:
+        return {"error": "year/month required for leave_summary scope"}
+    result = leave_tools.summarize_leave_grants(db, group_id, int(year), int(month))
+    if result is None:
+        return {
+            "found": False,
+            "message": "이 병동에는 보건휴가·수면OFF 자동부여 코드가 설정돼 있지 않아요.",
+        }
+    return result
 
 
 def _query_monthly_limits(db, group_id, year, month, params):
@@ -55,6 +132,8 @@ def _query_monthly_limits(db, group_id, year, month, params):
         return {"error": "year/month required for monthly_limit scope"}
     nurse_ids = params.get("nurse_ids")
     if nurse_ids and len(nurse_ids) == 1:
+        # as-of 조회(기본): 이 달 미설정이라도 과거 마지막 설정이 이월 적용된 값을 본다
+        # (생성이 실제로 쓰는 값과 일치). carried_over 면 출처 월을 고지한다.
         single = nurse_monthly_limit_tools.get_monthly_limit(
             db, nurse_ids[0], group_id, year, month
         )
@@ -66,7 +145,13 @@ def _query_monthly_limits(db, group_id, year, month, params):
                 "limit_set": False,
                 "message": "해당 간호사의 월 한도 설정 없음.",
             }
-        return {**single, "limit_set": True}
+        out = {**single, "limit_set": True}
+        if single.get("carried_over"):
+            out["message"] = (
+                f"{single['applied_from_year']}년 {single['applied_from_month']}월에 "
+                f"설정된 한도가 {year}년 {month}월에 이월 적용 중입니다."
+            )
+        return out
     return {
         "year": year,
         "month": month,
@@ -192,11 +277,14 @@ def _query_wanted_adjustments(db, group_id, year, month, params):
 
 def _query_schedule_entries(db, group_id, year, month, params):
     schedule_id = params.get("schedule_id")
+    roster_published = False
     if not schedule_id:
         meta = schedule_tools.resolve_target_schedule(db, group_id, year, month)
         if not meta:
             return {"error": f"No schedule found for {year}/{month}"}
         schedule_id = meta["schedule_id"]
+        # 확정본(IssuedRoster) 여부 — bulk_mutation 선행조건 트리거가 볼 수 있게 노출.
+        roster_published = bool(meta.get("is_published"))
 
     entries = schedule_tools.get_schedule_entries(
         db,
@@ -225,8 +313,17 @@ def _query_schedule_entries(db, group_id, year, month, params):
         "date_range_start", "shift_codes", "shift_name",
     ))
     if not has_filter and len(entries) > 60:
-        return _summarize_entries(entries, year, month)
+        result = _summarize_entries(entries, year, month)
+        if roster_published and isinstance(result, dict):
+            result["roster_source"] = "확정본(IssuedRoster·마감됨)"
+        return result
 
+    # 확정본이면 상태를 함께 노출(선행조건 트리거용). 작업본(미확정)은 기존 list 그대로.
+    if roster_published:
+        return {
+            "roster_source": "확정본(IssuedRoster·마감됨) — 에이전트로 칸 수정 불가(근무표 만들기 화면에서 마감 철회 후 수정 안내)",
+            "entries": entries,
+        }
     return entries
 
 
@@ -312,4 +409,8 @@ def _query_nurses(db, group_id, params):
         return nurse_tools.get_nurse_by_id(db, nurse_ids[0], group_id)
     if nurse_ids:
         return [nurse_tools.get_nurse_by_id(db, nid, group_id) for nid in nurse_ids]
-    return nurse_tools.get_nurses_in_group(db, group_id)
+    # year/month 가 주어지면 그 달 effective 멤버만 반환 (전입/전출 SSOT 반영).
+    return nurse_tools.get_nurses_in_group(
+        db, group_id,
+        year=params.get("year"), month=params.get("month"),
+    )
