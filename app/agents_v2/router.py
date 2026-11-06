@@ -258,21 +258,33 @@ def _confidence_for(categories: list[str]) -> float:
     return 0.4
 
 
-def route(llm: LLMClient, message: str) -> RouterResult:
-    """발화 → RouterResult. 분류가 비면 fallback(전체 tool). 토큰/모델도 함께 반환."""
+def route(llm: LLMClient, message: str, agent_id: str = "aide") -> RouterResult:
+    """발화 → RouterResult. 분류가 비면 fallback(그 에이전트 프로필의 전체 tool). 토큰/모델도 함께 반환."""
     cats, resp = _classify_raw(llm, message)
     it = resp.input_tokens if resp else 0
     ot = resp.output_tokens if resp else 0
     mdl = resp.model if resp else None
     confidence = _confidence_for(cats)
     if not cats:
+        if agent_id == "aide":
+            fallback_names = list(ALL_TOOL_NAMES)
+        else:
+            from agents_v2.profiles import profile_tool_names
+
+            fallback_names = profile_tool_names(agent_id)
         result = RouterResult(
-            categories=[], tool_names=list(ALL_TOOL_NAMES), fallback_used=True,
+            categories=[], tool_names=fallback_names, fallback_used=True,
             input_tokens=it, output_tokens=ot, model=mdl, confidence=confidence,
         )
     else:
+        names = resolve_tools(cats)
+        if agent_id != "aide":  # 파생 에이전트는 자기 도구와의 교집합만, 비면 프로필 전체(H4)
+            from agents_v2.profiles import profile_tool_names
+
+            own = set(profile_tool_names(agent_id))
+            names = [n for n in names if n in own] or profile_tool_names(agent_id)
         result = RouterResult(
-            categories=cats, tool_names=resolve_tools(cats), fallback_used=False,
+            categories=cats, tool_names=names, fallback_used=False,
             input_tokens=it, output_tokens=ot, model=mdl, confidence=confidence,
         )
     # B14: 한 줄 구조화 로그 — 디버깅/품질 모니터링용.

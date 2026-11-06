@@ -122,7 +122,7 @@ def approval_body_fp(preview: Any) -> str:
     미리보기 본문(예: update_constraint 의 `changes:{field:{old,new}}`)은 live 상태에 의존하므로,
     승인 시점 지문과 커밋 직전 dry-run 지문이 다르면 = 그 사이 상태가 바뀐 것(stale).
     실패모드는 **안전측**(달라 보이면 재확인; 잘못 커밋하지 않음). 지문 불가/빈 preview → "".
-    DAG 경로의 `preview_fingerprint`(task+summary 키)에 대응하는 ReAct 판.
+    DAG 경로의 `preview_fingerprint`(task + 미리보기 data 전체, 휘발 칸 제외)에 대응하는 ReAct 판.
     """
     import hashlib
     import json

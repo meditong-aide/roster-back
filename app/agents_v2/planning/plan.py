@@ -13,6 +13,45 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def _norm(name: str) -> str:
+    return str(name).replace("-", "_")
+
+
+def code_kind(skill: str) -> str:
+    """스킬의 읽기/쓰기(kind)를 코드가 정한다(H2) — LLM 이 적은 값은 쓰지 않는다.
+
+    매니페스트 스펙이 있으면 effective_mode == "write" 일 때 mutate, 옛 @register 스킬은
+    middleware._MUTATION_SKILLS 에 있으면 mutate, 나머지는 read(판정은 middleware.is_write_skill 한 곳).
+    """
+    from agents_v2.middleware import is_write_skill
+
+    return "mutate" if is_write_skill(skill) else "read"
+
+
+def drop_button_nodes(plan: "Plan") -> tuple["Plan", list[PlanTask]]:
+    """commit == "button" 노드와 그 노드의 출력에 기대는 노드(전이)를 뺀 계획 + 뺀 노드 목록(H3).
+
+    버튼 승인으로만 적용하는 스킬은 글자 승인의 다시 실행에서 돌리지 않는다.
+    """
+    from agents_v2.skills.manifest import find_spec, load_manifest_skills
+
+    load_manifest_skills()
+    dropped: set[str] = set()
+    for t in plan.tasks:  # 순서와 무관하게 전이 폐쇄가 될 때까지
+        spec = find_spec(t.skill)
+        if spec is not None and spec.commit == "button":
+            dropped.add(t.id)
+    changed = bool(dropped)
+    while changed:
+        changed = False
+        for t in plan.tasks:
+            if t.id not in dropped and any(d in dropped for d in t.deps):
+                dropped.add(t.id)
+                changed = True
+    return (Plan(tasks=[t for t in plan.tasks if t.id not in dropped]),
+            [t for t in plan.tasks if t.id in dropped])
+
+
 @dataclass
 class PlanTask:
     id: str
@@ -40,8 +79,16 @@ class Plan:
             deps=t.get("deps") or [], kind=t.get("kind", "read"),
         ) for t in (d or {}).get("tasks", [])])
 
-    def validate(self) -> None:
-        """중복 id·미존재 dep·순환을 검출(있으면 ValueError)."""
+    def validate(self, allowed: set[str] | frozenset[str] | None = None) -> None:
+        """중복 id·미존재 dep·순환을 검출(있으면 ValueError).
+
+        allowed(스킬 이름 집합)를 주면 그 밖의 스킬도 거절한다(H1) — 하이픈·밑줄은 같은 이름으로 본다.
+        """
+        if allowed is not None:
+            names = {_norm(n) for n in allowed}
+            for t in self.tasks:
+                if _norm(t.skill) not in names:
+                    raise ValueError(f"plan: task '{t.id}' 의 스킬 '{t.skill}' 은 허용 목록에 없음")
         ids = [t.id for t in self.tasks]
         if len(ids) != len(set(ids)):
             raise ValueError("plan: 중복 task id")

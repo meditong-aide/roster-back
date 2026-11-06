@@ -437,6 +437,32 @@ SCOPE_WRITE_SOURCE = "이 작업은 화면의 버튼으로만 할 수 있습니�
 SCOPE_SOURCE = "이 경로에서는 부를 수 없는 작업입니다."
 
 
+def check_profile_scope(skill_name: str, agent_id: str | None) -> str | None:
+    """⓪ 의 프로필 판정(모르는 에이전트·프로필 밖 스킬) — 계획 실행기가 노드마다 같은 판정을 쓴다(H1)."""
+    from agents_v2.profiles import in_scope, profile_of
+
+    profile = profile_of(agent_id)
+    if profile is None:
+        return SCOPE_UNKNOWN_AGENT
+    if not in_scope(profile.id, skill_name):
+        return SCOPE_OUT_OF_PROFILE
+    return None
+
+
+def is_write_skill(skill_name: str) -> bool:
+    """쓰기 스킬인가 — 스펙의 effective_mode, 스펙 없는 옛 @register 스킬은 _MUTATION_SKILLS.
+
+    ⓪ 의 쓰기 출처 판정과 계획의 kind 판정(plan.code_kind)이 같은 규칙을 쓰도록 한 곳에 둔다.
+    """
+    from agents_v2.skills.manifest import find_spec, load_manifest_skills
+
+    load_manifest_skills()
+    spec = find_spec(skill_name)
+    if spec is not None:
+        return spec.effective_mode == "write"
+    return skill_name.replace("-", "_") in _MUTATION_SKILLS
+
+
 def _check_scope(skill_name: str, ctx: SessionContext) -> str | None:
     """⓪ 범위 단계 — 에이전트 프로필(허용 목록). ①(역할 권한)보다 먼저 본다(S3 · 11-06).
 
@@ -445,22 +471,17 @@ def _check_scope(skill_name: str, ctx: SessionContext) -> str | None:
     - 쓰기 스킬은 프로필의 write_sources 에 든 출처에서 온 호출만(비우면 제한 없음 — aide).
       쓰기 판정은 LLM 이 적은 값이 아니라 스펙의 mode(옛 스킬은 _MUTATION_SKILLS)로 한다.
     """
-    from agents_v2.profiles import in_scope, profile_of
+    from agents_v2.profiles import profile_of
     from agents_v2.skills.manifest import find_spec, load_manifest_skills
 
+    block = check_profile_scope(skill_name, ctx.agent_id)
+    if block:
+        return block
     profile = profile_of(ctx.agent_id)
-    if profile is None:
-        return SCOPE_UNKNOWN_AGENT
-    if not in_scope(profile.id, skill_name):
-        return SCOPE_OUT_OF_PROFILE
-    if profile.write_sources:
-        load_manifest_skills()
-        spec = find_spec(skill_name)
+    if profile is not None and profile.write_sources:
         # 옛 @register 스킬(스펙 없음)의 _MUTATION_SKILLS 판정은 지금 쓰이지 않는다 — write_sources 가 있는 프로필은
         # schedule-edit 하나이고 그 프로필은 위 in_scope 에서 옛 스킬을 이미 막는다. 프로필을 넓혀 옛 스킬을 열 때의 안전망.
-        writes = (spec.effective_mode == "write") if spec is not None \
-            else skill_name.replace("-", "_") in _MUTATION_SKILLS
-        if writes and ctx.source not in profile.write_sources:
+        if is_write_skill(skill_name) and ctx.source not in profile.write_sources:
             return SCOPE_WRITE_SOURCE
     # 스펙이 호출 출처를 좁혔으면(수정 도우미: LLM·예시는 도구만 · 버튼은 버튼만) 그 출처에서 온 호출만. AIDE 스펙은 비어 있어 그대로(S4)
     load_manifest_skills()

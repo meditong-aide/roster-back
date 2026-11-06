@@ -72,3 +72,24 @@ def in_scope(agent_id: str, skill_name: str) -> bool:
     if agent_id == AIDE:
         return spec is None or AIDE in spec.agents
     return spec is not None and agent_id in spec.agents
+
+
+def profile_tools(agent_id: Optional[str]) -> list[dict]:
+    """그 에이전트의 LLM 에 보일 도구 스키마 목록(H4). aide 는 지금 descriptions.SKILL_TOOLS 그대로,
+    파생 에이전트는 매니페스트에서 자기 id 가 든 LLM 노출 스킬만. 모르는 에이전트는 빈 목록(전체 도구로 새지 않는다)."""
+    profile = profile_of(agent_id)
+    if profile is None:
+        return []
+    if profile.id == AIDE:
+        from agents_v2.skills.descriptions import SKILL_TOOLS
+
+        return SKILL_TOOLS
+    from agents_v2.skills.manifest import load_manifest_skills, manifest_tools
+
+    load_manifest_skills()
+    return manifest_tools(profile.id)
+
+
+def profile_tool_names(agent_id: Optional[str]) -> list[str]:
+    """profile_tools 의 이름 목록(정의 순서 보존) — 라우터 분류 실패 폴백이 쓴다."""
+    return [t["name"] for t in profile_tools(agent_id)]

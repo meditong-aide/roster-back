@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from agents_v2.errors import ErrorType, classify
-from agents_v2.planning.plan import Plan, PlanTask, resolve_args
+from agents_v2.planning.plan import Plan, PlanTask, _norm, code_kind, resolve_args
 
 
 # 비동기·외부 부수효과 skill — 트랜잭션 밖·커밋 후에만 실행(플랜 롤백돼도 enqueue 안 되게,
@@ -74,8 +74,24 @@ def execute_plan(
     안전: 병렬 read 는 fresh 세션·plain data 반환이라 cross-session 오염 없음. outputs 쓰기는
     메인 스레드에서만(각 task 자기 키) → race 없음.
     """
+    # 읽기/쓰기는 실행 직전에 코드가 다시 정한다(H2) — 되살린 옛 계획의 kind 도 믿지 않는다(검증보다 먼저).
+    for t in plan.tasks:
+        t.kind = code_kind(t.skill)
     plan.validate()
     res = PlanExecResult()
+    # 노드마다 프로필 범위를 다시 본다(H1) — execute_fn 이 execute_skill 이 아니어도. 범위 밖이면 아무것도 실행하지 않고 STOP.
+    # ctx 가 있으면 agent_id 가 없어도 거절한다(⓪ 과 같음 · ctx=None 만 건너뜀). 쓰기 출처·호출 출처 검사와 감사 행은 ⓪(execute_skill)만 남긴다.
+    if ctx is not None:
+        from agents_v2.middleware import check_profile_scope
+
+        agent_id = getattr(ctx, "agent_id", None)
+        for t in plan.tasks:
+            block = check_profile_scope(t.skill, agent_id)
+            if block:
+                res.outputs[t.id] = {"error": block, "permission_denied": True}
+                res.order.append(t.id)
+                res.failed = {"task": t.id, "skill": t.skill, "data": res.outputs[t.id]}
+                return res
     blocked: set[str] = set()  # collect 모드: 되물음/스킵된 task → 그 dependents 도 스킵
 
     def _record(task: PlanTask, data: Any, args: dict | None, is_mutate_dry: bool) -> bool:
@@ -99,7 +115,8 @@ def execute_plan(
             if res.failed is None:
                 res.failed = {"task": task.id, "skill": task.skill, "data": data}
             return True
-        if is_mutate_dry:
+        # 미리보기로 돌아온 것만 승인 대상 — 쓰기 스킬의 조회 op 결과는 outputs 로만 흐른다(ReAct 와 같은 기준)
+        if is_mutate_dry and oc is ErrorType.PREVIEW:
             res.previews.append({"task": task.id, "skill": task.skill, "args": args, "data": data})
         return False
 
@@ -115,10 +132,10 @@ def execute_plan(
 
     for level in plan.topo_levels():
         # async skill 은 실행 않고 deferred 로(커밋 후 실행). 원 순서 보존.
-        for t in level:
-            if t.skill in defer_skills:
-                res.deferred.append(t)
-        active = _runnable([t for t in level if t.skill not in defer_skills])
+        # defer_skills 는 밑줄 이름이라 하이픈 표기도 같게 본다.
+        deferred_now = [t for t in level if _norm(t.skill) in defer_skills]
+        res.deferred.extend(deferred_now)
+        active = _runnable([t for t in level if _norm(t.skill) not in defer_skills])
         reads = [t for t in active if t.kind == "read"]
         mutates = [t for t in active if t.kind == "mutate"]
 
@@ -156,5 +173,15 @@ def execute_plan(
             data, args = _run_task(db, task, ctx, execute_fn, res.outputs, dry_run_mutations)
             if _record(task, data, args, dry_run_mutations):
                 return res
+
+        # 3) 미룬 쓰기 노드(생성 등)는 미리보기 단계에서만 preview_only=True 로 한 번 돌려 승인 대상에 올린다.
+        #    실제 실행은 커밋 뒤(deferred) — 승인 없이 쓰는 길을 막는다(H2).
+        if dry_run_mutations:
+            for task in _runnable(deferred_now):
+                if task.kind != "mutate":
+                    continue
+                data, args = _run_task(db, task, ctx, execute_fn, res.outputs, True)
+                if _record(task, data, args, True):
+                    return res
 
     return res

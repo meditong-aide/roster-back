@@ -20,15 +20,37 @@ from agents_v2.planning.planner import build_plan
 logger = logging.getLogger(__name__)
 
 
+# 같은 상태에서도 호출마다 달라지는 칸 — 지문에서 뺀다. 이름은 AIDE 쓰기 스킬 미리보기 data 와 그 아래 도구·수정 도우미 기록에서
+# 시각·소요·토큰·호출 식별자로 쓰이는 것만 모았다(DB 행 id·request_id·entry_id 는 상태이므로 빼지 않는다).
+_VOLATILE_KEYS = frozenset({
+    "elapsed_ms", "duration_ms", "took_ms", "latency_ms", "remaining_ms", "duration_sec",
+    "timestamp", "ts", "generated_at", "computed_at", "created_at", "touched_at",
+    "trace_id", "call_id", "job_id",
+    "input_tokens", "output_tokens", "usage", "tokens",
+})
+
+
+def _stable(v: Any) -> Any:
+    """휘발 칸을 걷고 집합은 정렬 목록으로 — 정규 JSON 이 실행마다 같도록."""
+    if isinstance(v, dict):
+        # 키는 str 로 — int·날짜 키가 섞여도 sort_keys 직렬화가 터지지 않게
+        return {str(k): _stable(x) for k, x in v.items() if k not in _VOLATILE_KEYS}
+    if isinstance(v, (list, tuple)):
+        return [_stable(x) for x in v]
+    if isinstance(v, (set, frozenset)):
+        return sorted((_stable(x) for x in v), key=lambda x: json.dumps(x, sort_keys=True, default=str))
+    return v
+
+
 def preview_fingerprint(previews: list[dict]) -> str:
-    """미리보기 요약의 지문 — 승인 시점 대비 커밋 시점 상태 변화(staleness) 감지용."""
+    """미리보기 data 전체(휘발 칸 제외)의 정규 JSON 해시 — 승인 시점 대비 커밋 시점 상태 변화(staleness) 감지용."""
     import hashlib
 
     key = json.dumps(
-        [[p.get("task"), (p.get("data") or {}).get("summary")] for p in (previews or [])],
+        [[p.get("task"), _stable(p.get("data"))] for p in (previews or [])],
         ensure_ascii=False, sort_keys=True, default=str,
     )
-    return hashlib.md5(key.encode()).hexdigest()
+    return hashlib.sha256(key.encode()).hexdigest()
 
 
 @dataclass

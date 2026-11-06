@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Any
 
-from agents_v2.planning.plan import Plan, PlanTask
+from agents_v2.planning.plan import Plan, PlanTask, code_kind
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +133,18 @@ def build_plan(llm: Any, user_message: str, skill_tools: list[dict],
     if plan is None or len(plan.tasks) <= 1:
         return None  # 단일/단순/파싱실패 → ReAct
     try:
-        plan.validate()
+        # 보여 준 도구 밖의 스킬은 허용하지 않는다(H1) — 부정 plan 과 같은 길(ReAct 폴백)
+        plan.validate(allowed={t.get("name", "") for t in skill_tools})
     except ValueError as e:
         logger.warning("[planner] 부정 plan(%s) → ReAct fallback", e)
         return None
+    # 읽기/쓰기는 LLM 이 적은 값이 아니라 코드가 정한다(H2)
+    for t in plan.tasks:
+        kind = code_kind(t.skill)
+        if t.kind != kind:
+            # 쓰기 스킬의 조회 op 를 read 로 적은 건 정상이라 info, 쓰기로 적었는데 읽기면 이상 신호라 warning
+            log = logger.warning if t.kind == "mutate" else logger.info
+            log("[planner] task %s(%s) kind %s → %s (코드 판정으로 덮어씀)",
+                t.id, t.skill, t.kind, kind)
+            t.kind = kind
     return plan

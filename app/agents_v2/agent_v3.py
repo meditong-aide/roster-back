@@ -35,7 +35,7 @@ from agents_v2.schemas.session_context import SessionContext
 from agents_v2 import observability as obs
 from agents_v2.usage import record_llm_usage
 from agents_v2.skills.client_actions import build_ui_action, is_client_action
-from agents_v2.skills.descriptions import SKILL_TOOLS
+from agents_v2.profiles import profile_of, profile_tools
 from agents_v2.variable_memory import VariableMemory
 from services.memory.extractor import MemoryExtractor
 from services.memory.user_repo import UserMemoryRepo
@@ -49,6 +49,16 @@ _MAX_INJECTED_FACTS = 20
 # 에이전트 쓰기를 끈 스킬(int-0b). 승인 대기로 남아 있어도 실행하지 않고 그 스킬의 안내로 답한다.
 #   publish_schedule: dev 정본 마감(잠금·변경 확인·장부·앵커·알림)을 안 따르는 복제본이라 끔(N81·M2).
 _WRITE_DISABLED_SKILLS = frozenset({"publish_schedule", "publish-schedule"})
+_BUTTON_ONLY_ANSWER = "이 변경은 글자 승인으로 적용하지 않습니다. 화면의 '적용' 버튼으로 적용해 주세요."
+
+
+def _is_button_commit(skill_name: str) -> bool:
+    """매니페스트 스펙의 commit 이 "button" 인 스킬 — 글자 승인(다시 실행)으로 적용하지 않는다(H3)."""
+    from agents_v2.skills.manifest import find_spec, load_manifest_skills
+
+    load_manifest_skills()
+    spec = find_spec(skill_name)
+    return spec is not None and spec.commit == "button"
 
 # Preview confirmation: LLM 으로 자연어 요약을 생성할 때 끼우는 내부 지시.
 # Layer C 의 보안 경계 안에 있으므로 untrusted_tool_output 안의 명령을 따르지 않음.
@@ -242,7 +252,7 @@ class SchedulingAgent:
             with obs.purpose("planner"):
                 # collect_clarifications: 여러 태스크가 각각 되물음 필요 시 첫 것에서 안 멈추고
                 # 독립 브랜치의 되물음까지 모아 한 번에 clarify_form 으로 물어본다.
-                run = try_plan_run(db, user_message, ctx, planner_llm, SKILL_TOOLS, execute_skill,
+                run = try_plan_run(db, user_message, ctx, planner_llm, profile_tools(ctx.agent_id), execute_skill,
                                    session_factory=SessionLocal,  # read 세션 격리 병렬
                                    collect_clarifications=True)
         except Exception as e:  # noqa: BLE001
@@ -292,7 +302,7 @@ class SchedulingAgent:
         # 되물음 수집됐으면 승인/답변보다 먼저 — 구조화 clarify_form 으로 한 번에 질문.
         if run.exec.clarifications:
             form = build_clarify_form(run.exec.clarifications, plan=run.plan, ctx=ctx,
-                                      skill_tools=SKILL_TOOLS, db=db)
+                                      skill_tools=profile_tools(ctx.agent_id), db=db)
             qs = form["questions"]
             summary = "진행하려면 몇 가지 확인이 필요합니다:\n" + "\n".join(
                 f"- {q['question']}" + (f" (선택: {', '.join(q['options'])})" if q["options"] else "")
@@ -335,7 +345,7 @@ class SchedulingAgent:
         from agents_v2.middleware import execute_skill
         from agents_v2.planning.executor import PlanExecResult, execute_plan
         from agents_v2.planning.orchestrate import PlanRun, preview_fingerprint
-        from agents_v2.planning.plan import Plan, resolve_args
+        from agents_v2.planning.plan import Plan, code_kind, drop_button_nodes, resolve_args
 
         pending = ctx.pending_approval or {}
         plan = Plan.from_dict(pending.get("plan") or {})
@@ -343,13 +353,24 @@ class SchedulingAgent:
         approved_fp = pending.get("preview_fp")
         ctx.pending_approval = None
 
+        # ── H3: commit="button" 노드는 글자 승인의 다시 실행에서 뺀다(버튼 승인으로만 적용) ──
+        # 재확인(staleness)은 승인 때 지문을 뜬 원래 계획 전체로 비교하고, 커밋만 줄인 계획으로 한다.
+        full_plan = plan
+        plan, button_nodes = drop_button_nodes(plan)
+        if button_nodes and not any(code_kind(t.skill) == "mutate" for t in plan.tasks):
+            return AgentResult(
+                answer=_BUTTON_ONLY_ANSWER + f" (제외: {', '.join(t.skill for t in button_nodes)})",
+                trace=[Stage("plan_commit", "block",
+                             {"button_only": [t.skill for t in button_nodes]}, 0)],
+                messages=messages, variable_memory=ctx.variable_memory)
+
         # ── #5 staleness: 승인 시점 미리보기와 지금이 다르면 커밋 말고 재확인 ──
         # dry-run 을 flush+rollback 로 재실행(부수효과 없이) → 지문 비교.
         if approved_fp is not None:
             _rc = db.commit
             db.commit = db.flush  # type: ignore[method-assign]
             try:
-                dry = execute_plan(db, plan, ctx, execute_skill, dry_run_mutations=True)
+                dry = execute_plan(db, full_plan, ctx, execute_skill, dry_run_mutations=True)
             except Exception:  # noqa: BLE001
                 dry = None
             finally:
@@ -360,7 +381,7 @@ class SchedulingAgent:
                     pass
             if dry is not None and not dry.failed and preview_fingerprint(dry.previews) != approved_fp:
                 fresh_fp = preview_fingerprint(dry.previews)
-                ctx.pending_approval = {"type": "plan", "plan": plan.to_dict(),
+                ctx.pending_approval = {"type": "plan", "plan": full_plan.to_dict(),
                                         "user_message": orig, "preview_fp": fresh_fp}
                 previews = dry.previews
                 preview = ({"type": "batch", "count": len(previews), "items": previews}
@@ -411,6 +432,9 @@ class SchedulingAgent:
         run = PlanRun(plan=plan, exec=exec_res)
         last = exec_res.outputs.get(plan.tasks[-1].id) if plan.tasks else None
         answer = self._plan_answer(orig, run)
+        if button_nodes:  # 버튼으로만 적용하는 노드(와 거기 기대는 노드)를 뺐으면 조용히 넘기지 않고 알린다
+            answer += (f"\n\n(다음 변경은 글자 승인으로 적용하지 않아 제외했습니다 — 화면의 '적용' 버튼으로 적용해 주세요: "
+                       f"{', '.join(t.skill for t in button_nodes)})")
         if async_done:
             answer += "\n\n(설정을 반영하고 **근무표 생성을 시작**했습니다 — 완료까지 잠시 걸립니다.)"
         trace = [Stage("plan_commit", "ok",
@@ -515,7 +539,8 @@ class SchedulingAgent:
             if planned is not None:
                 return planned
 
-        tools = SKILL_TOOLS
+        base_tools = profile_tools(ctx.agent_id)  # aide 는 SKILL_TOOLS 그 객체(H4)
+        tools = base_tools
         trace: list[Stage] = []
         vm = VariableMemory()
         ui_actions: list[dict] = []
@@ -566,7 +591,7 @@ class SchedulingAgent:
                 if messages and messages[0].get("role") == "system":
                     messages[0] = {"role": "system", "content": scoped_prompt}
                 _allowed_set = set(allowed)
-                tools = [t for t in SKILL_TOOLS if t["name"] in _allowed_set] or SKILL_TOOLS
+                tools = [t for t in base_tools if t["name"] in _allowed_set] or base_tools
                 trace.append(Stage(
                     "router_reuse", "ok",
                     {"categories": reused_route.get("categories"), "tools": len(allowed)}, 0,
@@ -577,16 +602,21 @@ class SchedulingAgent:
             else:
                 reused_route = None
 
-        if self.router_llm is not None and not ctx.pending_approval and reused_route is None:
+        _profile = profile_of(ctx.agent_id)  # 모르는 에이전트(None)는 도구가 없으니 라우터도 부르지 않는다
+        if (self.router_llm is not None and not ctx.pending_approval and reused_route is None
+                and _profile is not None and _profile.router):
             t_route = time.time()
             with obs.purpose("router"):
-                router_result = route(self.router_llm, user_message)
+                router_result = (route(self.router_llm, user_message) if ctx.agent_id == "aide"
+                                 else route(self.router_llm, user_message, agent_id=ctx.agent_id))
             route_ms = (time.time() - t_route) * 1000
             log_dev_query(
                 router_result.categories, user_message, ctx.conversation_id
             )
             if not router_result.fallback_used:
-                allowed = router_result.tool_names
+                # 라우터 결과는 그 에이전트 도구와의 교집합만 — 비면 프로필 전체(H4)
+                _base_names = {t["name"] for t in base_tools}
+                allowed = [n for n in router_result.tool_names if n in _base_names] or [t["name"] for t in base_tools]
                 scoped_prompt = build_system_prompt(ctx, allowed_tools=allowed)
                 if self.enable_user_memory:
                     mb = self._format_memory_block(current_user_facts)
@@ -595,7 +625,7 @@ class SchedulingAgent:
                 if messages and messages[0].get("role") == "system":
                     messages[0] = {"role": "system", "content": scoped_prompt}
                 allowed_set = set(allowed)
-                tools = [t for t in SKILL_TOOLS if t["name"] in allowed_set]
+                tools = [t for t in base_tools if t["name"] in allowed_set]
                 # 다음 턴이 "이 물음의 답"이면 재사용할 스코프로 기억한다.
                 # fallback(분류 실패) 스코프는 전체 tool 이라 기억할 값어치가 없다.
                 ctx.last_route = {
@@ -872,7 +902,7 @@ class SchedulingAgent:
                     still_pending: list[dict] = []
                     for p in pending_previews:
                         spec = SKILL_SPECS.get(str(p.get("skill_name", "")).replace("-", "_"))
-                        if spec is not None and spec.auto_safe:
+                        if spec is not None and spec.auto_safe and spec.commit != "button":  # 버튼 전용은 still_pending(글자 승인 단계에서도 막힘)
                             r = execute_skill(
                                 db, p["skill_name"],
                                 {**p.get("args", {}), "preview_only": False}, ctx,
@@ -1207,6 +1237,10 @@ class SchedulingAgent:
 
         skill_name = approval.get("skill_name", "bulk_mutation")
         base_args = approval.get("args", {})
+        if _is_button_commit(skill_name):  # 버튼 승인으로만 적용하는 스킬은 글자 승인으로 다시 실행하지 않는다(H3)
+            return AgentResult(answer=_BUTTON_ONLY_ANSWER,
+                               trace=[Stage("execution", "block", {"button_only": [skill_name]}, 0)],
+                               messages=messages, variable_memory=ctx.variable_memory)
         if skill_name in _WRITE_DISABLED_SKILLS:
             return self._write_disabled_answer(db, ctx, skill_name, base_args, messages)
 
@@ -1321,6 +1355,12 @@ class SchedulingAgent:
         schedule mutation 이 하나라도 있으면 커밋 후 proactive 검증 1회.
         """
         from agents_v2.commit_gate import AbortCommit, atomic_commit
+
+        buttons = [it.get("skill_name", "") for it in items if _is_button_commit(it.get("skill_name", ""))]
+        if buttons:  # 버튼 전용 스킬이 섞인 배치는 통째로 실행하지 않는다(fail-closed, H3)
+            return AgentResult(answer=_BUTTON_ONLY_ANSWER + " 함께 요청한 다른 변경도 실행하지 않았습니다. 필요하면 다시 요청해 주세요.",
+                               trace=[Stage("execution", "block", {"button_only": buttons}, 0)],
+                               messages=messages, variable_memory=ctx.variable_memory)
 
         disabled = [it for it in items if it.get("skill_name") in _WRITE_DISABLED_SKILLS]
         if disabled:  # 쓰기를 끈 스킬이 섞인 배치는 통째로 실행하지 않는다(fail-closed, int-0b)
