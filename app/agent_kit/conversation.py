@@ -86,6 +86,9 @@ class Conversation:
     state: Any = None
     #: 기록에서 다시 세운 상태 — 에이전트가 다음 턴에 state 를 열 때 얹는다
     restored: Any = None
+    #: 대상이 바뀌어도(적용 → 새 버전 · 다른 버전 열기) 이어 가는 에이전트 값 — move_to 가 지우지 않는다
+    #: (근무표 수정은 사용자가 정한 고칠 수 있는 첫날 · 기록에서 다시 세울 때도 여기에 얹는다)
+    carry: Dict[str, Any] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def begin_turn(self) -> int:
@@ -108,7 +111,7 @@ class Conversation:
         return self.dropped
 
     def move_to(self, context: Dict[str, Any]) -> None:
-        """대상을 옮긴다(화면에서 다른 버전으로 갔거나 적용으로 새 버전이 생김) — 실행 상태는 새로 연다."""
+        """대상을 옮긴다(화면에서 다른 버전으로 갔거나 적용으로 새 버전이 생김) — 실행 상태는 새로 연다(carry 는 남긴다)."""
         self.context, self.state, self.restored = dict(context), None, None
 
     def info(self) -> Dict[str, Any]:

@@ -35,7 +35,8 @@ BUTTON_TEXT = {"apply_edit": "{rank}번 안 적용", "reject_candidate": "{rank}
                "keep_candidate": "{rank}번 안을 기준으로 다듬기", "choose_lever": "레버 고르기",
                "choose_transfer": "메우는 방식 고르기({choice_id})", "confirm_request": "그래도 진행",
                "cancel_request": "바꾸지 않기", "back_to_candidates": "다른 안 보기",
-               "retry_request": "같은 요청으로 다시 찾기", "open_version": "그 버전 열기"}
+               "retry_request": "같은 요청으로 다시 찾기", "open_version": "그 버전 열기",
+               "choose_staffing": "인원 계획 고르기({choice_id})"}
 #: 말이 흔적을 바꾸는 방식 — 새 요청은 흔적을 새로, 고쳐 말하면 단계로. 그 밖(상태 질문·안내)은 그대로
 #: (실화면 확인 11-03: '반영 안 된 거지?' 가 요청 줄을 덮어썼다)
 TRAIL = {"propose_edit": "new", "revise_edit": "step", "run_postprocess": "new", "answer_confirm": "step",
@@ -129,7 +130,7 @@ class EditAgent:
         return reply
 
     def session_for(self, db: Session, conv: Conversation) -> EditSession:
-        """판정 재료 — 없으면 열고, 근무표가 그사이 바뀌었으면 다시 연다(요청·레버·넘긴 묶음은 이어 간다)."""
+        """판정 재료 — 없으면 열고, 근무표가 그사이 바뀌었으면 다시 연다(요청·레버·넘긴 묶음·고칠 수 있는 첫날은 이어 간다)."""
         session = conv.state
         schedule_id = schedule_of(conv)
         if session is not None and session.schedule_id == schedule_id and not is_stale(db, session):
@@ -138,6 +139,11 @@ class EditAgent:
         carry = conv.restored or ({"requests": session.requests, "allow": session.allow,
                                    "avoid": session.avoid_people} if same else None)
         fresh = open_session(db, schedule_id)
+        held = conv.carry.get("edit_from")
+        if held and tuple(held[:2]) == (fresh.ctx.year, fresh.ctx.month):
+            # 고칠 수 있는 첫날은 대화 내내 — 칸이 바뀌어 다시 열거나 적용 뒤 새 버전으로 옮겨 가도(사용자 결정 11-05).
+            # 같은 대화로 다른 달 근무표로 옮겨 가면 그 달 날짜가 아니라 쓰지 않는다
+            fresh.ctx.edit_from = held[2]
         if same:
             fresh.shown_notes = set(session.shown_notes)          # 같은 근무표면 참고 문구를 다시 붙이지 않는다(검토 L2)
             # 동의한 것·묻는 중인 확인도 이어 간다(칸이 바뀌어 다시 열어도 같은 대화다). 되돌릴 앞 후보는 버린다 —
@@ -166,7 +172,7 @@ class EditAgent:
         deadline = deadline if deadline is not None else time.monotonic() + CHAT_BUDGET
         session = session if session is not None else self.session_for(db, conv)
         return Turn(db=db, user=user, conversation_id=conv.id, turn_no=conv.turn_no, session=session,
-                    today=today, deadline=deadline)
+                    today=today, deadline=deadline, carry=conv.carry)
 
     def _run(self, turn: Turn, run, params: Dict[str, Any]) -> Outcome:
         try:

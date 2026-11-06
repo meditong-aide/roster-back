@@ -17,9 +17,9 @@ from ortools.sat.python import cp_model
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    AGGREGATE, SHAPE_COUNTED, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, ShapeTarget,
-    WishTarget, count_cells, count_in, cover_members, is_satisfied, shape_count, shape_instances, shape_people,
-    weekend_days, weekend_floor, wish_targets, work_targets,
+    AGGREGATE, SHAPE_COUNTED, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, GiveUpWish, GradeFloor, SetCell,
+    ShapeTarget, StaffingPlan, WishTarget, count_cells, count_in, cover_members, grade_slots, is_satisfied, plan_people,
+    shape_count, shape_instances, shape_people, staffing_bounds, weekend_days, weekend_floor, wish_targets, work_targets,
 )
 from services.schedule_edit.rules import (
     WISH, Grid, Ineq, RuleSet, Term, TeamCover, cell, coverage_bounds, team_present, value_of,
@@ -64,6 +64,11 @@ class EditModel:
     wish: Any = None
     #: 근무 모양 요청 → 그 모양 개수 식(줄일 수를 아직 정하지 않은 요청만 · `solver.min_shape_count` 가 하나씩 줄인다)
     shape: Dict[Any, Any] = field(default_factory=dict)
+    #: 인원 계획의 모자라는 칸 (날, 근무) → 변수 · 등급 하한의 모자라는 수 (날, 근무) → 변수(`add_staffing`·`add_grade_floor`)
+    short: Dict[Tuple[int, str], Any] = field(default_factory=dict)
+    grade_short: Dict[Tuple[int, str], Any] = field(default_factory=dict)
+    #: 묶은 품질 규칙(`add_holds`)이 지금보다 나빠진 양 — 넘겨야 하는지 셀 때만 변수(위치 → 변수)
+    hold: Dict[Tuple, Any] = field(default_factory=dict)
 
     def ind(self, term: Term):
         """칸이 term.codes 중 하나인가 — 자유 칸이면 변수 합, 아니면 0/1 상수."""
@@ -146,8 +151,10 @@ def requested_cells(ctx: EditContext, requests: List[EditRequest]) -> Set[Cell]:
     개수·그날 인원 요청은 칸을 짚지 않는다. 이미 그렇게 된 칸(기간 OFF 안의 원래 OFF · 'D 넣지 마' 인데 지금 O)은
     바꿀 칸이 아니라 면제하지 않는다(검토 11-03: 면제하면 그 원티드 칸이 다른 근무로 바뀔 수 있었다).
     """
-    return {(r.nurse_id, r.day) for r in requests
-            if not isinstance(r, AGGREGATE) and not is_satisfied(ctx, r)}
+    cells = {(r.nurse_id, r.day) for r in requests
+             if not isinstance(r, AGGREGATE) and not is_satisfied(ctx, r)}
+    # 포기한 원티드 칸 — 계획이 막혀 수간호사가 그 카드를 고른 것이 짚는 것이다(사용자 결정 11-05 · [RD-29])
+    return cells | {c for r in requests if isinstance(r, GiveUpWish) for c in r.cells}
 
 
 def is_waived(key: Tuple, waived: Set[Cell]) -> bool:
@@ -297,6 +304,10 @@ def add_requests(em: EditModel, requests: List[EditRequest]) -> None:
             add_wish(em, req)
         elif isinstance(req, ShapeTarget):
             add_shape(em, req)
+        elif isinstance(req, StaffingPlan):
+            add_staffing(em, req)
+        elif isinstance(req, GradeFloor):
+            add_grade_floor(em, req)
         elif isinstance(req, SetCell):
             if (req.nurse_id, req.day) in em.free:
                 em.model.Add(em.x[req.nurse_id, req.day, req.code] == 1)
@@ -330,12 +341,70 @@ def add_balance(em: EditModel, req: BalanceTarget) -> None:
 
 
 def add_wish(em: EditModel, req: WishTarget) -> None:
-    """넣은 원티드 수 ≥ at_least. at_least 가 None 이면 수를 변수로 두고 묶지 않는다(가장 많이 넣을 수를 찾을 때)."""
-    hit = sum(em.ind(Term(n, d, codes)) for n, d, codes in wish_targets(em.ctx, req))
+    """넣은 원티드 수 ≥ at_least. at_least 가 None 이면 수를 변수로 두고 묶지 않는다(가장 많이 넣을 수를 찾을 때).
+    반영 안 된 확정 원티드 칸(`ctx.wish_fixed`)은 지금 근무 그대로이거나 원티드대로만 — 다른 근무로는 바꾸지 않는다."""
+    targets = wish_targets(em.ctx, req)
+    for n, d, codes in targets:
+        if (n, d) in em.ctx.wish_fixed and (n, d) in em.free:
+            for c in em.codes:
+                if c not in codes and c != em.base[n][d]:
+                    em.model.Add(em.x[n, d, c] == 0)
+    hit = sum(em.ind(Term(n, d, codes)) for n, d, codes in targets)
     if req.at_least is None:
         em.wish = hit
     else:
         em.model.Add(hit >= req.at_least)
+
+
+def add_staffing(em: EditModel, req: StaffingPlan) -> None:
+    """날마다 근무별 인원 — 최소에 못 미친 만큼은 모자람 변수(em.short)로 두고(전체 ≤ req.short · 없으면 0), 최대는 넘지 않는다.
+    바꿀 수 없는 칸만으로 최대를 넘는 날은 그 수까지(지금보다 나빠지지 않게 · 규칙 상대화와 같다)."""
+    ctx, m = em.ctx, em.model
+    for d, by in sorted(staffing_bounds(ctx, req).items()):
+        people = plan_people(ctx, d, req.count_fixed)
+        for code, (low, high) in sorted(by.items()):
+            count = sum(em.ind(Term(n, d, frozenset({code}))) for n in people)
+            if high is not None:
+                fixed = sum(1 for n in people if (n, d) not in em.free and cell(ctx, em.base, n, d) == code)
+                m.Add(count <= max(high, fixed))
+            if low > 0:
+                gap = m.NewIntVar(0, low, f"short_{d}_{code}")
+                m.Add(count + gap >= low)
+                em.short[d, code] = gap
+    # 남겨도 되는 모자람을 정하지 않았으면 0 — 동의 없이는 부족 안을 내지 않는다(판정 `is_satisfied` 와 같은 기준 · 검토 H1).
+    # 얼마나 모자라는지 미리 풀어 볼 때는 `solver.probe_plan` 이 넉넉한 수를 넣는다
+    m.Add(sum(em.short.values()) <= (req.short or 0))
+
+
+def add_grade_floor(em: EditModel, req: GradeFloor) -> None:
+    """근무조마다 등급 ≤ g 인 사람 k명 이상 — 모자란 수는 em.grade_short(전체 ≤ req.short · 없으면 0)."""
+    m = em.model
+    for d, code, people in grade_slots(em.ctx, req):
+        count = sum(em.ind(Term(n, d, frozenset({code}))) for n in people)
+        gap = m.NewIntVar(0, req.count, f"grade_{d}_{code}")
+        m.Add(count + gap >= req.count)
+        em.grade_short[d, code] = gap
+    m.Add(sum(em.grade_short.values()) <= (req.short or 0))          # 정하지 않았으면 0(검토 H1)
+
+
+#: 인원 계획을 풀 때 지금보다 나빠지지 않게 묶는 품질 규칙(32장 — 안 묶으면 류예리 6일 연속 OFF 가 나왔다)
+HOLD_FAMILIES = ("연속OFF", "패턴", "고립OFF")
+
+
+def add_holds(em: EditModel, rules: RuleSet, allow: Optional[Dict[Tuple, int]] = None, *, slack: bool = False) -> None:
+    """HOLD_FAMILIES 품질 규칙을 지금보다 나빠지지 않게(동의한 넘김 allow{규칙 위치: 양} 만큼은 봐준다 — 그 계획에 동의한 것만
+    `solver._plan_model` 이 골라 넘긴다). slack 이면 넘긴 양을 변수로 둔다(묶어서 안 될 때 얼마나 넘겨야 하는지 셀 때 · em.hold)."""
+    for ineq in rules.soft:
+        if ineq.key[0] not in HOLD_FAMILIES or not em.touches(ineq.terms):
+            continue
+        cap = max(ineq.cap, value_of(em.ctx, em.base, ineq)) + (allow or {}).get(ineq.key, 0)
+        expr = ineq.const + sum(t.coef * em.ind(t) for t in ineq.terms)
+        if slack:
+            over = em.model.NewIntVar(0, len(ineq.terms) + 1, f"hold_{len(em.hold)}")
+            em.model.Add(expr <= cap + over)
+            em.hold[ineq.key] = over
+        else:
+            em.model.Add(expr <= cap)
 
 
 _SHAPE_WORK = frozenset({"D", "E", "N", "M", "W"})
@@ -451,6 +520,10 @@ def coverage_relief(ctx: EditContext, rules: RuleSet, requests: List[EditRequest
             for k, v in cover_relief(ctx, req).items():
                 out[k] = out.get(k, 0) + v
             continue
+        if isinstance(req, StaffingPlan):
+            for k, v in staffing_relief(ctx, req).items():
+                out[k] = out.get(k, 0) + v
+            continue
         if not isinstance(req, CountTarget) or req.transfer not in ("reduce_coverage", "add_coverage"):
             continue
         n, grade, work = req.nurse_id, ctx.grade_of.get(req.nurse_id), work_targets(req)
@@ -485,6 +558,21 @@ def cover_relief(ctx: EditContext, req: CoverTarget) -> Dict[Tuple, int]:
         out[("인원최대", None, req.day, req.code)] = req.target - upper
     if over is not None and req.target > over:
         out[("인원초과", None, req.day, req.code)] = req.target - over
+    return out
+
+
+def staffing_relief(ctx: EditContext, req: StaffingPlan) -> Dict[Tuple, int]:
+    """인원 계획이 넘기는 그날 병동 인원 설정 — 요청한 만큼(CoverTarget 과 같다 · 32장). 등급 규칙(`rules._grade`)은 병동
+    최소 인원을 그대로 보므로 건드리지 않는다(손풀이 1회차: 최소 인원을 비워 등급 없는 근무조 3개가 새로 생겼다)."""
+    out: Dict[Tuple, int] = {}
+    for d, by in staffing_bounds(ctx, req).items():
+        for code, (low, high) in by.items():
+            need, upper, _over = coverage_bounds(ctx, d, code)
+            if need and low < need:
+                out[("인원최소", None, d, code)] = need - low
+            top = high if high is not None else low
+            if upper is not None and top > upper:
+                out[("인원최대", None, d, code)] = top - upper
     return out
 
 

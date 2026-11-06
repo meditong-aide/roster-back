@@ -47,12 +47,18 @@ SOLVE_SECONDS = 2.0
 MAX_CHANGES = 20
 
 
+#: 수간호사가 동의해 넘기는 것 중 레버 카드가 아닌 것 — 인원 계획의 모자라는 칸·등급 하한의 부족 근무조·원티드 포기·묶은 품질
+#: 규칙 넘김(32장 · 사용자 지시 11-05 '판단이 갈리면 묻는다'). 열쇠에 계획 구분값(`requests.plan_sig`)이 들어 그 계획에만
+#: 걸린다(검토 H2 — 레버 허용량은 대화 내내 이어지는 규약 그대로). 하드락이 아니고 레버 찾기 대상도 아니다
+CONSENT_FAMILIES = {"인원부족", "등급부족", "원티드포기", "품질넘김"}
+
+
 def lever_allow(allow: Optional[Dict[Tuple, int]]) -> Dict[Tuple, int]:
-    """레버 대상 규칙의 넘김만 남긴다 — 밖에서 들어온 허용량(화면이 돌려보낸 JSON 등)에 하드락 위치가
-    섞여도 모델·검증 어디에서도 봐주지 않게 하는 관문(검토 11-02 M2). 버린 것은 경고로 남긴다."""
+    """레버 대상 규칙·동의로 넘기는 것(CONSENT_FAMILIES)의 넘김만 남긴다 — 밖에서 들어온 허용량(화면이 돌려보낸 JSON 등)에
+    하드락 위치가 섞여도 모델·검증 어디에서도 봐주지 않게 하는 관문(검토 11-02 M2). 버린 것은 경고로 남긴다."""
     out, dropped = {}, []
     for key, amount in (allow or {}).items():
-        if isinstance(key, tuple) and key and key[0] in LEVER_FAMILIES and int(amount) > 0:
+        if isinstance(key, tuple) and key and key[0] in LEVER_FAMILIES | CONSENT_FAMILIES and int(amount) > 0:
             out[key] = int(amount)
         else:
             dropped.append(key)

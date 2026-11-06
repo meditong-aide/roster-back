@@ -6,6 +6,7 @@
   · choose   개수 요청에서 빠지는 근무를 메우는 방식을 고름
   · confirm / cancel  바꾸기 전 확인에 [그래도 진행] / [바꾸지 않기]   · check  적용 전 확인을 물음
   · close    사용자가 대화를 닫음(다시 이어 가지 않는다)
+  · lock     고칠 수 있는 첫날을 정함 {"edit_from_day": 1부터} — 대화 내내 이어 간다(버전이 바뀌어도)
 대화 id 로 한 대화를 순서대로 다시 보고(`read_conversation`), 재기동 뒤 대화 상태를 다시 세운다.
 
 기록은 부가 기능이다. 표가 없거나 쓰기가 실패해도 수정 흐름은 멈추지 않는다(세이브포인트·경고 로그).
@@ -27,7 +28,7 @@ from db.models import ScheduleEditLog
 logger = logging.getLogger(__name__)
 
 EVENTS = ("message", "propose", "clarify", "lever", "reject", "keep", "choose", "confirm", "cancel", "check", "apply",
-          "error", "close", "open")
+          "error", "close", "open", "lock")
 #: 대화 하나를 다시 읽을 때 상한 — 대화가 이보다 길면 앞부분은 상태 복원에 안 쓴다
 READ_LIMIT = 500
 _ready = False
@@ -93,6 +94,21 @@ def read_conversation_head(db: Session, conversation_id: str) -> Optional[Schedu
     except SQLAlchemyError:
         db.rollback()
         logger.warning("[schedule_edit] 기록 읽기 실패: %s", conversation_id, exc_info=True)
+        return None
+
+
+def read_last_lock(db: Session, conversation_id: str) -> Optional[ScheduleEditLog]:
+    """대화의 마지막 lock(고칠 수 있는 첫날) 한 건 — 긴 대화라 최근 READ_LIMIT 건 밖으로 밀려났을 때만 복원이 부른다.
+    (conversation_id, log_id) 인덱스를 역순으로 훑다 첫 lock 에서 멈춘다(TOP 1). 없거나 읽기가 실패하면 None."""
+    if not conversation_id or not _table_ready(db):
+        return None
+    try:
+        return (db.query(ScheduleEditLog)
+                .filter(ScheduleEditLog.conversation_id == conversation_id, ScheduleEditLog.event == "lock")
+                .order_by(ScheduleEditLog.log_id.desc()).first())
+    except SQLAlchemyError:
+        db.rollback()
+        logger.warning("[schedule_edit] lock 기록 읽기 실패: %s", conversation_id, exc_info=True)
         return None
 
 

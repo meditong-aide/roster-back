@@ -27,7 +27,8 @@ from services.schedule_edit.explain import (
 from services.schedule_edit.levers import LEVER_FAMILIES, lever_allow
 from services.schedule_edit.model import coverage_relief, cover_relief, edit_codes, is_waived, requested_cells
 from services.schedule_edit.requests import (
-    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, count_cells, count_in, cover_count,
+    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, GiveUpWish, SetCell, count_cells, count_in,
+    cover_count,
     is_satisfied, request_problem,
 )
 from services.schedule_edit.rules import WISH, Ineq, RuleSet, cell, coverage_bounds, value_of
@@ -224,7 +225,8 @@ def _cover_findings(ctx: EditContext, requests: Sequence[EditRequest]) -> List[F
 def _wanted_findings(ctx: EditContext, requests: Sequence[EditRequest]) -> List[Finding]:
     """직접 짚은 원티드 칸 — 요청이 이기지만(사용자 지시 11-03) 그 원티드를 못 지킨다는 것을 먼저 묻는다."""
     out = []
-    for n, d in sorted(requested_cells(ctx, list(requests)), key=lambda c: (c[1], c[0])):
+    given = {c for r in requests if isinstance(r, GiveUpWish) for c in r.cells}    # 포기 카드로 이미 동의했다
+    for n, d in sorted(requested_cells(ctx, list(requests)) - given, key=lambda c: (c[1], c[0])):
         if ctx.frozen.get((n, d)) == FIXED_WANTED:
             key, label = (FIXED_WISH, n, d), "확정 원티드"
         elif ctx.main[n][d] in ctx.wishes.get((n, d), ()):
@@ -252,6 +254,8 @@ def apply_findings(ctx: EditContext, rules: Optional[RuleSet], candidate: Candid
         else:
             out.append(Finding(finding_id(key, total), bend_text(Bend(key[0], key, total), ctx.names), "setting"))
     for ch in candidate.changes:
+        if (ch.nurse_id, ch.day) in ctx.wish_fixed and ch.after_main in ctx.wishes.get((ch.nurse_id, ch.day), ()):
+            continue                     # 반영 안 된 확정 원티드를 원티드대로 되돌리는 칸 — 나빠지는 것이 아니다
         if ctx.frozen.get((ch.nurse_id, ch.day)) == FIXED_WANTED:
             out.append(Finding(finding_id((FIXED_WISH, ch.nurse_id, ch.day), 1),
                                _changed_wish(ctx, candidate, ch.nurse_id, ch.day, "확정 원티드"), "wanted"))

@@ -107,7 +107,7 @@ def test_nothing_to_take_back_says_why(world, monkeypatch):
     agent, _ = _agent(call("revert_version", which="first", nurses=["A"], day=1, to_day=1))
     reply = say(agent, world.conv, "A 1일 처음 버전처럼", date(2026, 11, 2))     # 1일은 지난 날
     assert reply.answer == ("VER1(11월 근무표 VER1)과 A · 1일에서 되돌릴 칸이 없습니다 — 다른 칸 1개는 모두 그대로 둬야 하는 "
-                            "칸입니다(지난 날 1칸).")
+                            "칸입니다(고치지 않는 날 1칸).")
 
 
 def test_compare_shows_the_cells_and_opens_on_the_button(world, monkeypatch):

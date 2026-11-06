@@ -12,7 +12,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -28,21 +28,24 @@ from services.schedule_edit.journal import record_event
 from services.schedule_edit.postprocess import ANNUAL_LEAVE_SWAP, RUNNERS, as_result
 from services.schedule_edit.postprocess import KINDS as POSTPROCESS_KINDS
 from services.schedule_edit.precheck import (
-    BLOCKED_HEAD, Finding, Precheck, apply_findings, finding_to_json, precheck,
+    BLOCKED_HEAD, Finding, Precheck, apply_findings, finding_id, finding_to_json, precheck,
 )
 from services.schedule_edit.rule_check import ALL as CHECK_ALL
 from services.schedule_edit.rule_check import TOPICS as CHECK_RULE_TOPICS
 from services.schedule_edit.requests import (
-    SHAPE_COUNTED, SHAPE_LABEL, TRANSFERS, BalanceTarget, CountTarget, CoverTarget, EditRequest, SetCell, ShapeTarget,
-    WishTarget, balance_counts, count_cells, eul, eun, shape_count,
-    count_in, first_open_day, transfer_label, wish_count, wish_targets, work_down, work_targets,
+    PLAN, SHAPE_COUNTED, SHAPE_LABEL, TRANSFERS, BalanceTarget, CountTarget, CoverTarget, EditRequest, GiveUpWish,
+    GradeFloor, SetCell, ShapeTarget, StaffingPlan, WishTarget, balance_counts, count_cells, eul, eun, fixed_in_plan, grade_gaps,
+    is_satisfied, plan_ambiguous, plan_capacity, plan_label, plan_people, plan_sig, shape_count, staffing_bounds,
+    staffing_gaps,
+    balance_members, count_in, days_text, edit_from_note, first_open_day, transfer_label, wish_count, wish_targets,
+    work_down, work_targets,
 )
-from services.schedule_edit.serialize import allow_to_json, requests_to_json, result_to_dict
+from services.schedule_edit.serialize import allow_to_json, lever_to_dict, requests_to_json, result_to_dict
 from services.schedule_edit.levers import find_levers, lever_allow
 from services.schedule_edit.session import EditSession, allow_lever_id, keep, propose, reject, stage
 from services.schedule_edit.solver import (
-    BALANCE_MAX_CHANGES, SHAPE_MAX_CHANGES, WISH_MAX_CHANGES, EditResult, apply_candidate, max_wish_count,
-    min_balance_spread, min_shape_count, prepare,
+    BALANCE_MAX_CHANGES, HOLD_CONSENT, SHAPE_MAX_CHANGES, WISH_MAX_CHANGES, EditResult, apply_candidate,
+    max_wish_count, min_balance_spread, min_shape_count, prepare, probe_plan,
     propose_edits,
 )
 
@@ -70,12 +73,16 @@ class Turn:
     deadline: float
     #: 적용으로 근무표가 바뀌면 새 schedule_id — 대화가 그 버전으로 옮겨 간다
     switched_to: Optional[str] = None
+    #: 대상이 바뀌어도 이어 가는 값(`Conversation.carry`) — 고칠 수 있는 첫날 (년, 월, 0부터)
+    carry: Dict[str, Any] = field(default_factory=dict)
+    #: 이번 답에 붙일 사실(앞 요청을 새 첫날에 맞추며 생긴 것 · 참고 문구로 처음 한 번만)
+    notes: List[str] = field(default_factory=list)
 
     def remaining(self) -> float:
         return self.deadline - time.monotonic()
 
     def open_from(self) -> int:
-        """바꿀 수 있는 첫날(0부터) — 오늘 이전은 닫는다."""
+        """바꿀 수 있는 첫날(0부터) — 오늘까지는 닫고, 사용자가 고칠 첫날을 정했으면(ctx.edit_from) 그 앞도 닫는다."""
         return first_open_day(self.session.ctx, self.today)
 
     def record(self, event: str, payload: Dict[str, Any], *, elapsed_ms: Optional[int] = None,
@@ -127,11 +134,28 @@ def llm_tools() -> List[Dict[str, Any]]:
 
 # ── 인자 스키마 ─────────────────────────────────────────────────────────────
 
+#: 인원 계획 한 줄(staffing.plans 의 항목)
+_STAFF_LINE = {
+    "type": "object",
+    "properties": {
+        "days": {"type": "string", "enum": ["all", "weekday", "weekend"],
+                 "description": "all=매일·그 외(따로 말한 날 말고 전부) · weekday=평일(월~금) · weekend=주말(토·일)"},
+        "dates": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 31},
+                  "description": "특정 날을 말했을 때만(days 대신)"},
+        "shift": {"type": "string", "enum": ["D", "E", "N", "M"]},
+        "count": {"type": "integer", "minimum": 0,
+                  "description": "숫자 하나만 말했을 때('3.3.3' → D·E·N 각 3 · '미드 1' → M 1)"},
+        "min": {"type": "integer", "minimum": 0, "description": "범위·이상을 말했을 때('3~4명' → 3 · '3명 이상' → 3)"},
+        "max": {"type": "integer", "minimum": 0, "description": "범위·이하를 말했을 때('3~4명' → 4)"},
+    },
+    "required": ["shift"],
+}
 _CHANGE = {
     "type": "object",
     "properties": {
         "kind": {"type": "string",
-                 "enum": ["set", "avoid", "swap", "off_period", "count", "leave", "cover", "balance", "wanted", "shape"],
+                 "enum": ["set", "avoid", "swap", "off_period", "count", "leave", "cover", "balance", "wanted", "shape",
+                          "staffing", "grade_floor"],
                  "description": "set=그 칸을 이 근무로 · avoid=그 칸에서 이 근무(들)를 빼기(무엇으로 바꿀지는 맡김) · "
                                 "swap=두 사람의 그날 근무 맞바꾸기 · off_period=day 부터 to_day 까지 OFF · "
                                 "count=날짜를 정하지 않고 그 사람의 그 근무 개수를 바꾸기(어느 날인지는 맡김) · "
@@ -144,7 +168,20 @@ _CHANGE = {
                                 "wanted=반영 안 된 원티드(간호사가 낸 희망 근무) 넣기(사람·기간을 말했을 때만 nurse·day·to_day · "
                                 "몇 개를 넣을지는 시스템이 정한다) · "
                                 "shape=근무 모양 고치기(shape 를 함께 · 사람·기간을 말했을 때만 nurse·day·to_day · "
-                                "몇 개·몇 일·몇 회 이하로라고 말했을 때만 target)"},
+                                "몇 개·몇 일·몇 회 이하로라고 말했을 때만 target) · "
+                                "staffing=여러 날의 근무별 하루 인원 계획(nurse 없이 plans · '3.3.3' 처럼 여러 날 인원을 "
+                                "말할 때 · 하루 한 근무만이면 cover) · "
+                                "grade_floor=근무조마다 그 등급까지인 사람 몇 명 이상(nurse 없이 grade·target · "
+                                "특정 근무조만 말했으면 shifts)"},
+        "plans": {"type": "array", "items": {"type": "array", "items": _STAFF_LINE},
+                  "description": "staffing: 차례대로 시도할 인원 계획 — 안 하나는 줄 목록. '안 되면·안될시' 뒤는 다음 안이다"
+                                 "(그 안에 말하지 않은 날·근무는 앞 안 그대로 다시 적는다). 예) '그외 3.3.3 안될시 주말 2.2.3 "
+                                 "미드 1' → [[매일 D3·E3·N3], [평일 D3·E3·N3, 토일 D2·E2·N3·M1]]"},
+        "count_fixed": {"type": "boolean",
+                        "description": "staffing·grade_floor: 고정 근무자도 인원에 셀지 사용자가 말했을 때만(말하지 "
+                                       "않았으면 비운다 — 시스템이 묻는다)"},
+        "total": {"type": "boolean",
+                  "description": "count: '총 14개'·'한 달 14개'처럼 그 달 전체 개수를 말했을 때 true(target 이 한 달 개수)"},
         "shape": {"type": "string", "enum": list(SHAPE_LABEL),
                   "description": "shape: isolated_off=근무 사이 OFF 하루(하루짜리 OFF·고립 OFF) · isolated_work=OFF 사이 하루 근무"
                                  "(퐁당퐁당) · pattern=N-O-D·N-O-E·E-O-D 같은 근무 순서 · work_run=연속 근무가 김 · "
@@ -154,7 +191,8 @@ _CHANGE = {
                                   "시스템이 줄일 수 있는 만큼 줄인다)"},
         "grade": {"type": "integer", "minimum": 1,
                   "description": "cover: 그 등급까지인 사람을 넣거나 뺄 때('20일 N에 1등급 넣어' → grade 1·change 1 · "
-                                 "'1등급 빼' → grade 1·change -1). grade 를 쓰면 change 도 넣는다"},
+                                 "'1등급 빼' → grade 1·change -1). grade 를 쓰면 change 도 넣는다 · grade_floor: 그 등급까지"
+                                 "('1등급(차지·서브차지)' → 1)"},
         "leave": {"type": "string",
                   "description": "leave 의 휴가 이름 — 사용자가 말한 그대로(연차·병가·공가·생휴 등). 말하지 않았으면 비운다"},
         "nurse": {"type": "string", "description": "사용자가 말한 간호사 이름 그대로(호칭 '선생님' 등은 빼고)"},
@@ -167,7 +205,8 @@ _CHANGE = {
                    "description": "count·cover: 늘리거나 줄일 개수·인원(2개 빼 → -2, 하나 더 → 1, 한 명 빼 → -1)"},
         "target": {"type": "integer", "minimum": 0,
                    "description": "count·cover·balance: '6개로'·'4명으로'·'모두 9개로' 처럼 목표 개수·인원을 말했을 때 · "
-                                  "shape: '연속 근무 4일까지만'·'주말 2번만'·'하루짜리 OFF 3개까지' 처럼 말했을 때"},
+                                  "shape: '연속 근무 4일까지만'·'주말 2번만'·'하루짜리 OFF 3개까지' 처럼 말했을 때 · "
+                                  "grade_floor: 근무조마다 몇 명 이상(말하지 않았으면 비운다 — 1명)"},
         "transfer": {"type": "string", "enum": list(TRANSFERS),
                      "description": "count: 상대를 어떻게 정할지 사용자가 이미 말했을 때만(빠지는 근무를 누가 메울지 / "
                                     "누구 것을 넘겨받을지). same_grade=같은 등급 · same_team=같은 팀 · fair=그 근무가 "
@@ -176,10 +215,15 @@ _CHANGE = {
         "shift": {"type": "string", "enum": list(SHIFTS),
                   "description": "set 의 근무. D=데이 E=이브닝 N=나이트 M=미드 OFF=휴무·오프"},
         "shifts": {"type": "array", "items": {"type": "string", "enum": list(SHIFTS)},
-                   "description": "avoid 에서 뺄 근무들"},
+                   "description": "avoid 에서 뺄 근무들 · wanted: 그 근무의 원티드만('신청 오프 유지'·'신청 오프 넣어' → "
+                                  "['OFF'] · 말하지 않았으면 비운다) · grade_floor: 그 근무조만(모든 근무조면 비운다)"},
     },
     "required": ["kind", "nurse"],
 }
+#: 고칠 수 있는 첫날(사용자 결정 11-05) — 정한 날은 대화 내내 이어 간다(다른 날을 말하면 덮어쓴다)
+_EDIT_FROM = {"type": "integer", "minimum": 1, "maximum": 31,
+              "description": "사용자가 고칠 수 있는 첫날을 정했을 때만: 'N일까지는 그대로·고정' → N+1 · 'N일부터 고쳐' → N · "
+                             "'오늘부터 고쳐' → 오늘 날짜 · 말하지 않았으면 비운다(앞에서 정한 날이 이어진다)"}
 _CELL = {
     "type": "object",
     "properties": {
@@ -205,12 +249,25 @@ _CELL = {
         "'장원영 나이트 너무 많아'(개수 없음) → [{kind:count, nurse:'장원영', shift:'N'}](시스템이 현황을 보여 주고 되묻는다) · "
         "'N 근무 수 고르게 맞춰줘' → [{kind:balance, shift:'N'}] · 'OFF 다 9개로 맞춰줘' → [{kind:balance, shift:'OFF', target:9}] · "
         "'하루짜리 OFF 없애줘' → [{kind:shape, shape:'isolated_off', nurse:''}] · '장원영 연속 근무 너무 길어' → "
-        "[{kind:shape, shape:'work_run', nurse:'장원영'}] · '김태희 주말 근무 너무 많아' → [{kind:shape, shape:'weekend', nurse:'김태희'}]"),
-    parameters={"type": "object", "properties": {"changes": {"type": "array", "items": _CHANGE}},
-                "required": ["changes"]},
+        "[{kind:shape, shape:'work_run', nurse:'장원영'}] · '김태희 주말 근무 너무 많아' → [{kind:shape, shape:'weekend', nurse:'김태희'}] · "
+        "'5일까지는 고정해'(바꿀 내용 없음) → edit_from_day=6 · changes 는 비운다 · "
+        "'류예리 총 오프 14개, 나이트 없음. 그외 3.3.3 안될시 주말 2.2.3 미드 1. 신청 오프 유지' → "
+        "[{kind:count, nurse:'류예리', shift:'OFF', target:14, total:true}, {kind:count, nurse:'류예리', shift:'N', "
+        "target:0, total:true}, {kind:staffing, nurse:'', plans:[[{days:'all', shift:'D', count:3}, {days:'all', "
+        "shift:'E', count:3}, {days:'all', shift:'N', count:3}], [{days:'weekday', shift:'D', count:3}, {days:'weekday', "
+        "shift:'E', count:3}, {days:'weekday', shift:'N', count:3}, {days:'weekend', shift:'D', count:2}, "
+        "{days:'weekend', shift:'E', count:2}, {days:'weekend', shift:'N', count:3}, {days:'weekend', shift:'M', "
+        "count:1}]]}, {kind:wanted, nurse:'', shifts:['OFF']}]"),
+    parameters={"type": "object", "properties": {"changes": {"type": "array", "items": _CHANGE},
+                                                 "edit_from_day": _EDIT_FROM}},
     mode="preview", llm=True)
 def propose_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
-    grounded = ground_changes(turn.session.ctx, params.get("changes") or [], turn.open_from())
+    ask = _lock(turn, params)               # 기준일을 먼저 — 이번 요청의 기간·검사가 새 기준을 쓴다
+    if ask:
+        return _clarify(turn, [ask])
+    if not params.get("changes") and params.get("edit_from_day") is not None:
+        return _locked(turn)
+    grounded = ground_changes(turn.session.ctx, params.get("changes") or [], turn.open_from(), today=turn.today)
     if grounded.asks:
         return _clarify(turn, grounded.asks)
     return _propose(turn, grounded.requests)
@@ -222,20 +279,31 @@ def propose_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
         "바로 앞 요청을 고쳐 다시 찾는다. add=요청 더하기, remove=그 칸 요청 빼기, keep=이 칸(또는 그날 전체)은 "
         "지금 근무 그대로 두기. 예) '그리고 이영희 16일도 오프' → add · '15일은 건드리지 마' → keep=[{day:15}] · "
         "'김민지 14일 건은 취소' → remove=[{nurse:'김민지', day:14}] · '15일 인원 요청은 빼' → remove=[{day:15}] · "
-        "개수 요청에서 빠지는 근무를 메우는 방식을 말하면 transfer('같은 등급으로' → same_grade)"),
+        "개수 요청에서 빠지는 근무를 메우는 방식을 말하면 transfer('같은 등급으로' → same_grade) · "
+        "'그리고 5일까지는 그대로 둬' → edit_from_day=6(앞 요청을 6일부터로 다시 찾는다) · "
+        "인원 계획에 덧붙이는 말 '평일 D 는 3~4명' → add=[{kind:staffing, nurse:'', plans:[[{days:'weekday', shift:'D', "
+        "min:3, max:4}]]}](앞 계획의 모든 안에 덧붙는다) · '매일 모든 근무조에 1등급 1명 이상' → "
+        "add=[{kind:grade_floor, nurse:'', grade:1, target:1}]"),
     parameters={"type": "object", "properties": {
         "add": {"type": "array", "items": _CHANGE},
         "remove": {"type": "array", "items": _CELL},
         "keep": {"type": "array", "items": _CELL},
         "transfer": {"type": "string", "enum": list(TRANSFERS)},
+        "edit_from_day": _EDIT_FROM,
     }},
     mode="preview", llm=True)
 def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     ctx = turn.session.ctx
+    ask = _lock(turn, params)
+    if ask:
+        return _clarify(turn, [ask])
     if not turn.session.requests:
+        if params.get("edit_from_day") is not None and not any(params.get(k) for k in ("add", "remove", "keep")):
+            return _locked(turn)
         return _clarify(turn, ["고칠 앞 요청이 없습니다. 무엇을 바꿀지 처음부터 말씀해 주세요."])
+    open_from = turn.open_from()
     asks: List[str] = []
-    add = ground_changes(ctx, params["add"], turn.open_from()) if params.get("add") else None
+    add = ground_changes(ctx, params["add"], open_from, today=turn.today) if params.get("add") else None
     if add is not None:
         asks += add.asks
     removed = _removals(ctx, params.get("remove") or [], asks)
@@ -244,13 +312,18 @@ def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
         return _clarify(turn, asks)
     # 날만 말한 빼기('15일 요청 빼') — 그날 인원 요청도 같이 뺀다(사람을 짚지 않아 칸으로는 안 걸린다 · 검토 11-03)
     removed_days = _whole_days(ctx, removed)
-    reqs = [r for r in turn.session.requests
+    moved, facts = _from_open(ctx, turn.session.requests, open_from)
+    turn.notes += facts
+    reqs = [r for r in moved
             if (r.nurse_id, r.day) not in removed and (r.nurse_id, None) not in removed
             and not (isinstance(r, CoverTarget) and r.day in removed_days)]
     if params.get("transfer") in TRANSFERS:
         # 말로 바꾼 방식은 이미 고른 방식도 덮어쓴다('아니 같은 팀으로' · 검토 L4) — 버튼은 정하지 않은 것만
         reqs = [_decided(r, params["transfer"], force=True) for r in reqs]
     for r in (add.requests if add else []):
+        old = next((x for x in reqs if isinstance(x, StaffingPlan)), None)
+        if isinstance(r, StaffingPlan) and old is not None and len(r.alternatives) == 1:
+            r = _patched(old, r)                  # '평일 D 는 3~4명' — 앞 계획의 모든 안에 덧붙인다
         # 같은 대상 요청은 새 것이 덮어쓴다('A 15일 E' 뒤 'A 15일 연차' · 검토 L1)
         reqs = [x for x in reqs if not _same_target(x, r)]
         if r not in reqs:
@@ -258,15 +331,98 @@ def revise_edit(turn: Turn, params: Dict[str, Any]) -> Outcome:
     # '21일은 그대로 둬' — 요청한 칸이 그 날이면 그 요청을 뺀다(평가 11-03: 요청은 남기고 그날 다른 칸만 고정해 모순).
     # 그날 전체를 두라면 그날 인원 요청도 뺀다(남기면 그날을 다 묶은 채 인원을 바꾸라는 모순 · 검토 11-03)
     kept_days = _whole_days(ctx, kept)
-    reqs = [r for r in reqs if isinstance(r, (CountTarget, BalanceTarget, WishTarget, ShapeTarget)) or _is_keep(ctx, r)
+    reqs = [r for r in reqs if isinstance(r, (CountTarget, BalanceTarget, WishTarget, ShapeTarget, *PLAN)) or _is_keep(ctx, r)
             or (r.day not in kept_days if isinstance(r, CoverTarget) else (r.nurse_id, r.day) not in kept)]
     asked = {(r.nurse_id, r.day) for r in reqs}
     for n, d in sorted(kept - asked):
-        if ctx.is_free(n, d):     # 고정 칸은 원래 안 바뀐다
+        if ctx.is_free(n, d) and d >= open_from:     # 고정 칸·고치지 않는 날은 원래 안 바뀐다
             reqs.append(SetCell(n, d, ctx.main[n][d]))
     if not any(not _is_keep(ctx, r) for r in reqs):
-        return _clarify(turn, ["남은 변경 요청이 없습니다. 무엇을 바꿀지 말씀해 주세요."])
+        # 날을 정한 턴이면 정한 날 안내를 앞에 — 남은 요청이 없다는 말만으로는 날이 정해졌는지 모른다(검토 11-05 LOW-3)
+        note = edit_from_note(ctx, open_from, turn.today)
+        return _clarify(turn, fresh_notes(turn.session, [note] if note else [])
+                        + ["남은 변경 요청이 없습니다. 무엇을 바꿀지 말씀해 주세요."])
     return _propose(turn, reqs)
+
+
+def _lock(turn: Turn, params: Dict[str, Any]) -> Optional[str]:
+    """'5일까지는 그대로'·'6일부터 고쳐' — 고칠 수 있는 첫날을 정한다(사용자 결정 11-05). 되물을 문장, 없으면 None.
+    대화 내내 이어 간다(`Conversation.carry` → `EditAgent.session_for`). 바뀌면 기록한다 — 재기동 뒤 `store.restore` 가
+    마지막 값을 되살린다."""
+    said = params.get("edit_from_day")
+    if said is None:
+        return None
+    ctx = turn.session.ctx
+    try:
+        day = int(said)
+    except (TypeError, ValueError):
+        return "고칠 수 있는 첫날을 숫자로 알려 주세요. 예) '6일부터 고쳐줘'"
+    if not 1 <= day <= ctx.days:
+        return f"고칠 수 있는 첫날을 {ctx.month}월 안의 날짜로 알려 주세요. 예) '6일부터 고쳐줘'"
+    if ctx.edit_from != day - 1:
+        ctx.edit_from = day - 1
+        turn.record("lock", {"edit_from_day": day, "year": ctx.year, "month": ctx.month})
+    turn.carry["edit_from"] = (ctx.year, ctx.month, ctx.edit_from)     # 적용 뒤 새 버전에서도(대상이 바뀌면 state 는 버린다)
+    return None
+
+
+def _locked(turn: Turn) -> Outcome:
+    """기준일만 정한 말('5일까지는 고정해') — 앞 요청이 있으면 새 첫날로 다시 찾는다(고쳐 말하기 `revise_edit` 와 같은 길 ·
+    옛 후보 카드가 남지 않게). 앞 요청이 없을 때만 정해진 답으로 끝낸다."""
+    if turn.session.requests:
+        return revise_edit(turn, {})
+    ctx = turn.session.ctx
+    open_from = turn.open_from()
+    note = edit_from_note(ctx, open_from, turn.today)
+    turn.session.shown_notes.add(note)          # 다음 제안 답에 같은 참고 문구를 다시 붙이지 않는다
+    return _clarify(turn, [note if open_from >= ctx.days else f"{note} 바꿀 내용을 말씀해 주세요."])
+
+
+def _from_open(ctx, reqs: List[EditRequest], open_from: int) -> Tuple[List[EditRequest], List[str]]:
+    """앞 요청을 지금 고칠 수 있는 첫날에 맞춘다 — 기준일을 새로 정하면('5일까지는 그대로') 기간 요청은 그날부터로
+    줄이고(개수 요청은 닫힌 날에 이미 있는 수를 목표에서 빼 합을 지킨다), 닫힌 날의 '그대로 두기'는 뺀다(원래 안 바뀐다).
+    닫힌 날을 짚은 칸 요청·기간이 모두 닫힌 요청은 그대로 둬 요청 검사가 이유를 말하게 한다.
+    반환: (맞춘 요청, 답에 붙일 사실) — 개수 요청의 닫힌 날에 이미 목표보다 많으면 바꿀 수 있는 몫을 0 으로 깎고 그 사실을 알린다
+    (거절로 끝내지 않는다 · 검토 11-05 L1).
+    정한 날은 앞뒤로 바뀔 수 있어 늘 원래 요청에서 다시 맞춘다 — 줄였던 요청은 원래 첫날·목표(`asked_*`)를 들고 있어, 날을
+    다시 당기면 그만큼 되살아난다(Codex 11-05). 기간을 말하지 않은 원티드·근무 모양과 고르게 맞추기는 '고칠 수 있는 첫날부터'라
+    새 첫날을 그대로 따른다(당기면 넓어진다). 개수 요청·기간을 말한 요청은 원래 범위 밖으로는 넓히지 않는다(말한 적 없는 날이다)."""
+    out: List[EditRequest] = []
+    facts: List[str] = []
+    for r in reqs:
+        if _is_keep(ctx, r) and r.day < open_from:
+            continue
+        if isinstance(r, (BalanceTarget, *PLAN)) or (isinstance(r, (WishTarget, ShapeTarget)) and not r.ranged):
+            if open_from <= r.last_day and r.first_day != open_from:
+                r = dataclasses.replace(r, first_day=open_from)
+                if isinstance(r, BalanceTarget):
+                    r = dataclasses.replace(r, members=balance_members(ctx, r.codes, open_from))
+        elif isinstance(r, (WishTarget, ShapeTarget, CountTarget)):
+            first = r.first_day if r.asked_first is None else r.asked_first
+            start = max(first, open_from)
+            if start > r.last_day:
+                pass                         # 기간이 모두 닫혔다 — 그대로 둬 요청 검사가 이유를 말하게(되살릴 값도 그대로)
+            elif not isinstance(r, CountTarget):
+                r = dataclasses.replace(r, first_day=start, asked_first=None if start == first else first)
+            else:
+                target = r.target if r.asked_target is None else r.asked_target
+                # 지금 근무표로 센다 — 적용하면 새 버전이라 앞 요청이 이어지지 않아(`session_for` 의 same) 닫힌 날 칸이 요청 때와 같다
+                held = count_cells(ctx, ctx.main, r.nurse_id, r.codes, range(first, start))
+                if held > target:
+                    word = "·".join(SHIFT_WORD.get(c, c) for c in sorted(r.codes))
+                    facts.append(f"{ctx.names.get(r.nurse_id, r.nurse_id)} {word}은(는) 고치지 않는 날"
+                                 f"({days_text(first, start - 1)})에 이미 {held}개가 있어 그만큼은 남습니다.")
+                cut = start != first
+                r = dataclasses.replace(r, first_day=start, target=max(0, target - held),
+                                        asked_first=first if cut else None, asked_target=target if cut else None)
+        out.append(r)
+    return out, facts
+
+
+def _patched(old: StaffingPlan, new: StaffingPlan) -> StaffingPlan:
+    """덧붙인 인원 줄 — 앞 계획의 안마다 뒤에 붙인다(같은 날·근무는 뒤 줄이 덮는다 · `staffing_bounds`). 고른 안·동의는 다시 정한다."""
+    return StaffingPlan(tuple(alt + new.alternatives[0] for alt in old.alternatives), old.first_day, old.last_day,
+                        count_fixed=new.count_fixed if new.count_fixed is not None else old.count_fixed)
 
 
 def _removals(ctx, items, asks: List[str]) -> set:
@@ -291,6 +447,8 @@ def _same_target(old: EditRequest, new: EditRequest) -> bool:
                 and (old.day, old.code, old.grade) == (new.day, new.code, new.grade))
     if isinstance(old, BalanceTarget) or isinstance(new, BalanceTarget):
         return isinstance(old, BalanceTarget) and isinstance(new, BalanceTarget) and old.codes == new.codes
+    if isinstance(old, PLAN) or isinstance(new, PLAN):
+        return type(old) is type(new)            # 인원 계획·등급 하한은 하나씩 — 새 것이 덮는다(덧붙임은 `_patched`)
     if isinstance(old, WishTarget) or isinstance(new, WishTarget):
         return isinstance(old, WishTarget) and isinstance(new, WishTarget)
     if isinstance(old, ShapeTarget) or isinstance(new, ShapeTarget):
@@ -307,7 +465,7 @@ def _whole_days(ctx, cells: set) -> set:
 
 def _decided(r: EditRequest, transfer: str, force: bool = False) -> EditRequest:
     if isinstance(r, CountTarget) and (r.transfer is None or force):
-        return CountTarget(r.nurse_id, r.codes, r.target, r.first_day, r.last_day, transfer)
+        return dataclasses.replace(r, transfer=transfer)     # 줄이기 전 원래 첫날·목표(asked_*)도 함께 이어 간다
     return r
 
 
@@ -724,16 +882,62 @@ def retry_request(turn: Turn, params: Dict[str, Any]) -> Outcome:
     return _propose(turn, turn.session.requests)
 
 
-@register("confirm_request", description="바꾸기 전 확인에서 '그래도 진행' — 짚은 것을 이번만 넘기고 후보를 찾는다.",
-          parameters={"type": "object", "properties": {}}, mode="preview", llm=False)
+@register("confirm_request", description="바꾸기 전 확인에서 '그래도 진행' — 짚은 것을 이번만 넘기고 후보를 찾는다. "
+                                          "pick 이 있으면 둘 중 고른 그 하나만 받아들인다.",
+          parameters={"type": "object", "properties": {"pick": {"type": "string"}}}, mode="preview", llm=False)
 def confirm_request(turn: Turn, params: Dict[str, Any]) -> Outcome:
-    return _answer(turn, go=True)
+    pick = params.get("pick")
+    return _answer(turn, go=True, pick=str(pick) if pick else None)
 
 
-@register("cancel_request", description="바꾸기 전 확인에서 '바꾸지 않기' — 이 요청을 거두고 앞 상태로 돌아간다.",
-          parameters={"type": "object", "properties": {}}, mode="read", llm=False)
+@register("cancel_request", description="바꾸기 전 확인에서 '바꾸지 않기' — 이 요청을 거두고 앞 상태로 돌아간다. "
+                                         "restate=true 면 인원 계획 확인의 '인원을 다시 말하기'(근무표는 그대로).",
+          parameters={"type": "object", "properties": {"restate": {"type": "boolean"}}}, mode="read", llm=False)
 def cancel_request(turn: Turn, params: Dict[str, Any]) -> Outcome:
-    return _answer(turn, go=False)
+    out = _answer(turn, go=False)
+    if params.get("restate"):
+        out.answer = RESTATE_ASK
+    return out
+
+
+#: 인원 계획 확인의 [인원을 다시 말하기] — 근무표는 그대로 두고 새 인원을 기다린다(사용자 지시 11-05)
+RESTATE_ASK = "근무표는 그대로입니다. 인원을 다시 말씀해 주세요. 예) '평일 D 3~4명·E 3명·N 3명', '주말 D 2명'"
+
+
+@register("choose_staffing", description="인원 계획에서 정하지 않은 것을 고른다 — count_fixed=고정 근무자도 센다 · "
+                                         "exclude_fixed=빼고 센다 · exact=숫자만 말한 인원을 정확히 · at_least=그 수 이상.",
+          parameters={"type": "object", "properties": {"choice_id": {"type": "string",
+                                                                     "enum": ["count_fixed", "exclude_fixed",
+                                                                              "exact", "at_least"]}},
+                      "required": ["choice_id"]},
+          mode="preview", llm=False)
+def choose_staffing(turn: Turn, params: Dict[str, Any]) -> Outcome:
+    session = turn.session
+    choice = params.get("choice_id")
+    plan = next((r for r in session.requests if isinstance(r, StaffingPlan)), None)
+    if plan is None:
+        raise SkillError("고를 인원 계획이 없습니다. 다시 요청해 주세요.")
+    if choice in ("count_fixed", "exclude_fixed"):
+        if plan.count_fixed is not None:
+            raise SkillError("고정 근무자를 셀지는 이미 정했습니다. 바꾸려면 말로 해 주세요.")
+        changed = dataclasses.replace(plan, count_fixed=choice == "count_fixed")
+    elif choice in ("exact", "at_least"):
+        changed = _with_exactness(session.ctx, plan, choice == "exact")
+        if changed == plan:
+            raise SkillError("정확히·이상을 고를 인원이 없습니다. 바꾸려면 말로 해 주세요.")
+    else:
+        raise SkillError("보여 드린 선택지 중에서 골라 주세요.")
+    turn.record("choose", {"choice_id": choice})
+    return _propose(turn, [changed if r is plan else r for r in session.requests])
+
+
+def _with_exactness(ctx, plan: StaffingPlan, exact: bool) -> StaffingPlan:
+    """숫자만 말한 줄 중 지금 판보다 적어 결과가 달라지는 줄 — 모든 안에서 고른 대로(같은 말에서 나온 숫자다)."""
+    alternatives = []
+    for i, alt in enumerate(plan.alternatives):
+        vague = {j for j, _r, _d in plan_ambiguous(ctx, dataclasses.replace(plan, chosen=i), i)}
+        alternatives.append(tuple(dataclasses.replace(r, exact=exact) if j in vague else r for j, r in enumerate(alt)))
+    return dataclasses.replace(plan, alternatives=tuple(alternatives))
 
 
 @register("reject_candidate", description="이 후보는 싫다 — 같은 사람들을 바꾸는 안은 빼고 다시 찾는다.",
@@ -779,6 +983,8 @@ def choose_transfer(turn: Turn, params: Dict[str, Any]) -> Outcome:
     if pending is None:
         raise SkillError("고를 개수 요청이 없습니다. 다시 요청해 주세요.")
     shown = _SHOW_DOWN if work_down(turn.session.ctx, pending) else _SHOW_UP
+    if any(isinstance(r, PLAN) for r in turn.session.requests):
+        shown = tuple(p for p in shown if p not in PLAN_LOCKED_TRANSFERS)
     if choice not in shown:                      # 보여 준 선택지만(방향과 맞지 않는 인원 완화 · 검토 P1)
         raise SkillError("보여 드린 선택지 중에서 골라 주세요.")
     turn.record("choose", {"choice_id": choice})
@@ -820,6 +1026,11 @@ def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
     if asking:
         return _ask(turn, requests, asking, started)
     session.asking, session.held = [], None
+    planned = any(isinstance(r, PLAN) for r in requests)
+    if planned:
+        # 인원 계획과 함께 온 개수 요청 중 이미 그렇게 된 것은 메울 것이 없다 — 방식을 묻지 않는다
+        requests = [_decided(r, "auto") if isinstance(r, CountTarget) and r.transfer is None
+                    and is_satisfied(session.ctx, r) else r for r in requests]
     undecided = next((r for r in requests if isinstance(r, CountTarget) and r.transfer is None), None)
     if undecided is not None:
         return _choose_transfer(turn, requests, undecided)
@@ -827,6 +1038,16 @@ def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
         turn.record("error", {"stage": "budget", "requests": requests_to_json(requests),
                               "remaining_ms": int(turn.remaining() * 1000)})
         return Outcome(answer=OUT_OF_TIME)
+    if planned:
+        requests, asked, info = _resolve_plan(turn, requests)
+        if asked is not None:
+            return asked
+        probe = info.get("probe")
+        result = propose(session, requests, today=turn.today, time_budget=turn.remaining() - 1,
+                         start=probe.grid if probe is not None else None)
+        if result.status == "ok":
+            _plan_followup(turn, requests, result, info)
+        return _finish(turn, requests, result, started)
     requests, why = _resolve_balance(turn, requests)
     requests, wish = _resolve_wish(turn, requests)
     requests, shape = _resolve_shape(turn, requests)
@@ -856,7 +1077,8 @@ def _propose(turn: Turn, requests: List[EditRequest]) -> Outcome:
 def _finish(turn: Turn, requests: List[EditRequest], result: EditResult, started: float) -> Outcome:
     ctx = turn.session.ctx
     preview = result_to_dict(ctx, result)
-    preview["notes"] = fresh_notes(turn.session, result.notes)          # 답과 미리보기 모두 처음 한 번만(검토 L3)
+    # 답과 미리보기 모두 처음 한 번만(검토 L3) — 사용자가 정한 기준일 안내도 같은 관례로
+    preview["notes"] = fresh_notes(turn.session, _open_notes(turn) + list(result.notes))
     answer = answer_for(ctx, requests, result, notes=preview["notes"])
     turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
                             "result": preview, "answer": answer,
@@ -907,13 +1129,18 @@ def _ask(turn: Turn, requests: List[EditRequest], asking: List[Finding], started
     return Outcome(answer=answer, preview=preview)
 
 
-def _answer(turn: Turn, go: bool) -> Outcome:
+def _answer(turn: Turn, go: bool, pick: Optional[str] = None) -> Outcome:
     """[그래도 진행] — 동의한 것을 기억하고(레버 대상 설정은 그만큼 이번만 넘긴다) 푼다.
     [바꾸지 않기] — 묻기 전 상태로 돌아간다(근무표는 그대로)."""
     session = turn.session
     asking = session.asking
     if not asking:
         raise SkillError("지금 확인을 기다리는 요청이 없습니다. 바꿀 내용을 다시 말씀해 주세요.")
+    if go and pick is not None:
+        # 둘 중 하나를 고르는 확인('모자라는 칸 남기기' / '원티드 포기') — 고른 것만 받아들인다
+        asking = [f for f in asking if f.id == pick]
+        if not asking:
+            raise SkillError("보여 드린 선택지 중에서 골라 주세요.")
     session.asking = []
     if not go:
         held, session.held = session.held, None
@@ -934,6 +1161,368 @@ def _answer(turn: Turn, go: bool) -> Outcome:
                             "allow_total": allow_to_json(session.allow)})
     # 되돌릴 지점(held)은 풀이에 들어갈 때 비운다 — 동의 뒤 다시 물으면 처음 상태로 돌아가야 한다(검토 M3)
     return _propose(turn, session.requests)
+
+
+# ── 여러 날 인원·등급 계획(32장 · 사용자 지시 11-05 '판단이 갈리면 묻는다') ─────────────────────────
+
+#: 동의로 넘기는 양의 위치 — 인원 계획의 모자라는 칸 · 등급 하한의 부족 근무조(`levers.CONSENT_FAMILIES`)
+#: 동의 종류 — 열쇠는 (종류, 계획 구분값, None, None) · 원티드 포기는 (종류, 간호사, 날, 계획 구분값) · 묶은 품질 규칙 넘김은
+#: (HOLD_CONSENT, 계획 구분값, *규칙 위치). 계획 구분값(`requests.plan_sig`)이 들어 그 계획에만 걸린다(검토 H2)
+SHORT, GRADE, GIVE_UP = "인원부족", "등급부족", "원티드포기"
+
+
+def consent_key(kind: str, sig: str) -> Tuple:
+    return (kind, sig, None, None)
+
+
+#: 계획 하나를 미리 풀어 보는 시간 상한(초)과 남은 시간 중 쓸 몫 — 모자라는 칸·부족 근무조를 끝까지 확인해야 묻는 수가 맞다
+#: (작업자 2 실측: 6초로는 0 인 등급 부족을 1로 보고 물었다)
+PLAN_PROBE_SECONDS = 10.0
+PLAN_PROBE_SHARE = 0.5
+#: 모자라는 칸·부족 근무조를 문장에 몇 개까지 보일지(나머지는 수만)
+PLAN_SHOWN = 12
+_HOLD_WORD = {"연속OFF": "연속 OFF", "패턴": "근무 순서", "고립OFF": "하루짜리 OFF"}
+#: 미리 풀기가 시간 안에 안 끝났을 때 — 얼마나 모자라는지 모르니 안을 내지 않는다(검토 H1)
+PLAN_TIMEOUT = ("시간 안에 확인하지 못했습니다 — 모자라는 칸·등급 하한을 끝까지 셈하지 못해 안을 내지 않았습니다. 근무표는 "
+                "바뀌지 않았습니다. 같은 요청으로 다시 찾거나 요청을 나눠 주세요.")
+
+
+def _resolve_plan(turn: Turn, requests: List[EditRequest]) -> Tuple[List[EditRequest], Optional[Outcome], Dict[str, Any]]:
+    """인원 계획·등급 하한을 풀기 전에 정할 것 — 요청에 답이 있으면 그대로, 없으면 엔진이 고르지 않고 묻는다(사용자 지시 11-05).
+      1. 계획한 근무를 하는 고정 근무자가 있는데 셀지 정하지 않았으면 [센다]/[빼고 센다].
+      2. 안마다 차례대로 — 산술(필요 > 근무 가능)이나 풀어 보니 모자라면 다음 안(요청에 있으니 묻지 않는다). 숫자만 말한 줄이
+         지금 판보다 적어 '정확히/이상'에 따라 결과가 갈리면 묻는다. 한 번 풀어 보고(`probe_plan`) 묶은 품질 규칙을 넘겨야 하면 ·
+         마지막 안도 모자라면(반영된 원티드를 포기하면 모자람 0 이 되는지도 함께) · 등급 하한이 모자라면 그것을 보이고 동의를
+         묻는다(동의 전에는 그런 안을 내지 않는다). 아예 안 풀리면 원티드 포기·레버를, 시간 안에 못 셈하면 안을 내지 않는다.
+    동의는 그 계획에만 걸린다(계획 구분값 · 검토 H2). 반환: (풀 요청, 물을 답 또는 None, 답에 쓸 정보)."""
+    session, ctx = turn.session, turn.session.ctx
+    plan = next((r for r in requests if isinstance(r, StaffingPlan)), None)
+    grade = next((r for r in requests if isinstance(r, GradeFloor)), None)
+    if plan is not None and plan.count_fixed is None:
+        fixed = fixed_in_plan(ctx, plan)
+        if fixed:
+            return requests, _ask_fixed(turn, requests, fixed), {}
+    sig = plan_sig(requests)
+    allowed = {kind: session.allow.get(consent_key(kind, sig), 0) for kind in (SHORT, GRADE)}
+    requests = _given_up(ctx, requests, {(k[1], k[2]) for k in session.allow
+                                         if k[0] == GIVE_UP and len(k) > 3 and k[3] == sig})
+    # 원티드 반영은 계획과 함께면 모두 넣는다('신청 오프 유지' · 32장) — 가장 많이 넣을 수를 따로 찾지 않는다.
+    # 넣을 수는 늘 남은 대상으로 다시 정한다(포기한 원티드를 뺀 뒤 옛 수가 남으면 다시 막힌다)
+    requests = [dataclasses.replace(r, at_least=len(wish_targets(ctx, r))) if isinstance(r, WishTarget) else r
+                for r in requests]
+    held = {tuple(k[2:]): v for k, v in session.allow.items() if k and k[0] == HOLD_CONSENT and len(k) > 2 and k[1] == sig}
+    skipped: List[str] = []
+    count = len(plan.alternatives) if plan is not None else 1
+    for i in range(count):
+        last = i == count - 1
+        p_i = dataclasses.replace(plan, chosen=i, short=None) if plan is not None else None
+        label = plan_label(plan.rules(i)) if plan is not None else ""
+        arithmetic = False
+        if p_i is not None:
+            need, cap = plan_capacity(ctx, p_i, requests=requests)
+            if need > cap:
+                arithmetic = True
+                why = f"{label}은 필요 {need}칸 > 근무 가능 {cap}칸(쉬는 날·휴가·바꿀 수 없는 칸 반영)"
+                if not last:
+                    skipped.append(why)
+                    continue
+                if allowed[SHORT] < need - cap:
+                    # 넘기는 양은 산술로 모자라는 수만 — 풀어 보니 더 모자라면 아래에서 다시 묻는다(재검토 LOW-1)
+                    key = consent_key(SHORT, sig)
+                    finding = Finding(finding_id(key, need - cap), "모자라는 칸을 가장 적게 남기는 안으로 찾기", "plan",
+                                      {key: need - cap - allowed[SHORT]})
+                    head = f"{why} — 어떤 방법으로도 다 채울 수 없습니다."
+                    return requests, _ask_consent(turn, requests, head, [finding], skipped, restate=True), {}
+            vague = plan_ambiguous(ctx, p_i)
+            if vague:
+                return requests, _ask_exact(turn, requests, vague, skipped), {}
+        g_i = None
+        if grade is not None:
+            g_i = dataclasses.replace(grade, m_days=_m_days(ctx, p_i), short=None,
+                                      count_fixed=plan.count_fixed if plan is not None else grade.count_fixed)
+        trial = [p_i if r is plan else g_i if r is grade else r for r in requests]
+        if turn.remaining() < MIN_SOLVE:
+            return requests, Outcome(answer=OUT_OF_TIME), {}
+        probe = probe_plan(ctx, trial, rules=session.rules, today=turn.today,
+                           seconds=min(PLAN_PROBE_SECONDS, max(1.0, turn.remaining() * PLAN_PROBE_SHARE)),
+                           allow=session.allow, avoid_people=session.avoid_people)
+        if probe.status == "infeasible":
+            return requests, _plan_blocked(turn, requests, trial, skipped, label, sig), {}
+        if probe.status == "timeout":
+            return requests, _plan_stopped(turn, requests, skipped), {}
+        if probe.status != "ok":
+            return trial, None, {"skipped": skipped, "label": label}     # 잘못된 요청은 요청 검사가 그대로 알린다
+        bends = {k: v - held.get(k, 0) for k, v in probe.hold.items() if v > held.get(k, 0)}
+        if bends:
+            findings = [Finding(finding_id((HOLD_CONSENT, sig) + k, v), _hold_text(ctx, k, v), "plan",
+                                {(HOLD_CONSENT, sig) + k: v})
+                        for k, v in sorted(bends.items(), key=lambda kv: (str(kv[0][0]),
+                                                                          kv[0][2] if isinstance(kv[0][2], int) else 0))]
+            head = (f"{label or describe_requests(ctx, requests)}대로 하려면 지금보다 나빠지지 않게 묶은 근무 모양"
+                    "(연속 OFF·근무 순서·하루짜리 OFF) 중 아래를 넘겨야 합니다.")
+            return requests, _ask_consent(turn, requests, head, findings, skipped), {}
+        # 끝까지 확인하지 못했으면 단정하지 않는다 — '시간 안에 찾은 방법은'(원티드 반영과 같은 규약 · 검토 11-03 M3)
+        found = "" if probe.proven else "시간 안에 찾은 방법으로는 "
+        unsure = "" if probe.proven else " 더 줄일 수 있는지 끝까지 확인하지 못했습니다."
+        short = sum(x for _d, _c, x in probe.short)
+        if short and not last and not arithmetic:
+            skipped.append(f"{label}은 {found or '풀어 보니 '}{short}칸이 모자랍니다({_gap_text(probe.short)})")
+            continue
+        if short > allowed[SHORT]:
+            key = consent_key(SHORT, sig)
+            findings = [Finding(finding_id(key, short), f"모자라는 {short}칸을 남기는 안으로 찾기", "plan",
+                                {key: short - allowed[SHORT]})]
+            choices = [{"id": findings[0].id, "label": "모자라는 칸 남기고 찾기"}]
+            give = _give_up_for_short(turn, trial, sig, held)
+            if give is not None:
+                findings.append(give)
+                choices.append({"id": give.id, "label": "원티드 포기하고 찾기"})
+            head = f"{label}로 하면 {found}{short}칸이 모자랍니다 — {_gap_text(probe.short)}.{unsure}"
+            return requests, _ask_consent(turn, requests, head, findings, skipped, restate=True,
+                                          choices=choices if len(findings) > 1 else None), {}
+        gshort = sum(x for _d, _c, x in probe.grade)
+        if gshort > allowed[GRADE]:
+            key = consent_key(GRADE, sig)
+            finding = Finding(finding_id(key, gshort), f"등급 하한이 모자라는 근무조 {gshort}곳을 남기는 안으로 찾기",
+                              "plan", {key: gshort - allowed[GRADE]})
+            head = f"{found}{describe_grade_short(grade)}을 다 채울 수 없습니다 — {_gap_text(probe.grade)}.{unsure}"
+            return requests, _ask_consent(turn, requests, head, [finding], skipped), {}
+        final = [dataclasses.replace(p_i, short=short) if r is plan else
+                 dataclasses.replace(g_i, short=gshort) if r is grade else r for r in requests]
+        return final, None, {"skipped": skipped, "label": label, "probe": probe}
+    return requests, None, {"skipped": skipped}
+
+
+def _given_up(ctx, requests: List[EditRequest], cells: set) -> List[EditRequest]:
+    """고른 '원티드 포기' — 넣을 원티드면 넣지 않고(WishTarget.skip), 지금 반영된 원티드면 그 칸을 짚은 것으로(GiveUpWish)."""
+    if not cells:
+        return requests
+    targets = {(n, d) for r in requests if isinstance(r, WishTarget) for n, d, _c in wish_targets(ctx, r)}
+    out = [dataclasses.replace(r, skip=tuple(sorted(set(r.skip) | (cells & targets)))) if isinstance(r, WishTarget)
+           else r for r in requests if not isinstance(r, GiveUpWish)]
+    kept = sorted(cells - targets, key=lambda c: (c[1], c[0]))
+    return out + ([GiveUpWish(tuple(kept))] if kept else [])
+
+
+def _give_up_finding(ctx, lost, sig: str, tail: str) -> Finding:
+    """'원티드 n칸을 포기하면 …' — 고르면 그 칸들을 포기한다(그 계획에만 · 검토 H2)."""
+    cells = [(n, d) for n, d, _c in lost]
+    names = " · ".join(f"{ctx.names.get(n, n)} {d + 1}일 {'·'.join(SHIFT_WORD.get(c, c) for c in sorted(codes))}"
+                       for n, d, codes in lost[:PLAN_SHOWN])
+    more = f" 외 {len(cells) - PLAN_SHOWN}칸" if len(cells) > PLAN_SHOWN else ""
+    return Finding(finding_id((GIVE_UP, sig, len(cells)), len(cells)),
+                   f"원티드 {len(cells)}칸을 포기하면 {tail}: {names}{more}", "plan",
+                   {(GIVE_UP, n, d, sig): 1 for n, d in cells})
+
+
+#: 모자라는 칸이 남을 때 '원티드 포기하면 모자람 0' 을 찾는 시간 몫(사용자는 풀이가 한 번 더 도는 시간 증가를 알고 골랐다)
+PLAN_GIVE_UP_SHARE = 0.4
+
+
+def _give_up_for_short(turn: Turn, trial: List[EditRequest], sig: str, held: Dict[Tuple, int]) -> Optional[Finding]:
+    """해는 있는데 모자라는 칸이 남는다 — 지금 반영된 원티드(넣을 원티드 포함)를 포기하면 모자람 0 이 되는지(사용자 결정 11-05).
+    되면 가장 적게 포기하는 안 하나를 선택지로. 그 안도 묶은 품질 규칙을 더 넘겨야 하면 내지 않는다."""
+    session, ctx = turn.session, turn.session.ctx
+    if turn.remaining() < MIN_SOLVE:
+        return None
+    give = probe_plan(ctx, trial, rules=session.rules, today=turn.today,
+                      seconds=max(1.0, turn.remaining() * PLAN_GIVE_UP_SHARE), allow=session.allow,
+                      avoid_people=session.avoid_people, release_wishes=True, short_first=True)
+    if give.status != "ok" or not give.wish_lost or give.short or any(v > held.get(k, 0) for k, v in give.hold.items()):
+        return None
+    return _give_up_finding(ctx, give.wish_lost, sig, "모자람 0")
+
+
+def _plan_stopped(turn: Turn, requests: List[EditRequest], skipped: List[str]) -> Outcome:
+    """미리 풀기가 시간 안에 안 끝났다 — 얼마나 모자라는지 모르니 안을 내지 않는다(검토 H1). [같은 요청으로 다시 찾기]로 잇는다."""
+    session = turn.session
+    stage(session, requests)
+    session.last = EditResult("timeout", reasons=[PLAN_TIMEOUT] + [f"앞 계획은 안 됩니다: {x}." for x in skipped],
+                              notes=list(session.ctx.notes))
+    return _finish(turn, requests, session.last, time.monotonic())
+
+
+#: 계획이 막혔을 때 레버를 찾는 시간 상한(초) — 칸 상한은 고칠 수 있는 칸 수(검토 L2)
+PLAN_LEVER_SECONDS = 5.0
+
+
+def _plan_blocked(turn: Turn, requests: List[EditRequest], trial: List[EditRequest], skipped: List[str],
+                  label: str, sig: str) -> Outcome:
+    """계획이 아예 안 풀린다(요청한 개수·원티드·규칙이 함께 안 맞는다) — '방법이 없습니다'와 함께 어떤 원티드를 포기하면
+    되는지(고르면 그 칸을 짚은 것으로 보고 진행 · [RD-29])와 넘길 설정(레버 · 하드락은 넘기지 않는다)을 같은 자리에 보인다.
+    둘 다 없으면 이유를 찾아 보인다(사용자 결정 11-05)."""
+    from services.schedule_edit.explain import explain_month
+    from services.schedule_edit.model import free_cells
+    from services.schedule_edit.solver import PROBE_FREE_SHORT
+    session, ctx = turn.session, turn.session.ctx
+    head = f"{label or describe_requests(ctx, requests)}대로는 지금 규칙과 함께 정한 요청(개수·원티드 등)을 모두 지키며 풀 방법이 없습니다."
+    findings: List[Finding] = []
+    give = probe_plan(ctx, trial, rules=session.rules, today=turn.today,
+                      seconds=max(1.0, turn.remaining() * PLAN_GIVE_UP_SHARE), allow=session.allow,
+                      avoid_people=session.avoid_people, release_wishes=True)
+    if give.status == "ok" and give.wish_lost:
+        findings.append(_give_up_finding(ctx, give.wish_lost, sig, "찾을 수 있습니다"))
+    # 레버는 '가능해지는' 설정을 찾는다 — 모자람은 뒤에서 따로 묻으니 넉넉히 두고, 칸 상한은 고칠 수 있는 칸 수까지(검토 L2)
+    loose = [dataclasses.replace(r, short=PROBE_FREE_SHORT) if isinstance(r, PLAN) else r for r in trial]
+    pctx, prules, preqs = prepare(ctx, session.rules, loose)
+    start = min(r.day for r in preqs)
+    cap = len(free_cells(pctx, range(start, pctx.days)))
+    levers = []
+    if turn.remaining() > MIN_SOLVE + 1:
+        levers = find_levers(pctx, preqs, None, rules=prules, allow=session.allow, max_levers=2,
+                             seconds=min(PLAN_LEVER_SECONDS, turn.remaining() - MIN_SOLVE), screen=session.screen,
+                             avoid_people=session.avoid_people, max_changes=cap)
+    reasons = [head]
+    if not findings and not levers and turn.remaining() > MIN_SOLVE + 1:
+        why = explain_month(pctx, prules, preqs, cap, min(PLAN_LEVER_SECONDS, turn.remaining() - MIN_SOLVE),
+                            days=range(start, pctx.days), allow=session.allow)
+        reasons += why.sentences(pctx.names, cap, list_bends=True)
+    stage(session, requests)
+    result = EditResult("infeasible", reasons=reasons, levers=levers, notes=list(ctx.notes))
+    if findings:
+        out = _ask_consent(turn, requests, head, findings, skipped, levers=levers, title="원티드를 포기하면 찾을 수 있습니다")
+        session.last = result                          # 레버 카드를 고를 수 있게(choose_lever 는 마지막 결과의 레버만)
+        return out
+    session.last = result
+    return _finish(turn, requests, result, time.monotonic())
+
+
+def describe_grade_short(grade: Optional[GradeFloor]) -> str:
+    return f"근무조마다 {grade.grade}등급까지 {grade.count}명" if grade is not None else "등급 하한"
+
+
+def _m_days(ctx, plan: Optional[StaffingPlan]) -> Tuple[int, ...]:
+    """등급 하한에 M 근무조를 더할 날 — 인원 계획에 M 이 있는 날(32장)."""
+    if plan is None:
+        return ()
+    return tuple(sorted(d for d, by in staffing_bounds(ctx, plan).items() if by.get("M", (0, None))[0] > 0))
+
+
+def _gap_text(gaps) -> str:
+    """'12일 D 1 · 19일 E 1' — 앞 PLAN_SHOWN 개만."""
+    shown = [f"{d + 1}일 {SHIFT_WORD.get(c, c)}" + (f" {x}" if x > 1 else "") for d, c, x in gaps[:PLAN_SHOWN]]
+    return " · ".join(shown) + (f" 외 {len(gaps) - PLAN_SHOWN}곳" if len(gaps) > PLAN_SHOWN else "")
+
+
+def _hold_text(ctx, key: Tuple, amount: int) -> str:
+    """넘길 품질 규칙 한 곳 — '류예리 6일부터 연속 OFF 3일 넘음' · '허건 12일 하루짜리 OFF'."""
+    family, nid, day = key[0], key[1], key[2]
+    who = ctx.names.get(nid, nid)
+    if family == "연속OFF":
+        return f"{who} {day + 1}일부터 연속 OFF {key[3]}일 넘음(+{amount})"
+    if family == "패턴":
+        return f"{who} {day + 1}일부터 {key[3]} 순서(+{amount})"
+    return f"{who} {day + 1}일 {_HOLD_WORD.get(family, family)}(+{amount})"
+
+
+def _ask_fixed(turn: Turn, requests: List[EditRequest], fixed: List[Tuple[str, str]]) -> Outcome:
+    """고정 근무자를 하루 인원에 셀지 — 기본값으로 고르지 않는다(사용자 지시 11-05)."""
+    ctx = turn.session.ctx
+    who: Dict[str, List[str]] = {}
+    for n, c in fixed:
+        who.setdefault(n, []).append(SHIFT_WORD.get(c, c))
+    listed = " · ".join(f"{ctx.names.get(n, n)}(고정 {'·'.join(cs)})" for n, cs in who.items())
+    question = f"{describe_requests(ctx, requests)} — 고정 근무자도 하루 인원에 셀까요? ({listed})"
+    options = [{"choice_id": "count_fixed", "label": "센다", "summary": "고정 근무자의 근무도 그날 인원에 넣어 셉니다"},
+               {"choice_id": "exclude_fixed", "label": "빼고 센다", "summary": "고정 근무자를 빼고 나머지로 인원을 맞춥니다"}]
+    return _ask_choice(turn, requests, "fixed", question, options)
+
+
+def _ask_exact(turn: Turn, requests: List[EditRequest], vague, skipped: Sequence[str] = ()) -> Outcome:
+    """숫자만 말한 인원이 지금 판보다 적은 날이 있다 — 정확히 그 수인지, 그 수 이상인지에 따라 결과가 갈린다."""
+    ctx = turn.session.ctx
+    plan = next(r for r in requests if isinstance(r, StaffingPlan))
+    lines = []
+    for _i, rule, days in vague:
+        where = {"all": "매일", "weekday": "평일", "weekend": "토일"}.get(rule.scope, "정한 날")
+        lines.append(f"{where} {SHIFT_WORD.get(rule.code, rule.code)} {rule.low}명 — 지금 그보다 많은 날 {len(days)}일"
+                     f"({'·'.join(str(d + 1) for d in days[:6])}일{' 등' if len(days) > 6 else ''})")
+    question = "\n".join([f"{describe_requests(ctx, requests)} — 숫자만 말씀하신 인원을 정확히 그 수로 맞출지, 그 수 "
+                          "이상이면 될지 골라 주세요. 지금 근무표에 그보다 많은 날이 있어 결과가 달라집니다."]
+                         + [f"앞 계획은 안 돼 다음 계획으로 갑니다: {x}." for x in skipped])
+    options = [{"choice_id": "exact", "label": "정확히 그 수", "summary": "많은 날은 그 수로 줄입니다"},
+               {"choice_id": "at_least", "label": "그 수 이상", "summary": "최대는 병동 인원 설정대로 둡니다"}]
+    return _ask_choice(turn, requests, "exact", question, options, lines, plan)
+
+
+def _ask_choice(turn: Turn, requests: List[EditRequest], kind: str, question: str, options: List[Dict[str, Any]],
+                lines: Sequence[str] = (), plan: Optional[StaffingPlan] = None) -> Outcome:
+    """인원 계획에서 정할 것을 고르게 한다 — 요청만 바꿔 두고(`stage`) 기록한다(재기동 뒤에도 같은 질문으로 이어진다)."""
+    session, ctx = turn.session, turn.session.ctx
+    stage(session, requests)
+    answer = "\n".join([question] + [f"· {x}" for x in lines]
+                       + [f"{i}. {o['label']} — {o['summary']}" for i, o in enumerate(options, 1)])
+    preview = {"status": "choose_plan", "kind": kind, "question": "\n".join([question] + [f"· {x}" for x in lines]),
+               "choices": options, "reasons": [], "notes": [], "candidates": [], "levers": [], "blocking": []}
+    turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
+                            "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
+                            "avoid": [sorted(p) for p in session.avoid_people]})
+    return Outcome(answer=answer, preview=preview)
+
+
+def _ask_consent(turn: Turn, requests: List[EditRequest], head: str, findings: List[Finding], skipped: List[str],
+                 restate: bool = False, levers: Sequence = (), title: str = "이렇게 찾을까요?",
+                 choices: Optional[List[Dict[str, str]]] = None) -> Outcome:
+    """동의를 묻는다(바꾸기 전 확인과 같은 [그래도 진행]/[바꾸지 않기] · 인원은 [인원을 다시 말하기]도) — 앞 안이 안 된 이유도 먼저."""
+    session, ctx = turn.session, turn.session.ctx
+    if session.held is None:
+        session.held = (list(session.requests), session.last, list(session.avoid_people))
+    stage(session, requests)
+    session.asking = list(findings)
+    lead = [f"앞 계획은 안 됩니다: {x}." for x in skipped]
+    question = "\n".join([f"{describe_requests(ctx, requests)} — {head}"] + lead)
+    lever_line = ["또는 아래 설정 중 하나를 이번만 넘기도록 고르시면 그 안에서 다시 찾습니다."] if levers else []
+    ask = ["둘 중 하나를 골라 주세요. 진행해도 이번 수정에만 해당하고 병동 설정은 바뀌지 않습니다."] if choices else [PLAN_CONFIRM_ASK]
+    answer = "\n".join([question] + [f"· {f.text}" for f in findings] + lever_line + ask)
+    preview = {"status": "confirm", "question": question, "findings": [finding_to_json(f) for f in findings],
+               "title": title, "footnote": PLAN_CONFIRM_NOTE, "restate": restate, "choices": choices,
+               "reasons": [], "notes": [], "candidates": [], "levers": [lever_to_dict(lv) for lv in levers],
+               "blocking": []}
+    turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
+                            "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
+                            "avoid": [sorted(p) for p in session.avoid_people]})
+    return Outcome(answer=answer, preview=preview)
+
+
+PLAN_CONFIRM_ASK = "이렇게 찾을까요? 진행해도 이번 수정에만 해당하고 병동 설정은 바뀌지 않습니다."
+PLAN_CONFIRM_NOTE = "동의하시기 전에는 모자라는 칸·넘기는 근무 모양이 있는 안을 내지 않습니다."
+
+
+def _plan_followup(turn: Turn, requests: List[EditRequest], result: EditResult, info: Dict[str, Any]) -> None:
+    """찾은 안 — 쓴 계획과 앞 계획이 안 된 이유(산술 한 줄), 모자라는 칸, 등급 부족 근무조, 사람별 바뀐 칸, 날마다 인원."""
+    ctx = turn.session.ctx
+    grid = apply_candidate(ctx, result.candidates[0])
+    plan = next((r for r in requests if isinstance(r, StaffingPlan)), None)
+    grade = next((r for r in requests if isinstance(r, GradeFloor)), None)
+    lines = [f"앞 계획은 안 돼 다음 계획으로 찾았습니다 — {x}." for x in info.get("skipped") or []]
+    gave = [c for r in requests if isinstance(r, WishTarget) for c in r.skip]
+    gave += [c for r in requests if isinstance(r, GiveUpWish) for c in r.cells]
+    if gave:
+        lines.append(f"포기한 원티드 {len(gave)}칸: " + " · ".join(f"{ctx.names.get(n, n)} {d + 1}일"
+                                                             for n, d in sorted(gave, key=lambda c: (c[1], c[0]))))
+    if plan is not None:
+        gaps = staffing_gaps(ctx, grid, plan)
+        lines.append(f"쓴 계획: {plan_label(plan.rules())}"
+                     + (f" · 모자라는 칸 {sum(h - x for _d, _c, h, x in gaps)}: "
+                        + _gap_text([(d, c, low - have) for d, c, low, have in gaps]) if gaps else " · 모자라는 칸 없음"))
+    if grade is not None:
+        g = grade_gaps(ctx, grid, grade)
+        lines.append(f"{describe_grade_short(grade)} — " + (f"모자라는 근무조 {len(g)}: {_gap_text(g)}" if g
+                                                            else "모든 근무조 채움"))
+    per: Dict[str, int] = {}
+    for ch in result.candidates[0].changes:
+        per[ch.nurse_id] = per.get(ch.nurse_id, 0) + 1
+    lines.append("사람별 바뀐 칸: " + " · ".join(f"{ctx.names.get(n, n)} {k}" for n, k in
+                                              sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))))
+    if plan is not None:
+        codes = [c for c in ("D", "E", "N", "M") if any(c in by for by in staffing_bounds(ctx, plan).values())]
+        days = []
+        for d in range(plan.first_day, plan.last_day + 1):
+            people = plan_people(ctx, d, plan.count_fixed)
+            counts = "·".join(str(sum(1 for n in people if grid[n][d] == c)) for c in codes)
+            days.append(f"{d + 1}{'월화수목금토일'[ctx.day_date(d).weekday()]} {counts}")
+        lines.append(f"날마다 인원({'·'.join(codes)}): " + " · ".join(days))
+    result.extra = list(result.extra) + lines
 
 
 #: 고르게 맞추기에서 가장 작은 차이를 찾는 데 쓰는 시간 상한(초) — 나머지로 후보를 찾는다
@@ -1098,6 +1687,8 @@ def _choose_transfer(turn: Turn, requests: List[EditRequest], req: CountTarget) 
     · 어느 방식도 안 되면 묻지 않고 '가장 적게 바꾸기'로 불가 이유·레버를 낸다. 모두 시간 부족이면 그렇게 안내.
     """
     ctx, session = turn.session.ctx, turn.session
+    if any(isinstance(r, PLAN) for r in requests):
+        return _choose_transfer_plain(turn, requests, req)
     if turn.remaining() < MIN_SOLVE:
         turn.record("error", {"stage": "budget", "requests": requests_to_json(requests)})
         return Outcome(answer=OUT_OF_TIME)
@@ -1128,7 +1719,7 @@ def _choose_transfer(turn: Turn, requests: List[EditRequest], req: CountTarget) 
            else f"늘어나는 {word} {moved}개를 누구에게서 넘겨받을지")
     question = f"{describe_requests(ctx, requests)} — {ask} 골라 주세요."
     lines = [question] + [f"{i}. {_choice_line(c)}" for i, c in enumerate(ordered, 1)]
-    notes = fresh_notes(session, ctx.notes)
+    notes = fresh_notes(session, _open_notes(turn) + list(ctx.notes))
     answer = "\n".join(lines + [f"참고: {n}" for n in notes])
     preview = {"status": "choose_transfer", "choices": ordered, "direction": "down" if down else "up",
                "question": question, "reasons": [], "notes": notes, "candidates": [], "levers": [],
@@ -1136,6 +1727,33 @@ def _choose_transfer(turn: Turn, requests: List[EditRequest], req: CountTarget) 
     turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
                             "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
                             "avoid": [sorted(p) for p in session.avoid_people]}, elapsed_ms=_ms(started))
+    return Outcome(answer=answer, preview=preview)
+
+
+#: 인원 계획과 함께면 고를 수 없는 메우는 방식 — 그날 인원은 계획이 정한다(사용자 결정 11-05)
+PLAN_LOCKED_TRANSFERS = ("reduce_coverage", "add_coverage")
+
+
+def _choose_transfer_plain(turn: Turn, requests: List[EditRequest], req: CountTarget) -> Outcome:
+    """인원 계획과 함께 온 개수 요청 — 메우는 방식은 묻되 방식마다 미리 풀어 보지 않는다(계획 풀이가 무거워 다섯 번 풀면
+    응답 시간을 넘는다 · 사용자 결정 11-05). 선택지만 보이고 고른 방식으로 한 번만 푼다. 그날 인원 줄이기·늘리기는 뺀다."""
+    ctx, session = turn.session.ctx, turn.session
+    down = work_down(ctx, req)
+    choices = [{"choice_id": p, "label": transfer_label(ctx, req, p)}
+               for p in (_SHOW_DOWN if down else _SHOW_UP)
+               if p not in PLAN_LOCKED_TRANSFERS and _applicable(ctx, req, p)]
+    stage(session, requests)
+    word, moved = _word(req), abs(count_in(ctx, ctx.main, req) - req.target)
+    ask = (f"빠지는 {word} {moved}개를 어떻게 메울지" if down
+           else f"늘어나는 {word} {moved}개를 누구에게서 넘겨받을지")
+    question = f"{describe_requests(ctx, requests)} — {ask} 골라 주세요(인원 계획과 함께라 미리 풀어 보지 않습니다)."
+    answer = "\n".join([question] + [f"{i}. {c['label']}" for i, c in enumerate(choices, 1)])
+    preview = {"status": "choose_transfer", "probed": False, "choices": choices,
+               "direction": "down" if down else "up", "question": question, "reasons": [], "notes": [],
+               "candidates": [], "levers": [], "blocking": []}
+    turn.record("propose", {"requests": requests_to_json(requests), "described": describe_requests(ctx, requests),
+                            "result": preview, "answer": answer, "allow": allow_to_json(session.allow),
+                            "avoid": [sorted(p) for p in session.avoid_people]})
     return Outcome(answer=answer, preview=preview)
 
 
@@ -1264,6 +1882,13 @@ def choice_parts(c: Dict[str, Any], *, quality: bool = True) -> List[str]:
     if c.get("same_as_auto"):
         parts.append("가장 적게 바꾸기와 같은 안")
     return parts
+
+
+def _open_notes(turn: Turn) -> List[str]:
+    """사용자가 정한 기준일 안내('6일부터 고칩니다(5일까지는 그대로 둡니다).')와 앞 요청을 그날에 맞추며 생긴 사실 —
+    참고 문구라 대화에서 처음 한 번만 붙는다."""
+    note = edit_from_note(turn.session.ctx, turn.open_from(), turn.today)
+    return ([note] if note else []) + list(turn.notes)
 
 
 def _clarify(turn: Turn, asks: List[str]) -> Outcome:

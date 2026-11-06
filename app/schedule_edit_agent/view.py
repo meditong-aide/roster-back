@@ -20,6 +20,7 @@ from agent_kit import blocks as B
 from schedule_edit_agent.agent import Reply
 from schedule_edit_agent.answer import SOURCE_WORD
 from schedule_edit_agent.skills import choice_parts
+from services.schedule_edit.distribution import is_metric_note
 from services.schedule_edit.requests import CountTarget, eul, gwa, transfer_label, work_down
 from services.schedule_edit.serialize import lever_id, result_to_dict
 from services.schedule_edit.session import EditSession
@@ -27,7 +28,7 @@ from services.schedule_edit.session import EditSession
 LEVER_NOTE = ("연속 근무·나이트 규칙·근무 순서 같은 하드락은 넘길 수 없습니다. "
               "이번 수정에만 적용되고 병동 설정은 바뀌지 않습니다.")
 CHOICE_NOTE = "선택지마다 미리 한 번 풀어 본 결과입니다. 고르면 그 방식으로 후보를 3개까지 다시 찾습니다."
-CONFIRM_NOTE = ("요청한 칸과 바꿀 수 없는 칸(지난 날·확정 칸·전월 근무)만으로 셈한 것이라 어떤 방법으로도 피할 수 "
+CONFIRM_NOTE = ("요청한 칸과 바꿀 수 없는 칸(고치지 않는 날·확정 칸·전월 근무)만으로 셈한 것이라 어떤 방법으로도 피할 수 "
                 "없습니다. 진행해도 이번 수정에만 해당하고 병동 설정은 바뀌지 않습니다.")
 APPLY_NOTE = "적용하면 새 버전으로 저장되고 이전 버전은 그대로 남습니다."
 #: 후보 카드 밑 — 카드를 보며 규칙을 물을 수 있다는 것(사용자 지시 11-03 '그레이드는 다 지켜져? 등 추가 문의')
@@ -63,12 +64,15 @@ def blocks_for(reply: Reply, session: Optional[EditSession]) -> List[B.Block]:
         return shown + cards
     if status == "choose_transfer":
         return shown + [_transfer_choice(preview)]
+    if status == "choose_plan":
+        return shown + [_plan_choice(preview)]
     if status == "compare":
         # 사람별 칸은 카드의 펼친 목록·표가 보인다 — 요약과 명단 줄만(같은 숫자를 두 번 보이지 않게)
         lines = reply.answer.split("\n")
         return [B.text("\n".join([lines[0]] + [x for x in lines[1:] if x.startswith("명단:")]))] + [_compare_card(preview)]
     if status == "confirm":
-        return shown + [_confirm_card(preview)]
+        # 계획이 막혀 '원티드 포기'를 묻는 자리 — 넘길 설정 카드(레버)도 같은 자리에(사용자 결정 11-05)
+        return shown + [_confirm_card(preview)] + ([_lever_cards(preview["levers"])] if preview.get("levers") else [])
     if status == "confirm_apply":
         return shown + [_apply_confirm_card(preview)]
     if status == "infeasible" and preview.get("levers"):
@@ -79,7 +83,7 @@ def blocks_for(reply: Reply, session: Optional[EditSession]) -> List[B.Block]:
 
 def _lead(answer: str, preview: Optional[Dict[str, Any]]) -> str:
     """방식 고르기·확인에서는 묻는 문장과 참고만 — 선택지·짚은 것은 아래 블록이 보인다."""
-    if preview and preview.get("status") in ("choose_transfer", "confirm", "confirm_apply") \
+    if preview and preview.get("status") in ("choose_transfer", "choose_plan", "confirm", "confirm_apply") \
             and preview.get("question"):
         return "\n".join([preview["question"]] + [f"참고: {n}" for n in preview.get("notes") or []])
     return answer
@@ -99,8 +103,12 @@ def _candidate_card(c: Dict[str, Any], source: Optional[str] = None) -> Dict[str
     rank = c["rank"]
     people = [p["name"] for p in c["affected"]]
     lines = []
-    if c["quality"]:
-        lines.append(B.line("규칙은 모두 지키지만 근무 모양이 나빠집니다: " + _few(c["quality"]), tone="warning"))
+    spread = [q for q in c["quality"] if is_metric_note(q)]          # 분배 지표는 '분배'로(사용자 결정 11-05)
+    shape = [q for q in c["quality"] if not is_metric_note(q)]
+    if spread:
+        lines.append(B.line("규칙은 모두 지키지만 분배가 나빠집니다: " + _few(spread), tone="warning"))
+    if shape:
+        lines.append(B.line("규칙은 모두 지키지만 근무 모양이 나빠집니다: " + _few(shape), tone="warning"))
     changes = c["changes"]
     actions = [B.action("이 안 적용", "apply_edit", {"rank": rank}, style="primary")]
     if source is None:
@@ -179,6 +187,11 @@ def _key(candidates: List[Dict[str, Any]]) -> str:
 
 
 def _transfer_choice(preview: Dict[str, Any]) -> B.Block:
+    if preview.get("probed") is False:           # 인원 계획과 함께 — 미리 풀어 보지 않아 추천 없이 버튼만(사용자 결정 11-05)
+        card = B.card("transfer", "메우는 방식", lines=[B.line(c["label"]) for c in preview["choices"]],
+                      actions=[B.action(c["label"], "choose_transfer", {"choice_id": c["choice_id"]})
+                               for c in preview["choices"]])
+        return B.cards([card], selectable=False, footnote="고르면 그 방식으로 한 번 찾습니다.")
     options = []
     for c in preview["choices"]:
         if c["feasible"]:
@@ -198,11 +211,27 @@ def _transfer_choice(preview: Dict[str, Any]) -> B.Block:
 
 def _confirm_card(preview: Dict[str, Any]) -> B.Block:
     items = preview.get("findings") or []
-    card = B.card("confirm", f"그대로 바꾸면 생기는 것 {len(items)}가지",
-                  lines=[B.line(f["text"], tone="warning") for f in items],
-                  actions=[B.action("그래도 진행", "confirm_request", style="primary"),
-                           B.action("바꾸지 않기", "cancel_request")])
-    return B.cards([card], selectable=False, footnote=CONFIRM_NOTE)
+    if preview.get("choices"):          # 둘 중 하나 — '모자라는 칸 남기기' / '원티드 포기'(사용자 결정 11-05)
+        actions = [B.action(c["label"], "confirm_request", {"pick": c["id"]}) for c in preview["choices"]]
+        actions.append(B.action("바꾸지 않기", "cancel_request"))
+    else:
+        actions = [B.action("그래도 진행", "confirm_request", style="primary"), B.action("바꾸지 않기", "cancel_request")]
+    if preview.get("restate"):           # 인원 계획 — [인원을 다시 말하기](사용자 지시 11-05)
+        actions.append(B.action("인원을 다시 말하기", "cancel_request", {"restate": True}))
+    card = B.card("confirm", preview.get("title") or f"그대로 바꾸면 생기는 것 {len(items)}가지",
+                  lines=[B.line(f["text"], tone="warning") for f in items], actions=actions)
+    return B.cards([card], selectable=False, footnote=preview.get("footnote") or CONFIRM_NOTE)
+
+
+def _plan_choice(preview: Dict[str, Any]) -> B.Block:
+    """인원 계획에서 정할 것 — 고정 근무자를 셀지 · 숫자만 말한 인원이 정확히인지 이상인지. 기본값으로 고르지 않도록
+    미리 짚힌 선택지(choice 블록은 첫 항목을 짚는다) 대신 버튼만 둔다(사용자 지시 11-05)."""
+    choices = preview.get("choices") or []
+    title = "고정 근무자도 하루 인원에 셀까요?" if preview.get("kind") == "fixed" else "숫자만 말씀하신 인원은 어떻게 볼까요?"
+    card = B.card(f"plan-{preview.get('kind')}", title,
+                  lines=[B.line(f"{c['label']} — {c['summary']}") for c in choices],
+                  actions=[B.action(c["label"], "choose_staffing", {"choice_id": c["choice_id"]}) for c in choices])
+    return B.cards([card], selectable=False)
 
 
 def _apply_confirm_card(preview: Dict[str, Any]) -> B.Block:
@@ -212,7 +241,11 @@ def _apply_confirm_card(preview: Dict[str, Any]) -> B.Block:
     base = _candidate_card(c, preview.get("source"))
     items = preview.get("findings") or []
     lines = [B.line(f["text"], tone="warning") for f in items if f.get("kind") != "quality"]
-    shape = [f["text"] for f in items if f.get("kind") == "quality"]
+    quality = [f["text"] for f in items if f.get("kind") == "quality"]
+    spread = [q for q in quality if is_metric_note(q)]
+    shape = [q for q in quality if not is_metric_note(q)]
+    if spread:
+        lines.append(B.line("분배가 나빠짐: " + _few(spread), tone="warning"))
     if shape:
         lines.append(B.line("근무 모양이 나빠짐: " + _few(shape), tone="warning"))
     card = B.card(str(rank), f"{base['title']} · 적용 전 확인", summary=base["summary"], chips=base["chips"],
@@ -263,9 +296,9 @@ def step_label(action: str, params: Dict[str, Any], session: Optional[EditSessio
         which = f"{SOURCE_WORD.get(source, source)}" if source else f"{rank}안"
         return f"{which} 확인하고 적용" if params.get("confirmed") else f"{which} 적용"
     if action == "confirm_request":
-        return "그래도 진행"
+        return "고른 쪽으로 진행" if params.get("pick") else "그래도 진행"
     if action == "cancel_request":
-        return "바꾸지 않기"
+        return "인원을 다시 말하기" if params.get("restate") else "바꾸지 않기"
     if action == "back_to_candidates":
         return "다른 안 보기"
     if action == "retry_request":
@@ -286,6 +319,9 @@ def step_label(action: str, params: Dict[str, Any], session: Optional[EditSessio
         return "이번만 넘김: " + ", ".join(lever.lose) if lever is not None else "설정 하나를 이번만 넘김"
     if action == "choose_transfer":
         return _transfer_step(session, params.get("choice_id"))
+    if action == "choose_staffing":
+        return {"count_fixed": "고정 근무자도 인원에 셈", "exclude_fixed": "고정 근무자 빼고 셈",
+                "exact": "인원을 정확히 그 수로", "at_least": "인원을 그 수 이상으로"}.get(params.get("choice_id"))
     return None
 
 

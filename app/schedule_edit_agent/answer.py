@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
+from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    SHAPE_COUNTED, SHAPE_LABEL, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, ShapeTarget,
-    WishTarget, balance_counts, count_in, cover_count, shape_count, shape_instances, shape_values, transfer_label,
-    wish_count, wish_targets,
+    SHAPE_COUNTED, SHAPE_LABEL, BalanceTarget, CountTarget, CoverTarget, EditRequest, GiveUpWish, GradeFloor, LeaveCell,
+    SetCell,
+    ShapeTarget, StaffingPlan, WishTarget, balance_counts, count_cells, count_in, cover_count, plan_label, shape_count,
+    eul, gwa, ro, shape_instances, shape_values, staffing_gaps, staffing_over, transfer_label, wish_count,
+    wish_targets,
 )
 
 _SHIFT_WORD = {"D": "D", "E": "E", "N": "N", "M": "M", "O": "OFF", "OFF": "OFF"}
@@ -58,6 +61,15 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
         if isinstance(r, ShapeTarget):
             parts.append(_describe_shape(ctx, r))
             continue
+        if isinstance(r, StaffingPlan):
+            parts.append(describe_plan(ctx, r))
+            continue
+        if isinstance(r, GradeFloor):
+            parts.append(describe_grade(r))
+            continue
+        if isinstance(r, GiveUpWish):
+            parts.append(f"원티드 포기 {len(r.cells)}칸")
+            continue
         who = ctx.names.get(r.nurse_id, r.nurse_id)
         if isinstance(r, CountTarget):
             parts.append(_describe_count(ctx, who, r))
@@ -82,12 +94,36 @@ def describe_requests(ctx: EditContext, requests: Sequence[EditRequest]) -> str:
 
 
 def _describe_count(ctx: EditContext, who: str, r: CountTarget) -> str:
-    """예) '장원영 N 5→3회(3~30일 · 같은 등급 간호사가 메우기)'."""
+    """예) '장원영 N 5→3회(3~30일 · 같은 등급 간호사가 메우기)' · 한 달 개수로 말했으면 '류예리 OFF 한 달 14회'(이미 그렇다)·
+    '류예리 OFF 한 달 12→14회'(사용자가 말한 기준 그대로 · 사용자 결정 11-05)."""
     word = "·".join(_SHIFT_WORD.get(c, c) for c in sorted(r.codes))
-    extra = [] if (r.first_day, r.last_day) == (0, ctx.days - 1) else [f"{r.first_day + 1}~{r.last_day + 1}일"]
+    extra = [] if r.total or (r.first_day, r.last_day) == (0, ctx.days - 1) else [f"{r.first_day + 1}~{r.last_day + 1}일"]
     if r.transfer and r.transfer != "auto":      # 기본값(가장 적게 바꾸기)은 적지 않는다 — 고른 것처럼 보이지 않게
         extra.append(transfer_label(ctx, r, r.transfer))
-    return f"{who} {word} {count_in(ctx, ctx.main, r)}→{r.target}회" + (f"({' · '.join(extra)})" if extra else "")
+    tail = f"({' · '.join(extra)})" if extra else ""
+    now = count_in(ctx, ctx.main, r)
+    if r.total:
+        outside = count_cells(ctx, ctx.main, r.nurse_id, r.codes, [d for d in range(ctx.days) if d not in r.days()])
+        month_now, month_target = now + outside, r.target + outside
+        amount = f"{month_target}회" if month_now == month_target else f"{month_now}→{month_target}회"
+        return f"{who} {word} 한 달 {amount}{tail}"
+    return f"{who} {word} {now}→{r.target}회{tail}"
+
+
+def describe_plan(ctx: EditContext, r: StaffingPlan) -> str:
+    """예) '하루 인원 매일 D3·E3·N3(6~30일) · 안 되면 평일 D3~4·E3·N3 · 토일 D2·E2·N3·M1' · 고른 안이 있으면 그 안만."""
+    when = "" if (r.first_day, r.last_day) == (0, ctx.days - 1) else f"({r.first_day + 1}~{r.last_day + 1}일)"
+    fixed = {True: " · 고정 근무자 포함", False: " · 고정 근무자 빼고"}.get(r.count_fixed, "")
+    if r.chosen is not None:
+        return f"하루 인원 {plan_label(r.rules())}{when}{fixed}"
+    labels = [plan_label(alt) for alt in r.alternatives]
+    return f"하루 인원 {labels[0]}{when}" + "".join(f" · 안 되면 {x}" for x in labels[1:]) + fixed
+
+
+def describe_grade(r: GradeFloor) -> str:
+    """예) '근무조마다 1등급 1명 이상(D·E·N · 계획한 날 M)'."""
+    codes = "·".join(r.codes) + (" · 계획한 날 M" if r.m_days and "M" not in r.codes else "")
+    return f"근무조마다 {r.grade}등급까지 {r.count}명 이상({codes})"
 
 
 def _describe_balance(ctx: EditContext, r: BalanceTarget, grid=None) -> str:
@@ -176,6 +212,98 @@ def balance_note(ctx: EditContext, r: BalanceTarget, cand) -> str:
     return text
 
 
+#: 사람 간 차이 지표(`distribution.metrics`) → 그 근무 · 근무 이름은 답 관례(데이·이브닝·나이트·미드·OFF)
+_RANGE_CODE = {"n_range": "N", "off_range": "O"}
+_SHIFT_NAME = {"D": "데이", "E": "이브닝", "N": "나이트", "M": "미드", "O": "OFF"}
+
+
+def _shift_count(ctx: EditContext, grid, nurse_id: str, code: str) -> int:
+    """그 사람의 그 근무 수(그 달 전체) — OFF 는 차이 지표처럼 휴가·공가 칸을 세지 않는다."""
+    return dist.off_count(ctx, nurse_id, grid[nurse_id]) if code == "O" else grid[nurse_id].count(code)
+
+
+def _day_count(ctx: EditContext, grid, day: int, code: str, people) -> int:
+    """그날 그 근무 수(people 만) — OFF 는 휴가·공가 칸을 세지 않는다(`_shift_count` 와 같은 기준)."""
+    return sum(1 for n in people if grid[n][day] == code and not (code == "O" and (n, day) in ctx.vacation))
+
+
+def _plan_share(ctx: EditContext, grid, plan: StaffingPlan, code: str, people) -> int:
+    """인원 계획 몫 — 계획이 그날 인원을 바꿔야 했던 날의 그 근무 증가분을, 그날 계획이 요구한 수까지만 센다.
+    나이트 등은 계획 최소보다 적던 날(늘려야 했다), OFF 는 계획 최대를 넘던 날(줄여야 했다 · 줄인 만큼 OFF 가 는다).
+    people 에서 늘리기 개수 요청자를 뺀다 — 그 몫은 개수 요청 문장이 따로 밝힌다(재검토 LOW-1)."""
+    need: Counter = Counter()
+    if code == "O":
+        for d, _c, high, have in staffing_over(ctx, ctx.main, plan):
+            need[d] += have - high
+    else:
+        for d, c, low, have in staffing_gaps(ctx, ctx.main, plan):
+            if c == code:
+                need[d] += low - have
+    return sum(min(max(0, _day_count(ctx, grid, d, code, people) - _day_count(ctx, ctx.main, d, code, people)), k)
+               for d, k in need.items())
+
+
+def _count_label(ctx: EditContext, r: CountTarget, code: str) -> str:
+    """'류예리 N 0회' — 한 달 개수로 말했거나 한 달 전체면 한 달 개수(요청 줄과 같게), 아니면 기간을 붙인다."""
+    name = ctx.names.get(r.nurse_id, r.nurse_id)
+    if r.total or (r.first_day, r.last_day) == (0, ctx.days - 1):
+        outside = count_cells(ctx, ctx.main, r.nurse_id, r.codes, [d for d in range(ctx.days) if d not in r.days()])
+        return f"{name} {_SHIFT_WORD[code]} {r.target + outside}회"
+    return f"{name} {_SHIFT_WORD[code]} {r.target}회({r.first_day + 1}~{r.last_day + 1}일)"
+
+
+def spread_notes(ctx: EditContext, requests: Sequence[EditRequest], cand) -> Dict[str, str]:
+    """사람마다 그 근무 수 차이가 커진 까닭을 밝힌다 {차이 지표: 문장} — 여럿이면 함께(사용자 결정 11-05·11-06).
+      · 개수 요청으로 빠진 몫을 다른 간호사가 나눠 받았다(요청자의 그 근무가 실제로 줄고 다른 사람 것이 늘었을 때) —
+        '류예리 N 0회로 빠진 나이트 5개를 다른 간호사가 나눠 받아 사람마다 나이트 수 차이가 6→8로 커졌습니다.'
+      · 인원 계획이 그 근무의 전체 수를 늘렸다(`_plan_share` 가 있고 전체 수가 실제로 늘었을 때) —
+        '하루 N 인원을 늘려 늘어난 나이트 12개를 나눠 받아 …' · OFF 는 '하루 인원을 줄여 늘어난 OFF 4개를 나눠 받아 …'.
+      · 늘리기 개수 요청이 차이 위쪽을 넓혔다(요청자가 차이 대상이고 전의 최대보다 많아졌을 때) —
+        '장원영 N 8회로 나이트 2개가 늘어 사람마다 나이트 수 차이가 6→8로 커졌습니다.'
+    수는 그 달 전체의 실제 전후 근무표 셈이다 — 고칠 수 없는 날은 전후가 같아 차이에 들지 않고, 차이 지표도 같은 기준이다
+    (OFF 는 휴가·공가 칸을 뺀다). 데이·이브닝·미드는 차이 지표가 없어 보지 않는다(사용자 결정 11-06). 해당하지 않으면 빈 dict."""
+    from services.schedule_edit.solver import apply_candidate   # 답 문장 모듈이 솔버를 늘 들고 있지 않게
+    grid = apply_candidate(ctx, cand)
+    before, after = dist.metrics(ctx, ctx.main), dist.metrics(ctx, grid)
+    plan = next((r for r in requests if isinstance(r, StaffingPlan) and r.chosen is not None), None)
+    out: Dict[str, str] = {}
+    for key, code in _RANGE_CODE.items():
+        if after[key] <= before[key]:
+            continue
+        change = {n: _shift_count(ctx, grid, n, code) - _shift_count(ctx, ctx.main, n, code) for n in ctx.nurse_ids}
+        counts = [r for r in requests if isinstance(r, CountTarget) and set(r.codes) == {code}]
+        givers = [r for r in counts if change[r.nurse_id] < 0]
+        raisers = {r.nurse_id for r in counts if change[r.nurse_id] > 0}
+        who = {r.nurse_id for r in givers}
+        removed = -sum(change[n] for n in who)
+        given = removed > 0 and sum(v for n, v in change.items() if n not in who) > 0
+        share = 0
+        # 계획 몫은 그 달 실제 순증가(늘리기 요청자 몫 빼고)를 넘지 않는다 — 남던 날에서 옮겨 온 것까지 '늘었다'고 하지 않게(검토 11-06)
+        net = sum(change.values()) - sum(max(0, change[n]) for n in raisers)
+        if plan is not None and net > 0:
+            share = min(_plan_share(ctx, grid, plan, code, [n for n in ctx.nurse_ids if n not in raisers]), net)
+        members = dist.night_range_members(ctx) if code == "N" else dist.range_members(ctx)
+        top = max((_shift_count(ctx, ctx.main, n, code) for n in members), default=0)
+        risen = [r for r in counts if r.nurse_id in raisers and r.nurse_id in members
+                 and _shift_count(ctx, grid, r.nurse_id, code) > top]
+        word = _SHIFT_NAME[code]
+        parts = []
+        if given:
+            parts.append(f"{ro(', '.join(_count_label(ctx, r, code) for r in givers))} 빠진 {word} {removed}개")
+        if share:
+            parts.append(f"하루 인원을 줄여 늘어난 OFF {share}개" if code == "O" else
+                         f"하루 {code} 인원을 늘려 늘어난 {word} {share}개")
+        took = (f"{eul(f'{gwa(parts[0])} {parts[1]}' if len(parts) == 2 else parts[0])} "
+                f"{'다른 간호사가 ' if given else ''}나눠 받") if parts else ""
+        rose = (f"{ro(', '.join(_count_label(ctx, r, code) for r in risen))} {word} "
+                f"{sum(change[r.nurse_id] for r in risen)}개가 늘") if risen else ""
+        if not (took or rose):
+            continue
+        head = f"{took}고 {rose}어" if took and rose else f"{took}아" if took else f"{rose}어"
+        out[key] = f"{head} {dist.METRIC_LABEL[key]}가 {ro(f'{before[key]}→{after[key]}')} 커졌습니다."
+    return out
+
+
 def _same(ctx: EditContext, r: EditRequest) -> bool:
     return isinstance(r, SetCell) and ctx.main[r.nurse_id][r.day] == r.code
 
@@ -201,8 +329,14 @@ def answer_for(ctx: EditContext, requests: Sequence[EditRequest], result, notes:
         moved = _count_changes(ctx, requests, first)
         if moved:
             lines.append(f"근무 수 변화: {moved}")
-        if first.quality:
-            lines.append(f"1안은 규칙을 모두 지키지만 근무 모양이 나빠지는 곳이 있습니다(예: {first.quality[0]}).")
+        # 차이가 커진 까닭을 밝힌 지표는 '분배가 나빠지는 곳'에서 빼 같은 것을 두 번 말하지 않는다
+        spread = spread_notes(ctx, requests, first) if first.quality else {}
+        told = tuple(dist.METRIC_LABEL[k] for k in spread)
+        rest = [q for q in first.quality if not (told and q.startswith(told))]
+        lines += list(spread.values())
+        if rest:
+            what = "분배가" if dist.is_metric_note(rest[0]) else "근무 모양이"
+            lines.append(f"1안은 규칙을 모두 지키지만 {what} 나빠지는 곳이 있습니다(예: {rest[0]}).")
         lines += [n for n in (cover_note(ctx, r) for r in requests if isinstance(r, CoverTarget)) if n]
         lines += [balance_note(ctx, r, first) for r in requests if isinstance(r, BalanceTarget)]
         lines += [wish_note(ctx, r, first) for r in requests if isinstance(r, WishTarget)]
@@ -304,7 +438,7 @@ def postprocess_answer(ctx: EditContext, result) -> str:
     if report.get("skipped_n_only"):
         notes.append(f"N 전담 {report['skipped_n_only']}명은 바꾸지 않습니다")
     if result.held:
-        notes.append(f"지난 날·바꿀 수 없는 칸 {result.held}칸은 바꾸지 않습니다")
+        notes.append(f"고치지 않는 날·바꿀 수 없는 칸 {result.held}칸은 바꾸지 않습니다")
     if not result.changes:
         if not report.get("excess_total"):
             return f"{head}을 돌려 봤지만 기준을 넘는 OFF 가 없어 바꿀 칸이 없습니다."

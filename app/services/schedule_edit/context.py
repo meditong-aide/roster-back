@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import logging
 from collections import defaultdict
 import dataclasses
 from dataclasses import dataclass, field
@@ -31,6 +32,8 @@ from db.models import (
 from services.cp_sat.allowed_shift_types import is_n_only_profile, normalize_allowed_shift_codes
 from services.cp_sat.off_policy import resolve_effective_off_days
 from services.cp_sat.shift_normalizer import build_shift_normalizer
+
+logger = logging.getLogger(__name__)
 
 
 #: 근무로 세는 대표코드. W 는 대표코드 없는 근무(수간호사 `DE` 등) — 고정칸으로만 존재한다.
@@ -99,6 +102,13 @@ class EditContext:
     #: locked = 바꿀 수 없는 칸(파견·프리셉티 등). 답이 요청 범위(날·사람) 안만 센다
     wish_skipped: List[Tuple[str, int, str, str]] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    #: 사용자가 정한 고칠 수 있는 첫날(0부터) — 그 앞은 모두 그대로 둔다. 없으면 오늘까지만 닫는다(`requests.first_open_day`)
+    edit_from: Optional[int] = None
+    #: 확정 원티드인데 근무표 칸이 그 원티드와 다른 칸(그룹웨어 가져오기 등) — 원티드 반영 요청이 원티드대로만 바꿀 수 있다
+    #: (`wish_targets` · `with_wish_cells`). ctx.wishes 에도 든다
+    wish_fixed: Set[Cell] = field(default_factory=set)
+    #: 바뀐 칸을 저장할 코드 — 나이트에 주로 묶음 코드를 쓰던 사람의 N 은 그 코드로(예: 윤지원 N → NK · `_note_group_codes`)
+    keep_code: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
     def is_free(self, nurse_id: str, day: int) -> bool:
         return (nurse_id, day) not in self.frozen
@@ -157,10 +167,12 @@ def refresh_derived(ctx: EditContext) -> None:
     _load_ban_n_before(ctx)
 
 
-def refresh_facts(db: Session, ctx: EditContext) -> None:
-    """지금 사실로 막을 칸 — 파견·이동·휴직·프리셉티 기간과 확정 원티드(사본 값에 더한다)."""
-    _freeze_fixed_wanted(ctx, _applied_fixed_wanted(db, ctx))
+def refresh_facts(db: Session, ctx: EditContext) -> List[FixedWantedEntry]:
+    """지금 사실로 막을 칸 — 파견·이동·휴직·프리셉티 기간과 확정 원티드(사본 값에 더한다). 확정 원티드 행을 돌려준다."""
+    rows = _applied_fixed_wanted(db, ctx)
+    _freeze_fixed_wanted(ctx, rows)
     _load_blocked(db, ctx)
+    return rows
 
 
 def _load_current(db: Session, ctx: EditContext) -> None:
@@ -186,8 +198,37 @@ def _load_config(db: Session, ctx: EditContext) -> None:
     if raw is None:
         raw = get_roster_config(db, ctx.group_id)
         ctx.notes.append("근무표에 연결된 설정이 없어 병동 최신 설정으로 판정했습니다.")
-    ctx.config = _effective_config(raw or {})
+    raw = dict(raw or {})
+    raw.update(_extra_config(db, raw.get("config_id")))
+    ctx.config = _effective_config(raw)
     ctx.use_mid = bool(ctx.config.get("use_mid"))
+
+
+#: 수정 엔진이 읽는데 `constraint_tools._config_dict`(agents_v2 공용 · 조회 결과로 LLM 에도 나간다)에 없는 설정 칸 —
+#: 그 사전은 넓히지 않고 같은 설정 행에서 여기서만 더한다(31장 결함 2 · 없으면 기본값 꺼짐·3·꺼짐으로 판정했다 ·
+#: off_first 는 사용자 결정 11-05 — 켜진 병동은 남는 인원을 OFF 로·인원 상한 = 필요 인원 · 생성 엔진과 같다)
+EXTRA_CONFIG = ("ban_night_before_fixed_wanted_off", "max_conseq_off", "off_first")
+
+
+def _extra_config(db: Session, config_id) -> Dict[str, Any]:
+    """그 설정 행의 EXTRA_CONFIG 값(비어 있는 칸은 뺀다 — 기본값은 `_effective_config` 가 채운다). 행이 없으면 빈 사전."""
+    from db.models import RosterConfig
+    if not config_id:
+        return {}
+    row = db.query(*(getattr(RosterConfig, k) for k in EXTRA_CONFIG)).filter(
+        RosterConfig.config_id == int(config_id)).first()
+    if row is None:
+        return {}
+    out = {k: v for k, v in zip(EXTRA_CONFIG, row) if v is not None}
+    for key in ("ban_night_before_fixed_wanted_off", "off_first"):
+        if key in out:
+            out[key] = bool(out[key])
+    return out
+
+
+def apply_extra_config(db: Session, ctx: EditContext) -> None:
+    """판정 기준 사본으로 판정할 때도 — 사본은 이 칸이 빠진 사전에 기본값을 채워 남겼다(그 근무표가 쓴 설정 행 값으로 덮는다)."""
+    ctx.config.update(_extra_config(db, ctx.config_id))
 
 
 def _effective_config(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -243,9 +284,31 @@ def _main_of(row: Optional[dict], code: str, id_to_main: Dict[str, str]) -> Opti
     return id_to_main.get(upper)
 
 
+def group_codes(shifts: List[dict]) -> Dict[str, str]:
+    """대표코드가 없는 근무 코드 중 같은 shift_gb 묶음에 대표 근무(D·E·N·M)가 있는 것 → 그 근무(예: 7B NK → N).
+    화면 검증(`screen_rules._group_main_letters`)과 같은 규칙이라 하루 인원·규칙 셈이 화면과 같다(31장 결함 3). 생성 엔진의
+    정규화(`build_shift_normalizer`)는 이런 코드를 '대표코드 없는 근무'(W)로 둔다 — 그쪽은 건드리지 않고 여기서만 더한다."""
+    from services.schedule_edit.screen_rules import ShiftDef, _group_main_letters
+    id_to_main, _ = build_shift_normalizer(shifts)
+    defs = [ShiftDef(id=s.get("id"), shift_id=str(s["shift_id"]), default_shift=s.get("default_shift") or None,
+                     shift_gb=s.get("shift_gb") or None, type=s.get("type")) for s in shifts]
+    out = {}
+    for code, letter in _group_main_letters(defs, include_mid=True).items():
+        upper = str(code).upper()
+        if letter in ("D", "E", "N", "M") and id_to_main.get(upper, "W") == "W":
+            out[upper] = letter
+    return out
+
+
+#: 나이트 묶음이 아닌 묶음 근무코드(D·E·M 묶음) 칸의 고정 이유 — 그런 코드는 아직 본 병동이 없어 이전처럼 바꾸지 않는다
+#: (사용자 결정 11-05 · 나이트 묶음은 `_note_group_codes`)
+GROUP_CODE_REASON = "묶음 근무코드"
+
+
 def _shift_lookup(shifts: List[dict]) -> Tuple[Dict[str, str], Dict[int, dict], Dict[str, dict]]:
     """(코드→대표코드, 숫자 id→행, 코드→행). 같은 코드가 여럿이면 순서상 앞 행(화면 규약)."""
     id_to_main, _ = build_shift_normalizer(shifts)
+    id_to_main = {**id_to_main, **group_codes(shifts)}
     by_num = {int(s["id"]): s for s in shifts if s.get("id") is not None}
     by_code: Dict[str, dict] = {}
     for s in shifts:
@@ -270,6 +333,28 @@ def _load_cells(db: Session, ctx: EditContext, shifts: List[dict]) -> None:
         _classify_cell(ctx, nid, day, row)
     ctx.nurse_ids = sorted(ctx.raw)
     _freeze_missing(ctx)
+    _note_group_codes(ctx, group_codes(shifts))
+
+
+def _note_group_codes(ctx: EditContext, group: Dict[str, str]) -> None:
+    """묶음 근무코드 칸(사용자 결정 11-05) — NK 는 N 의 하위코드 · 한 사람은 하나만 쓴다(7B 윤지원은 나이트를 늘 NK 로).
+    계산은 그냥 N 이다 — 칸은 다른 N 칸처럼 바꿀 수 있고, 근무 제한은 원래 간호사 설정(허용 근무형 등)만 따른다(7B 윤지원은
+    그 설정으로 D·E·M 이 막혀 있다). 저장만 후처리한다 — 그 사람이 쓰는 나이트 코드가 하위코드면 그 사람의 N 은 그 코드로
+    (keep_code), 다른 사람은 표준 N 으로. 한 사람의 나이트 칸에 N 과 하위코드가 섞여 있으면 데이터 이상이라 표준 N 으로 두고
+    로그만 남긴다. 나이트가 아닌 묶음 코드는 바꾸지 않는 칸으로 둔다(GROUP_CODE_REASON)."""
+    if not group:
+        return
+    for nid in ctx.nurse_ids:
+        night = {str(raw).upper(): str(raw) for d, raw in enumerate(ctx.raw[nid]) if raw and ctx.main[nid][d] == "N"}
+        sub = [code for code in night if group.get(code) == "N"]
+        if sub and len(night) > 1:
+            logger.warning("[schedule_edit] 한 사람의 나이트 코드가 섞여 있음(표준 N 으로 저장): %s %s %s",
+                           ctx.schedule_id, nid, sorted(night))
+        elif sub:
+            ctx.keep_code[nid] = {"N": night[sub[0]]}
+        for day, raw in enumerate(ctx.raw[nid]):
+            if raw and group.get(str(raw).upper()) not in (None, "N"):
+                ctx.frozen.setdefault((nid, day), GROUP_CODE_REASON)
 
 
 def _blank_row(ctx: EditContext, nurse_id: str) -> None:
@@ -506,6 +591,18 @@ def with_released(ctx: EditContext, cells) -> EditContext:
     return out
 
 
+def with_wish_cells(ctx: EditContext, cells) -> EditContext:
+    """원티드 반영 요청이 짚은 '반영 안 된 확정 원티드' 칸을 바꿀 수 있게 한 재료(사본) — 원티드대로만 바꾼다(`model.add_wish`).
+    전날 N 금지는 그대로 둔다(원티드 OFF 로 되돌리는 칸이다). 그런 칸이 없으면 그대로."""
+    cells = {c for c in cells if c in ctx.wish_fixed and ctx.frozen.get(c) == FIXED_WANTED}
+    if not cells:
+        return ctx
+    out = dataclasses.replace(ctx, notes=list(ctx.notes))
+    out.frozen = {c: r for c, r in ctx.frozen.items() if c not in cells}
+    out.notes.append(f"확정 원티드와 근무표가 다른 {len(cells)}칸은 원티드대로 되돌릴 수 있습니다(다른 근무로는 바꾸지 않습니다).")
+    return out
+
+
 def _load_wishes(db: Session, ctx: EditContext, shifts: List[dict], fixed_rows: List[FixedWantedEntry]) -> None:
     """간호사 원티드(희망) — 엔진 선호와 같은 출처.
 
@@ -524,10 +621,35 @@ def _load_wishes(db: Session, ctx: EditContext, shifts: List[dict], fixed_rows: 
             continue
         if main not in EDIT_MAINS:
             ctx.wish_skipped.append((nid, day, "code", str(main)))
+        elif _unreflected_fixed(ctx, nid, day, main):
+            ctx.wishes.setdefault((nid, day), set()).add(main)
+            ctx.wish_fixed.add((nid, day))
+        elif ctx.frozen.get((nid, day)) == FIXED_WANTED and ctx.main[nid][day] == main:
+            continue                     # 이미 반영된 확정 원티드 — 넣을 것도 못 넣는 것도 아니다
         elif not ctx.is_free(nid, day):
             ctx.wish_skipped.append((nid, day, "locked", str(main)))
         else:
             ctx.wishes.setdefault((nid, day), set()).add(main)
+
+
+def _unreflected_fixed(ctx: EditContext, nid: str, day: int, main: Optional[str]) -> bool:
+    """확정 원티드로만 묶였는데 칸이 그 원티드와 다르다(예: 7B 허건 11일 신청 OFF 인데 그룹웨어 판 D) — 원티드 반영 요청이
+    원티드대로 되돌릴 수 있는 칸. 칸 자체가 바꿀 수 없는 코드(휴가 등)면 아니다."""
+    return (ctx.frozen.get((nid, day)) == FIXED_WANTED and main in EDIT_MAINS and ctx.main[nid][day] != main
+            and ctx.main[nid][day] in EDIT_MAINS and (nid, day) not in ctx.vacation)
+
+
+def note_unreflected_fixed(db: Session, ctx: EditContext, shifts: List[dict], rows: List[FixedWantedEntry]) -> None:
+    """판정 기준 사본으로 판정할 때 — 사본의 원티드에는 묶인 칸이 없어 반영 안 된 확정 원티드만 지금 행으로 더한다."""
+    if not rows:
+        return
+    id_to_main, _by_num, by_code = _shift_lookup(shifts)
+    for r in rows:
+        nid, day = str(r.nurse_id), int(r.shift_date.day) - 1
+        main = _main_of(by_code.get(str(r.shift_id or "").upper()), r.shift_id, id_to_main)
+        if nid in ctx.raw and 0 <= day < ctx.days and _unreflected_fixed(ctx, nid, day, main):
+            ctx.wishes.setdefault((nid, day), set()).add(main)
+            ctx.wish_fixed.add((nid, day))
 
 
 def _submitted_wishes(db: Session, ctx: EditContext) -> List[Tuple[str, int, str]]:
@@ -560,10 +682,13 @@ def _load_blocked(db: Session, ctx: EditContext) -> None:
     """파견·이동·휴직·프리셉티 기간 — 엔진은 그 칸 변수를 아예 안 만든다.
 
     프리셉티는 프리셉터를 그대로 따라가므로(엔진 `X(n)==X(p)` 하드) 그날 프리셉터 칸도 묶는다.
+    ★ 막힌 날짜 함수(대체 추천용)는 확정 원티드 날짜도 돌려준다 — 빼고 받는다(31장 결함 1: '관할 밖'으로 덮어 원티드 OFF 전날
+      N 금지가 빠지고 직접 짚어 풀기도 안 됐다). 파견 날과 겹치는 원티드 날은 파견이 우선이라 관할 밖이다(사용자 결정 11-05).
     """
     from services.preceptee_period import resolve_preceptee_days_for_month
     from services.replacement_recommend_service import _build_assignment_blocked_dates
-    raw = _build_assignment_blocked_dates(db, ctx.group_id, ctx.year, ctx.month, ctx.days) or {}
+    raw = _build_assignment_blocked_dates(db, ctx.group_id, ctx.year, ctx.month, ctx.days,
+                                          include_fixed_wanted=False) or {}
     for nid, days in raw.items():
         for value in days or ():
             day = (value.day if hasattr(value, "day") else int(value)) - 1

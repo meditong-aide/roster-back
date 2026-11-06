@@ -134,11 +134,13 @@ def _build_assignment_blocked_dates(
     year: int,
     month: int,
     days_in_month: int,
+    include_fixed_wanted: bool = True,
 ) -> Dict[str, set]:
     """해당 월의 간호사별 blocked date 집합을 구성한다.
 
     파견/병동이동/휴직: source_group_id == group_id인 아웃바운드 기간(NurseAssignment)
     프리셉티: nurse_preceptee_period(SSOT) 의 그 달 겹치는 구간(assignment 안 봄 — 도려내기)
+    include_fixed_wanted=False 면 확정 원티드 날짜는 빼고 돌려준다(근무표 수정 엔진 — 원티드 날은 원티드 이유로 따로 묶는다).
     """
     month_start = date(year, month, 1)
     month_end = date(year, month, days_in_month)
@@ -185,6 +187,9 @@ def _build_assignment_blocked_dates(
         s = blocked.setdefault(str(nid), set())
         for d0 in info.get("days", set()):
             s.add(month_start + timedelta(days=int(d0)))
+
+    if not include_fixed_wanted:
+        return blocked
 
     # fixed_wanted_entries — 고정 셀이 있는 날짜는 추천 제외
     fixed_entries = (

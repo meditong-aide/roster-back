@@ -26,7 +26,8 @@ from sqlalchemy.orm import Session
 from db.models import ScheduleEditBasis
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import (
-    EditContext, load_cells, load_edit_context, refresh_derived, refresh_facts,
+    EditContext, apply_extra_config, load_cells, load_edit_context, note_unreflected_fixed, refresh_derived,
+    refresh_facts,
 )
 
 logger = logging.getLogger(__name__)
@@ -165,15 +166,17 @@ def read_basis(db: Session, schedule_id: str) -> Optional[Dict[str, Any]]:
 def apply_basis(db: Session, ctx: EditContext, payload: Dict[str, Any]) -> None:
     """사본 값으로 판정 재료를 채운다. 칸·근무 정의·이름은 지금 근무표에서 읽는다."""
     ctx.config = dict(payload.get("config") or {})
+    apply_extra_config(db, ctx)
     ctx.use_mid = bool(ctx.config.get("use_mid"))
-    load_cells(db, ctx)
+    shifts = load_cells(db, ctx)
     _apply_cells_rules(ctx, payload)
     _apply_people(ctx, payload)
     _apply_sequence(ctx, payload)
     # 기준은 사본, 사실은 지금 값도 — 그 뒤 새로 잡힌 파견·휴직·확정 원티드 칸은 막는다(검토 M3)
-    refresh_facts(db, ctx)
+    rows = refresh_facts(db, ctx)
     _freeze_unknown(ctx, payload)
     _apply_wishes(ctx, payload)
+    note_unreflected_fixed(db, ctx, shifts, rows)
     refresh_derived(ctx)
     ctx.notes.extend(payload.get("notes") or [])
 

@@ -6,7 +6,7 @@
     (off_swap_enabled · off_days · 바꿀 코드 off_swap_target · 주 2회 휴일 하한)대로. 연차 잔여 장부는 보지 않는다
     (생성할 때와 같다).
   · 설정은 그 근무표가 만들어질 때 쓴 것(schedules.config_id · [RVERIFY-08]).
-  · 지난 날·바꿀 수 없는 칸은 바꾸지 않는다 — 생성은 앞으로의 달이라 날짜를 보지 않는다.
+  · 고치지 않는 날(`first_open_day`)·바꿀 수 없는 칸은 바꾸지 않는다 — 생성은 앞으로의 달이라 날짜를 보지 않는다.
   · 원티드 칸도 바꾸지 않는다 — 확정 원티드는 서비스가 이미 빼고, 지금 반영된 제출 원티드는 `protect` 로
     넘겨 서비스가 다른 OFF 를 고르게 한다(원티드 칸은 수간호사가 그 칸을 직접 짚을 때만 바꾼다 · 사용자 지시 11-03).
 DB 는 읽기만 한다(서비스 함수도 읽기만 한다).
@@ -39,7 +39,7 @@ class PostprocessResult:
     changes: List[CellChange]
     #: 서비스 함수가 채운 숫자(off_swap 의 report) — 이유 문장 재료
     report: Dict[str, Any] = field(default_factory=dict)
-    #: 서비스가 바꿨지만 지난 날이거나 바꿀 수 없는 칸이라 뺀 수
+    #: 서비스가 바꿨지만 고치지 않는 날이거나 바꿀 수 없는 칸이라 뺀 수
     held: int = 0
 
 

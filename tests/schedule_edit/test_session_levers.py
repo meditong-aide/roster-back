@@ -62,7 +62,8 @@ def test_verify_candidate_rechecks_dates_and_request():
     s = _session(ctx)
     cand = _propose(s, [SetCell("A", 0, "O")]).candidates[0]
     # 후보를 찾은 뒤 자정을 넘겨 1일이 지난 날이 됐다
-    assert "1일은 이미 지난 날짜입니다" in verify_candidate(ctx, s.rules, cand, s.requests, today=date(2026, 11, 2))
+    assert any(p.startswith("1일은 이미 지난 날짜") for p in verify_candidate(ctx, s.rules, cand, s.requests,
+                                                                           today=date(2026, 11, 2)))
     cand.changes = [c for c in cand.changes if (c.nurse_id, c.day) != ("A", 0)]
     assert any(p.startswith("요청 미충족") for p in verify_candidate(ctx, s.rules, cand, s.requests,
                                                                     today=BEFORE_MONTH))

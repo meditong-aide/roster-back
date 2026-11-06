@@ -193,7 +193,7 @@ def test_asking_about_shapes_counts_them_like_the_fix_does(world):
                       "하루 근무(퐁당퐁당) 1개(B 8일) · N-O-D·N-O-E·E-O-D 순서 0개 · 가장 긴 연속 근무 3일(A) · "
                       "가장 많은 주말 근무 2회(A 외 1명).\n고치려면 '하루짜리 OFF 없애줘'·'퐁당퐁당 없애줘'처럼 말씀해 주세요.")
     # 달 중간이면 바꿀 수 있는 날부터 — 이어서 고쳐 달라고 할 때의 '지금 n개'와 같은 수
-    today = date(2026, 11, 4)
+    today = date(2026, 11, 3)                   # 오늘(3일)까지 닫혀 4일부터
     later = say(agent, world.conv, "하루짜리 OFF 있어?", today).answer
     assert later.startswith("근무 모양(바꿀 수 있는 칸 기준 · 4일부터): 하루짜리 OFF 2개(C 5일, B 9일) · ")
     fix = say(agent, world.conv, "하루짜리 OFF 없애줘", today).answer

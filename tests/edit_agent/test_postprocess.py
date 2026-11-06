@@ -15,7 +15,7 @@ from services.schedule_edit.apply import roster_payload
 from services.schedule_edit.solver import verify_candidate
 from tests.edit_agent.test_agent import _agent, call, make_ctx, press, say
 
-TODAY = date(2026, 11, 2)      # 11월 1일은 지난 날
+TODAY = date(2026, 11, 2)      # 11월 1일은 지난 날 · 2일은 오늘(고치지 않는 날 · 사용자 결정 11-05)
 SWAP = call("run_postprocess", kind="annual_leave_swap")
 
 
@@ -53,7 +53,7 @@ def test_swap_previews_one_card_and_holds_past_days(world, swap):
         [("A", 4, "O", "연"), ("B", 5, "O", "연")]                     # 1일은 지난 날이라 뺐다
     assert cand["counts"]["A"]["OFF"] == [3, 2]
     assert "OFF 2칸을 연차로 바꿉니다(2명)" in reply.answer
-    for why in ("주 2회 휴일 하한", "회복 OFF·원티드", "N 전담 1명", "지난 날·바꿀 수 없는 칸 1칸", "연차 잔여는 보지 않습니다"):
+    for why in ("주 2회 휴일 하한", "회복 OFF·원티드", "N 전담 1명", "고치지 않는 날·바꿀 수 없는 칸 1칸", "연차 잔여는 보지 않습니다"):
         assert why in reply.answer
     assert world.events[-1].event == "propose" and world.events[-1].payload["postprocess"] == "annual_leave_swap"
 
@@ -107,11 +107,13 @@ def test_apply_saves_the_converted_cells_as_a_new_version(world, swap, monkeypat
 
 def test_conversion_below_the_off_floor_is_refused_before_apply(world, swap):
     # 기준 OFF 2 · A 의 순수 OFF 3 — 두 칸을 연차로 바꾸면 1개가 되어 하한 아래(Codex 11-03: 대표코드 O 만 보면 놓친다)
+    # 2일 칸을 바꾸려면 오늘이 1일이어야 한다(오늘은 고치지 않는 날)
     swap["cells"] = [("A", 1), ("A", 3)]
+    today = date(2026, 11, 1)
     agent, _ = _agent(SWAP)
-    say(agent, world.conv, "자동 연차전환 해줘", TODAY)
+    say(agent, world.conv, "자동 연차전환 해줘", today)
     session = world.conv.state
-    problems = verify_candidate(session.ctx, session.rules, session.last.candidates[0], session.requests, today=TODAY)
+    problems = verify_candidate(session.ctx, session.rules, session.last.candidates[0], session.requests, today=today)
     assert any("OFF수" in p and "하한" in p for p in problems)
 
 

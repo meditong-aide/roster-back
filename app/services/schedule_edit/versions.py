@@ -3,7 +3,7 @@
   · 같은 병동·같은 달·지우지 않은 버전만. 어느 버전인지는 해석기가 which(number·previous·first·latest·date·name)로 준다.
   · 비교 숫자는 화면 [버전 비교](`/roster/compare`)와 같은 함수(`compare_schedules`) — 둘이 달라 보이면 안 된다.
   · 일부 되돌리기 = 그 버전의 칸을 칸 지정 요청(SetCell·LeaveCell)으로 — 규칙 확인·가장 적게 바꾸기·적용 전 확인을
-    다른 요청과 같은 길로 받는다. 지난 날·바꿀 수 없는 칸·도우미가 넣지 못하는 코드는 빼고 그 수를 알린다.
+    다른 요청과 같은 길로 받는다. 고치지 않는 날·바꿀 수 없는 칸·도우미가 넣지 못하는 코드는 빼고 그 수를 알린다.
 """
 
 from __future__ import annotations
@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 WHICH = ("number", "previous", "first", "latest", "date", "name")
 WHICH_ASK = "어느 버전과 견줄까요? 예) 'VER1과 뭐가 달라?', '바로 전 버전으로 되돌려줘', '처음 버전과 비교해줘'"
 #: 되돌리기에서 뺀 칸의 이유 → 문장 조각
-SKIP_WORD = {"past": "지난 날", "frozen": "바꿀 수 없는 칸(파견·확정 원티드 등)", "code": "도우미가 넣지 못하는 코드(주휴·특수 휴무 등)",
+#: past = 고치지 않는 날(지난 날·오늘·사용자가 그대로 두기로 한 날 · `first_open_day`)
+SKIP_WORD = {"past": "고치지 않는 날", "frozen": "바꿀 수 없는 칸(파견·확정 원티드 등)", "code": "도우미가 넣지 못하는 코드(주휴·특수 휴무 등)",
              "subcode": "같은 근무의 하위 코드만 다른 칸", "leave_on_off": "지금 쉬는 날인 칸의 휴가",
              "empty": "그 버전에 칸이 없는 날"}
 #: 일부 되돌리기 한 번에 가져올 칸 상한 — 넘으면 좁혀 달라고 되묻는다(칸 상한이 이 수 + 10 까지 커진다)

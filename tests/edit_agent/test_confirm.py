@@ -114,10 +114,10 @@ def test_already_confirmed_bend_is_not_asked_again_at_apply(world, monkeypatch):
     captured = {}
     monkeypatch.setattr(skills_mod, "apply_to_new_version", lambda *a, **kw: captured.update(kw) or saved)
     reply = press(agent, world.conv, "apply_edit", {"rank": 1})
-    # 동의한 위치·양은 다시 묻지 않고, 새로 나빠지는 근무 모양만 묻는다
+    # 동의한 위치·양은 다시 묻지 않고, 새로 나빠지는 품질만 묻는다 — 분배 지표는 '분배'로(사용자 결정 11-05)
     assert [f["text"] for f in reply.preview["findings"]] == ["사람마다 OFF 수 차이 2→3"]
     card = blocks_for(reply, world.conv.state)[-1]["items"][0]
-    assert [line["text"] for line in card["lines"]] == ["근무 모양이 나빠짐: 사람마다 OFF 수 차이 2→3"]
+    assert [line["text"] for line in card["lines"]] == ["분배가 나빠짐: 사람마다 OFF 수 차이 2→3"]
     done = press(agent, world.conv, "apply_edit", card["actions"][0]["input"]["params"])
     # 받아들인 것 전부를 종류와 함께 기록 — 변경 이력이 '넘긴 설정'과 '근무 모양'을 나눠 보인다
     assert done.effects and [(a["kind"], a["text"]) for a in captured["accepted"]] == [

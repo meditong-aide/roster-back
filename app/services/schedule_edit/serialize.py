@@ -12,7 +12,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell, SetCell, ShapeTarget, WishTarget,
+    AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, GiveUpWish, GradeFloor, LeaveCell, SetCell,
+    ShapeTarget, StaffingPlan, StaffRule, WishTarget,
 )
 
 
@@ -30,7 +31,8 @@ def requests_to_json(requests: Sequence[EditRequest]) -> List[Dict[str, Any]]:
     for r in requests:
         if isinstance(r, CountTarget):
             out.append({"kind": "count", "nurse_id": r.nurse_id, "codes": sorted(r.codes), "target": r.target,
-                        "first_day": r.first_day, "last_day": r.last_day, "transfer": r.transfer})
+                        "first_day": r.first_day, "last_day": r.last_day, "transfer": r.transfer, **_asked(r),
+                        **({"total": True} if r.total else {})})
         elif isinstance(r, SetCell):
             out.append({"kind": "set", "nurse_id": r.nurse_id, "day": r.day, "code": r.code})
         elif isinstance(r, LeaveCell):
@@ -42,12 +44,43 @@ def requests_to_json(requests: Sequence[EditRequest]) -> List[Dict[str, Any]]:
                         "first_day": r.first_day, "last_day": r.last_day, "spread": r.spread, "target": r.target})
         elif isinstance(r, WishTarget):
             out.append({"kind": "wanted", "nurses": list(r.nurses), "first_day": r.first_day, "last_day": r.last_day,
-                        "at_least": r.at_least, "ranged": r.ranged})
+                        "at_least": r.at_least, "ranged": r.ranged, **_asked(r),
+                        **({"codes": sorted(r.codes)} if r.codes is not None else {}),
+                        **({"skip": [list(c) for c in r.skip]} if r.skip else {})})
         elif isinstance(r, ShapeTarget):
             out.append({"kind": "shape", "shape": r.kind, "nurses": list(r.nurses), "first_day": r.first_day,
-                        "last_day": r.last_day, "at_most": r.at_most, "ranged": r.ranged, "said": r.said})
+                        "last_day": r.last_day, "at_most": r.at_most, "ranged": r.ranged, "said": r.said, **_asked(r)})
+        elif isinstance(r, StaffingPlan):
+            out.append({"kind": "staffing", "alternatives": [[_rule_to_json(x) for x in alt] for alt in r.alternatives],
+                        "first_day": r.first_day, "last_day": r.last_day, "chosen": r.chosen, "short": r.short,
+                        "count_fixed": r.count_fixed})
+        elif isinstance(r, GradeFloor):
+            out.append({"kind": "grade_floor", "grade": r.grade, "count": r.count, "first_day": r.first_day,
+                        "last_day": r.last_day, "codes": list(r.codes), "m_days": list(r.m_days), "short": r.short,
+                        "count_fixed": r.count_fixed})
+        elif isinstance(r, GiveUpWish):
+            out.append({"kind": "give_up_wish", "cells": [list(c) for c in r.cells]})
         else:
             out.append({"kind": "avoid", "nurse_id": r.nurse_id, "day": r.day, "codes": sorted(r.codes)})
+    return out
+
+
+def _rule_to_json(r: StaffRule) -> Dict[str, Any]:
+    return {"scope": r.scope, "code": r.code, "low": r.low, "high": r.high, "days": list(r.days), "exact": r.exact}
+
+
+def _rule_from_json(i: Dict[str, Any]) -> StaffRule:
+    return StaffRule(i["scope"], i["code"], int(i["low"]), None if i.get("high") is None else int(i["high"]),
+                     tuple(int(d) for d in i.get("days") or ()), i.get("exact"))
+
+
+def _asked(r) -> Dict[str, Any]:
+    """사용자가 정한 날로 줄이기 전 원래 첫날·목표 — 줄인 요청에만 싣는다(기존 기록 모양은 그대로)."""
+    out = {}
+    if r.asked_first is not None:
+        out["asked_first"] = r.asked_first
+    if getattr(r, "asked_target", None) is not None:
+        out["asked_target"] = r.asked_target
     return out
 
 
@@ -56,7 +89,8 @@ def requests_from_json(items: Sequence[Dict[str, Any]]) -> List[EditRequest]:
     for i in items or []:
         if i["kind"] == "count":
             out.append(CountTarget(i["nurse_id"], frozenset(i["codes"]), int(i["target"]), int(i["first_day"]),
-                                   int(i["last_day"]), i.get("transfer")))
+                                   int(i["last_day"]), i.get("transfer"), i.get("asked_first"), i.get("asked_target"),
+                                   bool(i.get("total"))))
         elif i["kind"] == "set":
             out.append(SetCell(i["nurse_id"], int(i["day"]), i["code"]))
         elif i["kind"] == "leave":
@@ -68,10 +102,22 @@ def requests_from_json(items: Sequence[Dict[str, Any]]) -> List[EditRequest]:
                                      int(i["last_day"]), i.get("spread"), i.get("target")))
         elif i["kind"] == "wanted":
             out.append(WishTarget(tuple(i.get("nurses") or ()), int(i["first_day"]), int(i["last_day"]),
-                                  i.get("at_least"), bool(i.get("ranged"))))
+                                  i.get("at_least"), bool(i.get("ranged")), i.get("asked_first"),
+                                  frozenset(i["codes"]) if i.get("codes") is not None else None,
+                                  tuple((str(n), int(d)) for n, d in i.get("skip") or ())))
         elif i["kind"] == "shape":
             out.append(ShapeTarget(i["shape"], tuple(i.get("nurses") or ()), int(i["first_day"]), int(i["last_day"]),
-                                   i.get("at_most"), bool(i.get("ranged")), bool(i.get("said"))))
+                                   i.get("at_most"), bool(i.get("ranged")), bool(i.get("said")), i.get("asked_first")))
+        elif i["kind"] == "staffing":
+            out.append(StaffingPlan(tuple(tuple(_rule_from_json(x) for x in alt) for alt in i.get("alternatives") or ()),
+                                    int(i["first_day"]), int(i["last_day"]), i.get("chosen"), i.get("short"),
+                                    i.get("count_fixed")))
+        elif i["kind"] == "grade_floor":
+            out.append(GradeFloor(int(i["grade"]), int(i["count"]), int(i["first_day"]), int(i["last_day"]),
+                                  tuple(i.get("codes") or ("D", "E", "N")), tuple(int(d) for d in i.get("m_days") or ()),
+                                  i.get("short"), i.get("count_fixed")))
+        elif i["kind"] == "give_up_wish":
+            out.append(GiveUpWish(tuple((str(n), int(d)) for n, d in i.get("cells") or ())))
         else:
             out.append(AvoidCell(i["nurse_id"], int(i["day"]), frozenset(i["codes"])))
     return out

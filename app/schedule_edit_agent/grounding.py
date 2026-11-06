@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
-    SHAPE_COUNTED, SHAPE_LABEL, TRANSFERS, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, LeaveCell,
-    SetCell, ShapeTarget, WishTarget, balance_members, cover_count, eul, shape_values, swap, weekend_floor,
+    SHAPE_COUNTED, SHAPE_LABEL, TRANSFERS, AvoidCell, BalanceTarget, CountTarget, CoverTarget, EditRequest, GradeFloor,
+    LeaveCell, SetCell, ShapeTarget, StaffingPlan, StaffRule, WishTarget, balance_members, closed_span_text, cover_count,
+    days_text, eul, shape_values, swap, weekend_floor,
 )
 from services.schedule_edit.rules import coverage_bounds
 
@@ -30,11 +32,14 @@ class Grounded:
     asks: List[str] = field(default_factory=list)
 
 
-def ground_changes(ctx: EditContext, changes: Sequence[Dict[str, Any]], open_from: int = 0) -> Grounded:
-    """open_from: 바꿀 수 있는 첫날(0부터) — 개수 요청의 기간이 여기서 시작한다."""
+def ground_changes(ctx: EditContext, changes: Sequence[Dict[str, Any]], open_from: int = 0,
+                   today: Optional[date] = None) -> Grounded:
+    """open_from: 바꿀 수 있는 첫날(0부터) — 개수 요청의 기간이 여기서 시작한다. today 는 닫힌 기간 문장에만 쓴다."""
     out = Grounded()
+    # 여러 요청을 한 번에 말하면 이미 그렇게 된 개수 요청은 되묻지 않고 그대로 둔다(그 하나로 나머지가 막히지 않게 · 32장)
+    alone = len(changes or []) <= 1
     for change in changes or []:
-        reqs, ask = _one(ctx, change, open_from)
+        reqs, ask = _one(ctx, change, open_from, today, alone)
         if ask:
             out.asks.append(ask)
         else:
@@ -44,21 +49,26 @@ def ground_changes(ctx: EditContext, changes: Sequence[Dict[str, Any]], open_fro
     return out
 
 
-def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
+def _one(ctx: EditContext, change: Dict[str, Any], open_from: int,
+         today: Optional[date], alone: bool = True) -> Tuple[List[EditRequest], Optional[str]]:
     kind = change.get("kind")
     if kind == "cover":                      # 그날 인원 — 사람을 짚지 않는다
         return _cover(ctx, change)
+    if kind == "staffing":                   # 여러 날 근무별 인원 계획 — 사람을 짚지 않는다(32장)
+        return _staffing(ctx, change, open_from, today)
+    if kind == "grade_floor":                # 근무조마다 등급 하한
+        return _grade_floor(ctx, change, open_from, today)
     if kind == "balance":                    # 여러 사람의 근무 수 고르게 — 사람을 짚지 않는다
-        return _balance(ctx, change, open_from)
+        return _balance(ctx, change, open_from, today)
     if kind == "wanted":                     # 반영 안 된 원티드 넣기 — 사람·기간은 말했을 때만
-        return _wanted(ctx, change, open_from)
+        return _wanted(ctx, change, open_from, today)
     if kind == "shape":                      # 근무 모양 고치기 — 사람·기간은 말했을 때만
-        return _shape(ctx, change, open_from)
+        return _shape(ctx, change, open_from, today)
     nurse, ask = resolve_nurse(ctx, change.get("nurse"))
     if ask:
         return [], ask
     if kind == "count":
-        return _count(ctx, change, nurse, open_from)
+        return _count(ctx, change, nurse, open_from, today, alone)
     day, ask = resolve_day(ctx, change.get("day"))
     if ask:
         return [], ask
@@ -95,10 +105,12 @@ def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List
         days = range(min(day, last), max(day, last) + 1)
         if len(days) > MAX_PERIOD_DAYS:
             return [], f"휴가 기간이 {MAX_PERIOD_DAYS}일보다 깁니다. 휴가 신청으로 처리해 주세요."
-        # 기간이면 바꿀 수 있는 근무일에만 — 쉬는 날·지난 날·고정 칸은 그대로 둔다(하루짜리는 요청 검사가 이유를
+        # 기간이면 바꿀 수 있는 근무일에만 — 쉬는 날·고치지 않는 날·고정 칸은 그대로 둔다(하루짜리는 요청 검사가 이유를
         # 말한다 · 검토 M3: 고정 칸 하나에 기간 전체가 거절됐다)
         work = ([d for d in days if ctx.main[nurse][d] not in (None, "O") and d >= open_from and ctx.is_free(nurse, d)]
                 if len(days) > 1 else list(days))
+        if not work and days[-1] < open_from:
+            return [], closed_span_text(ctx, days[-1], open_from, today)
         if not work:
             return [], f"{ctx.names.get(nurse, nurse)}의 그 기간은 모두 쉬는 날이라 {eul(ctx.leave_codes[code])} 넣을 날이 없습니다."
         return [LeaveCell(nurse, d, code) for d in work], None
@@ -114,7 +126,8 @@ def _one(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List
     return [], "어떤 변경인지 알기 어렵습니다. 예) '김민지 14일 OFF'"
 
 
-def _balance(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
+def _balance(ctx: EditContext, change: Dict[str, Any], open_from: int,
+             today: Optional[date]) -> Tuple[List[EditRequest], Optional[str]]:
     """'N 근무 수 고르게 맞춰줘' · 'OFF 다 9개로' — 대상은 그 근무를 할 수 있는 전원(사용자 결정 11-03).
     차이를 말하지 않았으면 비워 둔다 — 스킬이 줄일 수 있는 가장 작은 차이를 찾는다."""
     code, ask = resolve_shift(ctx, change.get("shift"))
@@ -124,13 +137,14 @@ def _balance(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[
     if bad:
         return [], "개수·차이는 숫자로 말씀해 주세요. 예) 'OFF 다 9개로'"
     if open_from >= ctx.days:
-        return [], "이 달에 바꿀 수 있는 날이 남아 있지 않습니다."
+        return [], closed_span_text(ctx, ctx.days - 1, open_from, today)
     codes = frozenset({code})
     return [BalanceTarget(codes, balance_members(ctx, codes, open_from), open_from, ctx.days - 1,
                           nums["spread"], nums["target"])], None
 
 
-def _wanted(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
+def _wanted(ctx: EditContext, change: Dict[str, Any], open_from: int,
+            today: Optional[date] = None) -> Tuple[List[EditRequest], Optional[str]]:
     """'반영 안 된 원티드 넣어줘' · '장원영 원티드 반영해줘' · '15~20일 원티드 맞춰줘' — 넣을 수는 스킬이 정한다
     (규칙을 지키며 넣을 수 있는 가장 많은 수 · 사용자 결정 11-03)."""
     nurses: Tuple[str, ...] = ()
@@ -150,17 +164,29 @@ def _wanted(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[L
             if ask:
                 return [], ask
             last = end
+    if last < open_from:                     # 기간이 모두 고치지 않는 날(지난 날·오늘·그대로 두기로 한 날)
+        return [], closed_span_text(ctx, last, open_from, today)
     first = max(first, open_from)
-    if first > last or first >= ctx.days:
+    if first > last:
         return [], "그 기간에는 바꿀 수 있는 날이 남아 있지 않습니다."
-    return [WishTarget(nurses, first, last, ranged=change.get("day") is not None)], None
+    codes = None
+    if change.get("kind") == "wanted" and change.get("shifts"):
+        picked = []
+        for said in change.get("shifts") or []:
+            code, ask = resolve_shift(ctx, said)
+            if ask:
+                return [], ask
+            picked.append(code)
+        codes = frozenset(picked)
+    return [WishTarget(nurses, first, last, ranged=change.get("day") is not None, codes=codes)], None
 
 
 SHAPE_ASK = ("어떤 근무 모양을 고칠까요? 예) '하루짜리 OFF 없애줘', '퐁당퐁당 없애줘', 'N-O-D 없애줘', "
              "'장원영 연속 근무 너무 길어', '김태희 주말 근무 너무 많아'")
 
 
-def _shape(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
+def _shape(ctx: EditContext, change: Dict[str, Any], open_from: int,
+           today: Optional[date] = None) -> Tuple[List[EditRequest], Optional[str]]:
     """'하루짜리 OFF 없애줘' · '장원영 연속 근무 너무 길어' · '김태희 주말 근무 너무 많아'(사용자 결정 11-04).
     말한 수가 있으면 그대로(said · '하루짜리 OFF 3개까지만'). 없으면 개수 종류는 스킬이 정한다(규칙을 지키며 줄일 수 있는
     만큼). 연속 근무·주말은 여기서 채운다 — 연속 근무는 그 사람들 중 지금 가장 긴 것 − 1, 주말은 병동 평균(올림 · 짚은
@@ -168,7 +194,7 @@ def _shape(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[Li
     kind = str(change.get("shape") or "").strip()
     if kind not in SHAPE_LABEL:
         return [], SHAPE_ASK
-    probe, ask = _wanted(ctx, change, open_from)            # 사람·기간 읽기는 원티드 반영과 같다
+    probe, ask = _wanted(ctx, change, open_from, today)     # 사람·기간 읽기는 원티드 반영과 같다
     if ask:
         return [], ask
     base = probe[0]
@@ -195,6 +221,101 @@ def _shape(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[Li
     average = -(-sum(every.values()) // len(every)) if every else 0      # 올림
     top = max(values.values())
     return [dataclasses.replace(req, at_most=average if top > average else max(0, top - 1))], None
+
+
+STAFFING_ASK = "몇 명으로 할지 알려 주세요. 예) '평일 D 3명·E 3명·N 3명', '주말 D 2명'"
+
+
+def _staffing(ctx: EditContext, change: Dict[str, Any], open_from: int,
+              today: Optional[date]) -> Tuple[List[EditRequest], Optional[str]]:
+    """'그외 3.3.3 안될시 주말 2.2.3 미드 1' — 차례대로 시도할 인원 계획(32장). 숫자 하나만 말한 줄은 정확히인지 이상인지
+    아직 정하지 않은 것(스킬이 필요할 때 묻는다), 범위·이상·이하를 말한 줄은 그대로."""
+    first, last, ask = _span(ctx, change, open_from)
+    if ask:
+        return [], ask
+    if last < open_from:
+        return [], closed_span_text(ctx, last, open_from, today)
+    alternatives = []
+    for plan in change.get("plans") or []:
+        rules = []
+        for line in plan or []:
+            rule, ask = _staff_rule(ctx, line)
+            if ask:
+                return [], ask
+            rules.append(rule)
+        if rules:
+            alternatives.append(tuple(rules))
+    if not alternatives:
+        return [], STAFFING_ASK
+    fixed = change.get("count_fixed")
+    return [StaffingPlan(tuple(alternatives), max(first, open_from), last,
+                         count_fixed=fixed if isinstance(fixed, bool) else None)], None
+
+
+def _staff_rule(ctx: EditContext, line: Dict[str, Any]) -> Tuple[Optional[StaffRule], Optional[str]]:
+    code, ask = resolve_shift(ctx, line.get("shift"))
+    if ask:
+        return None, ask
+    if code == "O":
+        return None, "하루 인원은 근무(D·E·N" + ("·M" if ctx.use_mid else "") + ")로 말씀해 주세요."
+    nums, bad = _numbers(line, "count", "min", "max")
+    if bad:
+        return None, "인원은 숫자로 말씀해 주세요. 예) '평일 D 3~4명'"
+    scope, days = str(line.get("days") or "all"), ()
+    if line.get("dates"):
+        picked = []
+        for said in line.get("dates") or []:
+            day, ask = resolve_day(ctx, said)
+            if ask:
+                return None, ask
+            picked.append(day)
+        scope, days = "days", tuple(sorted(set(picked)))
+    elif scope not in ("all", "weekday", "weekend"):
+        scope = "all"
+    if nums["count"] is not None:
+        return StaffRule(scope, code, nums["count"], None, days), None
+    if nums["min"] is None and nums["max"] is None:
+        return None, STAFFING_ASK
+    return StaffRule(scope, code, nums["min"] or 0, nums["max"], days, exact=False), None
+
+
+def _grade_floor(ctx: EditContext, change: Dict[str, Any], open_from: int,
+                 today: Optional[date]) -> Tuple[List[EditRequest], Optional[str]]:
+    """'매일 모든 근무조에 1등급 1명 이상' — 고칠 수 있는 날마다 근무조(D·E·N · 인원 계획에 M 이 있는 날은 M)에 등급 하한."""
+    nums, bad = _numbers(change, "grade", "target")
+    if bad or nums["grade"] is None:
+        return [], "몇 등급까지를 셀지 알려 주세요. 예) '모든 근무조에 1등급 1명 이상'"
+    first, last, ask = _span(ctx, change, open_from)
+    if ask:
+        return [], ask
+    if last < open_from:
+        return [], closed_span_text(ctx, last, open_from, today)
+    codes = []
+    for said in change.get("shifts") or []:
+        code, ask = resolve_shift(ctx, said)
+        if ask:
+            return [], ask
+        if code == "O":
+            return [], "근무조는 D·E·N" + ("·M" if ctx.use_mid else "") + " 중에서 말씀해 주세요."
+        codes.append(code)
+    fixed = change.get("count_fixed")
+    return [GradeFloor(nums["grade"], nums["target"] or 1, max(first, open_from), last,
+                       tuple(sorted(set(codes), key="DENM".index)) or ("D", "E", "N"),
+                       count_fixed=fixed if isinstance(fixed, bool) else None)], None
+
+
+def _span(ctx: EditContext, change: Dict[str, Any], open_from: int) -> Tuple[int, int, Optional[str]]:
+    """말한 기간(첫날·마지막 날, 0부터) — 말하지 않았으면 고칠 수 있는 첫날부터 말일까지."""
+    first, last = open_from, ctx.days - 1
+    if change.get("day") is not None:
+        first, ask = resolve_day(ctx, change.get("day"))
+        if ask:
+            return 0, 0, ask
+    if change.get("to_day") is not None:
+        last, ask = resolve_day(ctx, change.get("to_day"))
+        if ask:
+            return 0, 0, ask
+    return first, last, None
 
 
 def _cover(ctx: EditContext, change: Dict[str, Any]) -> Tuple[List[EditRequest], Optional[str]]:
@@ -231,10 +352,11 @@ def _cover(ctx: EditContext, change: Dict[str, Any]) -> Tuple[List[EditRequest],
     return [CoverTarget(day, code, target, grade)], None
 
 
-def _count(ctx: EditContext, change: Dict[str, Any], nurse: str,
-           open_from: int) -> Tuple[List[EditRequest], Optional[str]]:
+def _count(ctx: EditContext, change: Dict[str, Any], nurse: str, open_from: int,
+           today: Optional[date] = None, alone: bool = True) -> Tuple[List[EditRequest], Optional[str]]:
     """개수 요청 — '장원영 N 2개만 빼줘'. 기간은 바꿀 수 있는 첫날(또는 말한 날)부터 말일(또는 말한 날)까지.
-    개수를 말하지 않았으면 현황을 보여 주고 되묻는다(사용자 결정 11-02 · 추측하지 않는다)."""
+    개수를 말하지 않았으면 현황을 보여 주고 되묻는다(사용자 결정 11-02 · 추측하지 않는다).
+    '총 14개'·'한 달 14개'(total)는 그 달 전체 개수 — 고치지 않는 날에 이미 있는 수를 빼 기간 목표로 바꾼다(32장 류예리)."""
     code, ask = resolve_shift(ctx, change.get("shift"))
     if ask:
         return [], ask
@@ -249,8 +371,10 @@ def _count(ctx: EditContext, change: Dict[str, Any], nurse: str,
         if ask:
             return [], ask
         last = day
+    if last < open_from:
+        return [], closed_span_text(ctx, last, open_from, today)
     if first > last:
-        return [], "그 기간은 이미 지났거나 비어 있습니다. 기간을 다시 알려 주세요."
+        return [], "그 기간은 비어 있습니다. 기간을 다시 알려 주세요."
     row = ctx.main[nurse]
     # OFF 는 휴가·공가 칸을 세지 않는다(순수 OFF · `requests.counts_as`)
     now = sum(1 for d in range(first, last + 1) if row[d] == code and not (code == "O" and (nurse, d) in ctx.vacation))
@@ -258,19 +382,29 @@ def _count(ctx: EditContext, change: Dict[str, Any], nurse: str,
     nums, bad = _numbers(change, "target", "change")
     if bad:
         return [], "개수는 숫자로 말씀해 주세요. 예) '장원영 N 2개만 빼줘'"
+    name = ctx.names.get(nurse, nurse)
+    held = 0                     # 한 달 개수를 말했을 때 고치지 않는 날에 이미 있는 수
     if nums["target"] is not None:
         target = nums["target"]
+        if change.get("total") and change.get("day") is None and change.get("to_day") is None and first > 0:
+            held = sum(1 for d in range(first) if row[d] == code and not (code == "O" and (nurse, d) in ctx.vacation))
+            if nums["target"] < held:
+                return [], (f"{name}의 {word}은(는) 고치지 않는 날({days_text(0, first - 1)})에 이미 {held}회라 "
+                            f"한 달 {nums['target']}회로는 줄일 수 없습니다.")
+            target = nums["target"] - held
     elif nums["change"] is not None:
         target = now + nums["change"]
     else:
         return [], count_status(ctx, nurse, code) + " 몇 회로 바꿀까요?"
-    name = ctx.names.get(nurse, nurse)
+    transfer = change.get("transfer") if change.get("transfer") in TRANSFERS else None
+    total = bool(change.get("total")) and nums["target"] is not None      # 한 달 개수로 말했다 — 요청 줄도 그 기준
     if target == now:
-        return [], f"{name} {word}은(는) 이미 {now}회입니다."
+        if alone:
+            return [], f"{name} {word}은(는) 이미 {now + held}회입니다."
+        return [CountTarget(nurse, frozenset({code}), target, first, last, transfer or "auto", total=total)], None
     if target < 0:
         return [], f"{name}의 {word}은(는) {now}회라 그만큼 줄일 수 없습니다."
-    transfer = change.get("transfer") if change.get("transfer") in TRANSFERS else None
-    return [CountTarget(nurse, frozenset({code}), target, first, last, transfer)], None
+    return [CountTarget(nurse, frozenset({code}), target, first, last, transfer, total=total)], None
 
 
 #: 근무 종류를 사람에게 보일 때

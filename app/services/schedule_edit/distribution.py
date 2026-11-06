@@ -80,3 +80,8 @@ def metrics(ctx: EditContext, grid: Dict[str, List]) -> Dict[str, int]:
 
 METRIC_LABEL = {"off_range": "사람마다 OFF 수 차이", "n_range": "사람마다 나이트 수 차이",
                 "de": "D·E 쏠림 점수"}
+
+
+def is_metric_note(text: str) -> bool:
+    """품질 문구(`solver.quality_notes`)가 분배 지표인가 — 화면·답에서 '근무 모양'이 아니라 '분배'로 부른다(사용자 결정 11-05)."""
+    return text.startswith(tuple(METRIC_LABEL.values()))

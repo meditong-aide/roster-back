@@ -258,15 +258,17 @@ def test_chain_never_reaches_days_before_the_request():
 
 def test_past_days_are_closed():
     ctx = _two_nurse_ctx()
-    today = date(2026, 11, 3)                       # 1·2일은 이미 지났다
+    today = date(2026, 11, 3)                       # 1·2일은 이미 지났고 3일은 오늘 — 셋 다 닫힌다(사용자 결정 11-05)
     res = propose(ctx, [SetCell("A", 1, "D")], today=today)
     assert res.status == "invalid" and "지난 날짜" in res.reasons[0]
     res = propose(ctx, [SetCell("A", 2, "O")], today=today)
-    assert all(ch.day >= 2 for c in res.candidates for ch in c.changes)
+    assert res.status == "invalid" and res.reasons[0].startswith("오늘(3일)은 이미 시작된 근무일이라")
+    res = propose(ctx, [SetCell("A", 2, "O")], today=date(2026, 11, 2))
+    assert res.status == "ok" and all(ch.day >= 2 for c in res.candidates for ch in c.changes)
 
 
 @pytest.mark.parametrize("today,expected", [
-    (date(2026, 10, 15), 0), (date(2026, 11, 1), 0), (date(2026, 11, 3), 2), (date(2026, 12, 5), 4),
+    (date(2026, 10, 15), 0), (date(2026, 11, 1), 1), (date(2026, 11, 3), 3), (date(2026, 12, 5), 4),
 ])
 def test_first_open_day(today, expected):
     from services.schedule_edit.requests import first_open_day

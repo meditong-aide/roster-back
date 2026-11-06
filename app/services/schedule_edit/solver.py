@@ -10,9 +10,11 @@
 
 창은 요청한 가장 이른 날부터 **뒤로만** +3일 → +7일 → 말일 순으로 넓힌다(Wickert·Smet·Vanden Berghe
 2019). 그 앞 날짜는 바꾸지 않는다 — 이미 근무했거나 알려 준 근무와 달라지면 안 된다(사용자 지시 11-02).
-오늘 이전 날짜를 대상으로 한 요청은 받지 않는다. 셋 다 규칙을 모두
+지난 날·오늘(사용자가 고칠 첫날을 정했으면 그 앞 전부)을 대상으로 한 요청은 받지 않는다(`first_open_day`). 셋 다 규칙을 모두
 지키고 칸 수 상한(MAX_CHANGES)을 건 같은 모델이다. 한 달에서도 불가가 증명되면 `explain` 이 같은 상한
 안에서 무엇을 넘겨야 하는지 알려 준다. 하드락은 어느 단계에서도 풀지 않는다.
+
+여러 날 인원 계획·등급 하한(`requests.PLAN` · 32장)은 창을 넓혀 가지 않고 고칠 수 있는 칸 전부를 두 단계로 푼다(`_plan_search`).
 
 요청 하나에 시간 예산(TIME_BUDGET)을 둔다 — 채팅 응답이 CloudFront 30초 안에 들어와야 한다.
 예산을 다 쓰면 그때까지 찾은 후보만 낸다.
@@ -35,21 +37,22 @@ from ortools.sat.python import cp_model
 
 from services.schedule_edit import distribution as dist
 from services.schedule_edit.context import (
-    EditContext, pure_off_count, released_wanted, with_released, with_vacation,
+    FIXED_WANTED, EditContext, pure_off_count, released_wanted, with_released, with_vacation, with_wish_cells,
 )
 from services.schedule_edit.explain import direct_conflicts, explain_month
 from services.schedule_edit.levers import LEVER_SECONDS, find_levers, lever_allow
 from services.schedule_edit.model import (
-    CHANGE_COEF, SPAN_COEF, EditModel, build_model, forbid_same_people, free_cells, grid_relief, is_waived,
+    CHANGE_COEF, SPAN_COEF, EditModel, add_holds, build_model, forbid_same_people, free_cells, grid_relief, is_waived,
     new_solver,
     read_solution,
     requested_cells, subcode_changes,
 )
 from services.schedule_edit.requests import (
-    AvoidCell, BalanceTarget, CountTarget, EditRequest, LeaveCell, SetCell, ShapeTarget, WishTarget, balance_counts,
-    first_open_day, is_satisfied, request_problem, shape_count, wish_targets,
+    PLAN, AvoidCell, BalanceTarget, CountTarget, EditRequest, GiveUpWish, LeaveCell, SetCell, ShapeTarget, WishTarget,
+    balance_counts, closed_day_text, first_open_day, is_satisfied, plan_sig, request_label, request_problem, shape_count,
+    wish_targets,
 )
-from services.schedule_edit.rules import Grid, RuleSet, build_rules, measure, measure_soft, new_violations
+from services.schedule_edit.rules import Grid, RuleSet, Term, build_rules, measure, measure_soft, new_violations
 from services.schedule_edit.screen_check import ScreenBaseline, screen_regressions
 
 logger = logging.getLogger(__name__)
@@ -158,8 +161,9 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
     hint: 고른 후보 격자 — 이어지는 요청의 시작 해(CP-SAT 힌트, 해의 정당성과 무관).
     explain=False: 불가여도 이유·레버를 찾지 않는다(개수 요청의 메우는 방식 미리 풀기처럼 여러 번 돌릴 때)."""
     requests = list(requests)
-    open_from = first_open_day(ctx, today or datetime.now(KST).date())
-    problems = [p for p in (request_problem(ctx, r, open_from) for r in requests) if p]
+    today = today or datetime.now(KST).date()
+    open_from = first_open_day(ctx, today)
+    problems = [p for p in (request_problem(ctx, r, open_from, today=today) for r in requests) if p]
     if problems:
         return EditResult("invalid", reasons=problems, notes=list(ctx.notes))
     if all(is_satisfied(ctx, r) for r in requests):
@@ -175,6 +179,8 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
                time.monotonic() + time_budget, start=min(r.day for r in requests),
                allow=lever_allow(allow),
                avoid=[set(p) for p in avoid_people], hint=hint, max_changes=_max_changes(requests))
+    if any(isinstance(r, PLAN) for r in requests):
+        return _plan_search(run)
     status = cp_model.UNKNOWN
     # 개수 요청은 어느 날을 바꿀지 정해지지 않았다 — 좁은 창부터 넓힐 근거가 없어 기간 전체로 바로 푼다
     steps = ((None,) if any(isinstance(r, (CountTarget, BalanceTarget, WishTarget, ShapeTarget)) for r in requests)
@@ -264,6 +270,196 @@ WISH_MAX_CHANGES = 60
 #: 원티드 반영에서 '그 수 이상 넣으며 가장 적게 바꾸기' 첫 풀이 상한(초) — 가장 많이 넣은 해를 시작 해로 받아 첫 해는 바로
 #: 나오고, 남는 시간은 칸 줄이기에 쓴다. 평소(6초)대로면 응답 시간 안에 못 넣는 이유·레버까지 못 냈다(dev 전원 37개 실측)
 WISH_FIRST_SECONDS = 4.0
+
+
+# ── 여러 날 인원·등급 계획(32장) ────────────────────────────────────────────────
+
+#: 계획 풀이 1단계(모자람·칸 수) 상한(초) — 미리 풀어 본 해(`probe_plan`)를 시작 해로 받으면 짧게. 2단계(품질 다듬기)는 남는
+#: 시간을 쓰고 답을 만들 몫(PLAN_RESERVE)을 남긴다 — 7B 실측(작업자 4) 1단계 1초·2단계 OPTIMAL
+PLAN_FIRST_SECONDS = 8.0
+PLAN_HINTED_SECONDS = 3.0
+#: 2단계 상한(초) — 품질 다듬기는 끝까지 증명하기 어려워 남은 예산을 다 쓴다(7B 턴 22초). 그 뒤 나아지는 양이 작다
+PLAN_POLISH_SECONDS = 8.0
+PLAN_POLISH_MIN = 0.5
+PLAN_RESERVE = 1.5
+#: 2단계 무게 — 품질 ≫ 한 사람에게 몰린 변경 최댓값 ≫ 바뀐 사람 수(손풀이 `redo_edit.py` 와 같다)
+PLAN_SPREAD_WEIGHT = 100
+PLAN_PEOPLE_WEIGHT = 10
+
+
+@dataclass
+class PlanProbe:
+    """계획을 한 번 풀어 본 결과 — 무엇을 동의받아야 하는지(모자라는 칸·부족 근무조·넘길 품질 규칙)를 스킬이 묻는다."""
+
+    status: str                                    # ok · infeasible · timeout · invalid
+    short: List[Tuple[int, str, int]] = field(default_factory=list)   # (날, 근무, 모자라는 수)
+    grade: List[Tuple[int, str, int]] = field(default_factory=list)
+    hold: Dict[Tuple, int] = field(default_factory=dict)              # 넘겨야 하는 품질 규칙 위치 → 양
+    changes: int = 0
+    grid: Optional[Grid] = None
+    reason: str = ""
+    #: 끝까지 확인했나(OPTIMAL) — 아니면 모자라는 수가 더 줄 수도 있다(답은 '시간 안에'로 · 원티드 반영과 같은 규약)
+    proven: bool = False
+    #: 원티드를 느슨하게 두고 풀었을 때(release_wishes) 포기해야 하는 원티드 — (간호사, 날, 원하는 근무)
+    wish_lost: List[Tuple[str, int, FrozenSet[str]]] = field(default_factory=list)
+
+
+#: 묶은 품질 규칙 넘김 동의의 열쇠 — ('품질넘김', 계획 구분값, *규칙 위치) · 그 계획에만 걸린다(검토 H2)
+HOLD_CONSENT = "품질넘김"
+#: 얼마나 모자라는지 미리 풀어 볼 때 넣는 넉넉한 '남겨도 되는 모자람'(모델은 정하지 않으면 0 · 검토 H1)
+PROBE_FREE_SHORT = 10 ** 6
+
+
+def hold_allowance(allow: Dict[Tuple, int], requests: Sequence[EditRequest]) -> Dict[Tuple, int]:
+    """이 계획에 동의한 품질 규칙 넘김 {규칙 위치: 양}."""
+    sig = plan_sig(requests)
+    return {tuple(k[2:]): v for k, v in allow.items() if k and k[0] == HOLD_CONSENT and len(k) > 2 and k[1] == sig}
+
+
+def _plan_model(ctx: EditContext, rules: RuleSet, requests: List[EditRequest], start: int,
+                allow: Dict[Tuple, int], *, slack: bool) -> EditModel:
+    """칸 상한 없이 고칠 수 있는 칸 전부(32장 — 이 건은 90~151칸이 든다) + 품질 규칙 묶기(그 계획에 동의한 넘김만 봐준다)."""
+    free = free_cells(ctx, range(start, ctx.days))
+    em = build_model(ctx, rules, requests, free, len(free), allow)
+    add_holds(em, rules, hold_allowance(allow, requests), slack=slack)
+    return em
+
+
+def _plan_objective(em: EditModel):
+    """1단계 — 넘긴 품질 규칙 ≫ 모자라는 칸 ≫ 부족 근무조 ≫ 바뀌는 칸(앞 순위 1 이 뒤 순위 전부보다 무겁게)."""
+    w_grade = len(em.free) + 1
+    w_short = w_grade * (sum(_upper(v) for v in em.grade_short.values()) + 1)
+    w_hold = w_short * (sum(_upper(v) for v in em.short.values()) + 1)
+    return (w_hold * sum(em.hold.values()) + w_short * sum(em.short.values())
+            + w_grade * sum(em.grade_short.values()) + em.total_changes())
+
+
+def _upper(var) -> int:
+    return int(var.Proto().domain[-1])
+
+
+def _plan_solve(em: EditModel, seconds: float):
+    """계획 풀이 — 작업자가 2개 이하면(운영 API vCPU 2) 하위 풀이기를 core 먼저로. 기본 조합에는 core 탐색이 빠져 7B 를 20초에도
+    최적까지 못 풀었다(하한 25 · FEASIBLE). core 를 앞에 두면 2.2초 OPTIMAL 로 작업자 4개와 같은 해다(11-05 실측)."""
+    solver = new_solver(seconds)
+    if solver.parameters.num_workers <= 2:
+        solver.parameters.subsolvers.extend(["core", "default_lp"])
+    return solver.Solve(em.model), solver
+
+
+def probe_plan(ctx: EditContext, requests: Sequence[EditRequest], *, rules: Optional[RuleSet] = None,
+               today: Optional[date] = None, seconds: float = PLAN_FIRST_SECONDS,
+               allow: Optional[Dict[Tuple, int]] = None, avoid_people: Sequence[FrozenSet[str]] = (),
+               release_wishes: bool = False, short_first: bool = False) -> PlanProbe:
+    """계획을 동의 없이 한 번 풀어 본다 — 모자라는 칸·부족 근무조·넘겨야 하는 품질 규칙(묶은 것)을 가장 적게. 셋 다 0 이면
+    그대로 풀 수 있다. 요청의 short 는 비워 넘긴다(얼마나 모자라는지 보려고). 동의한 품질 규칙 넘김(allow)은 봐준다.
+    release_wishes: 풀 방법이 아예 없을 때 — 넣을 원티드와 지금 반영된 원티드(확정 원티드 포함)를 느슨하게 두고, 가장 적게
+    포기하면 풀리는 원티드를 찾는다(wish_lost · '이 원티드를 포기하면 가능' · 사용자 결정 11-05). 모자람·품질은 따지지 않는다.
+    short_first(release_wishes 와 함께): 해는 있는데 모자라는 칸이 남을 때 — 모자람 ≫ 묶은 품질 넘김 ≫ 포기하는 원티드 순으로
+    줄여, 모자람 0 이 되는 가장 적은 포기를 찾는다('이 원티드를 포기하면 모자람 0' · 사용자 결정 11-05)."""
+    # 얼마나 모자라는지 보려고 남겨도 되는 모자람을 넉넉히 — 모델은 정하지 않으면 0 이다(검토 H1)
+    requests = [dataclasses.replace(r, short=PROBE_FREE_SHORT) if isinstance(r, PLAN) else r for r in requests]
+    today = today or datetime.now(KST).date()
+    open_from = first_open_day(ctx, today)
+    problem = next((p for p in (request_problem(ctx, r, open_from, today=today) for r in requests) if p), None)
+    if problem:
+        return PlanProbe("invalid", reason=problem)
+    start = min(r.day for r in requests)
+    pool: List[Tuple[str, int, FrozenSet[str]]] = []
+    if release_wishes:
+        pool = _kept_wishes(ctx, start)
+        requests = [dataclasses.replace(r, at_least=None) if isinstance(r, WishTarget) else r for r in requests]
+        requests.append(GiveUpWish(tuple((n, d) for n, d, _c in pool)))
+    ctx, rules, requests = prepare(ctx, rules, requests)
+    em = _plan_model(ctx, rules, requests, start, lever_allow(allow), slack=True)
+    for people in avoid_people:
+        forbid_same_people(em, set(people))
+    targets = [t for r in requests if isinstance(r, WishTarget) for t in wish_targets(ctx, r)]
+    if release_wishes:
+        lost = sum(1 - em.ind(Term(n, d, codes)) for n, d, codes in pool + targets)
+        w_lost = len(em.free) + 1
+        if short_first:
+            w_hold = w_lost * (len(pool) + len(targets) + 1)
+            w_short = w_hold * (sum(_upper(v) for v in em.hold.values()) + 1)
+            em.model.Minimize(w_short * sum(em.short.values()) + w_hold * sum(em.hold.values()) + w_lost * lost
+                              + em.total_changes())
+        else:
+            em.model.Minimize(w_lost * lost + em.total_changes())
+    else:
+        em.model.Minimize(_plan_objective(em))
+    status, solver = _plan_solve(em, seconds)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return PlanProbe("infeasible" if status == cp_model.INFEASIBLE else "timeout")
+    grid = read_solution(em, solver)
+    if release_wishes:
+        return PlanProbe("ok", grid=grid, proven=status == cp_model.OPTIMAL,
+                         short=[(d, c, int(solver.Value(v))) for (d, c), v in sorted(em.short.items()) if solver.Value(v)],
+                         hold={k: int(solver.Value(v)) for k, v in em.hold.items() if solver.Value(v)},
+                         wish_lost=[(n, d, c) for n, d, c in pool + targets if grid[n][d] not in c])
+
+    def gaps(variables):
+        return [(d, c, int(solver.Value(v))) for (d, c), v in sorted(variables.items()) if solver.Value(v)]
+    return PlanProbe("ok", short=gaps(em.short), grade=gaps(em.grade_short),
+                     hold={k: int(solver.Value(v)) for k, v in em.hold.items() if solver.Value(v)},
+                     changes=sum(1 for n, d in em.free if grid[n][d] != em.base[n][d]), grid=grid,
+                     proven=status == cp_model.OPTIMAL)
+
+
+def _kept_wishes(ctx: EditContext, start: int) -> List[Tuple[str, int, FrozenSet[str]]]:
+    """지금 반영된 원티드(제출 원티드가 반영된 칸 · 확정 원티드 칸) 중 고칠 수 있는 날의 것 — 포기 후보."""
+    out = [(n, d, frozenset(c)) for (n, d), c in ctx.wishes.items()
+           if d >= start and ctx.is_free(n, d) and ctx.main[n][d] in c]
+    out += [(n, d, frozenset({ctx.main[n][d]})) for (n, d), why in ctx.frozen.items()
+            if why == FIXED_WANTED and d >= start and (n, d) not in ctx.wish_fixed and ctx.main[n][d] is not None]
+    return sorted(set(out), key=lambda t: (t[1], t[0]))
+
+
+def _plan_search(run: _Run) -> EditResult:
+    """여러 날 인원·등급 계획 — 칸 상한 없이 두 단계로(32장 · 손풀이 `redo_edit.py` 와 같다).
+      1단계: 모자라는 칸(동의한 만큼까지) ≫ 부족 근무조 ≫ 바뀌는 칸을 가장 적게.
+      2단계: 그 수들을 묶고 1단계 해를 시작 해로(안 주면 180초에 해 0개 · 실측) 품질 ≫ 한 사람 최대 변경 ≫ 바뀐 사람 수.
+    창을 넓혀 가며 찾지 않는다 — 여러 날·여러 사람을 함께 옮기는 요청이라 좁은 창에 답이 없다. 후보는 하나."""
+    ctx = run.ctx
+    em = _plan_model(ctx, run.rules, run.requests, run.start, run.allow, slack=False)
+    _carry_over(em, run)
+    em.model.Minimize(_plan_objective(em))
+    status, solver = _plan_solve(em, run.seconds(PLAN_HINTED_SECONDS if run.hint is not None else PLAN_FIRST_SECONDS))
+    notes = list(ctx.notes)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        if status == cp_model.INFEASIBLE:
+            return EditResult("infeasible", notes=notes, reasons=[
+                "지금 규칙과 함께 정한 요청(개수·원티드 등)을 모두 지키면서는 이 인원 계획을 풀 방법이 없습니다."])
+        return EditResult("timeout", notes=notes, reasons=["시간 안에 방법을 찾지 못했습니다. 요청을 나눠서 다시 시도해 주세요."])
+    first = read_solution(em, solver)
+    short = int(sum(solver.Value(v) for v in em.short.values()))
+    grade = int(sum(solver.Value(v) for v in em.grade_short.values()))
+    changes = sum(1 for n, d in em.free if first[n][d] != em.base[n][d])
+    m = em.model
+    m.Add(sum(em.short.values()) <= short)
+    m.Add(sum(em.grade_short.values()) <= grade)
+    m.Add(em.total_changes() <= changes)
+    m.ClearHints()
+    for var in em.x.values():
+        m.AddHint(var, int(solver.Value(var)))
+    spread = m.NewIntVar(0, ctx.days, "max_changes_per_person")
+    for n in sorted({n for n, _d in em.free}):
+        m.Add(sum(v for (p, _d), v in em.changed.items() if p == n) <= spread)
+    m.Minimize(QUALITY_WEIGHT * em.total_quality() + PLAN_SPREAD_WEIGHT * spread
+               + PLAN_PEOPLE_WEIGHT * em.total_affected())
+    left = min(PLAN_POLISH_SECONDS, run.deadline - time.monotonic() - PLAN_RESERVE)
+    polished = False
+    if left >= PLAN_POLISH_MIN:                   # 남은 시간이 모자라면 다듬지 않는다(예산을 넘겨 돌지 않게 · 검토 L1)
+        status2, solver2 = _plan_solve(em, left)
+        polished = status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+    else:
+        status2 = cp_model.UNKNOWN
+    grid = read_solution(em, solver2) if polished else first
+    cand = _candidate(run, grid, 1, (run.start, ctx.days - 1),
+                      status == cp_model.OPTIMAL and status2 == cp_model.OPTIMAL)
+    if cand is None:
+        return EditResult("infeasible", notes=notes, reasons=[
+            "찾은 방법이 근무표 화면에 새 위반을 만들어 후보로 내지 않았습니다."])
+    return EditResult("ok", candidates=[cand], notes=notes)
 
 
 def max_wish_count(ctx: EditContext, requests: Sequence[EditRequest], *, rules: Optional[RuleSet] = None,
@@ -400,6 +596,9 @@ def _release(ctx: EditContext, rules: Optional[RuleSet], requests: Sequence[Edit
     이미 그렇게 된 칸은 풀지 않는다 — 기간 OFF 안의 원래 OFF 원티드를 풀면 그 '전날 N 금지'가 빠진다(검토 11-03)."""
     direct = requested_cells(ctx, list(requests))
     out = with_released(ctx, direct)
+    # 원티드 반영 요청이 짚은 '반영 안 된 확정 원티드' 칸 — 원티드대로만 바꿀 수 있게 푼다(전날 N 금지는 그대로라 규칙은 같다)
+    out = with_wish_cells(out, {(n, d) for r in requests if isinstance(r, WishTarget)
+                                for n, d, _c in wish_targets(ctx, r)})
     if out is ctx:
         return ctx, rules
     return out, (None if released_wanted(ctx, direct) else rules)     # 고정을 풀었을 때만 규칙을 다시 만든다
@@ -589,20 +788,22 @@ def screen_problems(screen: Optional[ScreenBaseline], changes: Sequence["CellCha
 def verify_candidate(ctx: EditContext, rules: RuleSet, candidate: "Candidate", requests: Sequence[EditRequest], *,
                      allow: Optional[Dict[Tuple, int]] = None, screen: Optional[ScreenBaseline] = None,
                      today: Optional[date] = None) -> List[str]:
-    """적용 직전 재확인 — 요청 충족·지난 날짜·엔진 기준·화면 기준. 문제가 없으면 빈 목록.
+    """적용 직전 재확인 — 요청 충족·고치지 않는 날·엔진 기준·화면 기준. 문제가 없으면 빈 목록.
 
-    후보를 찾은 뒤 자정을 넘기면 그사이 지난 날이 된 칸을 바꾸는 후보가 될 수 있어 날짜도 다시 본다.
+    후보를 찾은 뒤 자정을 넘기거나 그사이 고칠 첫날을 정하면 닫힌 날을 바꾸는 후보가 될 수 있어 날짜도 다시 본다.
     """
     allow = lever_allow(allow)
     ctx, rules, grid, after_ctx, after_rules = _after(ctx, rules, candidate, requests)
-    open_from = first_open_day(ctx, today or datetime.now(KST).date())
-    found = [f"{c.day + 1}일은 이미 지난 날짜입니다" for c in candidate.changes if c.day < open_from][:1]
+    today = today or datetime.now(KST).date()
+    open_from = first_open_day(ctx, today)
+    found = [closed_day_text(ctx, d, open_from, today)
+             for d in sorted({c.day for c in candidate.changes if c.day < open_from})[:1]]
     # 묶인 칸(확정 원티드·파견 등)이 바뀌었으면 — 직접 짚은 확정 원티드 칸은 위에서 풀었다
     found += [f"{c.day + 1}일은 '{ctx.frozen[(c.nurse_id, c.day)]}' 칸입니다" for c in candidate.changes
               if not ctx.is_free(c.nurse_id, c.day)][:1]
-    found += [f"요청 미충족 {r}" for r in requests if not is_satisfied(ctx, r, grid)]
+    found += [f"요청 미충족: {request_label(ctx, r)}" for r in requests if not is_satisfied(ctx, r, grid)]
     # 휴가 요청 칸에 정말 그 휴가 코드가 들어갔는가(검토 L6)
-    found += [f"요청 미충족 {r}" for r in requests if isinstance(r, LeaveCell) and not any(
+    found += [f"요청 미충족: {request_label(ctx, r)}" for r in requests if isinstance(r, LeaveCell) and not any(
         (c.nurse_id, c.day, c.after) == (r.nurse_id, r.day, r.code) for c in candidate.changes)]
     base = measure(ctx, ctx.main, rules)
     found += [f"{k[0]} {k}" for k, _v in rule_regressions(after_ctx, after_rules, grid, requests, allow, before=base)]
@@ -674,7 +875,8 @@ SOFT_LABEL = {"패턴": "근무 순서", "고립OFF": "하루짜리 OFF", "연�
 def cell_change(ctx: EditContext, nurse_id: str, day: int, after_main: str) -> CellChange:
     return CellChange(
         nurse_id=nurse_id, name=ctx.names.get(nurse_id, nurse_id), day=day,
-        before=ctx.raw[nurse_id][day], after=str(ctx.rep_code.get(after_main, after_main)),
+        before=ctx.raw[nurse_id][day],
+        after=str((ctx.keep_code.get(nurse_id) or {}).get(after_main) or ctx.rep_code.get(after_main, after_main)),
         before_main=ctx.main[nurse_id][day], after_main=after_main,
     )
 

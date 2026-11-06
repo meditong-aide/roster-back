@@ -1,7 +1,7 @@
 """근무표 수정 대화의 보관 값과 복원 — 보관·잠금·한도 자체는 공통 틀(`agent_kit.conversation`).
 
   · 실행 중 상태는 서버 메모리, 모든 턴은 `schedule_edit_log`(사용자 결정 11-02).
-  · 기록에서 다시 세우는 것: 대상 근무표·턴 번호·지금 요청·허용 레버·넘긴 묶음·최근 대화 — 메모리에서
+  · 기록에서 다시 세우는 것: 대상 근무표·턴 번호·지금 요청·허용 레버·넘긴 묶음·최근 대화·고칠 수 있는 첫날 — 메모리에서
     내렸거나 서버가 재기동된 뒤에도 대화가 이어진다. 후보 자체는 다시 찾는다(솔버가 다시 낸다).
 한도(사용자 지시 11-02 · 환경변수): 유휴 SCHEDULE_EDIT_IDLE_MIN 분 · 대화 SCHEDULE_EDIT_MAX_HOURS 시간 ·
 SCHEDULE_EDIT_MAX_TURNS 턴 · 메모리 200개 · 사람당 3개.
@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from agent_kit.conversation import Conversation, ConversationError, Limits
 from schedule_edit_agent.answer import SOURCE_WORD
-from services.schedule_edit.journal import read_conversation, read_conversation_head
+from services.schedule_edit.journal import READ_LIMIT, read_conversation, read_conversation_head, read_last_lock
 
 AGENT_ID = "schedule-edit"
 
@@ -45,6 +45,7 @@ def restore(db: Session, conversation_id: str) -> Conversation:
     주인·시작 시각은 대화의 첫 기록에서(긴 대화도 최근 기록만 읽으니 따로 읽는다 · 검토 L1), 대상 버전은
     마지막 기록에서 — 화면에서 다른 버전으로 옮겨 간 턴은 그 뒤 기록의 schedule_id 에 남는다(검토 M5).
     버전이 바뀐 지점에서는 앞 버전의 요청·레버·넘긴 묶음을 버린다. 흔적은 마지막 말 한 줄만 되살린다.
+    고칠 수 있는 첫날(lock)은 버전이 바뀌어도 마지막 값을 이어 간다(`Conversation.carry`).
     """
     rows = read_conversation(db, conversation_id)
     head = read_conversation_head(db, conversation_id)
@@ -96,5 +97,18 @@ def restore(db: Session, conversation_id: str) -> Conversation:
         elif row.event == "apply" and row.new_schedule_id:
             # 적용 뒤에는 새 버전에서 이어 간다
             conv.context, state = {"schedule_id": row.new_schedule_id}, dict(empty)
+        elif row.event == "lock":
+            _carry_lock(conv, payload)
+    if "edit_from" not in conv.carry and len(rows) >= READ_LIMIT:
+        # 긴 대화는 최근 READ_LIMIT 건만 읽는다 — 그 앞에 정한 첫날은 마지막 한 건만 따로(검토 11-05 L4)
+        lock = read_last_lock(db, conversation_id)
+        if lock is not None:
+            _carry_lock(conv, lock.payload or {})
     conv.restored = state
     return conv
+
+
+def _carry_lock(conv: Conversation, payload: Dict[str, Any]) -> None:
+    """고칠 수 있는 첫날 — 버전 전환·적용과 무관하게 마지막 값(대상이 바뀌어도 남는 carry 에 · 달은 session_for 가 본다)."""
+    if all(isinstance(payload.get(k), int) for k in ("edit_from_day", "year", "month")):
+        conv.carry["edit_from"] = (payload["year"], payload["month"], payload["edit_from_day"] - 1)

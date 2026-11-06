@@ -43,8 +43,8 @@ def live_examples(db: Session, schedule: Optional[Schedule], today: date) -> Lis
 
 def examples_from(ctx: EditContext, today: date) -> List[str]:
     """바꿀 수 있는 날이 없으면(지난 달) 빈 목록."""
-    # 오늘 칸은 이미 근무 중일 수 있어 내일부터 · 사람은 근무표 순서, 날은 앞에서부터
-    days = list(range(first_open_day(ctx, today) + 1, ctx.days))
+    # 오늘 칸은 닫혀 있어 내일부터(`first_open_day`) · 사람은 근무표 순서, 날은 앞에서부터
+    days = list(range(first_open_day(ctx, today), ctx.days))
     people = [n for n in ctx.nurse_ids if ctx.names.get(n)]
     if not days or len(people) < 2:
         return []

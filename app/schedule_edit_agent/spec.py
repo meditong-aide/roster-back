@@ -65,7 +65,8 @@ class ScheduleEditAgent(Agent):
             "subtitle": (f"{label} 기준 · " if label else "") + "규칙을 지키며 가장 적게 바꾸는 안을 찾습니다",
             "blocks": [
                 B.notice("하드락과 병동 설정을 모두 지키면서 가장 적게 바꾸는 안을 3개까지 찾아 표에 미리 보여 드립니다. "
-                         "고른 안은 새 버전으로 저장되고, 이 버전은 그대로 남습니다.",
+                         "고른 안은 새 버전으로 저장되고, 이 버전은 그대로 남습니다. "
+                         "오늘까지는 바꾸지 않고, '6일부터 고쳐줘'처럼 날을 정하면 그 앞은 모두 그대로 둡니다.",
                          tone="normal", title="바꿀 내용을 말로 적어 주세요"),
                 B.examples("이렇게 말할 수 있어요", live_examples(db, schedule, self.today())),
                 B.notice(UNSUPPORTED, tone="muted", title="아직 못 하는 것"),
