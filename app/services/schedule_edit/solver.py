@@ -14,7 +14,10 @@
 지키고 칸 수 상한(MAX_CHANGES)을 건 같은 모델이다. 한 달에서도 불가가 증명되면 `explain` 이 같은 상한
 안에서 무엇을 넘겨야 하는지 알려 준다. 하드락은 어느 단계에서도 풀지 않는다.
 
-여러 날 인원 계획·등급 하한(`requests.PLAN` · 32장)은 창을 넓혀 가지 않고 고칠 수 있는 칸 전부를 두 단계로 푼다(`_plan_search`).
+여러 날 인원 계획·등급 하한(`requests.PLAN` · 32장)은 창을 넓혀 가지 않고 고칠 수 있는 칸 전부를 두 단계로 푼다(`plan_stage1` · `plan_polish`).
+
+`propose_edits` 는 단계 함수의 조합이다 — `start_run` → (창 경로 `window_stage` | 계획 경로 `plan_stage1` → `plan_polish` →
+`plan_recheck`). 에이전트 노드가 단계마다 따로 부를 수 있게 공개했다.
 
 요청 하나에 시간 예산(TIME_BUDGET)을 둔다 — 채팅 응답이 CloudFront 30초 안에 들어와야 한다.
 예산을 다 쓰면 그때까지 찾은 후보만 낸다.
@@ -31,7 +34,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple, Union
 
 from ortools.sat.python import cp_model
 
@@ -146,6 +149,14 @@ class _Run:
     max_changes: int = MAX_CHANGES
     avoid: List[Set[str]] = field(default_factory=list)
     hint: Optional[Grid] = None
+    #: 휴가 요청 칸 {(간호사, 날): 휴가 코드} — OFF 로 풀고 후보에서 그 칸만 휴가 코드로 바꾼다(`_as_leave`)
+    leave: Dict[Tuple[str, int], str] = field(default_factory=dict)
+    #: False 면 불가여도 이유·레버를 찾지 않는다(`propose_edits` 의 explain)
+    explain: bool = True
+
+    @property
+    def is_plan(self) -> bool:
+        return any(isinstance(r, PLAN) for r in self.requests)
 
     def seconds(self, cap: float) -> float:
         return max(0.0, min(cap, self.deadline - time.monotonic()))
@@ -160,6 +171,26 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
     avoid_people: 같은 대화에서 넘긴 후보의 '바뀐 사람 묶음' — 다시 내밀지 않는다.
     hint: 고른 후보 격자 — 이어지는 요청의 시작 해(CP-SAT 힌트, 해의 정당성과 무관).
     explain=False: 불가여도 이유·레버를 찾지 않는다(개수 요청의 메우는 방식 미리 풀기처럼 여러 번 돌릴 때)."""
+    run = start_run(ctx, requests, rules=rules, screen=screen, max_candidates=max_candidates,
+                    time_budget=time_budget, today=today, allow=allow, avoid_people=avoid_people, hint=hint,
+                    explain=explain)
+    if isinstance(run, EditResult):
+        return run
+    if run.is_plan:
+        first = plan_stage1(run)
+        if isinstance(first, EditResult):
+            return first
+        return plan_recheck(run, first, plan_polish(run, first))
+    return window_stage(run)
+
+
+def start_run(ctx: EditContext, requests: Sequence[EditRequest], *, rules: Optional[RuleSet] = None,
+              screen: Optional[ScreenBaseline] = None, max_candidates: int = 3,
+              time_budget: float = TIME_BUDGET, today: Optional[date] = None,
+              allow: Optional[Dict[Tuple, int]] = None, avoid_people: Sequence[FrozenSet[str]] = (),
+              hint: Optional[Grid] = None, explain: bool = True) -> Union[EditResult, "_Run"]:
+    """준비 — 요청 검사·확정 원티드 풀기·휴가 칸 바꾸기·기준선 재기. 풀 필요가 없으면(invalid·already) 그 EditResult 를,
+    아니면 이어지는 단계(`window_stage` · `plan_stage1`)가 들고 다닐 `_Run` 을 돌려준다. `propose_edits` 의 인자와 같다."""
     requests = list(requests)
     today = today or datetime.now(KST).date()
     open_from = first_open_day(ctx, today)
@@ -174,13 +205,18 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
     if wished:
         return EditResult("invalid", reasons=wished, notes=list(ctx.notes))
     ctx, rules, requests = _with_leave(ctx, rules, requests, leave)
-    run = _Run(ctx, rules, requests, measure(ctx, ctx.main, rules), measure_soft(ctx, ctx.main, rules),
-               screen, max_candidates,
-               time.monotonic() + time_budget, start=min(r.day for r in requests),
-               allow=lever_allow(allow),
-               avoid=[set(p) for p in avoid_people], hint=hint, max_changes=_max_changes(requests))
-    if any(isinstance(r, PLAN) for r in requests):
-        return _plan_search(run)
+    return _Run(ctx, rules, requests, measure(ctx, ctx.main, rules), measure_soft(ctx, ctx.main, rules),
+                screen, max_candidates,
+                time.monotonic() + time_budget, start=min(r.day for r in requests),
+                allow=lever_allow(allow),
+                avoid=[set(p) for p in avoid_people], hint=hint, max_changes=_max_changes(requests),
+                leave=leave, explain=explain)
+
+
+def window_stage(run: "_Run") -> EditResult:
+    """창 경로 한 단계 — 창을 넓혀 가며(`WINDOW_STEPS`) 풀고 후보를 재확인해(`_search`) 결과까지 만든다. 창 반복·`_wider`·
+    `_shortcuts`·`_no_candidate` 는 서로 얽혀 있어 쪼개지 않고 통째로 한 단계로 둔다."""
+    ctx, rules, requests, leave = run.ctx, run.rules, run.requests, run.leave
     status = cp_model.UNKNOWN
     # 개수 요청은 어느 날을 바꿀지 정해지지 않았다 — 좁은 창부터 넓힐 근거가 없어 기간 전체로 바로 푼다
     steps = ((None,) if any(isinstance(r, (CountTarget, BalanceTarget, WishTarget, ShapeTarget)) for r in requests)
@@ -196,13 +232,13 @@ def propose_edits(ctx: EditContext, requests: Sequence[EditRequest], *, rules: O
             found = _wider(run, found) or found
         if found:
             # 후보가 있어도 바꾸는 칸이 많으면 — 설정 하나를 이번만 넘겨 더 적게 바꿀 수 있는지(그때만 카드로)
-            shortcuts = _shortcuts(run, found) if explain else []
+            shortcuts = _shortcuts(run, found) if run.explain else []
             return EditResult("ok", candidates=[_as_leave(c, leave) for c in found] if leave else found,
                               notes=list(ctx.notes), levers=shortcuts)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return EditResult("infeasible", notes=list(ctx.notes), reasons=[
             "찾은 방법이 모두 근무표 화면에 새 위반을 만들어 후보로 내지 않았습니다."])
-    if not explain:
+    if not run.explain:
         return EditResult("infeasible" if status == cp_model.INFEASIBLE else "timeout", notes=list(ctx.notes),
                           reasons=[f"지금 규칙을 모두 지키면서는 방법을 찾지 못했습니다(바꾸는 칸 {run.max_changes}개까지 살펴봄)."
                                    if status == cp_model.INFEASIBLE else "시간 안에 방법을 찾지 못했습니다."])
@@ -414,11 +450,32 @@ def _kept_wishes(ctx: EditContext, start: int) -> List[Tuple[str, int, FrozenSet
     return sorted(set(out), key=lambda t: (t[1], t[0]))
 
 
-def _plan_search(run: _Run) -> EditResult:
-    """여러 날 인원·등급 계획 — 칸 상한 없이 두 단계로(32장 · 손풀이 `redo_edit.py` 와 같다).
-      1단계: 모자라는 칸(동의한 만큼까지) ≫ 부족 근무조 ≫ 바뀌는 칸을 가장 적게.
-      2단계: 그 수들을 묶고 1단계 해를 시작 해로(안 주면 180초에 해 0개 · 실측) 품질 ≫ 한 사람 최대 변경 ≫ 바뀐 사람 수.
-    창을 넓혀 가며 찾지 않는다 — 여러 날·여러 사람을 함께 옮기는 요청이라 좁은 창에 답이 없다. 후보는 하나."""
+@dataclass
+class PlanFirst:
+    """인원 계획 1단계 결과 — 2단계(`plan_polish`)가 이어 쓰는 모델과 1단계 해·경계."""
+
+    em: EditModel
+    status: int
+    grid: Grid
+    #: 1단계 해의 모자라는 칸 수·부족 근무조 수·바뀌는 칸 수 — 2단계에서 이 값 이하로 묶는다
+    short: int
+    grade: int
+    changes: int
+
+
+@dataclass
+class PlanPolished:
+    """인원 계획 2단계 결과 — 다듬기를 했으면 그 해, 못 했으면 1단계 해."""
+
+    grid: Grid
+    #: 두 단계 모두 OPTIMAL 인가(후보의 optimal 표시)
+    optimal: bool
+
+
+def plan_stage1(run: _Run) -> Union[PlanFirst, EditResult]:
+    """여러 날 인원·등급 계획 1단계 — 칸 상한 없이 모자라는 칸(동의한 만큼까지) ≫ 부족 근무조 ≫ 바뀌는 칸을 가장 적게
+    풀고(32장 · 손풀이 `redo_edit.py` 와 같다) 그 수들을 경계로 읽는다. 해가 없으면 그 EditResult(infeasible · timeout).
+    창을 넓혀 가며 찾지 않는다 — 여러 날·여러 사람을 함께 옮기는 요청이라 좁은 창에 답이 없다."""
     ctx = run.ctx
     em = _plan_model(ctx, run.rules, run.requests, run.start, run.allow, slack=False)
     _carry_over(em, run)
@@ -441,6 +498,14 @@ def _plan_search(run: _Run) -> EditResult:
     m.ClearHints()
     for var in em.x.values():
         m.AddHint(var, int(solver.Value(var)))
+    return PlanFirst(em, status, first, short, grade, changes)
+
+
+def plan_polish(run: _Run, first: PlanFirst) -> PlanPolished:
+    """2단계 — 1단계 수들을 묶고 1단계 해를 시작 해로(안 주면 180초에 해 0개 · 실측) 품질 ≫ 한 사람 최대 변경 ≫ 바뀐 사람 수.
+    남은 시간이 모자라면 다듬지 않고 1단계 해를 그대로 낸다."""
+    ctx, em = run.ctx, first.em
+    m = em.model
     spread = m.NewIntVar(0, ctx.days, "max_changes_per_person")
     for n in sorted({n for n, _d in em.free}):
         m.Add(sum(v for (p, _d), v in em.changed.items() if p == n) <= spread)
@@ -453,9 +518,14 @@ def _plan_search(run: _Run) -> EditResult:
         polished = status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE)
     else:
         status2 = cp_model.UNKNOWN
-    grid = read_solution(em, solver2) if polished else first
-    cand = _candidate(run, grid, 1, (run.start, ctx.days - 1),
-                      status == cp_model.OPTIMAL and status2 == cp_model.OPTIMAL)
+    grid = read_solution(em, solver2) if polished else first.grid
+    return PlanPolished(grid, first.status == cp_model.OPTIMAL and status2 == cp_model.OPTIMAL)
+
+
+def plan_recheck(run: _Run, first: PlanFirst, polished: PlanPolished) -> EditResult:
+    """재확인 — 다듬은 해로 후보를 만들고(`recheck_candidate`) 화면에서 나빠지면 버린다. 후보는 하나."""
+    cand = recheck_candidate(run, polished.grid, 1, (run.start, run.ctx.days - 1), polished.optimal)
+    notes = list(run.ctx.notes)
     if cand is None:
         return EditResult("infeasible", notes=notes, reasons=[
             "찾은 방법이 근무표 화면에 새 위반을 만들어 후보로 내지 않았습니다."])
@@ -739,6 +809,13 @@ def _switch_to_alternatives(em: EditModel, loose) -> None:
 def _solve(em: EditModel, seconds: float):
     solver = new_solver(seconds)
     return solver.Solve(em.model), solver
+
+
+def recheck_candidate(run: _Run, grid: Grid, rank: int, window: Tuple[int, int],
+                      optimal: bool) -> Optional[Candidate]:
+    """재확인 — 해 격자를 후보로 만든다. 한 달을 규칙으로 다시 재서 새 위반이 있으면(코드 결함) ERROR 로그와 함께, 화면 판정에서
+    새 빨간 칸이 생기면 INFO 로그와 함께 None. 바뀐 칸이 없어도 None."""
+    return _candidate(run, grid, rank, window, optimal)
 
 
 def _candidate(run: _Run, grid: Grid, rank: int, window: Tuple[int, int],

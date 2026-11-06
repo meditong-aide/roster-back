@@ -1,0 +1,1604 @@
+{
+ "count_target": {
+  "calls": [
+   {
+    "constraints": 448,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "c24ee2cea5e47bc9",
+    "objective": "3468bf34c0690dd8",
+    "seconds": 6.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 308,
+    "workers": 4
+   },
+   {
+    "constraints": 450,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "a3a5151bb906cb3e",
+    "objective": "a76b4a5781b78bf5",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 310,
+    "workers": 4
+   },
+   {
+    "constraints": 451,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "fec7ff8614aa2e82",
+    "objective": "55cd7ff741505f33",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 310,
+    "workers": 4
+   },
+   {
+    "constraints": 452,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "4675b5aca2845220",
+    "objective": "55cd7ff741505f33",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 310,
+    "workers": 4
+   }
+  ],
+  "result": {
+   "blocking": [],
+   "candidates": [
+    {
+     "affected": [
+      "A"
+     ],
+     "changes": [
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 6,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      }
+     ],
+     "counts": {
+      "A": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      }
+     },
+     "loss": 2,
+     "quality": [],
+     "rank": 1,
+     "span": [
+      6,
+      6
+     ],
+     "window": [
+      0,
+      9
+     ]
+    },
+    {
+     "affected": [
+      "A",
+      "B"
+     ],
+     "changes": [
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 0,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "D",
+       "after_main": "D",
+       "before": "E",
+       "before_main": "E",
+       "day": 0,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      }
+     ],
+     "counts": {
+      "A": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "B": {
+       "D": [
+        4,
+        5
+       ],
+       "E": [
+        3,
+        2
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      }
+     },
+     "loss": 4,
+     "quality": [
+      "D·E 쏠림 점수 0→1"
+     ],
+     "rank": 2,
+     "span": [
+      0,
+      0
+     ],
+     "window": [
+      0,
+      9
+     ]
+    },
+    {
+     "affected": [
+      "A",
+      "C"
+     ],
+     "changes": [
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 6,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "D",
+       "after_main": "D",
+       "before": "E",
+       "before_main": "E",
+       "day": 7,
+       "name": "C",
+       "nurse_id": "C",
+       "vacation": false
+      }
+     ],
+     "counts": {
+      "A": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "C": {
+       "D": [
+        4,
+        5
+       ],
+       "E": [
+        3,
+        2
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      }
+     },
+     "loss": 5,
+     "quality": [
+      "D·E 쏠림 점수 0→1"
+     ],
+     "rank": 3,
+     "span": [
+      6,
+      7
+     ],
+     "window": [
+      0,
+      9
+     ]
+    }
+   ],
+   "extra": [],
+   "levers": [],
+   "notes": [],
+   "reasons": [],
+   "source": null,
+   "status": "ok"
+  }
+ },
+ "plan": {
+  "calls": [
+   {
+    "constraints": 902,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "f2cb6c9644b06765",
+    "objective": "0a3e9b6459880d1e",
+    "seconds": 8.0,
+    "seed": 0,
+    "site": "_plan_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 416,
+    "workers": 4
+   },
+   {
+    "constraints": 909,
+    "hint_hash": "0f7cd20782436949",
+    "hints": 160,
+    "model": "6e80db3c805fe260",
+    "objective": "258fb2569629445a",
+    "seconds": 8.0,
+    "seed": 0,
+    "site": "_plan_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 418,
+    "workers": 4
+   }
+  ],
+  "result": {
+   "blocking": [],
+   "candidates": [
+    {
+     "affected": [
+      "A",
+      "B",
+      "D"
+     ],
+     "changes": [
+      {
+       "after": "O",
+       "after_main": "O",
+       "before": "E",
+       "before_main": "E",
+       "day": 1,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "D",
+       "after_main": "D",
+       "before": "O",
+       "before_main": "O",
+       "day": 3,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 6,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 4,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 1,
+       "name": "D",
+       "nurse_id": "D",
+       "vacation": false
+      }
+     ],
+     "counts": {
+      "A": {
+       "D": [
+        4,
+        4
+       ],
+       "E": [
+        3,
+        3
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "B": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "D": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      }
+     },
+     "loss": 15,
+     "quality": [],
+     "rank": 1,
+     "span": [
+      1,
+      6
+     ],
+     "window": [
+      0,
+      9
+     ]
+    }
+   ],
+   "extra": [],
+   "levers": [],
+   "notes": [],
+   "reasons": [],
+   "source": null,
+   "status": "ok"
+  }
+ },
+ "plan_infeasible": {
+  "calls": [
+   {
+    "constraints": 902,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "54c04ac28bd86724",
+    "objective": "0a3e9b6459880d1e",
+    "seconds": 8.0,
+    "seed": 0,
+    "site": "_plan_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 416,
+    "workers": 4
+   }
+  ],
+  "result": {
+   "blocking": [],
+   "candidates": [],
+   "extra": [],
+   "levers": [],
+   "notes": [],
+   "reasons": [
+    "지금 규칙과 함께 정한 요청(개수·원티드 등)을 모두 지키면서는 이 인원 계획을 풀 방법이 없습니다."
+   ],
+   "source": null,
+   "status": "infeasible"
+  }
+ },
+ "plan_polish_skipped": {
+  "calls": [
+   {
+    "constraints": 902,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "f2cb6c9644b06765",
+    "objective": "0a3e9b6459880d1e",
+    "seconds": 2.2,
+    "seed": 0,
+    "site": "_plan_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 416,
+    "workers": 4
+   }
+  ],
+  "result": {
+   "blocking": [],
+   "candidates": [
+    {
+     "affected": [
+      "A",
+      "B"
+     ],
+     "changes": [
+      {
+       "after": "O",
+       "after_main": "O",
+       "before": "E",
+       "before_main": "E",
+       "day": 1,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "D",
+       "after_main": "D",
+       "before": "O",
+       "before_main": "O",
+       "day": 3,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 6,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 1,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 4,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      }
+     ],
+     "counts": {
+      "A": {
+       "D": [
+        4,
+        4
+       ],
+       "E": [
+        3,
+        3
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "B": {
+       "D": [
+        4,
+        2
+       ],
+       "E": [
+        3,
+        5
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      }
+     },
+     "loss": 15,
+     "quality": [
+      "D·E 쏠림 점수 0→1"
+     ],
+     "rank": 1,
+     "span": [
+      1,
+      6
+     ],
+     "window": [
+      0,
+      9
+     ]
+    }
+   ],
+   "extra": [],
+   "levers": [],
+   "notes": [],
+   "reasons": [],
+   "source": null,
+   "status": "ok"
+  }
+ },
+ "window_explain_false_infeasible": {
+  "calls": [
+   {
+    "constraints": 272,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "e8b8b03d48567f45",
+    "objective": "8df23ce754167626",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 175,
+    "workers": 4
+   },
+   {
+    "constraints": 419,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "1b66d765a7a744f1",
+    "objective": "61d7fd5c5ca9ff1e",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 277,
+    "workers": 4
+   },
+   {
+    "constraints": 434,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "290fddfadb67b8a6",
+    "objective": "ad6ad3b38036156f",
+    "seconds": 6.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 292,
+    "workers": 4
+   }
+  ],
+  "result": {
+   "blocking": [],
+   "candidates": [],
+   "extra": [],
+   "levers": [],
+   "notes": [],
+   "reasons": [
+    "지금 규칙을 모두 지키면서는 방법을 찾지 못했습니다(바꾸는 칸 20개까지 살펴봄)."
+   ],
+   "source": null,
+   "status": "infeasible"
+  }
+ },
+ "window_hint": {
+  "calls": [
+   {
+    "constraints": 240,
+    "hint_hash": "ee0aebff6f8cc87e",
+    "hints": 48,
+    "model": "02dc37772ce2bcca",
+    "objective": "caec782e763c0004",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 160,
+    "workers": 4
+   },
+   {
+    "constraints": 242,
+    "hint_hash": "ee0aebff6f8cc87e",
+    "hints": 48,
+    "model": "eef3480ab2ee7e26",
+    "objective": "f572d91ad693eec0",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 162,
+    "workers": 4
+   },
+   {
+    "constraints": 243,
+    "hint_hash": "ee0aebff6f8cc87e",
+    "hints": 48,
+    "model": "76772f57eaaf120c",
+    "objective": "7178126b0c99f1d9",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 162,
+    "workers": 4
+   },
+   {
+    "constraints": 244,
+    "hint_hash": "ee0aebff6f8cc87e",
+    "hints": 48,
+    "model": "09e728e9f2f442fe",
+    "objective": "7178126b0c99f1d9",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 162,
+    "workers": 4
+   },
+   {
+    "constraints": 448,
+    "hint_hash": "cb74b2221c89041c",
+    "hints": 120,
+    "model": "3842ef5363108882",
+    "objective": "77349219941367b3",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 307,
+    "workers": 4
+   },
+   {
+    "constraints": 450,
+    "hint_hash": "cb74b2221c89041c",
+    "hints": 120,
+    "model": "e082c4bfbc0846e6",
+    "objective": "490445f9e3c02551",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 309,
+    "workers": 4
+   },
+   {
+    "constraints": 451,
+    "hint_hash": "cb74b2221c89041c",
+    "hints": 120,
+    "model": "554e3412f7b8e517",
+    "objective": "5ebba2a3ffc5018d",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 309,
+    "workers": 4
+   },
+   {
+    "constraints": 318,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "df4d9b41514665a4",
+    "objective": "f0d5fe2b19ce0d2e",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve_once",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 188,
+    "workers": 4
+   }
+  ],
+  "result": {
+   "blocking": [],
+   "candidates": [
+    {
+     "affected": [
+      "B",
+      "C"
+     ],
+     "changes": [
+      {
+       "after": "O",
+       "after_main": "O",
+       "before": "E",
+       "before_main": "E",
+       "day": 0,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "O",
+       "before_main": "O",
+       "day": 3,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 4,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "O",
+       "before_main": "O",
+       "day": 0,
+       "name": "C",
+       "nurse_id": "C",
+       "vacation": false
+      },
+      {
+       "after": "O",
+       "after_main": "O",
+       "before": "D",
+       "before_main": "D",
+       "day": 1,
+       "name": "C",
+       "nurse_id": "C",
+       "vacation": false
+      }
+     ],
+     "counts": {
+      "B": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "C": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      }
+     },
+     "loss": 14,
+     "quality": [
+      "C 2일 하루짜리 OFF",
+      "C 1일 근무 순서 E-O-D"
+     ],
+     "rank": 1,
+     "span": [
+      0,
+      4
+     ],
+     "window": [
+      0,
+      9
+     ]
+    }
+   ],
+   "extra": [],
+   "levers": [],
+   "notes": [],
+   "reasons": [],
+   "source": null,
+   "status": "ok"
+  }
+ },
+ "window_leave": {
+  "calls": [
+   {
+    "constraints": 285,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "c47abff5c95fd96f",
+    "objective": "efea75d9311a994d",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 187,
+    "workers": 4
+   },
+   {
+    "constraints": 287,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "04ef3f578de195c2",
+    "objective": "94977b51034b3b6c",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 189,
+    "workers": 4
+   },
+   {
+    "constraints": 288,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "964f53e7da94c790",
+    "objective": "f2ca36ca9ff2a9fd",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 189,
+    "workers": 4
+   },
+   {
+    "constraints": 289,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "2011627545420f57",
+    "objective": "f2ca36ca9ff2a9fd",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 189,
+    "workers": 4
+   },
+   {
+    "constraints": 406,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "298074efe0b6c06b",
+    "objective": "2adf49e8e81fce6b",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 274,
+    "workers": 4
+   }
+  ],
+  "result": {
+   "blocking": [],
+   "candidates": [
+    {
+     "affected": [
+      "A",
+      "B"
+     ],
+     "changes": [
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "O",
+       "before_main": "O",
+       "day": 2,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "O",
+       "after_main": "O",
+       "before": "D",
+       "before_main": "D",
+       "day": 4,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "연",
+       "after_main": "O",
+       "before": "E",
+       "before_main": "E",
+       "day": 2,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": true
+      }
+     ],
+     "counts": {
+      "A": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "B": {
+       "D": [
+        4,
+        4
+       ],
+       "E": [
+        3,
+        2
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      }
+     },
+     "loss": 8,
+     "quality": [],
+     "rank": 1,
+     "span": [
+      2,
+      4
+     ],
+     "window": [
+      2,
+      5
+     ]
+    },
+    {
+     "affected": [
+      "A",
+      "B",
+      "C"
+     ],
+     "changes": [
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "O",
+       "before_main": "O",
+       "day": 2,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "O",
+       "after_main": "O",
+       "before": "D",
+       "before_main": "D",
+       "day": 4,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "연",
+       "after_main": "O",
+       "before": "E",
+       "before_main": "E",
+       "day": 2,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": true
+      },
+      {
+       "after": "D",
+       "after_main": "D",
+       "before": "E",
+       "before_main": "E",
+       "day": 5,
+       "name": "C",
+       "nurse_id": "C",
+       "vacation": false
+      }
+     ],
+     "counts": {
+      "A": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "B": {
+       "D": [
+        4,
+        4
+       ],
+       "E": [
+        3,
+        2
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "C": {
+       "D": [
+        4,
+        5
+       ],
+       "E": [
+        3,
+        2
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      }
+     },
+     "loss": 11,
+     "quality": [
+      "D·E 쏠림 점수 0→1",
+      "6일 D 필요 인원보다 많음"
+     ],
+     "rank": 2,
+     "span": [
+      2,
+      5
+     ],
+     "window": [
+      2,
+      5
+     ]
+    }
+   ],
+   "extra": [],
+   "levers": [],
+   "notes": [],
+   "reasons": [],
+   "source": null,
+   "status": "ok"
+  }
+ },
+ "window_long_setcell_levers": {
+  "calls": [
+   {
+    "constraints": 264,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "1fa3337e794b2c13",
+    "objective": "e9a77289ccccb352",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 175,
+    "workers": 4
+   },
+   {
+    "constraints": 266,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "5726950dcec8043a",
+    "objective": "8e91871e0e3e5361",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 177,
+    "workers": 4
+   },
+   {
+    "constraints": 267,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "2b8c6f90cf8ff0e8",
+    "objective": "80dee1ba0762749e",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 177,
+    "workers": 4
+   },
+   {
+    "constraints": 343,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "2d953511c4efe65f",
+    "objective": "a8b28c7427b14027",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 232,
+    "workers": 4
+   },
+   {
+    "constraints": 237,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "a8bfd5fca3ef04f3",
+    "objective": "e91b638dd75ca154",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve_once",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 137,
+    "workers": 4
+   },
+   {
+    "constraints": 239,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "99d9dfc307436df2",
+    "objective": "e91b638dd75ca154",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve_once",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 137,
+    "workers": 4
+   }
+  ],
+  "result": {
+   "blocking": [],
+   "candidates": [
+    {
+     "affected": [
+      "A",
+      "C"
+     ],
+     "changes": [
+      {
+       "after": "O",
+       "after_main": "O",
+       "before": "E",
+       "before_main": "E",
+       "day": 1,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "D",
+       "after_main": "D",
+       "before": "O",
+       "before_main": "O",
+       "day": 3,
+       "name": "A",
+       "nurse_id": "A",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 1,
+       "name": "C",
+       "nurse_id": "C",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 2,
+       "name": "C",
+       "nurse_id": "C",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 3,
+       "name": "C",
+       "nurse_id": "C",
+       "vacation": false
+      }
+     ],
+     "counts": {
+      "A": {
+       "D": [
+        4,
+        5
+       ],
+       "E": [
+        1,
+        0
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "C": {
+       "D": [
+        4,
+        1
+       ],
+       "E": [
+        3,
+        6
+       ],
+       "OFF": [
+        1,
+        1
+       ]
+      }
+     },
+     "loss": 12,
+     "quality": [
+      "D·E 쏠림 점수 4→9"
+     ],
+     "rank": 1,
+     "span": [
+      1,
+      3
+     ],
+     "window": [
+      1,
+      4
+     ]
+    }
+   ],
+   "extra": [],
+   "levers": {
+    "best": {
+     "allow": [
+      [
+       [
+        "인원최소",
+        null,
+        1,
+        "E"
+       ],
+       1
+      ]
+     ],
+     "changes": [
+      5,
+      2
+     ],
+     "gain": null,
+     "lose": [
+      "2일 E 최소 근무 인원보다 1명 적게"
+     ],
+     "quality": [
+      "D·E 쏠림 점수 4→6",
+      "4일 D 필요 인원보다 많음"
+     ],
+     "span": [
+      2,
+      2
+     ]
+    },
+    "changes": [
+     [
+      5,
+      2
+     ],
+     [
+      5,
+      4
+     ]
+    ],
+    "count": 2
+   },
+   "notes": [],
+   "reasons": [],
+   "source": null,
+   "status": "ok"
+  }
+ },
+ "window_wide_setcell": {
+  "calls": [
+   {
+    "constraints": 240,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "d886bdf851dbf155",
+    "objective": "caec782e763c0004",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 160,
+    "workers": 4
+   },
+   {
+    "constraints": 242,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "86afb60913245ae8",
+    "objective": "f572d91ad693eec0",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 162,
+    "workers": 4
+   },
+   {
+    "constraints": 243,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "5098afd43f97ba4a",
+    "objective": "7178126b0c99f1d9",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 162,
+    "workers": 4
+   },
+   {
+    "constraints": 244,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "77a1e5675fe79490",
+    "objective": "7178126b0c99f1d9",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 162,
+    "workers": 4
+   },
+   {
+    "constraints": 448,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "1b22ab8b58a6a4ea",
+    "objective": "77349219941367b3",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 307,
+    "workers": 4
+   },
+   {
+    "constraints": 450,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "6fe53416598b9ba8",
+    "objective": "490445f9e3c02551",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 309,
+    "workers": 4
+   },
+   {
+    "constraints": 451,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "a77347bc07ac38c3",
+    "objective": "5ebba2a3ffc5018d",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve",
+    "status": "infeasible",
+    "subsolvers": [],
+    "vars": 309,
+    "workers": 4
+   },
+   {
+    "constraints": 318,
+    "hint_hash": "e3b0c44298fc1c14",
+    "hints": 0,
+    "model": "df4d9b41514665a4",
+    "objective": "f0d5fe2b19ce0d2e",
+    "seconds": 2.0,
+    "seed": 0,
+    "site": "_solve_once",
+    "status": "solved",
+    "subsolvers": [],
+    "vars": 188,
+    "workers": 4
+   }
+  ],
+  "result": {
+   "blocking": [],
+   "candidates": [
+    {
+     "affected": [
+      "B",
+      "C"
+     ],
+     "changes": [
+      {
+       "after": "O",
+       "after_main": "O",
+       "before": "E",
+       "before_main": "E",
+       "day": 0,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "O",
+       "before_main": "O",
+       "day": 3,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "D",
+       "before_main": "D",
+       "day": 4,
+       "name": "B",
+       "nurse_id": "B",
+       "vacation": false
+      },
+      {
+       "after": "E",
+       "after_main": "E",
+       "before": "O",
+       "before_main": "O",
+       "day": 0,
+       "name": "C",
+       "nurse_id": "C",
+       "vacation": false
+      },
+      {
+       "after": "O",
+       "after_main": "O",
+       "before": "D",
+       "before_main": "D",
+       "day": 1,
+       "name": "C",
+       "nurse_id": "C",
+       "vacation": false
+      }
+     ],
+     "counts": {
+      "B": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      },
+      "C": {
+       "D": [
+        4,
+        3
+       ],
+       "E": [
+        3,
+        4
+       ],
+       "OFF": [
+        3,
+        3
+       ]
+      }
+     },
+     "loss": 14,
+     "quality": [
+      "C 2일 하루짜리 OFF",
+      "C 1일 근무 순서 E-O-D"
+     ],
+     "rank": 1,
+     "span": [
+      0,
+      4
+     ],
+     "window": [
+      0,
+      9
+     ]
+    }
+   ],
+   "extra": [],
+   "levers": [],
+   "notes": [],
+   "reasons": [],
+   "source": null,
+   "status": "ok"
+  }
+ }
+}
