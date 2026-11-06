@@ -9,8 +9,12 @@
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, Dict, List
+import threading
+from collections import OrderedDict
+from datetime import date
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -22,7 +26,7 @@ from agent_kit.runtime import TurnError
 from db.models import Schedule
 from schedule_edit_agent import view
 from schedule_edit_agent.agent import EditAgent, Reply, close_conversation
-from schedule_edit_agent.examples import live_examples
+from schedule_edit_agent.examples import live_example_calls
 from schedule_edit_agent.llm import OpenAIEditLLM
 from schedule_edit_agent.skills import CHAT_BUDGET, MIN_SOLVE, UNSUPPORTED, SkillError
 from schedule_edit_agent.store import AGENT_ID, LIMITS, restore
@@ -31,6 +35,13 @@ from services.schedule_edit.journal import read_conversation, read_conversation_
 from services.schedule_edit.precheck import finding_to_json
 
 MANAGERS_ONLY = "근무표 수정 도우미는 수간호사·그룹관리자만 쓸 수 있습니다."
+#: 처음 화면에 낸 예시를 들고 있을 근무표·날 수 — 예시로 온 말이 서버가 만든 것인지 다시 읽지 않고 확인한다(검토 L1)
+EXAMPLE_KEEP = 64
+
+
+def _as_json(value: Any) -> Any:
+    """JSON 을 한 번 거친 모양 — 서버가 만든 인자(튜플 등)와 화면을 거쳐 온 인자를 같은 모양으로 견준다."""
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
 class ScheduleEditAgent(Agent):
@@ -43,6 +54,9 @@ class ScheduleEditAgent(Agent):
 
     def __init__(self, llm_factory=OpenAIEditLLM):
         self.core = EditAgent(llm_factory)
+        #: (schedule_id, 오늘) → 처음 화면에 낸 예시 [(문장, (도구, 인자) 또는 None)]
+        self._shown: "OrderedDict[Tuple[str, date], List]" = OrderedDict()
+        self._shown_lock = threading.Lock()
         super().__init__()
 
     def enabled(self) -> bool:
@@ -60,6 +74,8 @@ class ScheduleEditAgent(Agent):
         # 화면의 버전 고르기에 보이는 근무표 이름으로('11월 근무표 VER1 수정본' · 사용자 지적 11-03) — 이름이 없으면 VER 번호
         version = getattr(schedule, "version", None)
         label = str(getattr(schedule, "name", "") or "").strip() or (f"VER{version}" if version is not None else "")
+        examples = live_example_calls(db, schedule, self.today())    # 처음 화면은 늘 새로 만든다(칸이 바뀌었을 수 있다)
+        self._keep_shown(context["schedule_id"], examples)
         return {
             "title": self.title,
             "subtitle": (f"{label} 기준 · " if label else "") + "규칙을 지키며 가장 적게 바꾸는 안을 찾습니다",
@@ -68,7 +84,10 @@ class ScheduleEditAgent(Agent):
                          "고른 안은 새 버전으로 저장되고, 이 버전은 그대로 남습니다. "
                          "오늘까지는 바꾸지 않고, '6일부터 고쳐줘'처럼 날을 정하면 그 앞은 모두 그대로 둡니다.",
                          tone="normal", title="바꿀 내용을 말로 적어 주세요"),
-                B.examples("이렇게 말할 수 있어요", live_examples(db, schedule, self.today())),
+                # 누르면 LLM 없이 그 도구를 부른다(문장과 도구 호출을 우리 코드가 함께 만든다 · 사용자 지시 11-06) —
+                # 틀 예시(○○○)는 채워 써야 해 입력칸에 넣기만 한다(calls 가 null)
+                B.examples("이렇게 말할 수 있어요", [text for text, _call in examples],
+                           calls=[B.call(*call) if call else None for _text, call in examples]),
                 B.notice(UNSUPPORTED, tone="muted", title="아직 못 하는 것"),
             ],
             "composer": {"label": "바꿀 내용", "placeholder": "예: 15일 나이트를 데이로 바꿔줘",
@@ -79,12 +98,18 @@ class ScheduleEditAgent(Agent):
     def check_input(self, inp: TurnInput) -> None:
         if inp.kind == "action" and not self.core.is_button(inp.action):
             raise TurnError("bad_action", "알 수 없는 동작입니다.", 400)
+        if inp.kind == "text" and inp.action and not self.core.is_tool(inp.action):
+            # 해석이 붙은 말(예시)은 LLM 이 고를 수 있는 도구만 — 버튼·쓰기(적용)는 부르지 못한다
+            raise TurnError("bad_action", "알 수 없는 동작입니다.", 400)
 
     def handle(self, call: TurnCall) -> TurnResult:
         conv, inp = call.conv, call.input
         step = None
         if inp.kind == "text":
-            reply = self.core.chat(call.db, call.user, conv, inp.text or "", call.today, deadline=call.deadline)
+            preset = (inp.action, dict(inp.params)) if inp.action else None
+            verified = self._is_shown_example(call.db, str(conv.context.get("schedule_id") or ""), inp) if preset else None
+            reply = self.core.chat(call.db, call.user, conv, inp.text or "", call.today, deadline=call.deadline,
+                                   call=preset, verified=verified)
         else:
             params = dict(inp.params)
             if inp.action == "apply_edit":
@@ -100,6 +125,29 @@ class ScheduleEditAgent(Agent):
         return TurnResult(blocks=view.blocks_for(reply, conv.state), effects=reply.effects, answer=reply.answer,
                           said=reply.said, step=None if reply.failed else step, context=reply.context,
                           trail=reply.trail, request_line=reply.request_line)
+
+    def _keep_shown(self, schedule_id: str, examples: List) -> None:
+        with self._shown_lock:
+            self._shown[(schedule_id, self.today())] = examples
+            self._shown.move_to_end((schedule_id, self.today()))
+            while len(self._shown) > EXAMPLE_KEEP:
+                self._shown.popitem(last=False)
+
+    def _is_shown_example(self, db: Session, schedule_id: str, inp: TurnInput) -> bool:
+        """예시로 온 말(문장·도구·인자)이 서버가 이 근무표의 처음 화면에서 보여 준 예시 그대로인가(검토 L1 · 기록의
+        example_verified). 뜻은 '보여 준 예시'다 — 그날 안에 칸이 바뀌어 지금은 만들지 않을 예시라도 화면에 보였던 것이면 참
+        (칸 지문을 열쇠에 넣으면 클릭마다 근무표 전체를 읽어야 한다 · 검토 11-06). 목록이 없으면(재기동·다른 서버) 한 번 다시
+        만든다. 없어도 실행은 한다 — 인자는 LLM 인자와 같은 신뢰 수준이다(권한 단계가 도구를 거르고 이름 확정이 근무표 안에서
+        확인한다)."""
+        with self._shown_lock:
+            examples: Optional[List] = self._shown.get((schedule_id, self.today()))
+        if examples is None:
+            schedule = db.query(Schedule).filter(Schedule.schedule_id == schedule_id).first() if schedule_id else None
+            examples = live_example_calls(db, schedule, self.today())
+            self._keep_shown(schedule_id, examples)
+        sent = _as_json(dict(inp.params))      # 화면을 거쳐 온 인자는 JSON 모양(튜플 → 목록) — 같은 모양으로 견준다
+        return any(text == inp.text and call is not None and call[0] == inp.action and _as_json(call[1]) == sent
+                   for text, call in examples)
 
     def restore(self, db: Session, conversation_id: str) -> Conversation:
         return restore(db, conversation_id)

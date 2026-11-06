@@ -1,4 +1,6 @@
 """근무표 수정 한 턴의 핵심 — 말(chat)은 LLM 이 스킬을 고르고, 버튼(act)은 LLM 없이 스킬을 바로 부른다.
+처음 화면 예시처럼 해석이 이미 붙은 말(chat 의 call)도 LLM 없이 그 도구를 부른다(사용자 지시 11-06 · 토큰 0).
+스킬 실행은 늘 `middleware.execute_skill`(권한 → 문맥 주입 → 이름 확정 → 실행 → 기록 · AIDE 와 같은 단계)을 거친다.
 
 턴마다: 판정 재료 준비(없으면 열고, 근무표가 그사이 바뀌었으면 다시 연다) → LLM 1번(말일 때만) → 스킬 → 기록
 (message·propose·clarify·…). 턴 번호·최근 대화·흔적·대상 이동(적용 → 새 버전)은 공통 틀(`agent_kit.runtime`)이
@@ -11,17 +13,18 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from agent_kit.conversation import Conversation
+from schedule_edit_agent import registry
 from schedule_edit_agent.answer import current_request
+from schedule_edit_agent.descriptions import SKILL_TOOLS
 from schedule_edit_agent.llm import CALL_TIMEOUT, EditLLM
+from schedule_edit_agent.middleware import execute_skill
 from schedule_edit_agent.prompt import build_messages
-from schedule_edit_agent.skills import (
-    CHAT_BUDGET, MIN_SOLVE, OUT_OF_TIME, SKILLS, Outcome, SkillError, Turn, llm_tools, reply_text,
-)
+from schedule_edit_agent.skills import CHAT_BUDGET, MIN_SOLVE, OUT_OF_TIME, Outcome, SkillError, Turn, reply_text
 from services.schedule_edit.journal import record_event
 from services.schedule_edit.precheck import finding_from_json
 from services.schedule_edit.serialize import allow_from_json, requests_from_json
@@ -77,43 +80,58 @@ class EditAgent:
 
     @staticmethod
     def is_button(action: Optional[str]) -> bool:
-        skill = SKILLS.get(action or "")
-        return skill is not None and not skill.llm
+        return registry.kind_of(action) == "button"
+
+    @staticmethod
+    def is_tool(name: Optional[str]) -> bool:
+        """LLM 이 고르는 도구인가 — 해석이 붙은 말(예시)이 부를 수 있는 것."""
+        return registry.kind_of(name) == "tool"
 
     def chat(self, db: Session, user, conv: Conversation, text: str, today: date, *,
-             deadline: Optional[float] = None) -> Reply:
-        """deadline: 경로에 들어온 순간 + CHAT_BUDGET(time.monotonic 기준) — 없으면 지금부터."""
+             deadline: Optional[float] = None, call: Optional[Tuple[str, Dict[str, Any]]] = None,
+             verified: Optional[bool] = None) -> Reply:
+        """deadline: 경로에 들어온 순간 + CHAT_BUDGET(time.monotonic 기준) — 없으면 지금부터.
+        call: 해석이 이미 붙은 말(처음 화면 예시 — 우리 코드가 근무표에서 문장과 도구 호출을 함께 만든다)의
+        (도구 이름, 인자). 주면 LLM 을 부르지 않는다. 기록·흔적에는 문장을 사용자가 한 말로 남긴다.
+        verified: 그 호출이 서버가 이 근무표에서 만든 예시 목록에 그대로 있었나(`spec._is_shown_example`) — 기록에만
+        남긴다(example_verified · 검토 L1). 실행은 같다(인자는 LLM 인자와 같은 신뢰 수준)."""
         turn = self._turn(db, user, conv, today, deadline)
         started = time.monotonic()
         room = turn.remaining() - MIN_SOLVE
         if room < 1.0:      # 판정 재료 로드·대기로 이미 시간을 다 썼다 — LLM 도 솔버도 부르지 않는다
             turn.record("error", {"text": text, "stage": "budget", "remaining_ms": int(turn.remaining() * 1000)})
             return self._reply(turn, Outcome(answer=OUT_OF_TIME))
-        try:
-            # 언제나 도구 하나 — 글로 답하면 사실을 지어낼 수 있다(바꾸지 않는 답은 reply_only 의 정해진 문장)
-            response = self.llm.chat(build_messages(conv, turn.session, text, today), llm_tools(),
-                                     tool_choice="required", timeout=min(CALL_TIMEOUT, room))
-        except Exception as exc:   # noqa: BLE001 — 공급자 오류·키 없음 등. 대화는 이어 간다.
-            logger.exception("[schedule_edit] LLM 호출 실패 conv=%s", conv.id)
-            turn.record("error", {"text": text, "stage": "llm", "error": f"{type(exc).__name__}: {exc}"[:500]},
+        if call is not None:
+            name, args, source = call[0], dict(call[1] or {}), "example"
+            turn.record("message", {"text": text, "tool": name, "args": args, "source": source,
+                                    "example_verified": bool(verified)}, elapsed_ms=_ms(started))
+        else:
+            try:
+                # 언제나 도구 하나 — 글로 답하면 사실을 지어낼 수 있다(바꾸지 않는 답은 reply_only 의 정해진 문장)
+                response = self.llm.chat(build_messages(conv, turn.session, text, today), list(SKILL_TOOLS),
+                                         tool_choice="required", timeout=min(CALL_TIMEOUT, room))
+            except Exception as exc:   # noqa: BLE001 — 공급자 오류·키 없음 등. 대화는 이어 간다.
+                logger.exception("[schedule_edit] LLM 호출 실패 conv=%s", conv.id)
+                turn.record("error", {"text": text, "stage": "llm", "error": f"{type(exc).__name__}: {exc}"[:500]},
+                            elapsed_ms=_ms(started))
+                return self._reply(turn, Outcome(answer=LLM_FAILED))
+            usage = dict(getattr(self.llm, "last_usage", {}) or {})
+            if not response.is_tool_call:
+                # 도구를 강제했는데도 글이 왔다 — 그 글은 보여 주지 않고(분석용으로만 남긴다) 정해진 문장으로
+                reply = reply_text("unclear", turn.session)
+                turn.record("message", {"text": text, "reply": reply, "llm_text": (response.text or "")[:500],
+                                        "usage": usage}, elapsed_ms=_ms(started))
+                return self._reply(turn, Outcome(answer=reply))
+            picked = response.tool_calls[0]
+            turn.record("message", {"text": text, "tool": picked.name, "args": picked.args, "usage": usage,
+                                    "ignored_calls": [c.name for c in response.tool_calls[1:]]},
                         elapsed_ms=_ms(started))
-            return self._reply(turn, Outcome(answer=LLM_FAILED))
-        usage = dict(getattr(self.llm, "last_usage", {}) or {})
-        if not response.is_tool_call:
-            # 도구를 강제했는데도 글이 왔다 — 그 글은 보여 주지 않고(분석용으로만 남긴다) 정해진 문장으로
-            reply = reply_text("unclear", turn.session)
-            turn.record("message", {"text": text, "reply": reply, "llm_text": (response.text or "")[:500],
-                                    "usage": usage}, elapsed_ms=_ms(started))
-            return self._reply(turn, Outcome(answer=reply))
-        call = response.tool_calls[0]
-        turn.record("message", {"text": text, "tool": call.name, "args": call.args, "usage": usage,
-                                "ignored_calls": [c.name for c in response.tool_calls[1:]]},
-                    elapsed_ms=_ms(started))
-        skill = SKILLS.get(call.name)
-        if skill is None or not skill.llm:
-            return self._reply(turn, Outcome(answer="무엇을 바꿀지 다시 말씀해 주세요."))
-        reply = self._reply(turn, self._run(turn, skill.run, call.args or {}))
-        reply.trail = TRAIL.get(call.name, "keep")
+            name, args, source = picked.name, picked.args or {}, "llm"
+        result = execute_skill(turn, name, args, source=source)
+        reply = self._reply(turn, result.data)
+        if result.blocked:          # 수정 도우미에 없는 도구·버튼을 골랐다 — 흔적은 그대로
+            return reply
+        reply.trail = TRAIL.get(result.skill_name, "keep")
         if reply.trail == "new":
             reply.request_line = current_request(turn.session) or None
         return reply
@@ -125,7 +143,7 @@ class EditAgent:
             raise SkillError("알 수 없는 동작입니다.")
         turn = self._turn(db, user, conv, today, deadline, session)
         label = BUTTON_TEXT.get(action, action).format(rank=params.get("rank"), choice_id=params.get("choice_id"))
-        reply = self._reply(turn, self._run(turn, SKILLS[action].run, params))
+        reply = self._reply(turn, execute_skill(turn, action, params, source="button").data)
         reply.said = f"[버튼] {label}"
         return reply
 
@@ -173,17 +191,6 @@ class EditAgent:
         session = session if session is not None else self.session_for(db, conv)
         return Turn(db=db, user=user, conversation_id=conv.id, turn_no=conv.turn_no, session=session,
                     today=today, deadline=deadline, carry=conv.carry)
-
-    def _run(self, turn: Turn, run, params: Dict[str, Any]) -> Outcome:
-        try:
-            return run(turn, params)
-        except SkillError as exc:
-            # 버튼이 지금 상태와 안 맞았다(없는 후보 번호 등) — 분석용으로 남긴다
-            turn.record("error", {"stage": "button", "params": params, "message": str(exc)})
-            return Outcome(answer=str(exc), failed=True)
-        except Exception as exc:   # noqa: BLE001 — 기록을 남기고 위로(500)
-            turn.record("error", {"stage": "skill", "error": f"{type(exc).__name__}: {exc}"[:500]})
-            raise
 
     @staticmethod
     def _reply(turn: Turn, outcome: Outcome) -> Reply:

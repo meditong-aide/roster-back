@@ -3,6 +3,10 @@
 화면은 이 어휘만 알면 어떤 에이전트든 그린다 — 새 에이전트·새 요청 종류를 붙일 때 화면을 고치지 않는다.
   · 블록: text · notice · trail · cards · choice · examples. 화면은 모르는 종류를 건너뛴다(오래된 화면도 안 깨진다).
   · 버튼(action): 화면은 뜻을 모른 채 `input` 을 그대로 다시 보낸다. 문구·순서·강조도 서버가 정한다.
+  · 예시(examples)의 calls: items(문장)와 같은 자리에 미리 정한 도구 호출 `{action, params}`(없으면 null). 새 화면은
+    calls[i] 가 있으면 `{kind:"text", text: items[i], action, params}` 를 바로 보내고(해석이 붙은 말 — 서버는 LLM 을
+    거치지 않고 그 도구를 부르며 대화·흔적·기록에는 말로 남는다), 없으면 입력칸에 채운다. 옛 화면은 calls 를 몰라
+    지금처럼 문장만 쓴다 — items 는 늘 문장 목록이다(검토 M1).
   · 카드의 overlay: 화면(호스트)이 아는 종류만 그린다 — 근무표 칸 미리보기는 `schedule_cells`.
   · 효과(effects): 호스트가 아는 종류만 처리한다 — `switch_version`(근무표 버전 바꾸기), 나중에 AIDE 의
     `navigate`·`prefill` 도 같은 자리에 온다.
@@ -76,6 +80,19 @@ def choice(choice_id: str, options: List[Dict[str, Any]], *, legend: str, submit
             "footnote": footnote}
 
 
-def examples(label: str, items: Iterable[str]) -> Block:
-    """누르면 입력칸에 채워지는 예시 문장."""
-    return {"type": "examples", "label": label, "items": list(items)}
+def call(name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """예시 하나의 미리 정한 도구 호출(examples 의 calls 칸)."""
+    return {"action": name, "params": dict(params or {})}
+
+
+def examples(label: str, items: Iterable[str], calls: Optional[Iterable[Optional[Dict[str, Any]]]] = None) -> Block:
+    """누르면 입력칸에 채워지는 예시 문장. calls 는 items 와 같은 길이의 도구 호출(`call()` · 없는 항목은 None) —
+    하나라도 있을 때만 싣는다."""
+    block: Block = {"type": "examples", "label": label, "items": list(items)}
+    if calls is not None:
+        calls = list(calls)
+        if len(calls) != len(block["items"]):
+            raise ValueError("calls 는 items 와 같은 길이여야 합니다")
+        if any(c is not None for c in calls):
+            block["calls"] = calls
+    return block

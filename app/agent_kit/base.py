@@ -31,7 +31,9 @@ KST = timezone(timedelta(hours=9))
 
 @dataclass
 class TurnInput:
-    kind: str                      # text · action (에이전트가 accepts 로 받을 종류를 정한다)
+    #: text · action (에이전트가 accepts 로 받을 종류를 정한다). text 에 action·params 가 함께 오면 해석이 붙은 말
+    #: (처음 화면 예시 — `blocks.example`) — 말로 다루되 에이전트가 LLM 없이 그 도구를 부른다
+    kind: str
     text: Optional[str] = None
     action: Optional[str] = None
     params: Dict[str, Any] = field(default_factory=dict)
