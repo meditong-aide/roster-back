@@ -103,6 +103,21 @@ User Input (자연어)
 4. **Thin memory**: 병원/병동별 데이터는 절대 프롬프트에 넣지 않음. 런타임 DB 조회
 5. **Transparent pipeline**: 모든 단계(intent analysis, planning, execution, verification)가 추적 가능해야 함
 
+### 파생 에이전트 예외 — 근무표 수정 도우미(`schedule-edit`)
+
+근무표 수정 도우미는 AIDE 의 파생 에이전트다. 위 'LLM-first' 는 이 에이전트에 그대로 적용하지 않는다(2026-11-06 사용자 지시).
+LLM 의존도를 최소로 두고, 동작은 우리 서비스 스킬·함수로 풀어낸다.
+
+- **LLM 은 한 턴에 한 번, 사용자 문장을 보고 부를 스킬과 인자를 고르기만 한다.** 버튼·예시 문장 클릭은 LLM 을 부르지 않는다(토큰 0).
+- 이름 확정·사전 점검·풀이(소형 CP-SAT)·재확인·답 문장·적용은 **전부 코드**다. 답 문장을 LLM 이 쓰지 않는다.
+- 실행 계획(DAG)은 코드가 짠다. AIDE 의 LLM 계획기는 **다른 AIDE 도구가 섞인 요청에서만** 쓰고, 수정 도우미 프로필에서는 끈다.
+  AIDE 라우터·L2·미리보기 요약·기억 추출도 이 프로필에서는 끈다.
+- 판단이 갈리는 지점(메우는 방식·정확히/이상·원티드 포기 등)은 코드가 정하지 않고 **사용자에게 버튼으로 묻는다.**
+- 적용은 **버튼으로만** 한다. 글자 승인('응'·'네')으로는 적용하지 않는다.
+- 하드락(연속 근무·ND/ED/NE·나이트 상한 등)은 수정 도우미에서도 완화하지 않는다. 해가 없으면 이유와 사용자가 고를 수 있는 길을 보인다.
+- 수정 도우미가 부를 수 있는 스킬은 프로필(허용 목록)로 막는다. 다른 AIDE 도구는 나중에 프로필을 넓혀서 연다.
+- 경로 `/api/agents/schedule-edit/*`(스위치 `SCHEDULE_EDIT_AGENT_ENABLED=1`) · 에이전트 `app/schedule_edit_agent/` · 엔진 `app/services/schedule_edit/`.
+
 ## Tech Stack
 
 - **Backend**: Python, FastAPI, SQLAlchemy
