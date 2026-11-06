@@ -1,6 +1,7 @@
 """Middleware pipeline — skill execution with permission, context, and grounding.
 
 Pipeline stages:
+  ⓪ Scope Check — 에이전트 프로필(허용 목록) · 모르는 에이전트·프로필 밖 스킬·버튼 아닌 쓰기 거절(S3)
   ① Permission Check — user role → mutation access control
   ② Context Injection — session context → skill params (group_id, year, month, "나"→nurse_id)
   ③ Internal Grounding — nurse_name→ID, shift_name→code, date→ISO
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 class MiddlewareStep:
     """Single middleware substep for debug trace."""
 
-    name: str  # "permission", "context_injection", "grounding", "execution"
+    name: str  # "scope", "permission", "context_injection", "grounding", "execution", "verification"
     status: str  # "pass", "block", "grounded", "skip"
     detail: str = ""
     before: dict | None = None
@@ -157,6 +158,23 @@ def execute_skill(
     steps: list[MiddlewareStep] = []
     args_original = {**args}
 
+    # ── ⓪ Scope Check — 에이전트 프로필(허용 목록) · S3 ──
+    block = _check_scope(skill_name, ctx)
+    if block:
+        steps.append(MiddlewareStep("scope", "block", detail=block))
+        dt = (time.time() - t0) * 1000
+        _write_skill_audit(db, ctx, skill_name, args_original, "DENIED", block, dt)
+        return SkillResult(
+            data={"error": block, "permission_denied": True},
+            duration_ms=dt,
+            skill_name=skill_name,
+            grounded_params=args,
+            blocked=True,
+            block_reason=block,
+            middleware_steps=steps,
+        )
+    steps.append(MiddlewareStep("scope", "pass", detail=f"agent={ctx.agent_id}, source={ctx.source}"))
+
     # ── ① Permission Check ──
     block = _check_permission(skill_name, args, ctx)
     if block:
@@ -224,7 +242,9 @@ def execute_skill(
     try:
         # 인증 사용자는 args 가 아니라 실행 순간에만 묶는다(감사·승인 대기 직렬화 차단).
         with bind_auth_user(ctx.auth_user):
-            result = run_skill(db, skill_name, args)
+            # aide 는 지금 호출 그대로(run_skill 의 agent 기본이 aide) — 파생 에이전트만 자기 id 를 넘겨 스펙 agents 로 거른다
+            result = (run_skill(db, skill_name, args) if ctx.agent_id == "aide"
+                      else run_skill(db, skill_name, args, agent=ctx.agent_id))
         steps.append(MiddlewareStep("execution", "ok", detail=skill_name))
     except KeyError as e:
         result = {"error": f"Unknown skill: {e}"}
@@ -315,6 +335,39 @@ _SELF_REFERENCE_ALIASES = ("나", "내", "제", "본인")
 
 def _is_head_or_admin(ctx: SessionContext) -> bool:
     return ctx.user_role in ("HN", "ADM")
+
+
+SCOPE_UNKNOWN_AGENT = "알 수 없는 에이전트라 이 작업을 할 수 없습니다."
+SCOPE_OUT_OF_PROFILE = "이 도우미에서는 할 수 없는 작업입니다."
+SCOPE_WRITE_SOURCE = "이 작업은 화면의 버튼으로만 할 수 있습니다."
+
+
+def _check_scope(skill_name: str, ctx: SessionContext) -> str | None:
+    """⓪ 범위 단계 — 에이전트 프로필(허용 목록). ①(역할 권한)보다 먼저 본다(S3 · 11-06).
+
+    - 모르는 agent_id → 거절.
+    - 프로필 밖 스킬 → 거절(aide 는 파생 에이전트 전용 스킬만 밖이다 — 지금 AIDE 동작 그대로).
+    - 쓰기 스킬은 프로필의 write_sources 에 든 출처에서 온 호출만(비우면 제한 없음 — aide).
+      쓰기 판정은 LLM 이 적은 값이 아니라 스펙의 mode(옛 스킬은 _MUTATION_SKILLS)로 한다.
+    """
+    from agents_v2.profiles import in_scope, profile_of
+    from agents_v2.skills.manifest import find_spec, load_manifest_skills
+
+    profile = profile_of(ctx.agent_id)
+    if profile is None:
+        return SCOPE_UNKNOWN_AGENT
+    if not in_scope(profile.id, skill_name):
+        return SCOPE_OUT_OF_PROFILE
+    if profile.write_sources:
+        load_manifest_skills()
+        spec = find_spec(skill_name)
+        # 옛 @register 스킬(스펙 없음)의 _MUTATION_SKILLS 판정은 지금 쓰이지 않는다 — write_sources 가 있는 프로필은
+        # schedule-edit 하나이고 그 프로필은 위 in_scope 에서 옛 스킬을 이미 막는다. 프로필을 넓혀 옛 스킬을 열 때의 안전망.
+        writes = (spec.effective_mode == "write") if spec is not None \
+            else skill_name.replace("-", "_") in _MUTATION_SKILLS
+        if writes and ctx.source not in profile.write_sources:
+            return SCOPE_WRITE_SOURCE
+    return None
 
 
 def _check_permission(

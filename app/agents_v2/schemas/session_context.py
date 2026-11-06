@@ -31,6 +31,15 @@ class SessionContext:
     # 승인 턴은 그 턴을 보낸 요청의 사용자다(pending_approval 에는 담지 않는다).
     auth_user: Any = field(default=None, repr=False, compare=False)
 
+    # 어느 에이전트의 호출인가(프로필 id · agents_v2.profiles) — ⓪ 범위 단계가 허용 목록으로 거른다(S3 · 11-06).
+    #   aide 가 기본이라 지금 AIDE 경로는 그대로다. 파생 에이전트(근무표 수정 도우미 = "schedule-edit")가 자기 id 를 채운다.
+    agent_id: str = "aide"
+    # 이 호출이 어디서 왔나 — llm(말을 LLM 이 도구로 바꿈) · button(카드 버튼) · example(예시 문장).
+    #   프로필의 write_sources 가 비어 있지 않으면 쓰기 스킬은 거기 든 출처에서만 받는다.
+    source: str = "llm"
+    # 파생 에이전트의 턴 상태(근무표 수정 도우미의 Turn) — 실행 순간에만 스킬에 묶는다(S4). 기록·직렬화·비교에서 뺀다.
+    turn: Any = field(default=None, repr=False, compare=False)
+
     # Auto-computed
     today: str = field(default_factory=lambda: date.today().isoformat())
 
