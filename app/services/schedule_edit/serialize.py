@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from services.schedule_edit.context import EditContext
 from services.schedule_edit.requests import (
@@ -172,3 +172,154 @@ def result_to_dict(ctx: EditContext, result) -> Dict[str, Any]:
         "levers": [lever_to_dict(lv) for lv in result.levers],
         "source": getattr(result, "source", None),
     }
+
+
+# ── 대화 상태 저장·복원(S10a) — 서버 메모리 밖(AIDE 저장소)에 싣기 위한 무손실 JSON ────────────────────
+
+#: 직렬화한 상태 JSON(utf-8)의 상한 — 넘으면 후보를 빼고 싣는다(`candidates_dropped`)
+SESSION_JSON_LIMIT = 128 * 1024
+#: 마지막 결과·넘긴 결과에 싣는 후보 수
+KEEP_CANDIDATES = 3
+
+
+class SessionStateTooLarge(ValueError):
+    """후보·레버를 다 빼고도 상태 JSON 이 SESSION_JSON_LIMIT 를 넘는다 — 저장소(S10b)가 이 예외를 받으면 싣지 않고
+    기록(`schedule_edit_log`) 복원으로 떨어진다."""
+
+
+def candidate_to_json(cand) -> Dict[str, Any]:
+    """`solver.Candidate` 전 칸 — 화면용 `candidate_to_dict` 와 달리 날짜는 0부터 그대로, ctx 가 필요 없다."""
+    return {
+        "rank": cand.rank,
+        "changes": [{"nurse_id": c.nurse_id, "name": c.name, "day": c.day, "before": c.before, "after": c.after,
+                     "before_main": c.before_main, "after_main": c.after_main, "vacation": c.vacation}
+                    for c in cand.changes],
+        "affected": list(cand.affected), "optimal": cand.optimal, "window": list(cand.window),
+        "counts": {n: {code: list(pair) for code, pair in by.items()} for n, by in cand.counts.items()},
+        "span": list(cand.span), "loss": cand.loss, "quality": list(cand.quality),
+    }
+
+
+def candidate_from_json(data: Dict[str, Any]):
+    from services.schedule_edit.solver import Candidate, CellChange    # solver 가 serialize 를 부르므로 지연 import
+    return Candidate(
+        rank=int(data["rank"]),
+        changes=[CellChange(c["nurse_id"], c["name"], int(c["day"]), c["before"], c["after"], c["before_main"],
+                            c["after_main"], bool(c.get("vacation"))) for c in data.get("changes") or []],
+        affected=list(data.get("affected") or []), optimal=bool(data["optimal"]),
+        window=tuple(data["window"]),
+        counts={n: {code: tuple(pair) for code, pair in by.items()} for n, by in (data.get("counts") or {}).items()},
+        span=tuple(data["span"]), loss=int(data["loss"]), quality=list(data.get("quality") or []))
+
+
+def _lever_to_json(lv) -> Dict[str, Any]:
+    return {"allow": allow_to_json(lv.allow), "lose": list(lv.lose), "changes": list(lv.changes),
+            "span": list(lv.span), "quality": list(lv.quality), "gain": lv.gain}
+
+
+def _lever_from_json(data: Dict[str, Any]):
+    from services.schedule_edit.levers import Lever    # levers·precheck 가 serialize 를 부르므로 지연 import
+    return Lever(allow=allow_from_json(data.get("allow")), lose=list(data.get("lose") or []),
+                 changes=tuple(data["changes"]), span=tuple(data["span"]), quality=list(data.get("quality") or []),
+                 gain=data.get("gain"))
+
+
+def result_to_json(result) -> Dict[str, Any]:
+    """`solver.EditResult` 전 칸 — 후보·레버 포함."""
+    return {"status": result.status, "candidates": [candidate_to_json(c) for c in result.candidates],
+            "reasons": list(result.reasons), "notes": list(result.notes), "blocking": list(result.blocking),
+            "levers": [_lever_to_json(lv) for lv in result.levers], "source": result.source,
+            "extra": list(result.extra)}
+
+
+def result_from_json(data: Dict[str, Any]):
+    from services.schedule_edit.solver import EditResult
+    return EditResult(status=data["status"], candidates=[candidate_from_json(c) for c in data.get("candidates") or []],
+                      reasons=list(data.get("reasons") or []), notes=list(data.get("notes") or []),
+                      blocking=list(data.get("blocking") or []),
+                      levers=[_lever_from_json(lv) for lv in data.get("levers") or []],
+                      source=data.get("source"), extra=list(data.get("extra") or []))
+
+
+def _kept_result(result) -> Optional[Dict[str, Any]]:
+    """저장할 결과 — 후보는 앞 KEEP_CANDIDATES 개만."""
+    if result is None:
+        return None
+    out = result_to_json(result)
+    out["candidates"] = out["candidates"][:KEEP_CANDIDATES]
+    return out
+
+
+def _json_bytes(data: Dict[str, Any]) -> int:
+    return len(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _results(out: Dict[str, Any]):
+    return [r for r in (out["last"], (out["held"] or {}).get("result")) if r]
+
+
+def session_state_to_json(session, *, edit_from: Optional[int] = None) -> Dict[str, Any]:
+    """대화 상태(`EditSession`) → JSON. 판정 재료(ctx·rules·screen)와 시작 해(hint)는 싣지 않는다 — 복원 때 다시 짓는다.
+
+    edit_from: 고칠 수 있는 첫날(0부터) — 안 주면 판정 재료(ctx)에 얹힌 값.
+    직렬화 크기가 SESSION_JSON_LIMIT 를 넘으면 단계마다 다시 재며 줄인다 — ① 후보(마지막 결과·넘긴 결과)를 빼고
+    `candidates_dropped: true` ② 그래도 넘으면 레버도 빼고 `levers_dropped: true` ③ 그래도 넘으면 SessionStateTooLarge.
+    표시는 실제로 뭔가를 뺐을 때만 true — 화면이 '다시 찾기'를 낸다.
+    """
+    from services.schedule_edit.precheck import finding_to_json
+    held = session.held
+    out: Dict[str, Any] = {
+        "schedule_id": session.schedule_id, "stamp": session.stamp,
+        "requests": requests_to_json(session.requests), "allow": allow_to_json(session.allow),
+        "avoid_people": [sorted(p) for p in session.avoid_people],
+        "confirmed": sorted(session.confirmed), "asking": [finding_to_json(f) for f in session.asking],
+        "held": None if held is None else {"requests": requests_to_json(held[0]), "result": _kept_result(held[1]),
+                                           "avoid": [sorted(p) for p in held[2]]},
+        "shown_notes": sorted(session.shown_notes),
+        "edit_from": edit_from if edit_from is not None else getattr(session.ctx, "edit_from", None),
+        "last": _kept_result(session.last),
+        "candidates_dropped": bool(getattr(session, "candidates_dropped", False)),
+        "levers_dropped": bool(getattr(session, "levers_dropped", False)),
+    }
+    if _json_bytes(out) > SESSION_JSON_LIMIT:
+        for result in _results(out):
+            if result["candidates"]:
+                result["candidates"] = []
+                out["candidates_dropped"] = True
+    if _json_bytes(out) > SESSION_JSON_LIMIT:
+        for result in _results(out):
+            if result["levers"]:
+                result["levers"] = []
+                out["levers_dropped"] = True
+    if _json_bytes(out) > SESSION_JSON_LIMIT:
+        raise SessionStateTooLarge(f"대화 상태가 {SESSION_JSON_LIMIT} 바이트를 넘습니다(후보·레버를 빼고도).")
+    return out
+
+
+def session_state_from_json(data: Dict[str, Any], *, rebuild: Callable[[str], Any]):
+    """JSON → `EditSession`. rebuild(schedule_id) 가 판정 재료(ctx·rules·screen)와 지금 칸 지문(stamp)을 다시 지어 준다.
+
+    `agent.session_for` 가 다시 열 때와 다른 점이 하나 있다. 같은 점: 요청·허용량·넘긴 묶음·동의·묻는 중인 확인·보인
+    문구·고칠 첫날은 이어 가고, held 는 요청·넘긴 묶음만 되살린다(결과는 언제나 버린다 — 옛 판정 재료로 찾은 후보이고
+    칸 지문은 설정·원티드 변경을 못 본다). 다른 점: 마지막 결과(last)의 후보는 칸 지문이 저장본과 같을 때만 이어 간다
+    (다르면 근무표가 바뀐 것이라 버린다). 적용은 잠금 → 최신 확인 → 재검증을 다시 하므로 이어 가도 안전하다.
+    """
+    from services.schedule_edit.precheck import finding_from_json
+    session = rebuild(data["schedule_id"])
+    stale = session.stamp != data.get("stamp")
+    session.requests = requests_from_json(data.get("requests"))
+    session.allow = allow_from_json(data.get("allow"))
+    session.avoid_people = [frozenset(p) for p in data.get("avoid_people") or []]
+    session.confirmed = set(data.get("confirmed") or [])
+    session.asking = [finding_from_json(f) for f in data.get("asking") or []]
+    session.shown_notes = set(data.get("shown_notes") or [])
+    held = data.get("held")
+    if held:
+        session.held = (requests_from_json(held.get("requests")), None, [frozenset(p) for p in held.get("avoid") or []])
+    last = data.get("last")
+    session.last = None if stale or not last else result_from_json(last)
+    session.candidates_dropped = bool(data.get("candidates_dropped")) and not stale
+    session.levers_dropped = bool(data.get("levers_dropped")) and not stale
+    if data.get("edit_from") is not None:
+        session.ctx.edit_from = int(data["edit_from"])
+    return session

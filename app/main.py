@@ -670,15 +670,13 @@ app.include_router(nurse_period_router.router)
 from agents_v2 import chat_router as _agent_chat_module  # noqa: E402,F401
 from agents_v2 import test_chat_router as _agent_test_module  # noqa: E402,F401
 from agents_v2 import usage_router as _agent_usage_module  # noqa: E402,F401
+# 공통 에이전트 경로 /api/agents/{agent_id}/… — 에이전트는 import 할 때 등록된다. 마운트는 surface 가
+#   켜진 에이전트가 있을 때만 한다(근무표 수정 도우미 = schedule-edit · SCHEDULE_EDIT_AGENT_ENABLED=1).
+import schedule_edit_agent.spec  # noqa: F401,E402 — 등록
+from agent_kit import router as _agent_kit_router_module  # noqa: E402,F401
 from agents_v2.surface import mount_agent_routes  # noqa: E402
 
 mount_agent_routes(app)
-
-# 공통 에이전트 경로 /api/agents/{agent_id}/… — 에이전트는 import 할 때 등록된다(각자 스위치 · 꺼지면 404)
-#   근무표 수정 도우미(소형 CP-SAT) = schedule-edit · SCHEDULE_EDIT_AGENT_ENABLED=1 일 때만
-import schedule_edit_agent.spec  # noqa: F401,E402 — 등록
-from agent_kit.router import router as agents_router
-app.include_router(agents_router)
 
 import uvicorn
 

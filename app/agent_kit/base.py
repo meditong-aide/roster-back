@@ -85,9 +85,11 @@ class Agent(ABC):
     limits: Limits = Limits()
     #: 화면이 다른 대상으로 옮긴 뒤 앞 대상의 버튼을 눌렀을 때(409 context_changed)
     moved_message: str = "보던 대상이 바뀌어 이 버튼은 쓸 수 없습니다. 다시 요청해 주세요."
+    #: 새 대화 id 앞에 붙는 이름 공간('se:') — AIDE 대화 저장소와 id 가 섞이지 않게 에이전트마다 둔다
+    conversation_prefix: str = ""
 
     def __init__(self) -> None:
-        self.store = ConversationStore(self.id, self.limits, self.restore)
+        self.store = ConversationStore(self.id, self.limits, self.restore, prefix=self.conversation_prefix)
         self.slots = threading.BoundedSemaphore(max(1, self.concurrency()))
 
     def concurrency(self) -> int:
@@ -140,3 +142,8 @@ def register(agent: Agent) -> Agent:
 
 def get_agent(agent_id: str) -> Optional[Agent]:
     return AGENTS.get(agent_id)
+
+
+def any_enabled() -> bool:
+    """켜진 에이전트가 하나라도 있나 — 없으면 공통 경로를 아예 붙이지 않는다(surface)."""
+    return any(agent.enabled() for agent in AGENTS.values())

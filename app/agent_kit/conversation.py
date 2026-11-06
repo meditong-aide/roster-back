@@ -114,6 +114,29 @@ class Conversation:
         """대상을 옮긴다(화면에서 다른 버전으로 갔거나 적용으로 새 버전이 생김) — 실행 상태는 새로 연다(carry 는 남긴다)."""
         self.context, self.state, self.restored = dict(context), None, None
 
+    def to_json(self, state_json: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """저장용 — 메타만. lock·last_blocks·state·restored 는 싣지 않는다(state 는 에이전트가 직렬화해 state_json 으로 준다).
+
+        history 는 최근 history_keep 개만 — 넘치는 만큼은 dropped 에 더한다. carry 의 튜플은 JSON 이라 목록이 된다.
+        """
+        keep = self.limits.history_keep
+        over = max(0, len(self.history) - keep)
+        return {
+            "id": self.id, "agent": self.agent, "owner": self.owner, "context": dict(self.context),
+            "turn_no": self.turn_no, "history": [dict(h) for h in self.history[over:]], "dropped": self.dropped + over,
+            "request": self.request, "steps": list(self.steps), "carry": dict(self.carry),
+            "created_at": self.created_at, "touched_at": self.touched_at, "state": state_json,
+        }
+
+    @classmethod
+    def from_json(cls, data: Dict[str, Any], limits: Limits) -> "Conversation":
+        """저장본 → 대화(실행 상태 없음). data["state"] 는 에이전트가 따로 읽어 state 를 세운다."""
+        return cls(id=data["id"], agent=data["agent"], owner=data["owner"], context=dict(data.get("context") or {}),
+                   created_at=float(data["created_at"]), touched_at=float(data["touched_at"]), limits=limits,
+                   turn_no=int(data.get("turn_no") or 0), history=[dict(h) for h in data.get("history") or []],
+                   dropped=int(data.get("dropped") or 0), request=data.get("request"),
+                   steps=list(data.get("steps") or []), carry=dict(data.get("carry") or {}))
+
     def info(self) -> Dict[str, Any]:
         now = time.time()
         return {
@@ -129,15 +152,16 @@ Restorer = Callable[[Session, str], Conversation]
 
 
 class ConversationStore:
-    def __init__(self, agent: str, limits: Limits, restore: Restorer):
+    def __init__(self, agent: str, limits: Limits, restore: Restorer, *, prefix: str = ""):
         self.agent, self.limits, self._restore = agent, limits, restore
+        self.prefix = prefix
         self._items: "OrderedDict[str, Conversation]" = OrderedDict()
         self._guard = threading.Lock()
 
     def start(self, owner: str, context: Dict[str, Any]) -> Conversation:
         """새 대화 — 잠근 채로 돌려준다(`checkin` 으로 푼다)."""
         now = time.time()
-        conv = Conversation(id=str(uuid.uuid4()), agent=self.agent, owner=owner, context=dict(context),
+        conv = Conversation(id=f"{self.prefix}{uuid.uuid4()}", agent=self.agent, owner=owner, context=dict(context),
                             created_at=now, touched_at=now, limits=self.limits)
         conv.lock.acquire()
         with self._guard:

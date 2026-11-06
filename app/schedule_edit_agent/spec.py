@@ -51,6 +51,7 @@ class ScheduleEditAgent(Agent):
     min_work_seconds = MIN_SOLVE
     limits = LIMITS
     moved_message = "보던 근무표가 바뀌어 이 버튼은 쓸 수 없습니다. 바꿀 내용을 다시 말씀해 주세요."
+    conversation_prefix = "se:"
 
     def __init__(self, llm_factory=OpenAIEditLLM):
         self.core = EditAgent(llm_factory)

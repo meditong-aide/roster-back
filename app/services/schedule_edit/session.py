@@ -52,6 +52,10 @@ class EditSession:
     asking: List[Finding] = field(default_factory=list)
     #: 확인을 묻기 전 상태(요청·결과·넘긴 묶음) — [바꾸지 않기]면 되돌린다
     held: Optional[Tuple[List[EditRequest], Optional[EditResult], List[FrozenSet[str]]]] = None
+    #: 저장 크기 때문에 후보를 빼고 복원했다 — 화면이 '다시 찾기'를 낸다(`serialize.session_state_from_json`)
+    candidates_dropped: bool = False
+    #: 저장 크기 때문에 레버까지 뺐다(`candidates_dropped` 보다 심한 경우)
+    levers_dropped: bool = False
 
 
 def cells_stamp(db: Session, schedule_id: str) -> str:
