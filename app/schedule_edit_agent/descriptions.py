@@ -5,8 +5,8 @@
                    캐시가 걸린다 — 날짜·상태는 넣지 않는다(상태는 `prompt.state_summary` 가 대화 뒤에 붙인다).
   · BUTTON_TOOLS : 카드 버튼 — 모양은 같지만 LLM 에 보이지 않는다(화면이 서버가 준 input 을 그대로 보낸다).
   · SKILL_MODES  : read · preview · write. 쓰기는 적용(apply_edit) 하나뿐이고 새 버전(draft)만 만든다(`middleware` 권한 단계).
-실행 함수는 `skills.py` 가 `registry.register(name)` 으로 붙인다. 이 목록은 수정 도우미 전용이다 — AIDE 의
-`SKILL_REGISTRY` 와 섞지 않고, AIDE 스킬(조회·일괄 수정·설정 변경·생성 등)은 여기에 없다.
+실행 함수는 `skills.py` 가 `registry.register(name)` 으로 붙인다. 이 목록은 수정 도우미 전용이다 — 자기 함수는 AIDE 의
+`SKILL_REGISTRY` 에 그대로 넣지 않고(감싼 함수만 `aide_skills` 가 올린다 · S4), AIDE 스킬(조회·일괄 수정·설정 변경·생성 등)은 여기에 없다.
 """
 
 from __future__ import annotations

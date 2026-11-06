@@ -5,7 +5,8 @@
   · `run_skill` 은 이름을 정규화한다(그대로 → 하이픈 → 밑줄 · AIDE 와 같다).
   · 도구 정의(설명·인자·읽기/미리보기/쓰기)는 `descriptions.py` 한 곳에 있다 — 등록 이름과 정의 이름이 어긋나면
     `definition_gaps()` 가 알린다(시험).
-이 레지스트리는 수정 도우미 전용이다 — AIDE `SKILL_REGISTRY` 에 넣지 않고 거기 있는 스킬도 부르지 않는다.
+이 레지스트리는 수정 도우미 전용이다 — 자기 함수 그대로는 AIDE `SKILL_REGISTRY` 에 넣지 않고, AIDE 목록에는
+`aide_skills` 가 (db, params) 로 감싼 함수만 올린다(S4). 거기 있는 AIDE 스킬은 여기서 부르지 않는다.
 """
 
 from __future__ import annotations

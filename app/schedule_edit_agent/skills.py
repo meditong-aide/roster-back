@@ -111,6 +111,37 @@ class Outcome:
     focus: Optional[int] = None
     #: 버튼이 지금 상태와 안 맞아 아무것도 안 했다 — 흔적에 남기지 않는다
     failed: bool = False
+    #: 스킬 본문이 사용자에게 되물었다(`_clarify`) — 분류만 위한 표식이라 같음 비교에서는 뺀다
+    asked: bool = field(default=False, compare=False)
+
+    def to_data(self, *, clarify: bool = False) -> Dict[str, Any]:
+        """AIDE 실행 경로의 결과 dict(S4) — 무손실(`from_data` 로 되돌린다) + `agents_v2.errors.classify` 가 알아보는 표식.
+
+        분류표: failed → ``error``(GENERIC_ERROR) · 되물음(clarify=True · asked(`_clarify`) 또는 확인·선택을 묻는 preview.status:
+        confirm·confirm_apply·choose_plan·choose_transfer) → ``needs_clarification``(CLARIFICATION) ·
+        후보를 낸 결과(preview.status == ok 이고 후보 있음) → ``preview_only``(PREVIEW) ·
+        그 밖(infeasible·invalid·already·timeout·compare·미리보기 없음) → 표식 없음(OK)."""
+        data: Dict[str, Any] = {"answer": self.answer, "preview": self.preview, "effects": list(self.effects),
+                                "focus": self.focus, "failed": self.failed}
+        status = (self.preview or {}).get("status")
+        if self.failed:
+            data["error"] = self.answer
+        elif clarify or self.asked or status in ASKING_STATUSES:
+            data["needs_clarification"] = True
+        elif status == "ok" and (self.preview or {}).get("candidates"):
+            data["preview_only"] = True
+        return data
+
+    @classmethod
+    def from_data(cls, data: Dict[str, Any]) -> "Outcome":
+        return cls(answer=data["answer"], preview=data.get("preview"), effects=list(data.get("effects") or []),
+                   focus=data.get("focus"), failed=bool(data.get("failed")),
+                   asked=bool(data.get("needs_clarification")))
+
+
+#: 사용자에게 확인·선택을 묻는 preview.status — 바꾸기 전 확인(confirm)·적용 전 확인(confirm_apply)·인원 계획/메우는 방식 고르기
+#: (choose_plan)·옮길 곳 고르기(choose_transfer). 그 밖의 status(ok·infeasible·invalid·already·timeout·compare)는 묻지 않는다.
+ASKING_STATUSES = frozenset({"confirm", "confirm_apply", "choose_plan", "choose_transfer"})
 
 
 # ── LLM 이 고르는 스킬 ───────────────────────────────────────────────────────
@@ -1654,7 +1685,7 @@ def _open_notes(turn: Turn) -> List[str]:
 def _clarify(turn: Turn, asks: List[str]) -> Outcome:
     answer = "\n".join(dict.fromkeys(asks))
     turn.record("clarify", {"asks": asks, "answer": answer})
-    return Outcome(answer=answer)
+    return Outcome(answer=answer, asked=True)
 
 
 def _ms(started: float) -> int:

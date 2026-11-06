@@ -5,6 +5,7 @@ Pipeline stages:
   ① Permission Check — user role → mutation access control
   ② Context Injection — session context → skill params (group_id, year, month, "나"→nurse_id)
   ③ Internal Grounding — nurse_name→ID, shift_name→code, date→ISO
+     (파생 스펙 — grounder·context_first 가 있거나 agents 에 aide 가 없는 스킬 — 은 ②③ 대신 스펙 훅 · S4)
   ④ Skill Execution — run_skill(db, name, params)
   ⑤ Trace Capture — stage metadata for debug UI
 """
@@ -15,6 +16,7 @@ import json
 import logging
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,6 +32,7 @@ from agents_v2.grounding.internal import (
 )
 from agents_v2.schemas.session_context import SessionContext
 from agents_v2.skills.registry import run_skill
+from agents_v2.turn_context import bind_turn
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +198,10 @@ def execute_skill(
         detail=f"role={ctx.user_role}, skill={skill_name}",
     ))
 
+    spec = _derived_spec(skill_name)
+    if spec is not None:
+        return _execute_derived(db, skill_name, spec, args, args_original, ctx, steps, t0)
+
     # ── ② Context Injection ──
     args_before = {**args}
     args = _inject_context(args, ctx)
@@ -313,6 +320,93 @@ def execute_skill(
     )
 
 
+# ── 파생 스펙 실행(S4) ───────────────────────────────────────
+
+#: 늘 미들웨어가 채우는 칸 — LLM·화면이 보낸 값은 버린다(수정 도우미 `middleware.GROUNDED` 와 같다)
+_GROUNDED = "grounded"
+
+
+def _derived_spec(skill_name: str):
+    """파생 스펙이면 그 스펙, 아니면 None. 판정: grounder 나 context_first 가 있거나, agents 에 aide 가 없는 스펙.
+    AIDE 스펙(훅 없음 · agents 에 aide)은 모두 아니라 지금 ②③ 그대로다."""
+    from agents_v2.skills.manifest import find_spec, load_manifest_skills
+
+    load_manifest_skills()
+    spec = find_spec(skill_name)
+    if spec is None:
+        return None
+    if spec.grounder is not None or spec.context_first is not None or "aide" not in spec.agents:
+        return spec
+    return None
+
+
+def _spec_context(spec, args: dict, ctx: SessionContext) -> tuple[dict, list[str]]:
+    """② 파생판 — (인자, 버린 칸). 확정 칸은 늘 미들웨어가 채운다. 버튼이 아닌 출처의 인자는 스키마 properties 안의 칸만 —
+    세션이 아는 값(schedule_id·오늘·달)은 정의에 없어 받지 않는다. 버튼 인자는 서버가 만든 것이라 그대로 둔다."""
+    dropped = [_GROUNDED] if _GROUNDED in args else []
+    params = {k: v for k, v in args.items() if k != _GROUNDED}
+    if ctx.source != "button":
+        allowed = set((spec.schema.get("parameters") or {}).get("properties") or {})
+        dropped += [k for k in params if k not in allowed]
+        params = {k: v for k, v in params.items() if k in allowed}
+    return params, dropped
+
+
+def _execute_derived(
+    db: Session, skill_name: str, spec, args: dict, args_original: dict, ctx: SessionContext,
+    steps: list[MiddlewareStep], t0: float,
+) -> SkillResult:
+    """②③ 을 스펙 훅으로 바꾼 실행 — 문맥 주입(스키마 밖 인자·확정 칸 버림) → context_first → grounder → 확정 값을 params 로 → ④.
+    훅이 결과 dict 를 돌려주면(되물음·거절) 그것으로 끝낸다. 턴은 훅과 실행 동안만 묶는다(turn_context)."""
+    status, err_msg = "SUCCESS", None
+    skill_name = spec.name       # 하이픈 이름으로 와도 결과·감사는 정의된 이름으로(수정 도우미 경로와 같다)
+    params, dropped = _spec_context(spec, args, ctx)
+    detail = f"출처={ctx.source}" + (f", 버린 인자={','.join(sorted(dropped))}" if dropped else "")
+    stop: Any = None
+    result: Any = None
+    try:
+        with bind_auth_user(ctx.auth_user), \
+                (bind_turn(ctx.turn, source=ctx.source, args=args_original) if ctx.turn is not None else nullcontext()):
+            if ctx.turn is not None and hasattr(ctx.turn, "trace"):
+                # 이 호출의 단계 기록을 턴에 건다 — 앞 호출 것이 첫 기록에 붙지 않게(수정 도우미 경로와 같다)
+                ctx.turn.trace, ctx.turn.traced = steps, False
+            if spec.context_first is not None:
+                stop = spec.context_first(ctx.turn, params)
+            if stop is not None:
+                steps.append(MiddlewareStep("context_injection", "clarification_needed", detail=detail))
+            else:
+                steps.append(MiddlewareStep("context_injection", "injected", detail=detail))
+                if spec.grounder is not None:
+                    grounded, stop = spec.grounder(ctx.turn, params)
+                    if stop is not None:
+                        steps.append(MiddlewareStep("grounding", "clarification_needed"))
+                    elif grounded is None:
+                        steps.append(MiddlewareStep("grounding", "skip", detail="실행 단계가 먼저 답한다"))
+                    else:
+                        params[_GROUNDED] = grounded
+                        steps.append(MiddlewareStep("grounding", "grounded"))
+                else:
+                    steps.append(MiddlewareStep("grounding", "skip", detail="no grounding needed"))
+            if stop is None:
+                result = run_skill(db, skill_name, params, agent=ctx.agent_id)
+                steps.append(MiddlewareStep("execution", "ok", detail=skill_name))
+    except Exception as e:  # noqa: BLE001 — 파생 에이전트가 기록을 남기고 올린 예상 밖 예외
+        logger.exception("파생 스킬 실행 오류: %s", skill_name)
+        stop = {"error": f"Skill execution error: {str(e)}"}
+        steps.append(MiddlewareStep("execution", "error", detail=str(e)))
+    if stop is not None:
+        result = stop
+    kind = classify(result)      # 훅이 끝낸 결과든 실행 함수가 돌려준 결과든 같은 표로 상태를 정한다
+    if kind is ErrorType.CLARIFICATION:
+        status, err_msg = "CLARIFICATION_NEEDED", str(result.get("answer") or "")[:500] or None
+    elif kind is ErrorType.GENERIC_ERROR:
+        status, err_msg = "ERROR", str(result.get("error"))[:500]
+    dt = (time.time() - t0) * 1000
+    _write_skill_audit(db, ctx, skill_name, params, status, err_msg, dt)
+    return SkillResult(data=result, duration_ms=dt, skill_name=skill_name, grounded_params=params,
+                       middleware_steps=steps)
+
+
 # ── Permission Check ────────────────────────────────────────
 
 _MUTATION_SKILLS = frozenset({
@@ -340,6 +434,7 @@ def _is_head_or_admin(ctx: SessionContext) -> bool:
 SCOPE_UNKNOWN_AGENT = "알 수 없는 에이전트라 이 작업을 할 수 없습니다."
 SCOPE_OUT_OF_PROFILE = "이 도우미에서는 할 수 없는 작업입니다."
 SCOPE_WRITE_SOURCE = "이 작업은 화면의 버튼으로만 할 수 있습니다."
+SCOPE_SOURCE = "이 경로에서는 부를 수 없는 작업입니다."
 
 
 def _check_scope(skill_name: str, ctx: SessionContext) -> str | None:
@@ -367,6 +462,11 @@ def _check_scope(skill_name: str, ctx: SessionContext) -> str | None:
             else skill_name.replace("-", "_") in _MUTATION_SKILLS
         if writes and ctx.source not in profile.write_sources:
             return SCOPE_WRITE_SOURCE
+    # 스펙이 호출 출처를 좁혔으면(수정 도우미: LLM·예시는 도구만 · 버튼은 버튼만) 그 출처에서 온 호출만. AIDE 스펙은 비어 있어 그대로(S4)
+    load_manifest_skills()
+    sourced = find_spec(skill_name)
+    if sourced is not None and sourced.sources and ctx.source not in sourced.sources:
+        return SCOPE_SOURCE
     return None
 
 

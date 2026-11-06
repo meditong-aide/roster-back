@@ -75,9 +75,13 @@ def _schema_hash(schema: dict) -> str:
 
 
 def test_untagged_specs_belong_to_aide():
+    """AIDE 모듈의 스펙은 aide 소속 · 수정 도우미 모듈(schedule_edit_agent.aide_skills)의 스펙은 schedule-edit 소속(S4)."""
     load_manifest_skills()
     assert SKILL_SPECS, "매니페스트 스킬이 하나도 없다"
     for spec in SKILL_SPECS.values():
+        if spec.handler.__module__.startswith("schedule_edit_agent"):
+            assert spec.agents == (_EDIT,), spec.name
+            continue
         assert spec.agents == ("aide",), spec.name
         assert spec.commit == "rerun" and spec.sources == () and spec.llm_visible
 
@@ -92,8 +96,9 @@ def test_derived_skills_stay_out_of_aide_lists(derived_skills):
 
 def test_derived_skills_listed_for_their_agent_only_when_llm_visible(derived_skills):
     propose, apply = derived_skills
-    assert [s.name for s in manifest_specs(_EDIT)] == [propose, apply]
-    assert [s["name"] for s in manifest_tools(_EDIT)] == [propose]           # 버튼 전용은 LLM 에 안 보임
+    fake = {propose, apply}      # 수정 도우미의 진짜 스킬 20개(S4)도 같은 에이전트라 가짜 둘만 골라 본다
+    assert [s.name for s in manifest_specs(_EDIT) if s.name in fake] == [propose, apply]
+    assert [s["name"] for s in manifest_tools(_EDIT) if s["name"] in fake] == [propose]    # 버튼 전용은 LLM 에 안 보임
     assert manifest_category_tools(_EDIT) == {"analyze": [propose]}
     assert "근무표 칸을 바꿔 달라는 말" in manifest_router_hints(_EDIT)
 

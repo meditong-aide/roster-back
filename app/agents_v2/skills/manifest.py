@@ -70,9 +70,10 @@ class SkillSpec:
     sources: tuple[str, ...] = ()
     # llm_visible: LLM 도구 목록에 보이나 — 버튼 전용 스킬은 False.
     llm_visible: bool = True
-    # grounder: 스킬 자체 이름 확정(params → 확정 params 또는 되물음). 있으면 AIDE 공통 문맥 주입·grounding 을 건너뛴다(S4).
+    # grounder: 스킬 자체 이름 확정 — grounder(turn, params) → (확정한 값 또는 None, 끝낼 결과 dict 또는 None).
+    #   결과 dict 가 있으면(되물음 등) 그대로 돌려주고 끝낸다. 있으면 AIDE 공통 문맥 주입·grounding 을 건너뛴다(S4).
     grounder: Callable[..., Any] | None = None
-    # context_first: 문맥 주입 전에 먼저 정할 것(수정 도우미의 고칠 첫날) — S4.
+    # context_first: 문맥 주입 전에 먼저 정할 것(수정 도우미의 고칠 첫날) — context_first(turn, params) → 끝낼 결과 dict 또는 None. S4.
     context_first: Callable[..., Any] | None = None
     # commit: 승인 뒤 커밋 방식 — rerun(미리보기 뒤 다시 실행 · AIDE) · button(버튼으로만, 다시 풀지 않음 · H3·S9).
     commit: str = "rerun"
@@ -233,6 +234,8 @@ _MANIFEST_MODULES: list[str] = [
     "agents_v2.skills.manage_daily_shift",
     "agents_v2.skills.manage_leave_targets",
     "agents_v2.skills.manage_banned_wanted",
+    # 파생 에이전트(근무표 수정 도우미) 스킬 — 등록은 그쪽 모듈이 이 파일을 import 해서 한다(층 분리 · S4)
+    "schedule_edit_agent.aide_skills",
 ]
 
 _loaded = False

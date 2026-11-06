@@ -44,7 +44,8 @@ def test_registry_is_edit_only_and_matches_the_definitions():
     aide_registry._ensure_loaded()
     ours = set(registry.SKILL_REGISTRY)
     assert registry.definition_gaps() == []
-    assert not ours & set(aide_registry.SKILL_REGISTRY)                 # AIDE 등록 목록에 섞지 않는다
+    # 자기 레지스트리 함수를 AIDE 목록에 그대로 섞지 않는다 — S4 부터 AIDE 목록에는 (db, params) 로 감싼 함수만 올라간다
+    assert not [n for n in ours if aide_registry.SKILL_REGISTRY.get(n) is registry.SKILL_REGISTRY[n]]
     assert not {"query_schedule", "bulk_mutation", "update_constraint", "generate_schedule",
                 "update_person_attr", "repair_schedule"} & ours        # AIDE 스킬은 열지 않는다
     assert [t["name"] for t in SKILL_TOOLS] == ["propose_edit", "revise_edit", "reply_only", "answer_confirm", "lookup",
