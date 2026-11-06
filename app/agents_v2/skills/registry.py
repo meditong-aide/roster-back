@@ -20,7 +20,7 @@ def register(name: str):
     return decorator
 
 
-def run_skill(db: Session, skill_name: str, params: dict) -> Any:
+def run_skill(db: Session, skill_name: str, params: dict, *, agent: str = "aide") -> Any:
     """Execute a skill by name.
 
     This is the SkillRunner callable expected by the executor.
@@ -30,17 +30,26 @@ def run_skill(db: Session, skill_name: str, params: dict) -> Any:
         db: Database session.
         skill_name: Registered skill name (e.g. "query-schedule" or "query_schedule").
         params: Parameters dict from the execution plan.
+        agent: 부르는 에이전트(프로필 id). 매니페스트 스킬의 `agents` 에 없으면 모르는 스킬과 똑같이 막는다 —
+            파생 에이전트(근무표 수정 도우미 등) 스킬이 같은 SKILL_REGISTRY 에 있어도 AIDE 계획이 그 이름을
+            적어(환각·옛 기록) 실행하지 못하게(검토 M1 · 11-06). 태그 없는 옛 @register 스킬은 aide 소속이다.
 
     Returns:
         Skill execution result (data dict/list).
 
     Raises:
-        KeyError: If skill_name is not registered.
+        KeyError: If skill_name is not registered, or not available to `agent`.
     """
     _ensure_loaded()
+    from agents_v2.skills.manifest import SKILL_SPECS
+
     # Normalize: try as-is, then hyphenated, then underscored
     for candidate in (skill_name, skill_name.replace("_", "-"), skill_name.replace("-", "_")):
         if candidate in SKILL_REGISTRY:
+            spec = SKILL_SPECS.get(candidate)
+            agents = spec.agents if spec is not None else ("aide",)
+            if agent not in agents:
+                raise KeyError(f"Unknown skill: {skill_name}")
             return SKILL_REGISTRY[candidate](db, params)
     raise KeyError(f"Unknown skill: {skill_name}")
 

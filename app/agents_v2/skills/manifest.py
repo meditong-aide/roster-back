@@ -22,12 +22,17 @@ ADR: docs/adr/0003-agent-orchestration-contracts.md (계약화 흐름)
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
 SkillFunc = Callable[[Session, dict], Any]
+
+#: AIDE 본 에이전트(프로필 id). 태그 없는 스킬은 전부 여기 속한다.
+AIDE = "aide"
+MODES = ("read", "preview", "write")
+COMMITS = ("rerun", "button")
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,27 @@ class SkillSpec:
     # HITL 3-tier 의 auto/notify 티어. 기본 False(=항상 승인). '어느 변경이 안전한가'는
     # 위험한 결정이라 스킬별 명시 opt-in 으로만 켠다.
     auto_safe: bool = False
+    # ── 파생 에이전트 칸(S2 · 11-06) — 한 매니페스트에 AIDE 와 파생 에이전트(근무표 수정 도우미 등) 스킬이 함께 산다 ──
+    # agents: 이 스킬을 쓸 수 있는 에이전트(프로필 id). AIDE 도구 목록·라우터는 "aide" 가 든 스킬만 받는다.
+    agents: tuple[str, ...] = (AIDE,)
+    # mode: read · preview · write. 비우면 mutation 에서 정한다(write/read) — 계획 노드의 읽기/쓰기를
+    # LLM 이 적은 값이 아니라 이것으로 정한다(H2).
+    mode: str = ""
+    # sources: 호출이 올 수 있는 곳(llm · button · example …). 비우면 제한 없음 — 파생 에이전트의 적용처럼
+    # 버튼으로만 와야 하는 스킬이 좁힌다(⓪ 범위 단계가 소비 · S3).
+    sources: tuple[str, ...] = ()
+    # llm_visible: LLM 도구 목록에 보이나 — 버튼 전용 스킬은 False.
+    llm_visible: bool = True
+    # grounder: 스킬 자체 이름 확정(params → 확정 params 또는 되물음). 있으면 AIDE 공통 문맥 주입·grounding 을 건너뛴다(S4).
+    grounder: Callable[..., Any] | None = None
+    # context_first: 문맥 주입 전에 먼저 정할 것(수정 도우미의 고칠 첫날) — S4.
+    context_first: Callable[..., Any] | None = None
+    # commit: 승인 뒤 커밋 방식 — rerun(미리보기 뒤 다시 실행 · AIDE) · button(버튼으로만, 다시 풀지 않음 · H3·S9).
+    commit: str = "rerun"
+
+    @property
+    def effective_mode(self) -> str:
+        return self.mode or ("write" if self.mutation else "read")
 
 
 # name → SkillSpec. @skill 이 채운다.
@@ -71,6 +97,13 @@ def skill(
     trigger_hint: str = "",
     postcondition: Callable[[Any], bool] | None = None,
     auto_safe: bool = False,
+    agents: tuple[str, ...] | list[str] = (AIDE,),
+    mode: str = "",
+    sources: tuple[str, ...] | list[str] = (),
+    llm_visible: bool = True,
+    grounder: Callable[..., Any] | None = None,
+    context_first: Callable[..., Any] | None = None,
+    commit: str = "rerun",
 ) -> Callable[[SkillFunc], SkillFunc]:
     """스킬 단일 소스 등록 데코레이터.
 
@@ -83,6 +116,12 @@ def skill(
         raise ValueError(
             f"skill schema name mismatch: decorator name={name!r} != schema name={schema.get('name')!r}"
         )
+    if not agents:
+        raise ValueError(f"skill {name!r}: agents 가 비었다 — 어느 에이전트도 쓸 수 없는 스킬")
+    if mode and mode not in MODES:
+        raise ValueError(f"skill {name!r}: mode={mode!r} 는 {MODES} 중 하나여야 한다")
+    if commit not in COMMITS:
+        raise ValueError(f"skill {name!r}: commit={commit!r} 는 {COMMITS} 중 하나여야 한다")
 
     def decorator(func: SkillFunc) -> SkillFunc:
         spec = SkillSpec(
@@ -96,6 +135,13 @@ def skill(
             trigger_hint=trigger_hint,
             postcondition=postcondition,
             auto_safe=auto_safe,
+            agents=tuple(agents),
+            mode=mode,
+            sources=tuple(sources),
+            llm_visible=llm_visible,
+            grounder=grounder,
+            context_first=context_first,
+            commit=commit,
         )
         SKILL_SPECS[name] = spec
         # 기존 dispatch 재사용 — run_skill 이 그대로 찾는다.
@@ -110,15 +156,24 @@ def skill(
 # ── 파생(derive) — 소비 지점들이 부른다 ──────────────────────────
 
 
-def manifest_tools() -> list[dict]:
-    """매니페스트 스킬들의 LLM 스키마 목록 (descriptions.SKILL_TOOLS 로 병합)."""
-    return [spec.schema for spec in SKILL_SPECS.values()]
+def manifest_specs(agent: str = AIDE) -> list[SkillSpec]:
+    """그 에이전트가 쓸 수 있는 스펙 — 등록 순서대로."""
+    return [spec for spec in SKILL_SPECS.values() if agent in spec.agents]
 
 
-def manifest_category_tools() -> dict[str, list[str]]:
-    """카테고리 → 매니페스트 스킬 이름 목록 (router.CATEGORY_TOOLS 로 병합)."""
+def manifest_tools(agent: str = AIDE) -> list[dict]:
+    """그 에이전트의 LLM 에 보일 스키마 목록 (aide 면 descriptions.SKILL_TOOLS 로 병합).
+
+    파생 에이전트 스킬은 AIDE 목록에 들어가지 않고, 버튼 전용(llm_visible=False)은 어느 LLM 에도 안 보인다."""
+    return [spec.schema for spec in manifest_specs(agent) if spec.llm_visible]
+
+
+def manifest_category_tools(agent: str = AIDE) -> dict[str, list[str]]:
+    """카테고리 → 그 에이전트 스킬 이름 목록 (aide 면 router.CATEGORY_TOOLS 로 병합)."""
     out: dict[str, list[str]] = {}
-    for spec in SKILL_SPECS.values():
+    for spec in manifest_specs(agent):
+        if not spec.llm_visible:
+            continue
         for cat in spec.categories:
             out.setdefault(cat, []).append(spec.name)
     return out
@@ -134,17 +189,33 @@ def manifest_hn_only_skills() -> set[str]:
     return {s.name for s in SKILL_SPECS.values() if s.hn_only}
 
 
-def manifest_router_hints() -> str:
+def find_spec(name: str) -> SkillSpec | None:
+    """스킬 이름 → 스펙. `run_skill` 처럼 원래 이름·하이픈·밑줄 순서로 찾는다(어느 쪽으로 등록했든)."""
+    for candidate in (name, name.replace("_", "-"), name.replace("-", "_")):
+        spec = SKILL_SPECS.get(candidate)
+        if spec is not None:
+            return spec
+    return None
+
+
+def skill_mode(name: str) -> str | None:
+    """스킬 이름(하이픈·밑줄 무관) → read·preview·write. 매니페스트에 없으면 None(옛 @register 스킬)."""
+    spec = find_spec(name)
+    return spec.effective_mode if spec is not None else None
+
+
+def manifest_router_hints(agent: str = AIDE) -> str:
     """신규 스킬의 trigger_hint 를 라우터 분류 프롬프트에 붙일 텍스트로 파생.
 
     category→tool 배선(manifest_category_tools)만으로는 라우터가 "이 발화가 그 category
     인지"를 모른다. trigger_hint 를 분류 프롬프트에 주입해 신규 스킬의 어휘를 라우터가
     학습하게 한다(vocabulary propagation). trigger_hint 가 없으면 빈 문자열.
+    파생 에이전트 스킬의 힌트는 AIDE 라우터에 들어가지 않는다.
     """
     lines = [
         f"- {s.trigger_hint} → {', '.join(s.categories)}"
-        for s in SKILL_SPECS.values()
-        if s.trigger_hint and s.categories
+        for s in manifest_specs(agent)
+        if s.trigger_hint and s.categories and s.llm_visible
     ]
     if not lines:
         return ""
