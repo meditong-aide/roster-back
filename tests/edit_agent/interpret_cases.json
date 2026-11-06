@@ -610,61 +610,83 @@
   },
   {
    "id": "I41",
-   "category": "unsupported",
+   "category": "cover",
    "context": null,
    "text": "15일 E 한 명 더 넣어줘",
    "expect": {
-    "reply": "unsupported"
+    "cover": {
+     "day": 15,
+     "shift": "E",
+     "change": 1
+    }
    },
    "why": "그날 인원 늘리기"
   },
   {
    "id": "I42",
-   "category": "unsupported",
+   "category": "shape",
    "context": null,
    "text": "장원영 연속 근무 너무 길어, 좀 끊어줘",
    "expect": {
-    "reply": "unsupported"
+    "shape": {
+     "nurse": "장원영",
+     "shape": "work_run"
+    }
    },
    "why": "근무 모양"
   },
   {
    "id": "I43",
-   "category": "unsupported",
+   "category": "leave",
    "context": null,
    "text": "김지원 20일부터 22일까지 연차 넣어줘",
    "expect": {
-    "reply": "unsupported"
+    "leave": {
+     "nurse": "김지원",
+     "day": 20,
+     "to_day": 22,
+     "leave": "연차"
+    }
    },
    "why": "휴가 넣기(연차는 OFF 가 아니다)"
   },
   {
    "id": "I44",
-   "category": "unsupported",
+   "category": "lookup",
    "context": null,
    "text": "장원영 N 몇 개야?",
    "expect": {
-    "reply": "unsupported"
+    "lookup": {
+     "kind": "person_count",
+     "nurse": "장원영",
+     "shift": "N"
+    }
    },
-   "why": "조회 — 조회 스킬이 생기면 기대값이 바뀐다"
+   "why": "조회 — 근무표를 바꾸지 않는다"
   },
   {
    "id": "I45",
-   "category": "unsupported",
+   "category": "lookup",
    "context": null,
    "text": "15일 나이트 누구야?",
    "expect": {
-    "reply": "unsupported"
+    "lookup": {
+     "kind": "day_shift",
+     "day": 15,
+     "shift": "N"
+    }
    },
    "why": "조회"
   },
   {
    "id": "I46",
-   "category": "unsupported",
+   "category": "balance",
    "context": null,
    "text": "N 좀 고르게 맞춰줘",
    "expect": {
-    "reply": "unsupported"
+    "balance": {
+     "shift": "N"
+    }
    },
    "why": "여러 사람 공평성"
   }
