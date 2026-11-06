@@ -1,11 +1,19 @@
-"""S4(11-06) — 같은 스킬을 수정 도우미 미들웨어와 AIDE 실행 경로(`agents_v2.middleware.execute_skill`)로 돌려 같은 결과가 나오는지.
+"""S4·S5(11-06) — 수정 도우미가 AIDE 실행 경로(`agents_v2.middleware.execute_skill`)로 돌아도 갈아타기 전과 같은 결과가 나오는지.
 
-각 경우마다 새 대화·새 턴으로 두 경로를 따로 돌려 Outcome(answer·preview·effects·focus·failed)과 기록 이벤트(이름·payload —
-단계 기록 steps 칸은 뺀다)를 견준다. 판정 재료·기록은 `world` fixture 가 가짜로 바꾼 것을 쓴다(실 DB·LLM 없음).
+S5 에서 수정 도우미 자기 경로(자체 미들웨어·registry 실행 분기)가 없어졌다. 그래서 '지금 경로'를 그때그때 견주지 않고,
+갈아타기 직전 HEAD(`ba79615` · S6 커밋)의 수정 도우미 자기 경로 결과를 고정 기대값으로 저장해 두고 새 경로가 그것과 같은지 본다.
+
+기대값(`tests/edit_agent/fixtures/aide_path_expected.json`)을 뽑은 방법:
+  1. HEAD 코드(자기 경로 `schedule_edit_agent.middleware.execute_skill` 이 살아 있는 상태)에서 이 파일의 CASES 21개를 `_run(..., "edit")` 으로 돌렸다.
+  2. 경우마다 Outcome(answer·preview·effects·focus·failed) · 예외 이름 · 기록 이벤트(event·schedule_id·payload·new_schedule_id·turn_no)를
+     JSON(정렬·들여쓰기 1)으로 덤프했다. 기록 이벤트 payload 의 단계 기록 steps 칸은 뺀다(AIDE 단계 기록으로 바뀌었다 · S5).
+  3. 새 경로(껍데기 `edit_mw.execute_skill`, 그리고 AIDE `execute_skill` 직접 호출)는 같은 CASES 를 돌려 이 파일과 견준다.
+각 경우마다 새 대화·새 턴으로 돌린다. 판정 재료·기록은 `world` fixture 가 가짜로 바꾼 것을 쓴다(실 DB·LLM 없음).
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +34,7 @@ from tests.edit_agent.test_agent import A_OFF, N_LESS_2, USER, _agent, _count_wa
 from tests.schedule_edit.test_solver import BEFORE_MONTH, make_ctx
 
 ROOT = Path(__file__).resolve().parents[2]
+EXPECTED = json.loads((Path(__file__).parent / "fixtures" / "aide_path_expected.json").read_text(encoding="utf-8"))
 SAVED = {"new_schedule_id": "s2", "new_version": 7, "status": "draft", "name": "11월 수정본"}
 
 
@@ -81,7 +90,7 @@ def _run(world, monkeypatch, db, case, path, role="HN"):
     turn = agent._turn(db, USER, conv, BEFORE_MONTH, None)
     raised = None
     outcome = None
-    if path == "edit":
+    if path == "shell":
         try:
             outcome = edit_mw.execute_skill(turn, name, dict(args), source=source).data
         except Exception as exc:   # noqa: BLE001
@@ -105,18 +114,35 @@ def _events(world):
     return rows
 
 
+def _plain(value):
+    """기대값 파일과 같은 JSON 모양으로(튜플→리스트 등)."""
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _as_dict(outcome):
+    if outcome is None:
+        return None
+    return {"answer": outcome.answer, "preview": outcome.preview, "effects": list(outcome.effects),
+            "focus": outcome.focus, "failed": outcome.failed}
+
+
+def _expected_events(case_id):
+    return [(e["event"], e["schedule_id"], e["payload"], e["new_schedule_id"], e["turn_no"]) for e in EXPECTED[case_id]["events"]]
+
+
 @pytest.mark.parametrize("case", CASES, ids=[c[0] for c in CASES])
-def test_both_paths_give_the_same_outcome_and_records(world, monkeypatch, db, case):
-    edit = _run(world, monkeypatch, db, case, "edit")
-    aide = _run(world, monkeypatch, db, case, "aide")
-    assert aide[1] is None and edit[1] is None
-    assert aide[0] == edit[0]                      # answer·preview·effects·focus·failed
-    assert aide[2] == edit[2]                      # 기록 이벤트
-    assert edit[0] is not None
+def test_the_new_path_gives_the_saved_outcome_and_records(world, monkeypatch, db, case):
+    expected = EXPECTED[case[0]]
+    assert expected["raised"] is None and expected["outcome"] is not None
+    for path in ("shell", "aide"):               # 수정 도우미 껍데기 · AIDE execute_skill 직접
+        out, raised, events = _run(world, monkeypatch, db, case, path)
+        assert raised is None, path
+        assert _plain(_as_dict(out)) == expected["outcome"], path                 # answer·preview·effects·focus·failed
+        assert _plain(events) == _plain(_expected_events(case[0])), path          # 기록 이벤트
 
 
 def test_cases_cover_what_they_claim(world, monkeypatch, db):
-    by_id = {c[0]: _run(world, monkeypatch, db, c, "edit") for c in CASES}
+    by_id = {c[0]: _run(world, monkeypatch, db, c, "shell") for c in CASES}
     assert by_id["propose_candidates"][0].preview["status"] == "ok"
     assert [e[0] for e in by_id["ambiguous_name"][2]] == ["clarify"] and "김민지·이민지 중 누구인가요" in by_id["ambiguous_name"][0].answer
     assert [e[0] for e in by_id["edit_from_day_asked"][2]] == ["lock", "clarify"]
@@ -134,10 +160,11 @@ def test_an_unexpected_exception_is_recorded_by_the_agent_and_returned_as_an_err
 
     monkeypatch.setattr(skills_mod, "lookup_answer", boom)
     case = next(c for c in CASES if c[0] == "lookup")
-    edit_out, edit_raised, edit_events = _run(world, monkeypatch, db, case, "edit")
+    shell_out, shell_raised, shell_events = _run(world, monkeypatch, db, case, "shell")
     aide_out, aide_raised, aide_events = _run(world, monkeypatch, db, case, "aide")
-    assert edit_raised == "RuntimeError" and aide_raised == "Exception" and edit_out is None and aide_out is None
-    assert aide_events == edit_events and aide_events[-1][0] == "error"
+    # HEAD 자기 경로는 원래 예외를 그대로 올렸다(RuntimeError) · 껍데기는 AIDE 의 error 결과를 RuntimeError 로 다시 올린다
+    assert shell_raised == "RuntimeError" and aide_raised == "Exception" and shell_out is None and aide_out is None
+    assert aide_events == shell_events and aide_events[-1][0] == "error"
     assert aide_events[-1][2] == {"stage": "skill", "error": "RuntimeError: 터졌다"}
 
 
@@ -235,31 +262,6 @@ def test_all_twenty_skills_are_in_the_manifest_with_their_fields():
     assert {n for n in tools + buttons if SKILL_SPECS[n].context_first} == set(skills_mod.CONTEXT_FIRST)
 
 
-@pytest.mark.parametrize("clash", ["lookup", "check-rules"])
-def test_a_name_clash_with_aide_raises_at_registration(monkeypatch, clash):
-    # 20개 이름을 두 dict 에서 모두 뺀 뒤 옛 @register 쪽에만 겹치는 이름을 심어, 그 이름에서 터지는지 본다(하이픈·밑줄 구분 없이)
-    from agents_v2.skills.registry import SKILL_REGISTRY
-    from schedule_edit_agent import aide_skills
-
-    load_manifest_skills()
-    for t in SKILL_TOOLS + BUTTON_TOOLS:
-        monkeypatch.delitem(SKILL_SPECS, t["name"])
-        monkeypatch.delitem(SKILL_REGISTRY, t["name"])
-    monkeypatch.setitem(SKILL_REGISTRY, clash, lambda db, params: {})
-    with pytest.raises(RuntimeError, match="이미 등록") as err:
-        aide_skills.register_all()
-    assert clash.replace("-", "_") in str(err.value)
-
-
-def test_no_name_overlaps_the_old_aide_skills():
-    from agents_v2.skills import registry as aide_registry
-    aide_registry._ensure_loaded()
-    mine = {t["name"] for t in SKILL_TOOLS + BUTTON_TOOLS}
-    others = {n for n, s in SKILL_SPECS.items() if "schedule-edit" not in s.agents} | \
-        {n for n in aide_registry.SKILL_REGISTRY if n not in SKILL_SPECS}
-    assert not mine & {n.replace("-", "_") for n in others}       # 옛 스킬은 하이픈 이름이라 밑줄로 맞춰 견준다
-
-
 @pytest.mark.parametrize("statement", [
     "import agents_v2.skills.descriptions",
     "import schedule_edit_agent.spec; import agents_v2.middleware; import agents_v2.router",
@@ -350,10 +352,29 @@ def test_the_trace_is_this_calls_not_a_previous_calls(world, db):
     conv = world.store.start(USER.account_id, {"schedule_id": "s1"})
     conv.begin_turn()
     turn = _agent()[0]._turn(db, USER, conv, BEFORE_MONTH, None)
-    edit_mw.execute_skill(turn, "apply_edit", {"rank": 1}, source="llm")        # ① 에서 막혀 기록 없이 끝난다
+    edit_mw.execute_skill(turn, "apply_edit", {"rank": 1}, source="llm")        # ⓪ 에서 막혀 기록 없이 끝난다
     world.events.clear()
     ctx = SessionContext(office_id="o", group_id="g", year=2026, month=11, user_role="HN", agent_id="schedule-edit",
                          source="llm", turn=turn, auth_user=USER)
     aide_execute(db, "propose_edit", {"changes": [A_OFF]}, ctx)
     first = next(e for e in world.events if e.event == "propose")
-    assert all(step["name"] != "permission" or step["status"] != "block" for step in first.payload.get("steps", []))
+    steps = first.payload.get("steps", [])
+    assert all(step["status"] != "block" for step in steps)             # 앞 호출의 거절 단계(scope·permission)가 새지 않는다
+    assert [s["name"] for s in steps[:2]] == ["scope", "permission"] and "propose_edit" in steps[1]["detail"]
+
+
+def test_the_shell_commits_the_audit_row_even_when_the_skill_is_refused(world, db, monkeypatch):
+    # AIDE 감사는 add·flush 까지만 한다 — 요청 세션은 커밋 없이 닫히므로 껍데기가 커밋해야 행이 남는다(R7)
+    conv = world.store.start(USER.account_id, {"schedule_id": "s1"})
+    conv.begin_turn()
+    turn = _agent()[0]._turn(db, USER, conv, BEFORE_MONTH, None)
+    commits = []
+    monkeypatch.setattr(db, "commit", lambda: commits.append(1))
+    edit_mw.execute_skill(turn, "apply_edit", {"rank": 1}, source="llm")        # ⓪ 거절도 감사 행을 쓴다
+    edit_mw.execute_skill(turn, "propose_edit", {"changes": [A_OFF]}, source="llm")
+    assert len(commits) == 2
+
+    def broken():
+        raise RuntimeError("commit down")
+    monkeypatch.setattr(db, "commit", broken)
+    edit_mw.execute_skill(turn, "propose_edit", {"changes": [A_OFF]}, source="llm")      # 감사 커밋 실패가 요청을 깨뜨리지 않는다

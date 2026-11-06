@@ -1,0 +1,1578 @@
+{
+ "aide_skill_name": {
+  "events": [],
+  "outcome": {
+   "answer": "무엇을 바꿀지 다시 말씀해 주세요.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "ambiguous_name": {
+  "events": [
+   {
+    "event": "clarify",
+    "new_schedule_id": null,
+    "payload": {
+     "answer": "'민지'(이)라는 이름이 여럿입니다. 김민지·이민지 중 누구인가요?",
+     "asks": [
+      "'민지'(이)라는 이름이 여럿입니다. 김민지·이민지 중 누구인가요?"
+     ]
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "'민지'(이)라는 이름이 여럿입니다. 김민지·이민지 중 누구인가요?",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "button_apply_asks": {
+  "events": [
+   {
+    "event": "check",
+    "new_schedule_id": null,
+    "payload": {
+     "findings": [
+      {
+       "allow": [],
+       "id": "품질|사람마다 OFF 수 차이 0→1",
+       "kind": "quality",
+       "text": "사람마다 OFF 수 차이 0→1"
+      }
+     ],
+     "rank": 1
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "1안을 적용하면 지금보다 나빠지는 것이 있습니다. 그래도 적용할까요?\n· 사람마다 OFF 수 차이 0→1",
+   "effects": [],
+   "failed": false,
+   "focus": 1,
+   "preview": {
+    "blocking": [],
+    "candidates": [
+     {
+      "affected": [
+       {
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "name": "C",
+        "nurse_id": "C"
+       }
+      ],
+      "changed_count": 2,
+      "changes": [
+       {
+        "after": "O",
+        "after_main": "O",
+        "before": "N",
+        "before_main": "N",
+        "date": "2026-11-01",
+        "day": 1,
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "after": "N",
+        "after_main": "N",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-01",
+        "day": 1,
+        "name": "C",
+        "nurse_id": "C"
+       }
+      ],
+      "counts": {
+       "A": {
+        "N": [
+         4,
+         3
+        ],
+        "OFF": [
+         0,
+         1
+        ]
+       },
+       "C": {
+        "D": [
+         4,
+         3
+        ],
+        "N": [
+         0,
+         1
+        ],
+        "OFF": [
+         0,
+         0
+        ]
+       }
+      },
+      "loss": 4,
+      "optimal": true,
+      "quality": [
+       "사람마다 OFF 수 차이 0→1"
+      ],
+      "rank": 1,
+      "span": {
+       "days": 0,
+       "from": "2026-11-01",
+       "to": "2026-11-01"
+      }
+     },
+     {
+      "affected": [
+       {
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "name": "B",
+        "nurse_id": "B"
+       }
+      ],
+      "changed_count": 2,
+      "changes": [
+       {
+        "after": "O",
+        "after_main": "O",
+        "before": "N",
+        "before_main": "N",
+        "date": "2026-11-01",
+        "day": 1,
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "after": "N",
+        "after_main": "N",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-01",
+        "day": 1,
+        "name": "B",
+        "nurse_id": "B"
+       }
+      ],
+      "counts": {
+       "A": {
+        "N": [
+         4,
+         3
+        ],
+        "OFF": [
+         0,
+         1
+        ]
+       },
+       "B": {
+        "D": [
+         4,
+         3
+        ],
+        "N": [
+         0,
+         1
+        ],
+        "OFF": [
+         0,
+         0
+        ]
+       }
+      },
+      "loss": 4,
+      "optimal": false,
+      "quality": [
+       "사람마다 OFF 수 차이 0→1"
+      ],
+      "rank": 2,
+      "span": {
+       "days": 0,
+       "from": "2026-11-01",
+       "to": "2026-11-01"
+      }
+     },
+     {
+      "affected": [
+       {
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "name": "B",
+        "nurse_id": "B"
+       },
+       {
+        "name": "C",
+        "nurse_id": "C"
+       }
+      ],
+      "changed_count": 3,
+      "changes": [
+       {
+        "after": "O",
+        "after_main": "O",
+        "before": "N",
+        "before_main": "N",
+        "date": "2026-11-01",
+        "day": 1,
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "after": "N",
+        "after_main": "N",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-01",
+        "day": 1,
+        "name": "B",
+        "nurse_id": "B"
+       },
+       {
+        "after": "E",
+        "after_main": "E",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-01",
+        "day": 1,
+        "name": "C",
+        "nurse_id": "C"
+       }
+      ],
+      "counts": {
+       "A": {
+        "N": [
+         4,
+         3
+        ],
+        "OFF": [
+         0,
+         1
+        ]
+       },
+       "B": {
+        "D": [
+         4,
+         3
+        ],
+        "N": [
+         0,
+         1
+        ],
+        "OFF": [
+         0,
+         0
+        ]
+       },
+       "C": {
+        "D": [
+         4,
+         3
+        ],
+        "E": [
+         0,
+         1
+        ],
+        "OFF": [
+         0,
+         0
+        ]
+       }
+      },
+      "loss": 6,
+      "optimal": false,
+      "quality": [
+       "사람마다 OFF 수 차이 0→1"
+      ],
+      "rank": 3,
+      "span": {
+       "days": 0,
+       "from": "2026-11-01",
+       "to": "2026-11-01"
+      }
+     }
+    ],
+    "findings": [
+     {
+      "allow": [],
+      "id": "품질|사람마다 OFF 수 차이 0→1",
+      "kind": "quality",
+      "text": "사람마다 OFF 수 차이 0→1"
+     }
+    ],
+    "levers": [],
+    "notes": [],
+    "question": "1안을 적용하면 지금보다 나빠지는 것이 있습니다. 그래도 적용할까요?",
+    "rank": 1,
+    "reasons": [],
+    "source": null,
+    "status": "confirm_apply"
+   }
+  },
+  "raised": null
+ },
+ "button_apply_saved": {
+  "events": [],
+  "outcome": {
+   "answer": "새 버전으로 저장했습니다: (VER7). 화면을 새 버전으로 바꿉니다.",
+   "effects": [
+    {
+     "name": "",
+     "schedule_id": "s2",
+     "status": "draft",
+     "type": "switch_version",
+     "version": 7
+    }
+   ],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "button_choose_transfer": {
+  "events": [
+   {
+    "event": "choose",
+    "new_schedule_id": null,
+    "payload": {
+     "choice_id": "same_team"
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   },
+   {
+    "event": "propose",
+    "new_schedule_id": null,
+    "payload": {
+     "allow": [],
+     "answer": "A N 4→2회(같은 팀 간호사가 메우기) — 바꿀 방법 2가지를 찾았습니다. 가장 적게 바꾸는 1안은 4칸(2~3일). 카드를 누르면 표에서 미리 볼 수 있습니다.\n근무 수 변화: A N 4→2, C N 0→2",
+     "avoid": [],
+     "described": "A N 4→2회(같은 팀 간호사가 메우기)",
+     "requests": [
+      {
+       "codes": [
+        "N"
+       ],
+       "first_day": 0,
+       "kind": "count",
+       "last_day": 3,
+       "nurse_id": "A",
+       "target": 2,
+       "transfer": "same_team"
+      }
+     ],
+     "result": {
+      "blocking": [],
+      "candidates": [
+       {
+        "affected": [
+         {
+          "name": "A",
+          "nurse_id": "A"
+         },
+         {
+          "name": "C",
+          "nurse_id": "C"
+         }
+        ],
+        "changed_count": 4,
+        "changes": [
+         {
+          "after": "D",
+          "after_main": "D",
+          "before": "N",
+          "before_main": "N",
+          "date": "2026-11-02",
+          "day": 2,
+          "name": "A",
+          "nurse_id": "A"
+         },
+         {
+          "after": "D",
+          "after_main": "D",
+          "before": "N",
+          "before_main": "N",
+          "date": "2026-11-03",
+          "day": 3,
+          "name": "A",
+          "nurse_id": "A"
+         },
+         {
+          "after": "N",
+          "after_main": "N",
+          "before": "D",
+          "before_main": "D",
+          "date": "2026-11-02",
+          "day": 2,
+          "name": "C",
+          "nurse_id": "C"
+         },
+         {
+          "after": "N",
+          "after_main": "N",
+          "before": "D",
+          "before_main": "D",
+          "date": "2026-11-03",
+          "day": 3,
+          "name": "C",
+          "nurse_id": "C"
+         }
+        ],
+        "counts": {
+         "A": {
+          "D": [
+           0,
+           2
+          ],
+          "N": [
+           4,
+           2
+          ],
+          "OFF": [
+           0,
+           0
+          ]
+         },
+         "C": {
+          "D": [
+           4,
+           2
+          ],
+          "N": [
+           0,
+           2
+          ],
+          "OFF": [
+           0,
+           0
+          ]
+         }
+        },
+        "loss": 9,
+        "optimal": true,
+        "quality": [],
+        "rank": 1,
+        "span": {
+         "days": 1,
+         "from": "2026-11-02",
+         "to": "2026-11-03"
+        }
+       },
+       {
+        "affected": [
+         {
+          "name": "A",
+          "nurse_id": "A"
+         },
+         {
+          "name": "B",
+          "nurse_id": "B"
+         },
+         {
+          "name": "C",
+          "nurse_id": "C"
+         }
+        ],
+        "changed_count": 5,
+        "changes": [
+         {
+          "after": "D",
+          "after_main": "D",
+          "before": "N",
+          "before_main": "N",
+          "date": "2026-11-03",
+          "day": 3,
+          "name": "A",
+          "nurse_id": "A"
+         },
+         {
+          "after": "E",
+          "after_main": "E",
+          "before": "N",
+          "before_main": "N",
+          "date": "2026-11-04",
+          "day": 4,
+          "name": "A",
+          "nurse_id": "A"
+         },
+         {
+          "after": "E",
+          "after_main": "E",
+          "before": "D",
+          "before_main": "D",
+          "date": "2026-11-04",
+          "day": 4,
+          "name": "B",
+          "nurse_id": "B"
+         },
+         {
+          "after": "N",
+          "after_main": "N",
+          "before": "D",
+          "before_main": "D",
+          "date": "2026-11-03",
+          "day": 3,
+          "name": "C",
+          "nurse_id": "C"
+         },
+         {
+          "after": "N",
+          "after_main": "N",
+          "before": "D",
+          "before_main": "D",
+          "date": "2026-11-04",
+          "day": 4,
+          "name": "C",
+          "nurse_id": "C"
+         }
+        ],
+        "counts": {
+         "A": {
+          "D": [
+           0,
+           1
+          ],
+          "E": [
+           0,
+           1
+          ],
+          "N": [
+           4,
+           2
+          ],
+          "OFF": [
+           0,
+           0
+          ]
+         },
+         "B": {
+          "D": [
+           4,
+           3
+          ],
+          "E": [
+           0,
+           1
+          ],
+          "OFF": [
+           0,
+           0
+          ]
+         },
+         "C": {
+          "D": [
+           4,
+           2
+          ],
+          "N": [
+           0,
+           2
+          ],
+          "OFF": [
+           0,
+           0
+          ]
+         }
+        },
+        "loss": 11,
+        "optimal": false,
+        "quality": [],
+        "rank": 2,
+        "span": {
+         "days": 1,
+         "from": "2026-11-03",
+         "to": "2026-11-04"
+        }
+       }
+      ],
+      "levers": [],
+      "notes": [],
+      "reasons": [],
+      "source": null,
+      "status": "ok"
+     }
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "A N 4→2회(같은 팀 간호사가 메우기) — 바꿀 방법 2가지를 찾았습니다. 가장 적게 바꾸는 1안은 4칸(2~3일). 카드를 누르면 표에서 미리 볼 수 있습니다.\n근무 수 변화: A N 4→2, C N 0→2",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": {
+    "blocking": [],
+    "candidates": [
+     {
+      "affected": [
+       {
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "name": "C",
+        "nurse_id": "C"
+       }
+      ],
+      "changed_count": 4,
+      "changes": [
+       {
+        "after": "D",
+        "after_main": "D",
+        "before": "N",
+        "before_main": "N",
+        "date": "2026-11-02",
+        "day": 2,
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "after": "D",
+        "after_main": "D",
+        "before": "N",
+        "before_main": "N",
+        "date": "2026-11-03",
+        "day": 3,
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "after": "N",
+        "after_main": "N",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-02",
+        "day": 2,
+        "name": "C",
+        "nurse_id": "C"
+       },
+       {
+        "after": "N",
+        "after_main": "N",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-03",
+        "day": 3,
+        "name": "C",
+        "nurse_id": "C"
+       }
+      ],
+      "counts": {
+       "A": {
+        "D": [
+         0,
+         2
+        ],
+        "N": [
+         4,
+         2
+        ],
+        "OFF": [
+         0,
+         0
+        ]
+       },
+       "C": {
+        "D": [
+         4,
+         2
+        ],
+        "N": [
+         0,
+         2
+        ],
+        "OFF": [
+         0,
+         0
+        ]
+       }
+      },
+      "loss": 9,
+      "optimal": true,
+      "quality": [],
+      "rank": 1,
+      "span": {
+       "days": 1,
+       "from": "2026-11-02",
+       "to": "2026-11-03"
+      }
+     },
+     {
+      "affected": [
+       {
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "name": "B",
+        "nurse_id": "B"
+       },
+       {
+        "name": "C",
+        "nurse_id": "C"
+       }
+      ],
+      "changed_count": 5,
+      "changes": [
+       {
+        "after": "D",
+        "after_main": "D",
+        "before": "N",
+        "before_main": "N",
+        "date": "2026-11-03",
+        "day": 3,
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "after": "E",
+        "after_main": "E",
+        "before": "N",
+        "before_main": "N",
+        "date": "2026-11-04",
+        "day": 4,
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "after": "E",
+        "after_main": "E",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-04",
+        "day": 4,
+        "name": "B",
+        "nurse_id": "B"
+       },
+       {
+        "after": "N",
+        "after_main": "N",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-03",
+        "day": 3,
+        "name": "C",
+        "nurse_id": "C"
+       },
+       {
+        "after": "N",
+        "after_main": "N",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-04",
+        "day": 4,
+        "name": "C",
+        "nurse_id": "C"
+       }
+      ],
+      "counts": {
+       "A": {
+        "D": [
+         0,
+         1
+        ],
+        "E": [
+         0,
+         1
+        ],
+        "N": [
+         4,
+         2
+        ],
+        "OFF": [
+         0,
+         0
+        ]
+       },
+       "B": {
+        "D": [
+         4,
+         3
+        ],
+        "E": [
+         0,
+         1
+        ],
+        "OFF": [
+         0,
+         0
+        ]
+       },
+       "C": {
+        "D": [
+         4,
+         2
+        ],
+        "N": [
+         0,
+         2
+        ],
+        "OFF": [
+         0,
+         0
+        ]
+       }
+      },
+      "loss": 11,
+      "optimal": false,
+      "quality": [],
+      "rank": 2,
+      "span": {
+       "days": 1,
+       "from": "2026-11-03",
+       "to": "2026-11-04"
+      }
+     }
+    ],
+    "levers": [],
+    "notes": [],
+    "reasons": [],
+    "source": null,
+    "status": "ok"
+   }
+  },
+  "raised": null
+ },
+ "button_keep": {
+  "events": [
+   {
+    "event": "keep",
+    "new_schedule_id": null,
+    "payload": {
+     "people": [
+      "A",
+      "B"
+     ],
+     "rank": 1
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "1번 안을 기준으로 이어서 다듬습니다. 더 바꾸거나 그대로 둘 곳을 말씀해 주세요.",
+   "effects": [],
+   "failed": false,
+   "focus": 1,
+   "preview": null
+  },
+  "raised": null
+ },
+ "button_picks_a_tool": {
+  "events": [],
+  "outcome": {
+   "answer": "알 수 없는 동작입니다.",
+   "effects": [],
+   "failed": true,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "button_reject": {
+  "events": [
+   {
+    "event": "reject",
+    "new_schedule_id": null,
+    "payload": {
+     "people": [
+      "A",
+      "B"
+     ],
+     "rank": 1
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   },
+   {
+    "event": "propose",
+    "new_schedule_id": null,
+    "payload": {
+     "allow": [],
+     "answer": "A 1일 OFF:\n넘기신 후보와 같은 사람들을 바꾸는 방법 말고는 찾지 못했습니다. 넘긴 후보를 다시 보시려면 요청을 새로 해 주세요.",
+     "avoid": [
+      [
+       "A",
+       "B"
+      ]
+     ],
+     "described": "A 1일 OFF",
+     "requests": [
+      {
+       "code": "O",
+       "day": 0,
+       "kind": "set",
+       "nurse_id": "A"
+      }
+     ],
+     "result": {
+      "blocking": [],
+      "candidates": [],
+      "levers": [],
+      "notes": [],
+      "reasons": [
+       "넘기신 후보와 같은 사람들을 바꾸는 방법 말고는 찾지 못했습니다. 넘긴 후보를 다시 보시려면 요청을 새로 해 주세요."
+      ],
+      "source": null,
+      "status": "infeasible"
+     }
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "A 1일 OFF:\n넘기신 후보와 같은 사람들을 바꾸는 방법 말고는 찾지 못했습니다. 넘긴 후보를 다시 보시려면 요청을 새로 해 주세요.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": {
+    "blocking": [],
+    "candidates": [],
+    "levers": [],
+    "notes": [],
+    "reasons": [
+     "넘기신 후보와 같은 사람들을 바꾸는 방법 말고는 찾지 못했습니다. 넘긴 후보를 다시 보시려면 요청을 새로 해 주세요."
+    ],
+    "source": null,
+    "status": "infeasible"
+   }
+  },
+  "raised": null
+ },
+ "check_rules": {
+  "events": [
+   {
+    "event": "clarify",
+    "new_schedule_id": null,
+    "payload": {
+     "answer": "이 근무표 설정에는 등급별 최소 인원 규칙이 없어 따질 것이 없습니다.",
+     "check": "grade",
+     "rank": null
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "이 근무표 설정에는 등급별 최소 인원 규칙이 없어 따질 것이 없습니다.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "edit_from_day_asked": {
+  "events": [
+   {
+    "event": "lock",
+    "new_schedule_id": null,
+    "payload": {
+     "edit_from_day": 3,
+     "month": 11,
+     "year": 2026
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   },
+   {
+    "event": "clarify",
+    "new_schedule_id": null,
+    "payload": {
+     "answer": "3일부터 고칩니다(2일까지는 그대로 둡니다). 바꿀 내용을 말씀해 주세요.",
+     "asks": [
+      "3일부터 고칩니다(2일까지는 그대로 둡니다). 바꿀 내용을 말씀해 주세요."
+     ]
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "3일부터 고칩니다(2일까지는 그대로 둡니다). 바꿀 내용을 말씀해 주세요.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "edit_from_day_with_balance": {
+  "events": [
+   {
+    "event": "lock",
+    "new_schedule_id": null,
+    "payload": {
+     "edit_from_day": 2,
+     "month": 11,
+     "year": 2026
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   },
+   {
+    "event": "propose",
+    "new_schedule_id": null,
+    "payload": {
+     "allow": [],
+     "answer": "OFF 근무 수 고르게 2~2회(차이 0) → 차이 0 이하 · 2명 — 이미 그렇게 되어 있습니다.\n참고: 2일부터 고칩니다(1일까지는 그대로 둡니다).",
+     "avoid": [],
+     "described": "OFF 근무 수 고르게 2~2회(차이 0) → 차이 0 이하 · 2명",
+     "requests": [
+      {
+       "codes": [
+        "O"
+       ],
+       "first_day": 1,
+       "kind": "balance",
+       "last_day": 3,
+       "members": [
+        "A",
+        "B"
+       ],
+       "spread": 0,
+       "target": null
+      }
+     ],
+     "result": {
+      "blocking": [],
+      "candidates": [],
+      "levers": [],
+      "notes": [
+       "2일부터 고칩니다(1일까지는 그대로 둡니다)."
+      ],
+      "reasons": [],
+      "source": null,
+      "status": "already"
+     }
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "OFF 근무 수 고르게 2~2회(차이 0) → 차이 0 이하 · 2명 — 이미 그렇게 되어 있습니다.\n참고: 2일부터 고칩니다(1일까지는 그대로 둡니다).",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": {
+    "blocking": [],
+    "candidates": [],
+    "levers": [],
+    "notes": [
+     "2일부터 고칩니다(1일까지는 그대로 둡니다)."
+    ],
+    "reasons": [],
+    "source": null,
+    "status": "already"
+   }
+  },
+  "raised": null
+ },
+ "edit_from_day_with_count": {
+  "events": [
+   {
+    "event": "lock",
+    "new_schedule_id": null,
+    "payload": {
+     "edit_from_day": 2,
+     "month": 11,
+     "year": 2026
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   },
+   {
+    "event": "propose",
+    "new_schedule_id": null,
+    "payload": {
+     "allow": [],
+     "answer": "A OFF 2→3회(2~4일) — 바꾸기 전에 셈해 보니(전월 근무 포함) 어떤 방법으로 바꿔도 아래가 생깁니다.\n· A OFF 수 상한보다 1개 많게\n그래도 진행할까요? 진행해도 이번 수정에만 해당하고 병동 설정은 바뀌지 않습니다.",
+     "avoid": [],
+     "described": "A OFF 2→3회(2~4일)",
+     "requests": [
+      {
+       "codes": [
+        "O"
+       ],
+       "first_day": 1,
+       "kind": "count",
+       "last_day": 3,
+       "nurse_id": "A",
+       "target": 3,
+       "transfer": null
+      }
+     ],
+     "result": {
+      "blocking": [],
+      "candidates": [],
+      "findings": [
+       {
+        "allow": [
+         [
+          [
+           "OFF수",
+           "A",
+           null,
+           null,
+           "상한"
+          ],
+          1
+         ]
+        ],
+        "id": "OFF수/A/None/None/상한|1",
+        "kind": "setting",
+        "text": "A OFF 수 상한보다 1개 많게"
+       }
+      ],
+      "levers": [],
+      "notes": [],
+      "question": "A OFF 2→3회(2~4일) — 바꾸기 전에 셈해 보니(전월 근무 포함) 어떤 방법으로 바꿔도 아래가 생깁니다.",
+      "reasons": [],
+      "status": "confirm"
+     }
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "A OFF 2→3회(2~4일) — 바꾸기 전에 셈해 보니(전월 근무 포함) 어떤 방법으로 바꿔도 아래가 생깁니다.\n· A OFF 수 상한보다 1개 많게\n그래도 진행할까요? 진행해도 이번 수정에만 해당하고 병동 설정은 바뀌지 않습니다.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": {
+    "blocking": [],
+    "candidates": [],
+    "findings": [
+     {
+      "allow": [
+       [
+        [
+         "OFF수",
+         "A",
+         null,
+         null,
+         "상한"
+        ],
+        1
+       ]
+      ],
+      "id": "OFF수/A/None/None/상한|1",
+      "kind": "setting",
+      "text": "A OFF 수 상한보다 1개 많게"
+     }
+    ],
+    "levers": [],
+    "notes": [],
+    "question": "A OFF 2→3회(2~4일) — 바꾸기 전에 셈해 보니(전월 근무 포함) 어떤 방법으로 바꿔도 아래가 생깁니다.",
+    "reasons": [],
+    "status": "confirm"
+   }
+  },
+  "raised": null
+ },
+ "example_picks_write": {
+  "events": [],
+  "outcome": {
+   "answer": "무엇을 바꿀지 다시 말씀해 주세요.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "example_source": {
+  "events": [
+   {
+    "event": "clarify",
+    "new_schedule_id": null,
+    "payload": {
+     "answer": "1일 D 1명: A. (지금 저장된 근무표 기준)",
+     "lookup": "day_shift"
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "1일 D 1명: A. (지금 저장된 근무표 기준)",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "extra_args_dropped": {
+  "events": [
+   {
+    "event": "clarify",
+    "new_schedule_id": null,
+    "payload": {
+     "answer": "1일 D 1명: A. (지금 저장된 근무표 기준)",
+     "lookup": "day_shift"
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "1일 D 1명: A. (지금 저장된 근무표 기준)",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "llm_picks_a_button": {
+  "events": [],
+  "outcome": {
+   "answer": "무엇을 바꿀지 다시 말씀해 주세요.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "lookup": {
+  "events": [
+   {
+    "event": "clarify",
+    "new_schedule_id": null,
+    "payload": {
+     "answer": "1일 D 1명: A. (지금 저장된 근무표 기준)",
+     "lookup": "day_shift"
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "1일 D 1명: A. (지금 저장된 근무표 기준)",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "missing_candidate": {
+  "events": [
+   {
+    "event": "error",
+    "new_schedule_id": null,
+    "payload": {
+     "message": "그 후보는 지금 결과에 없습니다. 다시 찾아 주세요.",
+     "params": {
+      "rank": 9
+     },
+     "stage": "button"
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "그 후보는 지금 결과에 없습니다. 다시 찾아 주세요.",
+   "effects": [],
+   "failed": true,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "propose_candidates": {
+  "events": [
+   {
+    "event": "propose",
+    "new_schedule_id": null,
+    "payload": {
+     "allow": [],
+     "answer": "A 1일 OFF — 바꿀 방법을 찾았습니다: 4칸(1~2일). 카드를 누르면 표에서 미리 볼 수 있습니다.",
+     "avoid": [],
+     "described": "A 1일 OFF",
+     "requests": [
+      {
+       "code": "O",
+       "day": 0,
+       "kind": "set",
+       "nurse_id": "A"
+      }
+     ],
+     "result": {
+      "blocking": [],
+      "candidates": [
+       {
+        "affected": [
+         {
+          "name": "A",
+          "nurse_id": "A"
+         },
+         {
+          "name": "B",
+          "nurse_id": "B"
+         }
+        ],
+        "changed_count": 4,
+        "changes": [
+         {
+          "after": "O",
+          "after_main": "O",
+          "before": "D",
+          "before_main": "D",
+          "date": "2026-11-01",
+          "day": 1,
+          "name": "A",
+          "nurse_id": "A"
+         },
+         {
+          "after": "D",
+          "after_main": "D",
+          "before": "O",
+          "before_main": "O",
+          "date": "2026-11-02",
+          "day": 2,
+          "name": "A",
+          "nurse_id": "A"
+         },
+         {
+          "after": "D",
+          "after_main": "D",
+          "before": "O",
+          "before_main": "O",
+          "date": "2026-11-01",
+          "day": 1,
+          "name": "B",
+          "nurse_id": "B"
+         },
+         {
+          "after": "O",
+          "after_main": "O",
+          "before": "D",
+          "before_main": "D",
+          "date": "2026-11-02",
+          "day": 2,
+          "name": "B",
+          "nurse_id": "B"
+         }
+        ],
+        "counts": {
+         "A": {
+          "D": [
+           2,
+           2
+          ],
+          "OFF": [
+           2,
+           2
+          ]
+         },
+         "B": {
+          "D": [
+           2,
+           2
+          ],
+          "OFF": [
+           2,
+           2
+          ]
+         }
+        },
+        "loss": 9,
+        "optimal": true,
+        "quality": [],
+        "rank": 1,
+        "span": {
+         "days": 1,
+         "from": "2026-11-01",
+         "to": "2026-11-02"
+        }
+       }
+      ],
+      "levers": [],
+      "notes": [],
+      "reasons": [],
+      "source": null,
+      "status": "ok"
+     }
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "A 1일 OFF — 바꿀 방법을 찾았습니다: 4칸(1~2일). 카드를 누르면 표에서 미리 볼 수 있습니다.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": {
+    "blocking": [],
+    "candidates": [
+     {
+      "affected": [
+       {
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "name": "B",
+        "nurse_id": "B"
+       }
+      ],
+      "changed_count": 4,
+      "changes": [
+       {
+        "after": "O",
+        "after_main": "O",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-01",
+        "day": 1,
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "after": "D",
+        "after_main": "D",
+        "before": "O",
+        "before_main": "O",
+        "date": "2026-11-02",
+        "day": 2,
+        "name": "A",
+        "nurse_id": "A"
+       },
+       {
+        "after": "D",
+        "after_main": "D",
+        "before": "O",
+        "before_main": "O",
+        "date": "2026-11-01",
+        "day": 1,
+        "name": "B",
+        "nurse_id": "B"
+       },
+       {
+        "after": "O",
+        "after_main": "O",
+        "before": "D",
+        "before_main": "D",
+        "date": "2026-11-02",
+        "day": 2,
+        "name": "B",
+        "nurse_id": "B"
+       }
+      ],
+      "counts": {
+       "A": {
+        "D": [
+         2,
+         2
+        ],
+        "OFF": [
+         2,
+         2
+        ]
+       },
+       "B": {
+        "D": [
+         2,
+         2
+        ],
+        "OFF": [
+         2,
+         2
+        ]
+       }
+      },
+      "loss": 9,
+      "optimal": true,
+      "quality": [],
+      "rank": 1,
+      "span": {
+       "days": 1,
+       "from": "2026-11-01",
+       "to": "2026-11-02"
+      }
+     }
+    ],
+    "levers": [],
+    "notes": [],
+    "reasons": [],
+    "source": null,
+    "status": "ok"
+   }
+  },
+  "raised": null
+ },
+ "reply_only": {
+  "events": [
+   {
+    "event": "clarify",
+    "new_schedule_id": null,
+    "payload": {
+     "answer": "지금 요청: 없음. 아직 찾은 결과가 없습니다.",
+     "asks": [
+      "지금 요청: 없음. 아직 찾은 결과가 없습니다."
+     ],
+     "kind": "status"
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "지금 요청: 없음. 아직 찾은 결과가 없습니다.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ },
+ "unknown_name": {
+  "events": [
+   {
+    "event": "clarify",
+    "new_schedule_id": null,
+    "payload": {
+     "answer": "이 근무표에 '없는사람' 간호사가 없습니다. 이름을 다시 확인해 주세요.",
+     "asks": [
+      "이 근무표에 '없는사람' 간호사가 없습니다. 이름을 다시 확인해 주세요."
+     ]
+    },
+    "schedule_id": "s1",
+    "turn_no": 1
+   }
+  ],
+  "outcome": {
+   "answer": "이 근무표에 '없는사람' 간호사가 없습니다. 이름을 다시 확인해 주세요.",
+   "effects": [],
+   "failed": false,
+   "focus": null,
+   "preview": null
+  },
+  "raised": null
+ }
+}

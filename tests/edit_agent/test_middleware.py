@@ -1,10 +1,9 @@
-"""AIDE 와 같은 도구 형식(사용자 지시 11-06) — 정의 한 목록 · 이름 등록 레지스트리 · 권한 → 문맥 주입 → 이름 확정 → 실행 →
-기록 단계 · 등록 목록은 수정 도우미 전용(AIDE 스킬을 열지 않는다) · 예시는 LLM 없이 그 도구를 부른다(토큰 0)."""
+"""AIDE 와 같은 도구 형식(사용자 지시 11-06) — 정의 한 목록 · 핸들러 표 · 범위 → 권한 → 문맥 주입 → 이름 확정 →
+감사 단계(AIDE execute_skill) · 등록 목록은 수정 도우미 전용(AIDE 스킬을 열지 않는다) · 예시는 LLM 없이 그 도구를 부른다(토큰 0)."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import fields
 from datetime import date
 
 import pytest
@@ -31,12 +30,9 @@ def _stages(payload):
 
 
 def test_steps_and_results_have_the_aide_shape():
-    # 복제한 단계 기록이 AIDE 와 같은 칸·같은 dict 인지 — AIDE 쪽이 바뀌면 여기서 알린다(import 대신 복제한 근거)
+    # 껍데기는 AIDE 클래스를 그대로 다시 내보낸다 — 복제본이 생기면 여기서 알린다
     from agents_v2 import middleware as aide
-    assert [f.name for f in fields(MiddlewareStep)] == [f.name for f in fields(aide.MiddlewareStep)]
-    assert [f.name for f in fields(SkillResult)] == [f.name for f in fields(aide.SkillResult)]
-    for args in (("permission", "pass"), ("grounding", "grounded", "nurse=1개", {"a": 1}, {"b": 2})):
-        assert MiddlewareStep(*args).to_dict() == aide.MiddlewareStep(*args).to_dict()
+    assert MiddlewareStep is aide.MiddlewareStep and SkillResult is aide.SkillResult
 
 
 def test_registry_is_edit_only_and_matches_the_definitions():
@@ -91,20 +87,20 @@ def test_each_stage_is_recorded_with_the_first_result(world):
     message, lock, proposed = world.events
     assert (message.event, lock.event, proposed.event) == ("message", "lock", "propose")
     assert "steps" not in message.payload and "steps" not in lock.payload          # 첫날 기록은 첫날만
-    assert _stages(proposed.payload) == [("permission", "pass"), ("context_injection", "injected"),
-                                         ("grounding", "grounded"), ("execution", "ok")]
-    context = proposed.payload["steps"][1]["detail"]
-    assert "schedule_id=s1" in context and "고칠 수 있는 첫날=1일" in context
+    # S5: 단계 기록은 AIDE 것 — ⓪ 범위·① 권한이 앞에 붙고, 기록 시점까지의 단계만 담긴다(실행 단계는 기록 뒤에 붙는다)
+    assert _stages(proposed.payload) == [("scope", "pass"), ("permission", "pass"), ("context_injection", "injected"),
+                                         ("grounding", "grounded")]
+    context = proposed.payload["steps"][2]["detail"]
+    assert "출처=llm" in context
     assert "버린 인자=schedule_id" in context            # 세션이 아는 값은 LLM 인자로 받지 않는다
-    assert proposed.payload["steps"][2]["detail"] == "requests=1개"
 
 
-def test_an_unknown_name_stops_at_grounding(world):
+def test_an_unknown_name_asks_back_after_context_injection(world):
     agent, _ = _agent(call("propose_edit", changes=[{"kind": "set", "nurse": "없는사람", "day": 1, "shift": "OFF"}]))
     say(agent, world.conv, "없는사람 1일 오프")
     clarify = world.events[-1]
     assert clarify.event == "clarify" and world.conv.state.last is None
-    assert _stages(clarify.payload)[-1] == ("grounding", "clarification_needed")
+    assert _stages(clarify.payload)[-1] == ("context_injection", "injected")      # S5: 되물음 기록 시점까지의 단계
 
 
 def test_the_llm_cannot_pick_a_button_or_write(world):
@@ -122,7 +118,7 @@ def test_permission_blocks_by_source_and_mode(world, name, source, answer, faile
     agent, _ = _agent()
     turn = agent._turn(None, USER, world.conv, BEFORE_MONTH, None)
     result = execute_skill(turn, name, {"rank": 1}, source=source)
-    assert result.blocked and _stage_of(result) == ("permission", "block")
+    assert result.blocked and _stage_of(result) == ("scope", "block")      # S5: ⓪ 범위 단계가 먼저 막는다
     assert (result.data.answer, result.data.failed) == (answer, failed) and world.events == []
 
 
@@ -142,7 +138,7 @@ def test_an_example_runs_its_tool_without_the_llm(world):
     assert message.event == "message" and message.payload["text"] == "A 1일 오프로"       # 사용자가 한 말로
     assert (message.payload["tool"], message.payload["source"]) == ("propose_edit", "example")
     assert out.trail == "new" and out.request_line == "A 1일 OFF"
-    assert _stages(world.events[-1].payload)[0] == ("permission", "pass")
+    assert _stages(world.events[-1].payload)[0] == ("scope", "pass")
 
 
 def test_examples_carry_a_call_that_fits_the_tool_and_grounds():
@@ -254,6 +250,6 @@ def test_a_refused_skill_records_the_path_it_came_from(world, monkeypatch):
     agent, _ = _agent(call("lookup", kind="day_shift", day=1, shift="D"))
     out = say(agent, world.conv, "1일 데이 누구야")
     assert out.answer == "지금 상태와 안 맞습니다." and world.events[-1].event == "error"
-    assert world.events[-1].payload["stage"] == "llm" and _stages(world.events[-1].payload)[-1] == ("execution", "error")
+    assert world.events[-1].payload["stage"] == "llm" and _stages(world.events[-1].payload)[-1] == ("grounding", "grounded")
     say(agent, world.conv, "1일 데이 누구야", call=("lookup", {"kind": "day_shift", "day": 1, "shift": "D"}))
     assert world.events[-1].payload["stage"] == "example"

@@ -1,6 +1,6 @@
 """근무표 수정 한 턴의 핵심 — 말(chat)은 LLM 이 스킬을 고르고, 버튼(act)은 LLM 없이 스킬을 바로 부른다.
 처음 화면 예시처럼 해석이 이미 붙은 말(chat 의 call)도 LLM 없이 그 도구를 부른다(사용자 지시 11-06 · 토큰 0).
-스킬 실행은 늘 `middleware.execute_skill`(권한 → 문맥 주입 → 이름 확정 → 실행 → 기록 · AIDE 와 같은 단계)을 거친다.
+스킬 실행은 늘 `middleware.execute_skill`(AIDE `execute_skill` 의 얇은 껍데기 — ⓪ 범위 → ① 권한 → 문맥 주입 → 이름 확정 → 실행 → 감사)을 거친다.
 
 턴마다: 판정 재료 준비(없으면 열고, 근무표가 그사이 바뀌었으면 다시 연다) → LLM 1번(말일 때만) → 스킬 → 기록
 (message·propose·clarify·…). 턴 번호·최근 대화·흔적·대상 이동(적용 → 새 버전)은 공통 틀(`agent_kit.runtime`)이

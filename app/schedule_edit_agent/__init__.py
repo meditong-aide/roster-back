@@ -4,7 +4,7 @@
   ① 솔버 코어·적용 서비스 — `services/schedule_edit/`(에이전트를 모른다)
   ② 스킬 — AIDE(`agents_v2`)와 같은 형식(사용자 지시 11-06): 도구 정의 한 목록 `descriptions.py`(이름·설명·인자 JSON
      스키마·읽기/미리보기/쓰기) · 이름 → 실행 함수 `registry.py` · 실행 함수와 이름 확정 `skills.py` · 한 번 실행의 단계
-     `middleware.py`(권한 → 문맥 주입 → 이름 확정 → 실행 → 기록). 등록 목록은 수정 도우미 전용이다(AIDE 스킬은 열지 않는다)
+     AIDE `execute_skill`(`middleware.py` 는 얇은 껍데기 · 범위 → 권한 → 문맥 주입 → 이름 확정 → 실행 → 감사). 등록 목록은 수정 도우미 전용이다(AIDE 스킬은 열지 않는다)
   ③ 껍데기 — 한 턴 처리(`agent.py`)·기록 복원(`store.py`)·결과→화면 블록(`view.py`)·공통 틀 어댑터(`spec.py`)
 
 경로·대화 보관·잠금·한도·흔적·끝난 대화 이어 받기는 공통 틀(`agent_kit`)이 한다 — 경로는

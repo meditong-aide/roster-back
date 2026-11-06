@@ -322,7 +322,7 @@ def execute_skill(
 
 # ── 파생 스펙 실행(S4) ───────────────────────────────────────
 
-#: 늘 미들웨어가 채우는 칸 — LLM·화면이 보낸 값은 버린다(수정 도우미 `middleware.GROUNDED` 와 같다)
+#: 늘 미들웨어가 채우는 칸 — LLM·화면이 보낸 값은 버린다(수정 도우미 스펙 훅이 채운 값도 같은 칸)
 _GROUNDED = "grounded"
 
 
@@ -402,7 +402,8 @@ def _execute_derived(
     elif kind is ErrorType.GENERIC_ERROR:
         status, err_msg = "ERROR", str(result.get("error"))[:500]
     dt = (time.time() - t0) * 1000
-    _write_skill_audit(db, ctx, skill_name, params, status, err_msg, dt)
+    audit_args = {k: v for k, v in params.items() if k != _GROUNDED}   # 확정 칸은 ORM 객체 repr 뿐이라 감사에서 뺀다
+    _write_skill_audit(db, ctx, skill_name, audit_args, status, err_msg, dt)
     return SkillResult(data=result, duration_ms=dt, skill_name=skill_name, grounded_params=params,
                        middleware_steps=steps)
 

@@ -1,7 +1,7 @@
 """스킬 — 얇은 어댑터(②층). AIDE 와 같은 모양이다(사용자 지시 11-06 · 나중에 AIDE 와 합친다).
 
   · 도구 정의(이름·설명·인자 스키마·읽기/미리보기/쓰기)는 `descriptions.py`, 이름 → 실행 함수는 `registry.py`
-    (`@register(name)`), 한 번 실행의 단계(권한 → 문맥 주입 → 이름 확정 → 실행 → 기록)는 `middleware.py`.
+    (`@register(name)`), 한 번 실행의 단계(범위 → 권한 → 문맥 주입 → 이름 확정 → 실행 → 감사)는 AIDE `execute_skill`(`middleware.py` 는 얇은 껍데기).
   · 여기는 실행 함수와, 그 앞 단계에서 쓸 것 — 이름 확정(`GROUNDERS`)·문맥 주입 전에 정할 고칠 첫날(`CONTEXT_FIRST`).
   · LLM 이 고르는 도구(후보 제안·요청 고치기·조회 등)와 카드 버튼(적용·넘기기·다듬기·레버)은 같은 레지스트리에 있고,
     권한 단계가 부른 곳을 가른다. 쓰기는 적용 하나뿐이고 새 버전(draft)만 만든다.
@@ -773,7 +773,7 @@ def choose_transfer(turn: Turn, params: Dict[str, Any]) -> Outcome:
     return _propose(turn, [_decided(r, choice) for r in turn.session.requests])
 
 
-# ── 앞 단계(`middleware`)가 쓰는 표 ─────────────────────────────────────────
+# ── 앞 단계(`aide_skills` 의 스펙 훅)가 쓰는 표 ─────────────────────────────────────────
 
 #: 이름 확정 — (확정한 값 dict 또는 None, 되물을 문장). 확정한 값은 실행 인자 grounded 로 간다
 GROUNDERS = {"propose_edit": _ground_propose, "revise_edit": _ground_revise, "lookup": _ground_lookup,

@@ -1,18 +1,21 @@
-"""스킬 레지스트리 — 이름 → 실행 함수(AIDE `agents_v2/skills/registry.py` 와 같은 모양 · 사용자 지시 11-06).
+"""수정 도우미 핸들러 표 + 매니페스트 조회(S5 · 11-06).
 
-  · `register(name)` 데코레이터로 `SKILL_REGISTRY[name] = func(turn, params)` — AIDE 는 func(db, params) 다. 수정 도우미는
-    한 대화 안에서 판정 재료·요청·동의를 이어 가야 해 db 대신 그것들을 든 `Turn`(db 포함)을 넘긴다.
-  · `run_skill` 은 이름을 정규화한다(그대로 → 하이픈 → 밑줄 · AIDE 와 같다).
-  · 도구 정의(설명·인자·읽기/미리보기/쓰기)는 `descriptions.py` 한 곳에 있다 — 등록 이름과 정의 이름이 어긋나면
+정본은 AIDE 매니페스트 스펙(`agents_v2.skills.manifest.SKILL_SPECS` — agents·mode·sources·llm_visible)이다. 어떤 스킬이 있고
+도구/버튼인지 · 읽기/미리보기/쓰기인지 · 어디서 부를 수 있는지는 거기서 읽는다 — 이 모듈에 따로 판정을 두지 않는다.
+  · `register(name)` 데코레이터가 `SKILL_REGISTRY[name] = func(turn, params)` 만 채운다 — `aide_skills` 가 이 표로 (db, params) 감싸기를
+    만들어 매니페스트에 올린다. 핸들러 본문은 `(turn, params)` 그대로 — 한 대화 안에서 판정 재료·요청·동의를 이어 가야 해
+    db 대신 그것들을 든 `Turn` 을 받는다. 실행은 AIDE `execute_skill` 이 하므로 여기에 실행 분기는 없다.
+  · `resolve`·`kind_of` 는 매니페스트를 읽는 조회다(하이픈·밑줄 정규화는 AIDE `find_spec` 과 같다).
+  · 도구 정의(설명·인자·읽기/미리보기/쓰기)는 `descriptions.py` 한 곳에 있다 — 정의와 핸들러 표와 매니페스트가 어긋나면
     `definition_gaps()` 가 알린다(시험).
-이 레지스트리는 수정 도우미 전용이다 — 자기 함수 그대로는 AIDE `SKILL_REGISTRY` 에 넣지 않고, AIDE 목록에는
-`aide_skills` 가 (db, params) 로 감싼 함수만 올린다(S4). 거기 있는 AIDE 스킬은 여기서 부르지 않는다.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
+from agents_v2.profiles import SCHEDULE_EDIT
+from agents_v2.skills.manifest import SKILL_SPECS, SkillSpec, find_spec, load_manifest_skills
 from schedule_edit_agent.descriptions import BUTTON_TOOLS, SKILL_MODES, SKILL_TOOLS
 
 #: (turn, params) → Outcome — 타입은 `skills.Turn`·`skills.Outcome`(순환 import 를 피해 Any 로 둔다)
@@ -32,50 +35,44 @@ def register(name: str):
     return decorator
 
 
+def _spec(skill_name: Optional[str]) -> Optional[SkillSpec]:
+    """수정 도우미 스펙(agents 에 schedule-edit 가 든 것) — AIDE 스킬 이름이면 None."""
+    load_manifest_skills()
+    spec = find_spec(str(skill_name or ""))
+    return spec if spec is not None and SCHEDULE_EDIT in spec.agents else None
+
+
 def resolve(skill_name: Optional[str]) -> Optional[str]:
-    """등록된 이름으로 — 그대로, 하이픈, 밑줄 순(AIDE `run_skill` 과 같은 정규화). 없으면 None."""
-    _ensure_loaded()
-    name = str(skill_name or "")
-    for candidate in (name, name.replace("_", "-"), name.replace("-", "_")):
-        if candidate in SKILL_REGISTRY:
-            return candidate
-    return None
+    """정의된 이름으로 — 그대로, 하이픈, 밑줄 순(AIDE 와 같은 정규화). 수정 도우미 스킬이 아니면 None."""
+    spec = _spec(skill_name)
+    return spec.name if spec is not None else None
 
 
 def kind_of(skill_name: Optional[str]) -> Optional[str]:
-    """'tool'(LLM 이 고른다) · 'button'(카드 버튼) · None(없는 이름)."""
-    name = resolve(skill_name)
-    if name in TOOL_NAMES:
-        return "tool"
-    if name in BUTTON_NAMES:
-        return "button"
-    return None
-
-
-def mode_of(skill_name: str) -> Optional[str]:
-    return SKILL_MODES.get(resolve(skill_name) or "")
-
-
-def run_skill(turn: Any, skill_name: str, params: Dict[str, Any]) -> Any:
-    """이름으로 실행. 없는 이름이면 KeyError(AIDE 와 같다)."""
-    name = resolve(skill_name)
-    if name is None:
-        raise KeyError(f"Unknown skill: {skill_name}")
-    return SKILL_REGISTRY[name](turn, params)
+    """'tool'(LLM 이 고른다 · llm_visible) · 'button'(카드 버튼) · None(수정 도우미에 없는 이름)."""
+    spec = _spec(skill_name)
+    if spec is None:
+        return None
+    return "tool" if spec.llm_visible else "button"
 
 
 def definition_gaps() -> List[str]:
-    """정의는 있는데 실행 함수가 없거나, 실행 함수는 있는데 정의(모드 포함)가 없는 이름."""
+    """정의는 있는데 핸들러·모드·매니페스트가 없거나, 핸들러·모드·매니페스트는 있는데 정의가 없는 이름, AIDE 표의 함수가 매니페스트 핸들러와 다른(덮어쓴) 이름."""
     _ensure_loaded()
+    load_manifest_skills()
     defined = TOOL_NAMES | BUTTON_NAMES
-    return sorted((defined ^ set(SKILL_REGISTRY)) | (defined ^ set(SKILL_MODES)))
+    listed = {n for n, s in SKILL_SPECS.items() if SCHEDULE_EDIT in s.agents}
+    from agents_v2.skills import registry as aide_registry
+    aide_registry._ensure_loaded()     # 지연 적재되는 옛 @register 가 같은 이름을 덮어쓰지 않았는지도 본다
+    overwritten = {n for n in defined & listed if aide_registry.SKILL_REGISTRY.get(n) is not SKILL_SPECS[n].handler}
+    return sorted((defined ^ set(SKILL_REGISTRY)) | (defined ^ set(SKILL_MODES)) | (defined ^ listed) | overwritten)
 
 
 _loaded = False
 
 
 def _ensure_loaded() -> None:
-    """스킬 모듈을 불러 등록을 끝낸다(AIDE 와 같다)."""
+    """스킬 모듈을 불러 핸들러 등록을 끝낸다."""
     global _loaded
     if _loaded:
         return

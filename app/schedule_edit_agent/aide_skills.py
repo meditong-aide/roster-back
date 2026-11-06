@@ -1,5 +1,5 @@
 """수정 도우미 스킬 20개를 AIDE 매니페스트에 올린다(S4 · 11-06) — AIDE 실행 경로(`agents_v2.middleware.execute_skill`)로도
-같은 스킬을 같은 결과로 돌리기 위한 얇은 감싸기. 수정 도우미 자기 경로(`middleware.py`·`registry.py`)는 그대로다(S5 에서 갈아탄다).
+같은 스킬을 같은 결과로 돌리기 위한 얇은 감싸기. S5 부터 수정 도우미의 실행은 늘 이 경로다(`middleware.py` 는 AIDE `execute_skill` 의 얇은 껍데기).
 
   · 등록은 이 모듈이 매니페스트를 import 해서 한다 — `agents_v2/*` 는 `schedule_edit_agent` 를 import 하지 않는다(층 분리).
     AIDE 쪽은 `manifest._MANIFEST_MODULES` 에 이 모듈 경로 문자열만 두고 `load_manifest_skills()` 가 불러 준다.
@@ -9,7 +9,7 @@
       context_first(turn, params) → 끝낼 결과 dict 또는 None
       grounder(turn, params)      → (확정한 값 또는 None, 끝낼 결과 dict 또는 None)
     되물음 문장·기록(`skills._clarify`)은 여기서 만든다.
-  · 예외 처리는 수정 도우미 미들웨어와 같다: SkillError → 'error' 기록 + failed 결과 · 예상 밖 예외 → 'error' 기록 뒤 다시 올림
+  · 예외 처리(`_guarded`): SkillError → 'error' 기록 + failed 결과 · 예상 밖 예외 → 'error' 기록 뒤 다시 올림
     (AIDE 가 error 결과로 받는다).
 권한 칸: mutation·hn_only 는 끈다 — AIDE ①(`_check_permission`)은 hn_only 면 user_role 이 HN·ADM 이 아닌 사람을 막고 mutation 이면
 다른 간호사 이름 인자를 막는데, 수정 도우미를 쓰는 사람(수간호사·그룹관리자·ADM)은 경로가 `authorize_schedule` 로 먼저 가르며 그룹관리자의
@@ -28,7 +28,7 @@ from schedule_edit_agent.descriptions import BUTTON_TOOLS, SKILL_MODES, SKILL_TO
 from schedule_edit_agent.skills import CONTEXT_FIRST, GROUNDERS, Outcome, SkillError, Turn, _clarify
 
 AGENT = "schedule-edit"
-#: 말로 고르는 도구는 LLM·예시에서만, 버튼은 버튼에서만(`middleware._ALLOWED_KIND` 와 같다)
+#: 말로 고르는 도구는 LLM·예시에서만, 버튼은 버튼에서만(스펙의 sources 로 가른다 — AIDE ⓪ 범위 단계)
 TOOL_SOURCES = ("llm", "example")
 BUTTON_SOURCES = ("button",)
 
@@ -63,10 +63,9 @@ def _guarded(thunk: Callable[[Turn], Any]) -> Tuple[Any, Optional[Dict[str, Any]
 
 
 def _handler(name: str) -> Callable[[Any, Dict[str, Any]], Dict[str, Any]]:
-    func = registry.SKILL_REGISTRY[name]
-
     def run(db: Any, params: Dict[str, Any]) -> Dict[str, Any]:
-        out, failed = _guarded(lambda turn: func(turn, params).to_data())
+        # 핸들러는 부를 때 표에서 찾는다 — 표만 갈아 끼우면(시험) 바로 반영된다
+        out, failed = _guarded(lambda turn: registry.SKILL_REGISTRY[name](turn, params).to_data())
         return failed or out
 
     run.__name__ = f"aide_{name}"
