@@ -176,10 +176,11 @@ def update_schedule_entry(
 
 
 def _lock_schedule_row(db: Session, schedule_id: str) -> str | None:
-    """근무표 행 잠금(커밋까지) — `/roster/save` 의 잠금(근무표 행 UPDATE)과 서로 기다린다. 못 잡으면 안내 문구.
+    """근무표 행 잠금(커밋까지) — `/roster/save`·`/roster/autosave` 의 잠금(근무표 행 UPDATE)과 서로 기다린다.
+    못 잡으면 안내 문구.
 
-    ★ 저장은 이 행을 잠근 뒤 칸 지문(etag)을 비교하고 칸을 갈아 끼운다. 칸 수정이 이 잠금 없이 커밋되면 그 사이에
-      끼어 지문 검사 없이 덮인다(11-04 Codex). `updated_at` 은 건드리지 않는다(저장 시각이 아니다).
+    ★ 자동 저장은 이 행을 잠근 뒤 칸 지문(etag)을 비교하고 칸을 갈아 끼운다. 칸 수정이 이 잠금 없이 커밋되면 그
+      사이에 끼어 지문 검사 없이 덮인다(11-04 Codex). `updated_at` 은 건드리지 않는다(저장 시각이 아니다).
     ★ `with_for_update()` 는 mssql+pymssql 에서 SQL 에 아무것도 붙이지 않아(실측) 테이블 힌트로 건다
       (`lock_wanted_month` 와 같은 방식). 대기 상한도 같다 — [새 버전으로 저장]·마감이 행을 오래 쥐면 끝없이 기다린다.
     """
@@ -187,7 +188,7 @@ def _lock_schedule_row(db: Session, schedule_id: str) -> str | None:
     from services.wanted_daily_quota_service import _LOCK_TIMEOUT_MS, _lock_wait_limit
 
     try:
-        with _lock_wait_limit(db, _LOCK_TIMEOUT_MS):
+        with _lock_wait_limit(db, _LOCK_TIMEOUT_MS, label=f"schedule {schedule_id} AIDE 칸 수정"):
             db.query(Schedule.schedule_id).with_hint(Schedule, "WITH (UPDLOCK, ROWLOCK)", "mssql").filter(
                 Schedule.schedule_id == schedule_id,
             ).first()

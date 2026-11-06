@@ -19,6 +19,7 @@ from services.preferences_service import (
     PreferenceForbiddenError,
     PreferenceQuotaError,
     PreferenceValidationError,
+    WantedBusyError,
     submit_preferences_service,
     submit_empty_preferences_service,
     retract_submission_service,
@@ -48,7 +49,8 @@ def _raise_domain_error(exc: Exception) -> None:
     """원티드 도메인 예외를 HTTP 상태로 매핑한다.
 
     - 403: 역할/그룹 불일치
-    - 409: 마감 또는 이미 제출됨 · 일자별 신청 한도 초과(본문 `{code, message, detail.dates}`)
+    - 409: 마감 또는 이미 제출됨(문자열) · 일자별 신청 한도 초과(본문 `{code: DAILY_QUOTA_EXCEEDED, message,
+      detail.dates}`) · 같은 병동 원티드 처리 대기 초과(본문 `{code: WANTED_BUSY, message}` — 다시 시도하면 대개 통과)
     - 422: 날짜 중복 · 유효하지 않은 shift_id · 미지원 intent · 한도 초과
     매핑 대상이 아니면 그대로 재전파해 호출부가 500 으로 처리하게 둔다.
     """
@@ -60,6 +62,9 @@ def _raise_domain_error(exc: Exception) -> None:
             status_code=409,
             detail={"code": exc.code, "message": str(exc), "detail": exc.detail},
         )
+    if isinstance(exc, WantedBusyError):
+        # 잠금 대기 초과 — 마감·이미 제출과 달리 선택을 되돌릴 일이 아니다. 화면이 구분하게 code 를 단다(11-04 점검).
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)})
     if isinstance(exc, PreferenceConflictError):
         raise HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, PreferenceValidationError):

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
+import logging
 from datetime import datetime, date as date_type
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
 
@@ -17,6 +21,8 @@ from db.models import (
     FixedWantedEntry,
     ShiftPreference,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _wanted_request_month_str(year: int, month: int) -> str:
@@ -336,6 +342,114 @@ def clear_wanted_deadline(
     }
 
 
+def _release_lock_on_error(fn):
+    """쓰기 도구(실행)를 savepoint 로 감싼다 — 예외면 이 도구가 쓴 것만 되돌리고 병동·월 잠금을 푼 뒤 다시 던진다.
+
+    ★ 그냥 올려 보내면 잠금이 턴 끝 세션 저장(LLM 답 생성 뒤)까지 남아, 같은 병동·월 화면 제출이 10초 기다린 뒤
+      409 를 받는다. 덜 만든 초안·복사 칸이 그 커밋에 섞일 수도 있다(11-04 점검).
+    ★ 세션 rollback 은 쓰지 않는다 — 같은 턴 감사 기록까지 날아간다. 커밋(`_unlock`)으로 잠금을 풀고 그 기록을
+      확정한다(MSSQL 은 savepoint 롤백으로 그 뒤에 잡은 잠금이 풀리지만 확대·변환된 잠금은 남는다).
+      미리보기(preview_only=True)는 잠그지도 쓰지도 않아 감싸지 않는다.
+    ★ 예외: 교착(1205)이면 서버가 이미 턴 트랜잭션 전체를 되돌렸다(감사 기록도 사라졌다) — 세션만 서버에 맞추고
+      1205 를 다시 던진다(`_resync_lost_transaction`).
+    ★ 전제: 도구 안 commit 은 **마지막 쓰기**다(`_submit_draft`·철회의 commit·`_unlock`). commit 하면 savepoint 도
+      닫히므로, 그 뒤에 쓰고 예외가 나면 되돌릴 것이 없고 잠금 풀기 commit 이 그 쓰기까지 확정한다.
+    """
+    has_preview = "preview_only" in inspect.signature(fn).parameters
+
+    @functools.wraps(fn)
+    def wrapper(db: Session, *args, **kwargs):
+        if has_preview and kwargs.get("preview_only", True):
+            return fn(db, *args, **kwargs)
+        savepoint = db.begin_nested()
+        try:
+            result = fn(db, *args, **kwargs)
+        except Exception as exc:
+            reraise = _server_rolled_back(exc)
+            if reraise is not None:
+                _resync_lost_transaction(db, fn.__name__)
+                if reraise is exc:
+                    raise
+                raise reraise from None
+            try:
+                # ★ is_active 로 고르지 않는다 — 도구 안 commit 의 flush 가 실패하면 savepoint 는 비활성으로 세션에
+                #   남는다. 그대로 두면 잠금 풀기(commit)가 PendingRollbackError 로 실패하고, 턴 끝 rollback 에 앞선
+                #   감사 기록까지 사라진다(11-04 Codex 재현). 세션에 남아 있으면 비활성이어도 되돌려 닫는다.
+                if _savepoint_open(db, savepoint):
+                    savepoint.rollback()
+                _unlock(db)
+            except SQLAlchemyError:
+                # 연결이 끊긴 경우 등 — 턴 끝 정리에 맡기고 원래 예외를 올린다.
+                logger.warning("[aide.wanted] 오류 뒤 잠금 풀기 실패: %s", fn.__name__, exc_info=True)
+            raise
+        if _savepoint_open(db, savepoint):   # 도구가 커밋하지 않고 끝난 경로(잠금을 못 잡은 경우 등)
+            if savepoint.is_active:
+                savepoint.commit()
+            else:
+                savepoint.rollback()          # 삼켜진 flush 오류 — 세션을 다시 쓸 수 있게 닫는다
+        return result
+
+    return wrapper
+
+
+def _savepoint_open(db: Session, savepoint) -> bool:
+    """savepoint 가 아직 세션의 트랜잭션 체인에 있는지(비활성 포함). 도구가 커밋했으면 이미 닫혀 False."""
+    tx = db.get_nested_transaction()
+    while tx is not None:
+        if tx is savepoint:
+            return True
+        tx = tx.parent
+    return False
+
+
+#: 서버가 트랜잭션을 통째로 되돌렸다는 MSSQL 오류 — 1205 교착 희생, 그 뒤 savepoint 롤백·커밋이 받는 3903·3902.
+_SERVER_TX_LOST = (1205, 3902, 3903)
+
+
+def _sql_error_number(exc: BaseException) -> int | None:
+    args = getattr(getattr(exc, "orig", None), "args", None) or ()
+    return args[0] if args and isinstance(args[0], int) else None
+
+
+def _server_rolled_back(exc: BaseException) -> BaseException | None:
+    """서버가 트랜잭션을 통째로 되돌렸으면 다시 던질 예외, 아니면 None.
+
+    ★ 도구 안 commit 의 flush 가 1205 를 받으면 SQLAlchemy 의 savepoint 정리(ROLLBACK TRANSACTION)가 3903 으로
+      실패하고, 그 오류가 1205 를 가린다(11-04 점검). DB 오류면 사슬을 따라가 1205 를 찾아 그것을 던진다.
+    ★ 전제: 도구는 DB 오류를 잡아 같은 세션에서 다시 시도하지 않는다. 그런 도구가 생기면 사슬에 남은 옛 1205 때문에
+      살아 있는 트랜잭션까지 되돌린다.
+    """
+    chain, cur = [], exc
+    while cur is not None and len(chain) < 10:
+        chain.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    numbers = [_sql_error_number(e) for e in chain]
+    if not any(n in _SERVER_TX_LOST for n in numbers):
+        return None
+    if isinstance(exc, SQLAlchemyError) and 1205 in numbers:
+        return chain[numbers.index(1205)]
+    return exc
+
+
+def _resync_lost_transaction(db: Session, name: str) -> None:
+    """서버가 되돌린 트랜잭션에 세션을 맞춘다 — 남은 savepoint 마다 ROLLBACK TRANSACTION 이 3903 으로 실패하며
+    한 겹씩 닫히므로, 루트(pymssql rollback 은 3903 을 삼키고 BEGIN TRAN)에 닿을 때까지 거듭 부른다.
+
+    ★ 맞추지 않으면 서버는 트랜잭션 밖이라, 다음 쓰기(실패 감사 기록 등)가 문장마다 바로 확정되고 잠금 SELECT 의
+      UPDLOCK 이 문장 끝에 풀리며 턴 끝 commit 이 3902 로 실패한다(11-04 점검).
+    """
+    logger.error("[aide.wanted] 서버가 트랜잭션을 되돌림(교착 등) — 같은 턴 앞선 기록도 사라짐: %s", name, exc_info=True)
+    last_error = None
+    for _ in range(16):     # 실패 한 번에 살아 있는 savepoint 한 겹 — 지금 가장 깊은 경로는 3겹(루트 포함)
+        try:
+            db.rollback()
+            return
+        except SQLAlchemyError as err:
+            last_error = err
+    logger.warning("[aide.wanted] 교착 뒤 세션 맞추기 실패: %s", name, exc_info=last_error)
+
+
+@_release_lock_on_error
 def cancel_wanted_request(
     db: Session, nurse_id: str, group_id: str, year: int, month: int, request_id: int | None = None,
     *, self_rules: bool = False,
@@ -580,7 +694,7 @@ def _lock_for_write(db: Session, group_id: str, year: int, month: int, *, self_r
     from services.wanted_daily_quota_service import lock_wanted_month
 
     try:
-        lock_wanted_month(db, group_id, year, month)
+        lock_wanted_month(db, group_id, year, month, source="AIDE")
     except PreferenceConflictError as exc:
         return str(exc)
     if not self_rules:
@@ -665,6 +779,7 @@ def _submit_draft(db: Session, draft: WantedRequest) -> None:
     db.commit()
 
 
+@_release_lock_on_error
 def delete_wanted_by_date(
     db: Session, nurse_id: str, group_id: str, year: int, month: int, date: str,
     *, preview_only: bool = True, self_rules: bool = False,
@@ -728,6 +843,7 @@ def delete_wanted_by_date(
     }
 
 
+@_release_lock_on_error
 def add_wanted_by_date(
     db: Session, nurse_id: str, group_id: str,
     year: int, month: int, date: str, shift_code: str,
@@ -804,6 +920,7 @@ def add_wanted_by_date(
     }
 
 
+@_release_lock_on_error
 def modify_wanted_by_date(
     db: Session, nurse_id: str, group_id: str,
     year: int, month: int, date: str, new_shift_code: str,

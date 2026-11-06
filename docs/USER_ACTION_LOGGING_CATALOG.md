@@ -146,18 +146,19 @@ Firehose 는 3키로 쓰는데 **Glue 파티션키는 `dt` 단일**이다. `stor
 |---|---|---|---|---|---|
 | 스티커 저장 | 근무표 스티커 저장(삭제 후 입력) | POST | `/sticker/insert` | stcker_date, sticker_contents | — |
 
-#### 원티드 (13)
+#### 원티드 (14)
 
 | section | action | method | path | 로깅필드(화이트리스트) | PII 마스킹 |
 |---|---|---|---|---|---|
 | 원티드 작성 요청 | 원티드 작성기간 오픈(작성요청 생성) | POST | `/wanted/request` | year, month, exp_date | — |
 | 원티드 마감 | 원티드 작성 마감 | PATCH | `/wanted/close` | — | — |
 | 원티드 마감일 변경 | 원티드 마감일 변경 | PATCH | `/wanted/deadline` | year, month, exp_date | — |
-| 원티드 AI 반영 | 자연어 원티드 요청 분석·반영 | POST | `/wanted/invoke` | request, schema, case, year, month | — |
+| 원티드 AI 반영 | 자연어 원티드 요청 분석·반영 [DEPRECATED] — 운영 배포일부터 로그인한 호출에 410(`WANTED_INVOKE_GONE` · 커밋 38e0eb4, 11-04 결정) · 410 건수 = 남은 호출자 | POST | `/wanted/invoke` | year, month | — |
 | 원티드 만료 자동마감 | 만료 원티드 일괄 마감 [크론/내부] | POST | `/wanted/close-expired` | — | — |
 | 일자별 원티드 제한 설정 | 원티드 제한 설정 저장(upsert) | POST | `/wanted/config` | year, month, max_requests, target_date, shift_type | — |
 | 일자별 원티드 제한 설정 삭제 | 원티드 제한 설정 삭제 | DELETE | `/wanted/config` | — | — |
 | 원티드 제한 설정 월 일괄삭제(OFF) | 해당 월 원티드 설정 전체 삭제 | DELETE | `/wanted/config/toggle` | — | — |
+| 팀별 일자 한도 설정 | 팀별 원티드 신청 한도 저장(그 달 통째 교체) | PUT | `/wanted/team-limits` | defaults, dates | — |
 | 원티드 제한 검증 | 원티드 요청 제한 검증(비변경) [읽기성] | POST | `/wanted/validate-limits` | — | — |
 | 초과 OFF 삭제 | 간호사 초과 OFF 요청 삭제 | POST | `/wanted/delete-excess-off/{nurse_id}` | — | — |
 | 확정 원티드(조정판) 저장 | 확정 원티드 저장 | POST | `/wanted/adjustment` | year, month, entries[].nurse_id, entries[].shift_date, entries[].shift_id, entries[].is_applied, entries[].reason, entries[].head_nurse_memo | — |
@@ -168,8 +169,8 @@ Firehose 는 3키로 쓰는데 **Glue 파티션키는 `dt` 단일**이다. `stor
 
 | section | action | method | path | 로깅필드(화이트리스트) | PII 마스킹 |
 |---|---|---|---|---|---|
-| 선호 입력 | 희망근무 초안 임시저장 | POST | `/preferences` | year, month, data, preference | — |
-| 선호 제출 | 희망근무 최종 제출 | POST | `/preferences/submit` | year, month, data, preference | — |
+| 선호 입력 | 희망근무 초안 임시저장 | POST | `/preferences` | year, month | — |
+| 선호 제출 | 희망근무 최종 제출 | POST | `/preferences/submit` | year, month | — |
 | 선호 제출 | 빈 희망근무 최종 제출 | POST | `/preferences/submit/empty` | year, month | — |
 | 선호 제출 | 희망근무 제출 철회(수정 위해) | POST | `/preferences/retract` | year, month | — |
 
@@ -188,14 +189,15 @@ Firehose 는 3키로 쓰는데 **Glue 파티션키는 `dt` 단일**이다. `stor
 | 일자별 근무인원 | 월 일자별 근무인원(D/E/N/M) 일괄 교체 저장 | PUT | `/daily-shift` | office_id, group_id, year, month, date, max_enabled, apply_globally, month_summary, apply_summary_to_days | — |
 | 제약 조정 | 제약 조정 미리보기(dry-run config diff) [읽기성] | POST | `/constraint_impact/preview_adjustments` | year, month, constraint_adjustments | — |
 
-#### 근무표보기 (15)
+#### 근무표보기 (16)
 
 | section | action | method | path | 로깅필드(화이트리스트) | PII 마스킹 |
 |---|---|---|---|---|---|
 | 버전 관리 | 근무표(버전) 삭제·숨김(dropped=1) | DELETE | `/roster/{schedule_id}` | group_id | — |
 | 발행 | 근무표 발행(마감) | POST | `/roster/publish` | schedule_id, issue_comment, group_id | — |
 | 발행 | 근무표 발행 취소(마감 철회, issued→draft) | POST | `/roster/unpublish` | schedule_id, group_id | — |
-| 편집 저장 | 근무표 셀 수동편집 저장 | POST | `/roster/save` | year, month, schedule_id, roster, memo, group_id | — |
+| 편집 저장 | 근무표 셀 수동편집 저장(전량 교체 · base_etag 를 보내면 400) | POST | `/roster/save` | year, month, schedule_id, memo | — |
+| 편집 저장 | 근무표 자동 저장(내용 지문 검사 · base_etag 필수 · 11-04) | POST | `/roster/autosave` | year, month, schedule_id, memo, base_etag, remove_nurse_ids | — |
 | 검증 | 근무표 제약 위반 검증(부작용 없음) [읽기성] | POST | `/roster/validate` | year, month, roster, schedule_id, group_id | — |
 | 버전 관리 | 근무표 버전 이름 변경 | PATCH | `/roster/{schedule_id}/name` | name, group_id | — |
 | 버전 관리 | 근무표 새 버전으로 복사 | POST | `/roster/copy/{source_schedule_id}` | new_name, group_id | — |
@@ -325,12 +327,12 @@ Firehose 는 3키로 쓰는데 **Glue 파티션키는 `dt` 단일**이다. `stor
 
 | section | cta | event (data-track) | kind | 연결 API | 비고 |
 |---|---|---|---|---|---|
-| 신청 | 에이드(AI) 원티드 작성 제출 | `wanted.aide.submit` | **mutation** | POST /wanted/invoke → POST /preferences | — |
+| 신청 | 에이드(AI) 원티드 작성 제출 | `wanted.aide.submit` | **mutation** | POST /preferences(invoke 단계는 08-20 PC·모바일에서 뺐고, 서버는 38e0eb4 운영 배포부터 410) | — |
 | HN 일자별 설정 | 일자별 신청수 입력 | `wanted.calendar.daily_config_change` | **mutation** | 콜백(dailyConfigs, 저장은 /wanted/config) | — |
 | 캘린더 | 날짜 근무코드 셀/삭제 | `wanted.calendar.date_edit` | **mutation** | 콜백(setSelectedCalendarData, 저장은 index.tsx 임시저장/제출) | — |
 | 캘린더 | 사유 저장/삭제 | `wanted.calendar.reason_edit` | **mutation** | 콜백(comment) | — |
-| 초기화 | 초기화 | `wanted.calendar.reset` | **mutation** | POST /wanted/invoke → POST /preferences | — |
-| 저장 | 임시저장 | `wanted.calendar.save` | **mutation** | POST /wanted/invoke → POST /preferences | — |
+| 초기화 | 초기화 | `wanted.calendar.reset` | **mutation** | POST /preferences(invoke 단계는 08-20 PC·모바일에서 뺐고, 서버는 38e0eb4 운영 배포부터 410) | — |
+| 저장 | 임시저장 | `wanted.calendar.save` | **mutation** | POST /preferences(invoke 단계는 08-20 PC·모바일에서 뺐고, 서버는 38e0eb4 운영 배포부터 410) | — |
 | 희망동료 | 동료 삭제/비번확인 | `wanted.preference.edit` | **mutation** | 콜백(로컬, 저장은 제출) | — |
 | 수간호사 원티드 요청 | 원티드 요청 마감하기 | `wanted.request.close` | **mutation** | PATCH /wanted/close | — |
 | 수간호사 원티드 요청 | 요청하기/마감일 변경 | `wanted.request.submit` | **mutation** | requestWantedDeadline/saveChangeWantedDeadline(POST /wanted/request \| PATCH /wanted/deadline) | — |

@@ -36,7 +36,7 @@ from db.models import (
     WantedRequest,
     WantedTeamLimit,
 )
-from services.preferences_service import PreferenceConflictError, PreferenceQuotaError
+from services.preferences_service import PreferenceQuotaError, WantedBusyError
 from services.team_period import quota_team_map, sort_team_ids_by_name
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import text
@@ -49,7 +49,7 @@ QUOTA_SHIFT_TYPES = ("OFF", "휴가", "휴무", "연차")
 #: 응답에 싣는 적용 규칙 이름 — 날짜마다 내 팀 한도가 있으면 팀, 없으면 병동(11-04 결정).
 QUOTA_RULE = "team_first"
 
-#: 원티드 행 잠금 대기 상한(ms). 제출 트랜잭션은 짧아 이 안에 풀린다 — 넘으면 409 로 다시 제출하게 한다.
+#: 원티드 행 잠금 대기 상한(ms). 제출 트랜잭션은 짧아 이 안에 풀린다 — 넘으면 409 `WANTED_BUSY`(잠시 후 다시 시도).
 _LOCK_TIMEOUT_MS = 10000
 #: MSSQL 잠금 대기 시간 초과 오류 번호.
 _MSSQL_LOCK_TIMEOUT = 1222
@@ -138,12 +138,18 @@ def quota_shift_ids(db: Session, group_id: str) -> set:
 
 
 def ward_limits(db: Session, group_id: str, year: int, month: int) -> dict:
-    """병동 전체 일자별 한도 {날짜: 한도}. 화면처럼 shift_type 은 보지 않는다(항상 NULL)."""
+    """병동 전체 일자별 한도 {날짜: 한도} — `shift_type` 이 NULL 인 행만 쓴다.
+
+    NULL = 그날 병동 전체 한도(PC 설정 화면이 늘 NULL 로 저장 · 예전 판정 `validate_wanted_limits` 와 같다).
+    shift_type 이 있는 행은 쓰지 않는다 — 고유 인덱스가 (병동, 날짜, shift_type)이라 같은 날 NULL 행과 함께 있을 수 있고,
+    섞어 세면 화면에 보이는 한도보다 낮은 값으로 막힌다(11-04 점검). 같은 날 NULL 행이 둘이면(인덱스 없는 DB) 작은 값.
+    """
     start, end = _month_range(year, month)
     rows = db.query(WantedConfig.target_date, WantedConfig.max_requests).filter(
         WantedConfig.group_id == group_id,
         WantedConfig.target_date >= start,
         WantedConfig.target_date <= end,
+        WantedConfig.shift_type.is_(None),
         WantedConfig.max_requests.isnot(None),
     ).all()
     out: dict = {}
@@ -257,7 +263,7 @@ def _team_name(db: Session, group_id: str, team_id: int | None) -> str | None:
     return row[0] if row else None
 
 
-def lock_wanted_month(db: Session, group_id: str, year: int, month: int) -> None:
+def lock_wanted_month(db: Session, group_id: str, year: int, month: int, *, source: str = "") -> None:
     """병동·월 원티드 행을 잠근다(커밋까지). 같은 병동·월 제출이 줄을 서서 뒤 사람이 앞 사람 제출을 센다.
 
     ★ 제출 경로는 **자기 신청 칸을 쓰기 전에** 이걸 먼저 부른다. 칸을 쓴 뒤 잠그면 두 제출이
@@ -265,9 +271,11 @@ def lock_wanted_month(db: Session, group_id: str, year: int, month: int) -> None
     ★ `with_for_update()` 는 이 환경(mssql+pymssql·SQLAlchemy 2.0)에서 SQL 에 아무것도 붙이지
       않는다(실측) — 테이블 힌트로 건다(`retract_submission_service` 와 같은 방식).
     ★ 대기 상한 `_LOCK_TIMEOUT_MS` — roster-back 에는 쿼리 타임아웃이 없어, 잠금을 쥔 트랜잭션이 멈추면
-      제출이 끝없이 기다린다. 넘으면 PreferenceConflictError(409 '잠시 후 다시').
+      제출이 끝없이 기다린다. 넘으면 WantedBusyError(409 `WANTED_BUSY` '잠시 후 다시').
+    ★ source 는 대기 초과 로그에만 붙는다 — AIDE 쓰기('AIDE')는 409 가 아니라 도구 문구로 끝나서 화면 경합과 가른다.
     """
-    with _lock_wait_limit(db, _LOCK_TIMEOUT_MS):
+    label = f"wanted {group_id} {year}-{int(month):02d}" + (f" {source}" if source else "")
+    with _lock_wait_limit(db, _LOCK_TIMEOUT_MS, label=label):
         db.query(Wanted).with_hint(Wanted, "WITH (UPDLOCK, ROWLOCK)", "mssql").filter(
             Wanted.group_id == group_id, Wanted.year == year, Wanted.month == month,
         ).first()
@@ -278,14 +286,19 @@ def _is_lock_timeout(exc: OperationalError) -> bool:
     return (bool(args) and args[0] == _MSSQL_LOCK_TIMEOUT) or "Lock request time out" in str(exc)
 
 
+#: 잠금 대기 초과 안내 — 임시저장·제출·철회가 같이 쓴다(그래서 '다시 제출'이 아니라 '다시 시도').
+_BUSY_MESSAGE = "같은 병동의 다른 원티드를 처리하는 중이에요. 잠시 후 다시 시도해 주세요."
+
+
 @contextmanager
-def _lock_wait_limit(db: Session, timeout_ms: int,
-                     busy_message: str = "같은 병동의 다른 원티드를 처리하는 중이에요. 잠시 후 다시 제출해 주세요."):
+def _lock_wait_limit(db: Session, timeout_ms: int, busy_message: str = _BUSY_MESSAGE, *, label: str = ""):
     """이 블록의 잠금 대기를 timeout_ms 로 묶는다(MSSQL 만 — 테스트용 SQLite 는 그대로 통과).
 
     ★ `SET LOCK_TIMEOUT` 은 **연결(세션) 설정**이다. 되돌리지 않으면 연결 풀로 돌아간 뒤 다른 요청의
       쿼리까지 상한이 걸린다 — 블록이 끝나면 오류가 나도 무제한(-1)으로 되돌린다.
     ★ 시간 초과(1222)는 문장만 실패하고 트랜잭션은 살아 있다(XACT_ABORT 꺼짐) — 되돌리는 문장을 그대로 보낸다.
+    ★ 시간 초과는 경고 로그를 남긴다(label = 무엇을 기다렸나) — 배포 뒤 공용 DB 경합 횟수를 센다(11-04 점검).
+      문구는 중립이다 — AIDE 칸 수정·원티드 쓰기는 409 가 아니라 도구 문구로 끝난다(label 로 가른다).
     """
     if db.get_bind().dialect.name != "mssql":
         yield
@@ -295,7 +308,8 @@ def _lock_wait_limit(db: Session, timeout_ms: int,
         yield
     except OperationalError as exc:
         if _is_lock_timeout(exc):
-            raise PreferenceConflictError(busy_message) from exc
+            logger.warning("[lock_wait] 잠금 대기 %sms 초과: %s", timeout_ms, label or "-")
+            raise WantedBusyError(busy_message) from exc
         raise
     finally:
         try:

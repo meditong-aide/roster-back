@@ -36,6 +36,7 @@ from services.preferences_service import (
     PreferenceConflictError,
     PreferenceQuotaError,
     PreferenceValidationError,
+    WantedBusyError,
     retract_submission_service,
     save_wanted_entries_service,
     submit_preferences_service,
@@ -507,8 +508,8 @@ def test_aide_edit_copies_submission_committed_while_waiting(env, monkeypatch, s
     real_lock = quota.lock_wanted_month
     state = {"other_done": False}
 
-    def _lock_then_other_edit(db, group_id, year, month):
-        real_lock(db, group_id, year, month)
+    def _lock_then_other_edit(db, group_id, year, month, **kwargs):
+        real_lock(db, group_id, year, month, **kwargs)
         if not state["other_done"]:
             state["other_done"] = True        # 기다리는 사이 다른 편집(15일 추가)이 먼저 커밋된다
             wanted_tools.add_wanted_by_date(db, "N002", G, Y, M, "2026-11-15", V, preview_only=False)
@@ -550,8 +551,8 @@ def test_late_draft_save_cannot_change_request_submitted_meanwhile(env, monkeypa
     real_lock = quota.lock_wanted_month
     state = {"submitted": False}
 
-    def _lock_then_submit(db, group_id, year, month):
-        real_lock(db, group_id, year, month)
+    def _lock_then_submit(db, group_id, year, month, **kwargs):
+        real_lock(db, group_id, year, month, **kwargs)
         if not state["submitted"]:
             state["submitted"] = True                          # 기다리는 사이 같은 draft 가 제출·커밋된다
             submit_preferences_service(PreferenceData(year=Y, month=M), _user("N003"), db, is_draft=False)
@@ -654,3 +655,229 @@ def test_all_preferences_batch_keeps_each_nurses_latest_request(env, monkeypatch
     rows = {r["nurse_id"]: r["data"]["shift"] for r in ps.get_all_preferences_service(Y, M, _user("N001"), env)}
     assert set(rows["N002"][V]) == {"15"}
     assert set(rows["N003"][V]) == {"16"}
+
+
+# ── 11-04 점검 후속 ───────────────────────────────────────────────────────
+
+
+def test_ward_limit_uses_only_null_shift_type_rows(env):
+    """병동 일자 한도는 shift_type 이 NULL 인 행만 — 같은 날 'V' 행(0)이 섞여도 화면이 보여 주는 한도(2)로 센다.
+    고유 인덱스가 (병동, 날짜, shift_type)이라 두 행이 함께 있을 수 있다."""
+    _ward_limit(env, 14, 2)
+    env.add(WantedConfig(group_id=G, year=Y, month=M, target_date=date(Y, M, 14), max_requests=0, shift_type="V"))
+    env.flush()
+    assert quota.ward_limits(env, G, Y, M) == {date(Y, M, 14): 2}
+    _request(env, "N002", {14: V})
+    _check(env, "N003", _request(env, "N003", {14: V}, submitted=False))  # 다른 사람 1 + 나 = 2 ≤ 2
+
+
+@pytest.mark.parametrize("is_draft", [True, False])
+def test_daily_quota_failure_does_not_fail_committed_save(env, monkeypatch, is_draft):
+    """daily_quota 계산이 DB 오류가 아닌 예외로 실패해도 임시저장·제출 응답은 정상(그 필드만 None) — 이미 커밋된 뒤라
+    500 이면 성공한 저장이 실패로 보이고, 모바일은 낙관적 갱신을 되돌린 뒤 옛 상태로 다시 저장한다."""
+    def _broken_view(*_a, **_k):
+        raise RuntimeError("quota view broken")
+
+    monkeypatch.setattr(quota, "daily_quota_view", _broken_view)
+    body = PreferenceData(year=Y, month=M, wanted_entries=[{"date": "2026-11-14", "shift_id": V, "intent": "wanted"}])
+    result = save_wanted_entries_service(body, _user("N003"), env, is_draft=is_draft)
+    assert result["daily_quota"] is None
+    assert result["is_submitted"] is (not is_draft)
+
+
+def test_lock_timeout_is_wanted_busy_with_neutral_message(caplog):
+    """잠금 대기 초과 = 409 `WANTED_BUSY` — 마감·이미 제출(문자열 409)과 화면이 구분하고, 임시저장에도 맞는
+    '다시 시도' 문구를 쓴다. 경합 횟수를 셀 수 있게 경고 로그를 남긴다."""
+    from fastapi import HTTPException
+    from routers.preferences import _raise_domain_error
+
+    fake = _FakeMssql()
+    timeout = OperationalError("SELECT", {}, Exception(1222, b"Lock request time out period exceeded."))
+    with pytest.raises(WantedBusyError) as busy, quota._lock_wait_limit(fake, 10000, label="wanted GRP001 2026-11"):
+        raise timeout
+    assert busy.value.code == "WANTED_BUSY"
+    assert "다시 시도" in str(busy.value) and "제출" not in str(busy.value)
+    # 로그 문구는 중립(AIDE 는 409 가 아니다) — 무엇을 기다렸는지는 label 로 가른다
+    assert "잠금 대기 10000ms 초과: wanted GRP001 2026-11" in caplog.text and "409" not in caplog.text
+    with pytest.raises(HTTPException) as http:
+        _raise_domain_error(busy.value)
+    assert (http.value.status_code, http.value.detail) == (409, {"code": "WANTED_BUSY", "message": str(busy.value)})
+    with pytest.raises(HTTPException) as closed:                # 마감·이미 제출은 지금처럼 문자열
+        _raise_domain_error(PreferenceConflictError("2026년 11월 원티드가 마감되었습니다."))
+    assert closed.value.detail == "2026년 11월 원티드가 마감되었습니다."
+
+
+def test_all_preferences_rows_follow_primary_key_order():
+    """일괄 조회 행은 기본 키 순으로 담는다 — 같은 날 겹친 행은 뒤 행(큰 detailed_request_id)이 이기는데,
+    ORDER BY 없는 IN 조회는 그 순서가 실행 계획에 달린다."""
+    from types import SimpleNamespace
+
+    import services.preferences_service as ps
+
+    def _row(request_id, detailed):
+        return SimpleNamespace(nurse_id="N002", request_id=request_id, detailed_request_id=detailed,
+                               shift_date=date(Y, M, 14))
+
+    rows = [_row(1, 3), _row(1, 1), _row(2, 1), _row(1, 2)]     # DB 가 섞어 돌려준 순서
+    out = ps._rows_of_latest(rows, {"N002": SimpleNamespace(request_id=1)}, ps._SHIFT_ROW_ORDER)
+    assert [r.detailed_request_id for r in out["N002"]] == [1, 2, 3]
+
+
+def test_all_preferences_same_day_rows_keep_larger_detailed_row(env, monkeypatch):
+    """같은 날 겹친 칸은 큰 detailed_request_id 행이 이긴다(최종 응답) — 정렬을 빼거나 먼저 담은 행이 이기게 바꾸면
+    잡힌다. 큰 행을 먼저 넣어, DB 가 넣은 순서로 돌려줘도 결과가 같은지 본다."""
+    import services.preferences_service as ps
+
+    monkeypatch.setattr(ps, "_resolve_all_preferences_scope", lambda *a, **k: (G, True))
+    env.add(WantedRequest(nurse_id="N002", request_id=1, month=MONTH, group_id=G, request="", is_submitted=True,
+                          created_at=datetime(2026, 10, 1), submitted_at=datetime(2026, 10, 20)))
+    for detailed, comment in ((2, "뒤"), (1, "앞")):
+        env.add(NurseShiftRequest(nurse_id="N002", request_id=1, detailed_request_id=detailed,
+                                  shift_date=date(Y, M, 14), group_id=G, shift=V, score=10.0,
+                                  partial_request="", comment=comment))
+        env.flush()
+    rows = {r["nurse_id"]: r["data"]["shift"] for r in ps.get_all_preferences_service(Y, M, _user("N001"), env)}
+    assert rows["N002"][V]["14"]["comment"] == "뒤"
+
+
+@pytest.mark.parametrize("tool", ["add", "modify", "delete"])
+def test_aide_write_error_after_lock_undoes_tool_writes_and_unlocks(env, monkeypatch, tool):
+    """잠근 뒤 예외 — 그 도구가 쓴 것(초안·복사 칸)만 되돌리고 잠금을 푼 뒤 다시 던진다. 같은 턴의 앞선 기록은 남는다.
+    그냥 올려 보내면 잠금이 턴 끝(LLM 답 생성 뒤)까지 남아 같은 병동·월 화면 제출이 10초 기다린 뒤 409 를 받는다."""
+    _request(env, "N002", {14: V})
+    env.add(WantedConfig(group_id=G, year=Y, month=M, target_date=date(Y, M, 30), max_requests=9))  # 같은 턴 앞선 기록
+    env.flush()
+    unlocked: list = []
+    real_unlock, real_copy = wanted_tools._unlock, wanted_tools._create_draft_with_copy
+
+    def _spy_unlock(db):
+        unlocked.append(1)
+        real_unlock(db)
+
+    def _copy_then_fail(*args, **kwargs):
+        real_copy(*args, **kwargs)                               # 초안·복사 칸을 다 만든 뒤 터진다
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(wanted_tools, "_unlock", _spy_unlock)
+    monkeypatch.setattr(wanted_tools, "_create_draft_with_copy", _copy_then_fail)
+    calls = {
+        "add": lambda: wanted_tools.add_wanted_by_date(env, "N002", G, Y, M, "2026-11-15", V,
+                                                       preview_only=False, self_rules=True),
+        "modify": lambda: wanted_tools.modify_wanted_by_date(env, "N002", G, Y, M, "2026-11-14", GONGGA,
+                                                             preview_only=False, self_rules=True),
+        "delete": lambda: wanted_tools.delete_wanted_by_date(env, "N002", G, Y, M, "2026-11-14",
+                                                             preview_only=False, self_rules=True),
+    }
+    with pytest.raises(RuntimeError, match="boom"):
+        calls[tool]()
+    assert unlocked == [1]
+    assert {r.request_id for r in env.query(WantedRequest).filter(
+        WantedRequest.nurse_id == "N002", WantedRequest.month == MONTH)} == {1}
+    assert env.query(WantedConfig).filter(WantedConfig.target_date == date(Y, M, 30)).one().max_requests == 9
+
+
+@pytest.mark.parametrize("fail_at", ["commit", "inner_savepoint"])
+def test_release_lock_on_error_recovers_session_after_flush_failure(fail_at):
+    """도구 안 flush 가 실패해도(savepoint 비활성) 그 도구 쓰기만 되돌리고 커밋으로 잠금을 푼다 — 같은 턴의 앞선 감사
+    기록이 남고, 세션을 다시 써 실패 감사 기록도 남긴다. 실제 commit 으로 본다(11-04 Codex 재현 — is_active 만 보고
+    되돌리기를 건너뛰면 잠금 풀기가 PendingRollbackError 로 실패하고 앞선 감사 기록까지 사라진다)."""
+    from sqlalchemy import Column, Integer, String, create_engine
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.orm import Session, declarative_base
+
+    base = declarative_base()
+
+    class _Audit(base):
+        __tablename__ = "audit_probe"
+        id = Column(Integer, primary_key=True)
+        kind = Column(String)
+
+    engine = create_engine("sqlite://")
+    base.metadata.create_all(engine)
+
+    @wanted_tools._release_lock_on_error
+    def _tool(db, *, preview_only=False):
+        db.add(_Audit(id=2, kind="도구 쓰기"))
+        db.flush()
+        if fail_at == "commit":                  # 철회·_submit_draft 처럼 도구 안 commit 의 flush 가 실패
+            db.add(_Audit(id=1, kind="중복"))
+            db.commit()
+        else:                                    # _draft_within_quota 처럼 안쪽 savepoint 의 flush 가 실패
+            inner = db.begin_nested()
+            db.add(_Audit(id=1, kind="중복"))
+            db.flush()
+            inner.commit()
+
+    with Session(engine) as db:
+        db.add(_Audit(id=1, kind="앞선 감사"))
+        db.flush()
+        with pytest.raises(IntegrityError):
+            _tool(db, preview_only=False)
+        db.add(_Audit(id=3, kind="실패 감사"))
+        db.commit()
+    with Session(engine) as check:
+        assert sorted((r.id, r.kind) for r in check.query(_Audit)) == [(1, "앞선 감사"), (3, "실패 감사")]
+
+
+@pytest.mark.parametrize("fail_at", ["commit", "statement"])
+def test_release_lock_on_error_resyncs_session_after_deadlock(monkeypatch, caplog, fail_at):
+    """교착(1205)이면 서버가 턴 트랜잭션 전체를 이미 되돌렸다 — 잠금 풀기 커밋 대신 세션만 서버에 맞추고 1205 를 다시
+    던진다. 도구 안 commit 의 flush 에서 나면 savepoint 정리 실패가 1205 를 가린다(commit). 맞추지 않으면 MSSQL 에서는
+    다음 쓰기(실패 감사 기록)가 트랜잭션 밖에서 바로 확정되고 턴 끝 commit 이 3902 로 실패한다(11-04 점검 가짜 서버 재현)."""
+    import sqlite3
+
+    from sqlalchemy import Column, Integer, String, create_engine, text
+    from sqlalchemy.orm import Session, declarative_base
+
+    base = declarative_base()
+
+    class _Audit(base):
+        __tablename__ = "audit_probe"
+        id = Column(Integer, primary_key=True)
+        kind = Column(String)
+
+    engine = create_engine("sqlite://")
+    base.metadata.create_all(engine)
+    real_execute = engine.dialect.do_execute
+
+    def _deadlock_on_marker(cursor, statement, parameters, context=None):
+        if "교착" in statement or "교착" in tuple(parameters or ()):
+            cursor.connection.rollback()                 # 교착 희생 — 서버가 트랜잭션 전체를 되돌린다
+            raise sqlite3.OperationalError(1205, "chosen as the deadlock victim")
+        return real_execute(cursor, statement, parameters, context)
+
+    monkeypatch.setattr(engine.dialect, "do_execute", _deadlock_on_marker)
+    unlocked: list = []
+    monkeypatch.setattr(wanted_tools, "_unlock", lambda db: unlocked.append(1))
+
+    @wanted_tools._release_lock_on_error
+    def _tool(db, *, preview_only=False):
+        db.add(_Audit(id=2, kind="도구 쓰기"))
+        db.flush()
+        if fail_at == "commit":                          # 철회·_submit_draft 의 commit flush
+            db.add(_Audit(id=9, kind="교착"))
+            db.commit()
+        else:                                            # 잠금 SELECT 처럼 flush 밖 문장
+            db.execute(text("SELECT 1 /* 교착 */"))
+
+    with Session(engine) as db:
+        db.add(_Audit(id=1, kind="앞선 감사"))
+        db.flush()
+        with pytest.raises(OperationalError) as raised:
+            _tool(db, preview_only=False)
+        assert raised.value.orig.args[0] == 1205
+        assert unlocked == []                            # 서버엔 트랜잭션이 없다 — 잠금 풀기 커밋을 하지 않는다
+        db.add(_Audit(id=3, kind="실패 감사"))
+        db.commit()
+    with Session(engine) as check:
+        assert sorted((r.id, r.kind) for r in check.query(_Audit)) == [(3, "실패 감사")]
+    assert "서버가 트랜잭션을 되돌림" in caplog.text
+
+
+def test_aide_write_tool_keeps_signature_for_skill_calls():
+    """감싼 쓰기 도구도 원래 인자 이름을 그대로 보인다 — 스킬이 키워드로 부른다."""
+    import inspect
+
+    params = inspect.signature(wanted_tools.add_wanted_by_date).parameters
+    assert {"preview_only", "self_rules", "shift_code"} <= set(params)
+    assert params["preview_only"].default is True

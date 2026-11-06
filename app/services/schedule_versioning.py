@@ -1,4 +1,5 @@
-"""근무표 병동·달 단위 직렬화 잠금 — 버전 번호 매기기와 마감·철회.
+"""근무표 병동·달 단위 직렬화 잠금 — 버전 번호 매기기와 마감·철회. 앱 잠금(`_applock`)은 원티드 팀 한도 저장·
+팀 기간도 함께 쓴다.
 
 ★ 버전 번호는 "그 달 최대 VER + 1" 이다. 두 요청이 동시에 최대값을 읽으면 같은 VER 가 둘
   생긴다(새 버전 저장·복사·빈 근무표·주휴 근무표·생성 요청 5곳 — 한 곳만 잠그면 나머지와
@@ -39,7 +40,8 @@ def _applock(db: Session, resource: str, timeout_ms: int, busy_detail: str) -> N
     if rc is not None and int(rc) == -1:
         raise HTTPException(status_code=409, detail=busy_detail)
     logger.error("[ScheduleLock] 앱 잠금 실패 rc=%s resource=%s", rc, resource)
-    raise HTTPException(status_code=500, detail="근무표 잠금을 잡지 못했습니다(잠금 오류).")
+    # 문구는 근무표에 한정하지 않는다 — 원티드 팀 한도 저장도 이 잠금을 쓴다(11-04 점검).
+    raise HTTPException(status_code=500, detail="저장 잠금을 잡지 못했습니다(잠금 오류).")
 
 
 def lock_version_numbering(

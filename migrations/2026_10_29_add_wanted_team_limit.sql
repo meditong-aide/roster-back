@@ -3,17 +3,20 @@
  * 목적
  *   병원 요청: 팀마다 날짜별로 휴가·휴무 계열 원티드 신청 인원을 제한한다.
  *   한 달 일괄(팀 기본값, target_date NULL) + 특정 날짜 예외(target_date 지정, 기본값보다 우선).
- *   행이 없으면 제한 없음. 병동 전체 일자별 제한(wanted_config)과 함께 적용한다.
+ *   행이 없으면 제한 없음. 적용 기준은 날짜마다 하나다 — 그날 내 팀 한도가 있으면 팀, 없으면 병동 전체
+ *   일자별 제한(wanted_config)(11-04 결정 '팀 우선, 없으면 병동').
  *
  * ★ wanted_config 를 넓히지 않은 이유 — 그 저장(POST /wanted/config)은 한 달 통째 교체라
  *   팀 행을 섞으면 기존 화면이 저장할 때 팀 설정이 지워진다.
  *
  * ★ 접속한 DB 에 그대로 적용된다. USE 를 쓰지 않는다 — 하드코딩하면 dev 에 넣으려 해도
  *   운영으로 간다. 실행 대상은 연결/-d 로 지정할 것.
- *     dev  : sqlcmd -S <host> -d eun_roster_dev -i <이 파일>
- *     prod : sqlcmd -S <host> -d eun_roster     -i <이 파일>
+ *     dev  : sqlcmd -b -S <host> -d eun_roster_dev -i <이 파일>
+ *     prod : sqlcmd -b -S <host> -d eun_roster     -i <이 파일>
+ *   -b 를 붙인다 — 없으면 아래 정의 대조의 RAISERROR 가 나도 종료 코드가 0 이라 실패를 놓친다.
  *
- * ★ 코드 배포보다 먼저 적용한다. 없으면 팀 한도 설정 API 는 실패하고, 제출 검사·조회는
+ * ★ 코드 배포 전후 어느 쪽에 넣어도 깨지지 않는다(옛 코드는 이 표를 쓰지 않는다). 꼭 지킬 선후는
+ *   'PC 팀 한도 모달 공개 전'이다. 표가 없으면 팀 한도 설정 API 는 503 이고, 제출 검사·조회는
  *   팀 한도를 건너뛴다(병동 전체 한도만 검사 — 저장소 준비 확인 후 경고 로그).
  *
  * ★ collation: group_id 는 groups.group_id 와 같은 varchar(50) Korean_Wansung_CI_AS 로 명시한다([MSSQL-09]).
@@ -22,7 +25,7 @@
  * ★ 고유키에 target_date(NULL 허용)가 들어간다. SQL Server 의 UNIQUE 제약은 NULL 을 같은 값으로
  *   보므로 (병동·월·팀) 당 기본값 행은 하나만 들어간다 — 의도한 동작이다.
  *
- * 적용 이력: eun_roster_dev 2026-10-29 14:35(재실행 검증 통과 · 행 0) / eun_roster 미적용(승인 뒤 코드 배포 전)
+ * 적용 이력: eun_roster_dev 2026-10-29 14:35(재실행 검증 통과 · 행 0) / eun_roster 미적용(승인 뒤 · 코드 배포 전후 무관 · 늦어도 PC 팀 한도 모달 공개 전)
  */
 
 IF NOT EXISTS (

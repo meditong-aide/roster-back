@@ -60,6 +60,7 @@
 | POST | `/roster/publish` | query | ⬜ |
 | POST | `/roster/unpublish` | query | ⬜ |
 | POST | `/roster/save` | query | ⬜ |
+| POST | `/roster/autosave` | query | ⬜ |
 | GET | `/roster/{year}/{month}/submissions` | query | ⬜ |
 | POST | `/roster/validate` | query | ⬜ |
 | PATCH | `/roster/{schedule_id}/name` | query | ⬜ |
@@ -83,6 +84,8 @@
 | POST | `/wanted/config` | query | ⬜ |
 | DELETE | `/wanted/config` | query | ⬜ |
 | DELETE | `/wanted/config/toggle` | query | ⬜ |
+| GET | `/wanted/team-limits` | query | ⬜ |
+| PUT | `/wanted/team-limits` | query | ⬜ |
 | POST | `/wanted/validate-limits` | query | ⬜ |
 | GET | `/wanted/over-limit-nurses` | query | ⬜ |
 | POST | `/wanted/delete-excess-off/{nurse_id}` | — (대상 nurse로 관리 판정) | — |

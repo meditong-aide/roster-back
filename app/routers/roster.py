@@ -87,6 +87,7 @@ from db.models import (
 )
 from sqlalchemy import func, and_, or_
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm.exc import StaleDataError
 import logging as _logging
 from routers.utils import get_days_in_month
 from db.nurse_config import Nurse as NurseEngine
@@ -1655,11 +1656,17 @@ def get_roster_by_schedule_id(
             print(f"[Roster][MemberFilter] schedule={schedule_id} "
                   f"{_sch_year}-{_sch_month:02d} 명단 {_before} → {len(nurses_in_group)}")
 
-    # Get shift manage data
-    # Get shift colors
-    shifts_db = db.query(Shift).all()
-    shift_colors = {s.shift_id: s.color for s in shifts_db}
-    shift_id = {s.shift_id: s.shift_id for s in shifts_db}
+    # 근무코드 색·counts — 이 병동 코드만, 같은 코드면 대표 행(sequence·id 첫 행) 색.
+    #   ★ 예전엔 전 병원 shifts 를 조건 없이 통째로 읽어 간호사마다 전 병원 코드 수만큼 counts 를 만들었다 — 조회마다
+    #     공용 DB 부하가 들고, 화면이 이 행을 되돌려 보내는 저장 본문도 커진다(11-04 점검). 다른 병원 색이 섞이던 것도 없어진다.
+    shift_colors: dict = {}
+    for code, color in (
+        db.query(Shift.shift_id, Shift.color)
+        .filter(Shift.group_id == target_group_id)
+        .order_by(Shift.sequence.asc(), Shift.id.asc())
+        .all()
+    ):
+        shift_colors.setdefault(code, color)
     # Get schedule entries
     entries = (
         db.query(ScheduleEntry).filter(ScheduleEntry.schedule_id == schedule_id).all()
@@ -2478,18 +2485,36 @@ def unpublish_roster(
 
 
 def _reject_issued_overwrite(db: Session, schedule: Schedule) -> None:
-    """마감본은 덮어쓰지 않는다 — 철회 후 저장하거나 [새 버전으로 저장](성남 ③ 결정 10-02).
+    """마감본은 덮어쓰지 않는다 — 철회 후 저장하거나 [새 버전으로 저장](성남 ③ 결정 10-02). 삭제된 근무표는 404.
 
-    ★ 근무표 행 잠금을 잡은 **뒤에** 부른다. 잠금 전 값은 그 사이 끝난 마감을 못 본다 —
-      화면에서 연 뒤 다른 창에서 마감하면 낡은 draft 로 보고 마감본을 덮어쓴다.
-      잠금을 기다린 뒤 다시 읽으면 먼저 커밋된 마감이 보인다.
+    ★ 근무표 행 잠금을 잡은 **뒤에** 부른다. 잠금 전 값은 그 사이 끝난 마감·삭제를 못 본다 —
+      화면에서 연 뒤 다른 창에서 마감하면 낡은 draft 로 보고 마감본을 덮어쓴다. 삭제를 못 보면 숨겨진
+      근무표에 200 으로 쓴다(11-04 점검 — 자동 저장이 잠금을 기다리는 사이 삭제가 커밋되는 경우).
+      잠금을 기다린 뒤 다시 읽으면 먼저 커밋된 마감·삭제가 보인다.
     """
-    db.refresh(schedule, attribute_names=["status"])
+    db.refresh(schedule, attribute_names=["status", "dropped"])
+    if schedule.dropped:
+        raise HTTPException(status_code=404, detail="No schedule found for this month")
     if str(schedule.status or "") == "issued":
         raise HTTPException(
             status_code=409,
             detail="마감된 근무표는 덮어쓸 수 없습니다. 마감 철회 후 저장하거나 [새 버전으로 저장]을 이용해 주세요.",
         )
+
+
+def _lock_schedule_for_save(db: Session, schedule: Schedule) -> None:
+    """저장 직렬화 잠금 — 근무표 행을 UPDATE(updated_at)·flush 해 배타 잠금을 잡고, 잠근 뒤 마감·삭제를 다시 본다.
+
+    ★ 생성 실패 draft 는 행째 지운다(roster_create_service). 그 삭제 커밋을 기다린 UPDATE 는 0행이라
+      StaleDataError(500)가 난다 — 숨긴 삭제(dropped)처럼 404 로 낸다(11-04 점검).
+    """
+    schedule.updated_at = datetime.now()
+    try:
+        db.flush()
+    except StaleDataError:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="No schedule found for this month")
+    _reject_issued_overwrite(db, schedule)
 
 
 def _roster_payload_cells(
@@ -2576,7 +2601,7 @@ def _roster_payload_cells(
     return cells
 
 
-# [Roster] - 근무표 저장
+# [Roster] - 근무표 저장(전량 교체)
 @router.post("/save")
 #   ★ (2026-10-02) 마감본 저장을 막으면서 이 핸들러의 N 연번 재계산(그룹 전체 범위)을 없앴다.
 #     예전 주석은 그 재계산이 publish/unpublish/drop 과 병렬로 겹칠 위험 때문에 async 를 고집했는데,
@@ -2589,6 +2614,36 @@ def save_roster(
     current_user: UserSchema = Depends(get_current_user_from_cookie),
     db: Session = Depends(get_db),
 ):
+    """근무표 전량 교체 저장 — 본문 간호사 칸으로 그 근무표 칸을 통째로 바꾼다(지문 검사 없음).
+
+    ★ `base_etag` 를 보내면 400 — 지문 저장(바뀐 행만 보내는 자동 저장)은 `/roster/autosave` 만 받는다.
+      여기로 새면 본문에 없는 간호사 칸이 지워진다.
+    """
+    return _save_roster(roster_data, current_user, db, guarded=False)
+
+
+# [Roster] - 근무표 자동 저장(내용 지문 검사)
+@router.post("/autosave")
+def autosave_roster(
+    roster_data: dict,
+    group_id: Optional[str] = None,
+    current_user: UserSchema = Depends(get_current_user_from_cookie),
+    db: Session = Depends(get_db),
+):
+    """근무표 지문 저장(자동 저장 · 11-04 결정 D8) — `base_etag` 필수(없거나 비면 400).
+
+    - 지금 지문과 다르면 409 `ROSTER_STALE`(칸은 그대로) · 바뀐 것이 없으면 쓰지 않는다(`unchanged`)
+    - 본문에 행이 있는 간호사 칸만 바꾼다(메모만 바뀌었으면 roster 빈 목록) · 지우려면 `remove_nurse_ids` ·
+      memo 키가 없으면 메모 유지
+    ★ `/roster/save` 와 경로를 나눈 이유 — 옛 서버의 `/roster/save` 는 base_etag 를 모른 채 전량 교체해, 프론트가
+      서버보다 먼저 나가거나 서버를 되돌리면 다른 간호사 칸·메모가 지워진다. 이 경로는 옛 서버에서 405
+      (`DELETE /roster/{schedule_id}` 와 경로만 맞음)로 끝나 아무것도 쓰지 않는다(11-04 점검).
+    """
+    return _save_roster(roster_data, current_user, db, guarded=True)
+
+
+def _save_roster(roster_data: dict, current_user: UserSchema, db: Session, *, guarded: bool) -> dict:
+    """`/roster/save`(guarded=False · 전량 교체)와 `/roster/autosave`(guarded=True · 지문 검사)의 본체."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
     if not (
@@ -2605,17 +2660,17 @@ def save_roster(
     #   PC 는 늘 memo 를 보내므로 지금 화면 동작은 같다.
     memo_given = "memo" in roster_data
     memo = roster_data.get("memo")
-    # 자동 저장(디바운싱) 계약 — `base_etag` 를 보낸 요청만 내용 지문 검사·본문에 없는 간호사 칸 보존·
-    # 모양 검사를 받는다(11-04 결정 D8). 안 보낸 기존 요청은 예전처럼 전량 교체한다.
-    base_etag = roster_data.get("base_etag")
-    if "base_etag" in roster_data and not base_etag:
-        # ★ null·빈 값을 '안 보냄'으로 받으면 검사 없이 전량 교체돼, 바뀐 행만 보낸 자동 저장이 다른 간호사 칸을 지운다.
-        raise HTTPException(status_code=400, detail="base_etag 가 비어 있습니다. 근무표를 조회해 받은 etag 를 보내 주세요.")
+    if guarded and not roster_data.get("base_etag"):
+        # ★ null·빈 값도 막는다 — 지문을 모르면 그사이 바뀐 근무표를 덮을 수 있다.
+        raise HTTPException(status_code=400, detail="base_etag 가 필요합니다. 근무표를 조회해 받은 etag 를 보내 주세요.")
+    if not guarded and "base_etag" in roster_data:
+        # ★ 바뀐 행만 보낸 자동 저장이 전량 교체로 새면 다른 간호사 칸이 지워진다 — 새 서버에서 먼저 드러나게 막는다.
+        raise HTTPException(status_code=400, detail="base_etag 를 보내는 저장은 /roster/autosave 로 보내 주세요.")
     # 자동 저장은 바뀐 간호사 행만 보내도 된다 — 메모만 바뀐 저장은 roster 가 빈 목록이다(빈 목록 = 칸은 그대로).
-    if base_etag is None:
-        missing = not all([year, month, schedule_id, roster])
-    else:
+    if guarded:
         missing = not all([year, month, schedule_id]) or not isinstance(roster, list)
+    else:
+        missing = not all([year, month, schedule_id, roster])
     if missing:
         raise HTTPException(
             status_code=400,
@@ -2628,19 +2683,17 @@ def save_roster(
         not_found_detail="No schedule found for this month",
     )
     target_group_id = schedule.group_id
-    if base_etag is not None:
+    if guarded:
         _check_etag_save_shape(schedule, year, month, roster)
     # ★★ 같은 근무표에 대한 저장을 **직렬화**한다.
-    #   이 엔드포인트는 근무표를 전량 교체하므로, 두 사람이 동시에 저장하면 뒤늦은 쪽이
-    #   앞선 저장을 통째로 덮어쓴다(lost update). 이력도 덩달아 "무엇에서 무엇으로" 를
-    #   잘못 기록한다 — 둘 다 같은 옛 상태를 스냅샷으로 잡기 때문이다.
+    #   저장은 칸을 지우고 다시 넣으므로(`/roster/save` 는 전부, `/roster/autosave` 는 본문 간호사 칸),
+    #   두 사람이 동시에 저장하면 뒤늦은 쪽이 앞선 저장을 덮어쓴다(lost update). 이력도 덩달아
+    #   "무엇에서 무엇으로" 를 잘못 기록한다 — 둘 다 같은 옛 상태를 스냅샷으로 잡기 때문이다.
     #   여기서 schedule 행을 갱신하고 flush 하면 그 행에 배타 잠금이 걸려, 두 번째 저장은
     #   첫 번째가 커밋한 뒤에야 진행하고 **최신 상태를 스냅샷으로 본다**(실측: 대기 1.8초).
     #   ★ updated_at 을 함께 건드리는 이유 — memo 가 그대로면 SQLAlchemy 가 UPDATE 를
     #     생략해 잠금이 안 걸린다. 저장 시각 갱신은 의미상으로도 맞다.
-    schedule.updated_at = datetime.now()
-    db.flush()
-    _reject_issued_overwrite(db, schedule)
+    _lock_schedule_for_save(db, schedule)
     # ★ 저장 전 메모도 잠근 **뒤에** 다시 읽는다 — 잠금 전 값은 그 사이 커밋된 메모 저장을 못 봐
     #   지문 검사가 그 저장을 덮는다(11-04 검토). 그래서 새 메모는 다시 읽은 뒤에 넣는다.
     db.refresh(schedule, attribute_names=["memo"])
@@ -2649,9 +2702,10 @@ def save_roster(
         schedule.memo = memo
 
     # ── 수정 이력용 스냅샷 ──
-    #   ★ 이 엔드포인트는 근무표 **전체**를 받아 전량 교체한다. 즉 서버는 무엇이 바뀌었는지
-    #     모른다. 그래서 지우기 **직전에** 현재 상태를 찍어 두고, 재삽입 후 비교해 바뀐 칸만
-    #     로그로 남긴다. 실패해도 저장 자체는 막지 않는다(이력은 부가 기능).
+    #   ★ 저장 본문은 칸을 통째로 갈아 끼운다(guarded=False 는 근무표 전체, True 는 본문 간호사 칸).
+    #     즉 서버는 무엇이 바뀌었는지 모른다. 그래서 지우기 **직전에** 현재 상태를 찍어 두고, 재삽입 후
+    #     비교해 바뀐 칸만 로그로 남긴다. 실패해도 저장 자체는 막지 않는다(이력은 부가 기능).
+    #     guarded 는 이 스냅샷이 지문 검사의 기준이기도 해서, 실패하면 저장하지 않는다(503).
     #   ★★ 스냅샷은 **저장 트랜잭션 안**에서 도는 읽기다. 여기서 DB 예외가 나면 세션이
     #     깨진 채로 남아 이후 delete/insert/commit 이 통째로 실패한다 — "부가 기능이라
     #     감쌌다" 는 방어가 오히려 저장을 죽인다. 그래서 예외를 삼키기 전에 반드시
@@ -2668,7 +2722,7 @@ def save_roster(
             db.rollback()
         except Exception:
             pass
-        if base_etag is not None:
+        if guarded:
             # 지문을 확인할 수 없으면 검사 없이 저장하지 않는다 — 자동 저장이 최신 근무표를 덮을 수 있다.
             raise HTTPException(status_code=503, detail="근무표를 확인하지 못해 저장하지 않았습니다. 잠시 후 다시 시도해 주세요.")
         _hist_before = None
@@ -2682,21 +2736,21 @@ def save_roster(
         # ★ rollback 이 **직렬화 잠금까지 풀어 버린다.** 다시 잡지 않으면 이 저장만
         #   잠금 없이 진행해 동시 저장 시 lost update 가 그대로 난다(이력이 없는 것과
         #   근무표를 잃는 것은 다른 문제다). 위와 같은 방식으로 재획득한다.
-        schedule.updated_at = datetime.now()
-        db.flush()
-        _reject_issued_overwrite(db, schedule)
+        _lock_schedule_for_save(db, schedule)
     _hist_after: dict = {}
 
     # 케이스 보존을 위해 유효 shift_id 기반 정규화 — `_roster_payload_cells`
     payload = list(_roster_payload_cells(db, target_group_id, year, month, roster))
     kept_rows: list = []
-    if base_etag is not None:
+    if guarded:
         kept_rows = _etag_guarded_clear(db, schedule, roster_data, roster, payload, _rows_before, stored_memo)
         if kept_rows is None:
             # 바뀐 것이 없다 — 잠금용 updated_at 갱신까지 되돌리고 쓰지 않는다.
             db.rollback()
+            # 자동 저장 가운데 실제로 쓰지 않은 비율(디바운스 조정 근거)을 셀 수 있게 남긴다 — 응답 본문은 기록되지 않는다.
+            _roster_logger.info("[roster.autosave] unchanged schedule=%s group=%s", schedule_id, target_group_id)
             return {"message": "Roster saved successfully", "saved": True, "unchanged": True,
-                    "schedule_id": schedule_id, "etag": base_etag}
+                    "schedule_id": schedule_id, "etag": roster_data["base_etag"]}
         _hist_after.update(cells_from_rows(kept_rows))
     else:
         # Clear existing roster entries
@@ -2789,7 +2843,10 @@ def _etag_guarded_clear(db: Session, schedule: Schedule, roster_data: dict, rost
     """
     current = content_etag(rows_before, stored_memo)
     if roster_data.get("base_etag") != current:
+        schedule_id, group_id = schedule.schedule_id, schedule.group_id   # rollback 뒤엔 객체가 만료된다
         db.rollback()
+        # 배포 뒤 옛 탭·동시 편집·AIDE 칸 수정과 얼마나 부딪히는지 셀 수 있게 남긴다(11-04 점검).
+        _roster_logger.warning("[roster.autosave] 409 ROSTER_STALE schedule=%s group=%s", schedule_id, group_id)
         raise HTTPException(status_code=409, detail={
             "code": "ROSTER_STALE",
             "message": "다른 곳에서 근무표가 바뀌었어요. 최신 근무표를 불러온 뒤 다시 저장해 주세요.",

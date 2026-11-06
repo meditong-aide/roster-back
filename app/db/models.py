@@ -612,7 +612,7 @@ class PushOutbox(Base):
 class ScheduleEntryLog(Base):
     """근무표 셀 **수동 수정** 이력. `schedule_entries` 는 현재 상태만 유지하고 이력은 여기 쌓인다.
 
-    ★ 대상은 사람이 화면에서 고친 것 — `/roster/save`(source='manual')와 `/roster/save-as`
+    ★ 대상은 사람이 화면에서 고친 것 — `/roster/save`·`/roster/autosave`(source='manual')와 `/roster/save-as`
       (source='save_as', 원본 버전 대비 바뀐 칸)뿐이다. 생성·재생성은 남기지 않는다 —
       한 번에 수백 행이 바뀌어 로그가 금세 커지고, 사용자가 보려는 "내가 고친 이력"과 성격이 다르다.
       나중에 방침이 바뀌어도 `source` 로 구분만 하면 되도록 컬럼은 미리 뒀다.

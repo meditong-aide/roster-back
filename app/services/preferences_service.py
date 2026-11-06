@@ -7,6 +7,7 @@ import calendar
 import json
 import logging
 import pprint
+from operator import attrgetter
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import String, and_, cast, extract, inspect as sa_inspect, or_
@@ -43,6 +44,17 @@ class PreferenceQuotaError(PreferenceConflictError):
         super().__init__(message)
         self.code = "DAILY_QUOTA_EXCEEDED"
         self.detail = detail
+
+
+class WantedBusyError(PreferenceConflictError):
+    """같은 병동·월 원티드 잠금을 기다리다 대기 상한을 넘었다 (409 · code WANTED_BUSY).
+
+    마감·이미 제출 409(문자열 detail)와 화면이 구분하게 code 를 단다 — 다시 시도하면 대개 통과한다(11-04 점검).
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.code = "WANTED_BUSY"
 
 
 class PreferenceValidationError(Exception):
@@ -1219,7 +1231,7 @@ def retract_submission_service(req: PreferenceSubmit, current_user, db: Session)
     from services.wanted_daily_quota_service import _LOCK_TIMEOUT_MS, _lock_wait_limit
 
     with _lock_wait_limit(db, _LOCK_TIMEOUT_MS,
-                          "같은 병동의 다른 원티드를 처리하는 중이에요. 잠시 후 다시 시도해 주세요."):
+                          label=f"wanted {preference.group_id} {req.year}-{int(req.month):02d} 철회"):
         wanted = (
             db.query(Wanted)
             .with_hint(Wanted, "WITH (UPDLOCK, ROWLOCK)", "mssql")
@@ -1322,14 +1334,14 @@ def _build_daily_quota(db: Session, nurse_id: str, group_id: str, year: int, mon
 
     ★ 덧붙인 필드라 계산이 실패해도 원티드 조회 자체는 살린다(None + 로그). 이 호출은 조회의
       마지막 단계라 실패한 문장이 같은 트랜잭션의 다음 쿼리를 막지 않는다.
+    ★ DB 오류만이 아니라 모든 예외를 잡는다 — 임시저장·제출은 이 계산 **전에** 커밋됐다. 여기서 500 이 나면
+      성공한 저장이 실패로 보이고, 모바일은 낙관적 갱신을 되돌린 뒤 옛 상태로 다시 저장한다(11-04 점검).
     """
-    from sqlalchemy.exc import SQLAlchemyError
-
     from services.wanted_daily_quota_service import daily_quota_view
 
     try:
         return daily_quota_view(db, nurse_id=nurse_id, group_id=group_id, year=year, month=month)
-    except SQLAlchemyError:
+    except Exception:
         logger.error("[wanted_quota] daily_quota 계산 실패 — 필드 생략: nurse=%s, %s-%02d",
                      nurse_id, year, month, exc_info=True)
         return None
@@ -1535,13 +1547,21 @@ def _staff_visible_preference(data_json: dict) -> dict:
     }
 
 
-def _rows_of_latest(rows, latest_wr_map: dict) -> dict:
+#: 칸·짝꿍 행 순서 = 기본 키 순. 같은 날 겹친 행은 뒤 행(큰 detailed_request_id)이 이긴다.
+_SHIFT_ROW_ORDER = attrgetter("nurse_id", "request_id", "detailed_request_id", "shift_date")
+_PAIR_ROW_ORDER = attrgetter("nurse_id", "request_id", "detailed_request_id", "target_id")
+
+
+def _rows_of_latest(rows, latest_wr_map: dict, order) -> dict:
     """일괄로 읽은 칸·짝꿍 행을 간호사별로 나누되 **그 간호사의 최신 제출본** 행만 남긴다.
 
     request_id 는 간호사마다 따로 매기므로(복합 키) IN 조건만으로는 다른 간호사의 같은 번호 요청이 섞인다.
+    ★ 행 순서는 여기서 기본 키 순(order)으로 고정한다 — 같은 날 겹친 행은 뒤 행이 이기는데(호출부 덮어쓰기),
+      ORDER BY 없는 IN 일괄 조회는 그 순서가 실행 계획에 달린다. 정렬을 SQL 에 걸지 않는 건 공용 DB 에
+      Sort·메모리 그랜트를 더하지 않기 위해서다(11-04 점검).
     """
     out: dict = {}
-    for r in rows:
+    for r in sorted(rows, key=order):
         wr = latest_wr_map.get(r.nurse_id)
         if wr is not None and r.request_id == wr.request_id:
             out.setdefault(r.nurse_id, []).append(r)
@@ -1613,6 +1633,7 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             NurseShiftRequest.shift_date <= date(year, month, calendar.monthrange(year, month)[1]),
         ).all(),
         latest_wr_map,
+        _SHIFT_ROW_ORDER,
     )
     pair_rows_by_nurse = _rows_of_latest(
         db.query(NursePairRequest).filter(
@@ -1621,6 +1642,7 @@ def get_all_preferences_service(year: int, month: int, current_user, db: Session
             NursePairRequest.month == month_str,
         ).all(),
         latest_wr_map,
+        _PAIR_ROW_ORDER,
     )
 
     for nurse_id, wr in latest_wr_map.items():

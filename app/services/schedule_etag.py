@@ -1,7 +1,8 @@
 """근무표 내용 지문(etag) — 자동 저장(디바운싱)이 늦게 도착한 옛 요청으로 최신 근무표를 덮지 않게 한다.
 
-- 지문 = 칸(간호사·날짜·근무코드·shifts.id)과 메모. 조회(`GET /roster/schedule/{id}`)와 저장(`POST /roster/save`)
-  응답에 싣고, 저장 요청이 `base_etag` 로 되돌려 보낸다. 저장 때 지금 지문과 다르면 409 `ROSTER_STALE`.
+- 지문 = 칸(간호사·날짜·근무코드·shifts.id)과 메모. 조회(`GET /roster/schedule/{id}`)와 저장(`POST /roster/save`·
+  `/roster/autosave`) 응답에 싣고, 자동 저장(`POST /roster/autosave`)이 `base_etag` 로 되돌려 보낸다. 그때 지금
+  지문과 다르면 409 `ROSTER_STALE`. `/roster/save` 는 base_etag 를 받지 않는다(400 — 11-04 경로 분리).
 - 칸 행만으로 만든다 — `schedules.updated_at` 이나 버전 번호는 AIDE 칸 수정(`schedule_tools`)이 건드리지 않아
   그 수정을 놓친다. DDL 이 필요 없다(11-04 결정 D8).
 """
